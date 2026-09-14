@@ -5,7 +5,10 @@ use std::sync::{
 
 use async_trait::async_trait;
 use zeroclaw_commands::goal::GoalCommand;
-use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
+use zeroclaw_config::{
+    goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig, GoalVerifierConfig},
+    providers::ModelProviderRef,
+};
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
@@ -457,13 +460,44 @@ fn host_settings(enabled: bool) -> GoalHostSettings {
     GoalHostSettings::new(
         enabled,
         ConfigGoalBudgetLimits {
-            token_limit: None,
-            cost_limit_usd: None,
+            token_limit: Some(100),
+            cost_limit_usd: Some(1.0),
         },
         42,
         "test-boot",
     )
     .unwrap()
+}
+
+#[test]
+fn enabled_host_settings_reject_unproven_unlimited_defaults() {
+    assert!(
+        GoalHostSettings::new(
+            true,
+            ConfigGoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: None,
+            },
+            42,
+            "test-boot",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn explicitly_unlimited_enabled_config_retains_its_declaration_provenance() {
+    let config = GoalConfig {
+        enabled: true,
+        default_token_limit: Some(0),
+        default_cost_limit_usd: Some(0.0),
+        verifier: GoalVerifierConfig {
+            model_provider: ModelProviderRef::new("openai.default"),
+            model: None,
+        },
+    };
+
+    assert!(GoalHostSettings::from_config(&config, 42, "test-boot").is_ok());
 }
 
 fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
@@ -484,7 +518,12 @@ async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
     });
 
     let error = GoalExecutionHost::new()
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap_err();
 
@@ -506,7 +545,12 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     let settings = host_settings(true);
     let host = GoalExecutionHost::new();
     let submission = host
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
 
@@ -529,7 +573,12 @@ async fn mismatched_driver_key_is_rejected_before_binding() {
         execution_acquires: AtomicUsize::new(0),
     });
     let error = GoalExecutionHost::new()
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap_err();
 
@@ -549,7 +598,12 @@ async fn driver_returning_a_different_binding_is_rejected_after_binding() {
     });
 
     let error = GoalExecutionHost::new()
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap_err();
 
@@ -570,7 +624,12 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     let settings = host_settings(true);
     let host = GoalExecutionHost::new();
     let submission = host
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
 
@@ -623,7 +682,12 @@ async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
     let settings = host_settings(false);
     let host = GoalExecutionHost::new();
     let submission = host
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
 
@@ -647,7 +711,12 @@ async fn exact_driver_binding_and_typed_command_are_preserved() {
     let command = GoalCommand::Pause;
 
     let submission = GoalExecutionHost::new()
-        .submit(ingress.clone(), driver.clone(), command.clone())
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            command.clone(),
+        )
         .await
         .unwrap();
 
@@ -661,6 +730,7 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
     let ingress = matrix_ingress();
     let submission = GoalExecutionHost::new()
         .submit(
+            &host_settings(true),
             ingress.clone(),
             recording_driver(&ingress),
             GoalCommand::Start {
@@ -848,6 +918,7 @@ async fn controller_submission_future_is_send() {
     let ingress = matrix_ingress();
     let submission = GoalExecutionHost::new()
         .submit(
+            &host_settings(true),
             ingress.clone(),
             recording_driver(&ingress),
             GoalCommand::Status,
@@ -882,6 +953,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
 
     let start = host
         .submit(
+            &host_settings(true),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Start {
@@ -915,7 +987,12 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     );
 
     let pause = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause,
+        )
         .await
         .unwrap();
     let GoalResponse::Paused(paused) = controller.submit(&settings, &pause).await.unwrap() else {
@@ -924,7 +1001,12 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     assert_eq!(paused.execution_epoch, 2);
 
     let resume = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Resume)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Resume,
+        )
         .await
         .unwrap();
     let GoalResponse::Resumed(resumed) = controller.submit(&settings, &resume).await.unwrap()
@@ -934,7 +1016,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     assert_eq!(resumed.execution_epoch, 3);
 
     let cancel = host
-        .submit(ingress, driver, GoalCommand::Cancel)
+        .submit(&host_settings(true), ingress, driver, GoalCommand::Cancel)
         .await
         .unwrap();
     assert!(matches!(
@@ -957,7 +1039,12 @@ async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettle
         objective: "finish the assigned task".into(),
     };
     let start = host
-        .submit(ingress.clone(), driver.clone(), start_command())
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            start_command(),
+        )
         .await
         .unwrap();
     let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
@@ -965,7 +1052,12 @@ async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettle
     };
 
     let active_start = host
-        .submit(ingress.clone(), driver.clone(), start_command())
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            start_command(),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -986,7 +1078,12 @@ async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettle
         GoalTransitionResult::Applied
     );
     let cancel = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Cancel,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -994,7 +1091,10 @@ async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettle
         GoalResponse::Cancelled(_)
     ));
 
-    let terminal_start = host.submit(ingress, driver, start_command()).await.unwrap();
+    let terminal_start = host
+        .submit(&host_settings(true), ingress, driver, start_command())
+        .await
+        .unwrap();
     let GoalResponse::Terminal(terminal) =
         controller.submit(&settings, &terminal_start).await.unwrap()
     else {
@@ -1015,6 +1115,7 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
 
     let start = host
         .submit(
+            &host_settings(true),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Start {
@@ -1041,7 +1142,12 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
     );
 
     let pause = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1050,7 +1156,7 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
     ));
 
     let resume = host
-        .submit(ingress, driver, GoalCommand::Resume)
+        .submit(&host_settings(true), ingress, driver, GoalCommand::Resume)
         .await
         .unwrap();
     let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
@@ -1071,7 +1177,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
     let host = GoalExecutionHost::new();
 
     let help = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Help)
+        .submit(
+            &disabled,
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Help,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1079,7 +1190,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         GoalResponse::Help
     ));
     let disabled_status = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .submit(
+            &disabled,
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1091,7 +1207,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
     ));
 
     let absent = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1101,6 +1222,7 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
 
     let start = host
         .submit(
+            &host_settings(true),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Start {
@@ -1120,7 +1242,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         (GoalCommand::Budget, "budget"),
     ] {
         let submission = host
-            .submit(ingress.clone(), driver.clone(), command)
+            .submit(
+                &host_settings(true),
+                ingress.clone(),
+                driver.clone(),
+                command,
+            )
             .await
             .unwrap();
         let response = controller.submit(&enabled, &submission).await.unwrap();
@@ -1135,6 +1262,7 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
 
     let update = host
         .submit(
+            &host_settings(true),
             ingress.clone(),
             driver.clone(),
             GoalCommand::SetBudget(zeroclaw_commands::goal::GoalBudgetSelection::Limits(
@@ -1154,7 +1282,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
     assert_eq!(updated.cost_limit_usd, None);
 
     let pause = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1162,7 +1295,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         GoalResponse::Paused(_)
     ));
     let pause_again = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1171,7 +1309,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
     ));
 
     let cancel = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Cancel,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1179,7 +1322,12 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         GoalResponse::Cancelled(_)
     ));
     let cancel_again = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Cancel,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1187,7 +1335,7 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         GoalResponse::AlreadyCancelled(_)
     ));
     let terminal_status = host
-        .submit(ingress, driver, GoalCommand::Status)
+        .submit(&host_settings(true), ingress, driver, GoalCommand::Status)
         .await
         .unwrap();
     assert!(matches!(
@@ -1216,6 +1364,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
 
     let start = host
         .submit(
+            &host_settings(true),
             first_ingress,
             first_driver,
             GoalCommand::Start {
@@ -1240,6 +1389,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
     let refreshed_driver = recording_driver(&refreshed_ingress);
     let status = host
         .submit(
+            &host_settings(true),
             refreshed_ingress.clone(),
             refreshed_driver.clone(),
             GoalCommand::Status,
@@ -1253,6 +1403,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
 
     let cancel = host
         .submit(
+            &host_settings(true),
             refreshed_ingress.clone(),
             refreshed_driver.clone(),
             GoalCommand::Cancel,
@@ -1266,6 +1417,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
 
     let replacement = host
         .submit(
+            &host_settings(true),
             refreshed_ingress,
             refreshed_driver,
             GoalCommand::Start {
@@ -1309,6 +1461,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
 
     let first_start = host
         .submit(
+            &host_settings(true),
             first_ingress.clone(),
             recording_driver(&first_ingress),
             GoalCommand::Start {
@@ -1325,6 +1478,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
 
     let colliding_status = host
         .submit(
+            &host_settings(true),
             colliding_ingress.clone(),
             recording_driver(&colliding_ingress),
             GoalCommand::Status,
@@ -1340,6 +1494,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
     ));
     let colliding_cancel = host
         .submit(
+            &host_settings(true),
             colliding_ingress.clone(),
             recording_driver(&colliding_ingress),
             GoalCommand::Cancel,
@@ -1355,6 +1510,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
     ));
     let colliding_start = host
         .submit(
+            &host_settings(true),
             colliding_ingress.clone(),
             recording_driver(&colliding_ingress),
             GoalCommand::Start {
@@ -1380,6 +1536,7 @@ async fn typed_start_objective_is_rejected_before_durable_write() {
     let ingress = matrix_ingress();
     let submission = GoalExecutionHost::new()
         .submit(
+            &host_settings(true),
             ingress.clone(),
             recording_driver(&ingress),
             GoalCommand::Start {
@@ -1406,7 +1563,7 @@ async fn typed_start_objective_is_rejected_before_durable_write() {
 }
 
 #[tokio::test]
-async fn session_lease_blocks_reconnect_until_submission_is_settled() {
+async fn disabled_goal_submission_does_not_acquire_a_session_lease() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
@@ -1426,26 +1583,26 @@ async fn session_lease_blocks_reconnect_until_submission_is_settled() {
     });
 
     let submission = GoalExecutionHost::new()
-        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .submit(&settings, ingress, driver.clone(), GoalCommand::Status)
         .await
         .unwrap();
 
     assert!(
-        !driver.reconnect_is_allowed(),
-        "the host must retain the driver's session lease"
+        driver.reconnect_is_allowed(),
+        "disabled Goal Mode must not contend the driver's session lease"
     );
     assert!(matches!(
         controller.submit(&settings, &submission).await.unwrap(),
         GoalResponse::Disabled
     ));
     assert!(
-        !driver.reconnect_is_allowed(),
-        "the borrowed submission retains its exact driver proof"
+        driver.reconnect_is_allowed(),
+        "a disabled submission carries no live-session lease"
     );
     drop(submission);
     assert!(
         driver.reconnect_is_allowed(),
-        "the lease may release after the submission is settled"
+        "the host never acquired a lease for disabled Goal Mode"
     );
 }
 
@@ -1461,8 +1618,8 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     let settings = GoalHostSettings::new(
         true,
         ConfigGoalBudgetLimits {
-            token_limit: None,
-            cost_limit_usd: None,
+            token_limit: Some(100),
+            cost_limit_usd: Some(1.0),
         },
         42,
         "test-boot",
@@ -1474,7 +1631,12 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     });
 
     let submission = GoalExecutionHost::new()
-        .submit(ingress, driver.clone(), GoalCommand::Pause)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Pause,
+        )
         .await
         .unwrap();
 
@@ -1502,7 +1664,12 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
     });
     let host = GoalExecutionHost::new();
     let submission = host
-        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Status,
+        )
         .await
         .unwrap();
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
