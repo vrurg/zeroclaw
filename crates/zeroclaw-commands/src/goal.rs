@@ -69,7 +69,8 @@ pub fn parse_goal_command(content: &str) -> Result<GoalCommand, GoalCommandParse
         return Err(GoalCommandParseError::MissingSubcommand);
     }
 
-    match subcommand.to_ascii_lowercase().as_str() {
+    let normalized_subcommand = subcommand.to_ascii_lowercase();
+    match normalized_subcommand.as_str() {
         "start" => parse_start(arguments),
         "status" => argument_free(arguments, "status", GoalCommand::Status),
         "budget" => parse_budget(arguments),
@@ -78,7 +79,7 @@ pub fn parse_goal_command(content: &str) -> Result<GoalCommand, GoalCommandParse
         "cancel" => argument_free(arguments, "cancel", GoalCommand::Cancel),
         "help" => argument_free(arguments, "help", GoalCommand::Help),
         _ => Err(GoalCommandParseError::UnknownSubcommand(
-            subcommand.to_ascii_lowercase(),
+            normalized_subcommand,
         )),
     }
 }
@@ -110,19 +111,28 @@ fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
         .filter(|character| character.is_whitespace())
         .map_or(0, char::len_utf8);
     let objective = &objective[separator_len..];
-    if objective.trim().is_empty() {
-        return Err(GoalCommandParseError::MissingObjective);
-    }
-    if objective.chars().count() > MAX_GOAL_OBJECTIVE_CHARS {
-        return Err(GoalCommandParseError::TextTooLong {
-            max: MAX_GOAL_OBJECTIVE_CHARS,
-        });
-    }
+    validate_objective(objective)?;
 
     Ok(GoalCommand::Start {
         budget: parse_budget_selection(flags, true)?,
         objective: objective.to_string(),
     })
+}
+
+fn validate_objective(objective: &str) -> Result<(), GoalCommandParseError> {
+    let mut has_non_whitespace = false;
+    for (index, character) in objective.chars().enumerate() {
+        if index == MAX_GOAL_OBJECTIVE_CHARS {
+            return Err(GoalCommandParseError::TextTooLong {
+                max: MAX_GOAL_OBJECTIVE_CHARS,
+            });
+        }
+        has_non_whitespace |= !character.is_whitespace();
+    }
+
+    has_non_whitespace
+        .then_some(())
+        .ok_or(GoalCommandParseError::MissingObjective)
 }
 
 fn parse_budget(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
@@ -302,6 +312,38 @@ mod tests {
             Ok(GoalCommand::Start {
                 budget: GoalBudgetSelection::Defaults,
                 objective: " \u{2003}complete -- exactly\u{2002}".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_unknown_subcommands_once_for_the_error_payload() {
+        assert_eq!(
+            parse_goal_command("/goal MiXeD"),
+            Err(GoalCommandParseError::UnknownSubcommand("mixed".into()))
+        );
+    }
+
+    #[test]
+    fn bounds_objective_validation_before_scanning_unbounded_whitespace() {
+        let overlong_whitespace = " ".repeat(MAX_GOAL_OBJECTIVE_CHARS + 2);
+        assert_eq!(
+            parse_goal_command(&format!("/goal start --{overlong_whitespace}")),
+            Err(GoalCommandParseError::TextTooLong {
+                max: MAX_GOAL_OBJECTIVE_CHARS,
+            })
+        );
+    }
+
+    #[test]
+    fn objective_length_limit_counts_unicode_scalar_values() {
+        let within_limit = "🦀".repeat(MAX_GOAL_OBJECTIVE_CHARS);
+        let over_limit = "🦀".repeat(MAX_GOAL_OBJECTIVE_CHARS + 1);
+        assert!(parse_goal_command(&format!("/goal start -- {within_limit}")).is_ok());
+        assert_eq!(
+            parse_goal_command(&format!("/goal start -- {over_limit}")),
+            Err(GoalCommandParseError::TextTooLong {
+                max: MAX_GOAL_OBJECTIVE_CHARS,
             })
         );
     }
