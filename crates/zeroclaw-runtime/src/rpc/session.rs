@@ -88,6 +88,20 @@ pub struct ResumedRpcSession {
     pub message_count: usize,
 }
 
+/// The authoritative live-session facts required to admit a Goal command.
+///
+/// Goal admission must read these facts together: independent reads can span a
+/// same-ID replacement and accidentally combine the old generation with the
+/// successor's owner or agent. This remains a read-only projection of the
+/// canonical session store, not a second session registry.
+pub(crate) struct GoalSessionSnapshot {
+    pub(crate) agent: Arc<Mutex<Agent>>,
+    pub(crate) agent_alias: String,
+    pub(crate) chat_mode: crate::rpc::types::ChatMode,
+    pub(crate) owner_tui_id: Option<String>,
+    pub(crate) generation: u64,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -333,6 +347,21 @@ impl SessionStore {
     /// becomes a no-op.
     pub async fn get_generation(&self, id: &str) -> Option<u64> {
         self.sessions.lock().await.get(id).map(|s| s.generation)
+    }
+
+    /// Read the exact Goal-admission facts under one session-store lock.
+    pub(crate) async fn goal_session_snapshot(&self, id: &str) -> Option<GoalSessionSnapshot> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| GoalSessionSnapshot {
+                agent: Arc::clone(&session.agent),
+                agent_alias: session.agent_alias.clone(),
+                chat_mode: session.chat_mode.clone(),
+                owner_tui_id: session.owner_tui_id.clone(),
+                generation: session.generation,
+            })
     }
 
     /// Await the test-only pause gate before validating generation in
@@ -1553,6 +1582,45 @@ mod tests {
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_snapshot_reads_one_generation_with_its_authority_facts() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "first", ".", ChatMode::Chat)
+                    .with_owner(Some("tui-first".into())),
+            )
+            .await
+            .unwrap();
+        let first = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("first Goal session snapshot");
+        assert_eq!(first.agent_alias, "first");
+        assert_eq!(first.owner_tui_id.as_deref(), Some("tui-first"));
+        assert_eq!(first.chat_mode, ChatMode::Chat);
+
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "second", ".", ChatMode::Acp)
+                    .with_owner(Some("tui-second".into())),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("replacement Goal session snapshot");
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(second.agent_alias, "second");
+        assert_eq!(second.owner_tui_id.as_deref(), Some("tui-second"));
+        assert_eq!(second.chat_mode, ChatMode::Acp);
     }
 
     #[tokio::test]
