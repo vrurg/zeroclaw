@@ -279,7 +279,8 @@ pub trait GoalSessionDriver: Send + Sync {
 /// Controller-owned facts carried for one fenced Goal execution epoch.
 ///
 /// The host validates the session binding only. The later executor performs
-/// the durable task and epoch fence before it asks a driver for this lease.
+/// the durable task, epoch, and ingress-ownership fence before it asks a
+/// driver for this lease.
 #[derive(Clone)]
 pub struct GoalExecutionScope {
     task_id: String,
@@ -555,6 +556,9 @@ impl GoalExecutionHost {
     /// foreground execution so a driver can take its own session guard. The
     /// driver must therefore revalidate the live session while acquiring that
     /// guard; it may not treat the earlier admission as a durable snapshot.
+    /// This consumes `submission` even if acquisition fails; retry requires a
+    /// fresh host admission after the executor has rechecked durable task,
+    /// epoch, and ingress ownership.
     pub async fn acquire_execution(
         &self,
         settings: &GoalHostSettings,
@@ -626,9 +630,9 @@ impl GoalHostSettings {
     /// Build settings resolved from the active Goal configuration for one
     /// controller admission.
     ///
-    /// This constructor accepts only finite defaults when enabled. Call
-    /// [`Self::from_config`] for an enabled configuration whose explicit zero
-    /// values mean unlimited; that path retains the operator's declaration
+    /// When enabled, this constructor requires at least one finite default.
+    /// Call [`Self::from_config`] for an enabled configuration whose explicit
+    /// zero values mean unlimited; that path retains the operator's declaration
     /// provenance before normalization.
     ///
     /// # Errors

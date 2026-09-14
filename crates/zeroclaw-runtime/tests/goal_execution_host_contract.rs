@@ -1423,22 +1423,24 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
 
 #[tokio::test]
 async fn local_help_does_not_bind_a_live_session_when_goal_mode_is_enabled() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = recording_driver(&ingress);
 
     let submission = GoalExecutionHost::new()
-        .submit(
-            &host_settings(true),
-            ingress,
-            driver.clone(),
-            GoalCommand::Help,
-        )
+        .submit(&settings, ingress, driver.clone(), GoalCommand::Help)
         .await
         .unwrap();
 
     assert_eq!(submission.command(), &GoalCommand::Help);
     assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        controller.submit(&settings, &submission).await.unwrap(),
+        GoalResponse::Help
+    ));
 }
 
 #[tokio::test]
