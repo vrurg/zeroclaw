@@ -53,9 +53,10 @@ model_provider = "openai.default"
 
 When a Goal has a finite cost limit, the requested provider/model route and all
 prior recorded Goal usage must be priced before the next operation is admitted.
-An unpriced route reached later by ordinary provider failover is recorded and
-causes the following admission to fail. Token-only and unlimited Goals can run
-without pricing, but still require usable token usage.
+An unpriced route reached later by ordinary provider failover is recorded, then
+fails the Goal after settlement; no following operation is admitted. Token-only
+and unlimited Goals can run without pricing, but still require usable token
+usage.
 
 ## Commands
 
@@ -107,8 +108,8 @@ success criterion and candidate response and returns `Complete`. A verifier
 blockers. Provider, protocol, attribution, malformed-output, and verifier
 failures fail the Goal rather than becoming a semantic blocker.
 
-`/goal pause` prevents further admission and waits for an already-admitted
-operation to settle before the Goal becomes paused. `/goal resume` starts a
+`/goal pause` first durably fences the Goal as paused, then waits for an
+already-admitted operation to settle before returning. `/goal resume` starts a
 fresh executor after the persisted checks pass. `/goal cancel` retains the
 terminal audit record while the session still exists. Closing, deleting,
 killing, or truly replacing a session fences and disposes its Goal control
