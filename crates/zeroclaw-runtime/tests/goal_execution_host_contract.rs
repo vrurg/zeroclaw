@@ -137,15 +137,55 @@ impl LeaseDriver {
     fn reconnect_is_allowed(&self) -> bool {
         self.available_for_reconnect.load(Ordering::SeqCst) == 1
     }
+
+    fn acquire_reconnect_lease(&self) -> anyhow::Result<ReconnectLease> {
+        if self
+            .available_for_reconnect
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("session replacement is already in progress");
+        }
+        Ok(ReconnectLease {
+            available_for_reconnect: self.available_for_reconnect.clone(),
+        })
+    }
 }
 
-struct ReconnectBlocker {
+struct ReconnectLease {
     available_for_reconnect: Arc<AtomicUsize>,
 }
 
-impl Drop for ReconnectBlocker {
+impl Drop for ReconnectLease {
     fn drop(&mut self) {
         self.available_for_reconnect.store(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for ReconnectLease {
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _scope: &GoalExecutionScope,
+        _turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("lease execution test does not run parent turns")
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _scope: &GoalExecutionScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("lease execution test does not run verifier turns")
+    }
+
+    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        anyhow::bail!("lease execution test does not deliver candidates")
     }
 }
 
@@ -156,18 +196,9 @@ impl GoalSessionDriver for LeaseDriver {
     }
 
     async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
-        if self
-            .available_for_reconnect
-            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            anyhow::bail!("session replacement is already in progress");
-        }
         Ok(GoalSessionLease::new(
             self.binding.clone(),
-            ReconnectBlocker {
-                available_for_reconnect: self.available_for_reconnect.clone(),
-            },
+            self.acquire_reconnect_lease()?,
         ))
     }
 
@@ -176,7 +207,7 @@ impl GoalSessionDriver for LeaseDriver {
         _ingress: &GoalIngressContext,
         _scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
     ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionExecutionLease>> {
-        anyhow::bail!("lease driver has no execution lease")
+        Ok(Box::new(self.acquire_reconnect_lease()?))
     }
 }
 
@@ -739,6 +770,203 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
 }
 
 #[tokio::test]
+async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettled_operations() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let host = GoalExecutionHost::new();
+
+    let start_command = || GoalCommand::Start {
+        budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+        objective: "finish the assigned task".into(),
+    };
+    let start = host
+        .submit(ingress.clone(), driver.clone(), start_command())
+        .await
+        .unwrap();
+    let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
+        panic!("expected a started Goal");
+    };
+
+    let active_start = host
+        .submit(ingress.clone(), driver.clone(), start_command())
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&settings, &active_start).await.unwrap(),
+        GoalResponse::AlreadyActive
+    ));
+
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                &started.task_id,
+                &ingress.session_key().durable_id(),
+                started.execution_epoch,
+                "operation-under-settlement",
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let cancel = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&settings, &cancel).await.unwrap(),
+        GoalResponse::Cancelled(_)
+    ));
+
+    let terminal_start = host.submit(ingress, driver, start_command()).await.unwrap();
+    let GoalResponse::Terminal(terminal) =
+        controller.submit(&settings, &terminal_start).await.unwrap()
+    else {
+        panic!("a terminal Goal with an unsettled operation must not be called active");
+    };
+    assert_eq!(terminal.status, TaskStatus::Cancelled);
+    assert!(!terminal.resumable);
+}
+
+#[tokio::test]
+async fn controller_projects_each_command_state_without_reinterpreting_the_store() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+    let enabled = host_settings(true);
+    let disabled = host_settings(false);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let host = GoalExecutionHost::new();
+
+    let help = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Help)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&disabled, &help).await.unwrap(),
+        GoalResponse::Help
+    ));
+    let disabled_status = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&disabled, &disabled_status)
+            .await
+            .unwrap(),
+        GoalResponse::Disabled
+    ));
+
+    let absent = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &absent).await.unwrap(),
+        GoalResponse::NoCurrentGoal
+    ));
+
+    let start = host
+        .submit(
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the assigned task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &start).await.unwrap(),
+        GoalResponse::Started(_)
+    ));
+
+    for (command, expected) in [
+        (GoalCommand::Status, "status"),
+        (GoalCommand::Budget, "budget"),
+    ] {
+        let submission = host
+            .submit(ingress.clone(), driver.clone(), command)
+            .await
+            .unwrap();
+        let response = controller.submit(&enabled, &submission).await.unwrap();
+        assert!(
+            matches!(
+                (&response, expected),
+                (GoalResponse::Status(_), "status") | (GoalResponse::Budget(_), "budget")
+            ),
+            "unexpected response for {expected}: {response:?}"
+        );
+    }
+
+    let update = host
+        .submit(
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::SetBudget(zeroclaw_commands::goal::GoalBudgetSelection::Limits(
+                zeroclaw_commands::goal::GoalBudgetLimits {
+                    token_limit: Some(7),
+                    cost_limit_usd: None,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+    let GoalResponse::BudgetUpdated(updated) = controller.submit(&enabled, &update).await.unwrap()
+    else {
+        panic!("expected the guarded budget update projection");
+    };
+    assert_eq!(updated.token_limit, Some(7));
+    assert_eq!(updated.cost_limit_usd, None);
+
+    let pause = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &pause).await.unwrap(),
+        GoalResponse::Paused(_)
+    ));
+    let pause_again = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &pause_again).await.unwrap(),
+        GoalResponse::AlreadyPaused(_)
+    ));
+
+    let cancel = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &cancel).await.unwrap(),
+        GoalResponse::Cancelled(_)
+    ));
+    let cancel_again = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Cancel)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &cancel_again).await.unwrap(),
+        GoalResponse::AlreadyCancelled(_)
+    ));
+    let terminal_status = host
+        .submit(ingress, driver, GoalCommand::Status)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&enabled, &terminal_status).await.unwrap(),
+        GoalResponse::Terminal(_)
+    ));
+}
+
+#[tokio::test]
 async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
@@ -903,4 +1131,30 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         driver.reconnect_is_allowed(),
         "the lease may release after the guarded lifecycle submission is settled"
     );
+}
+
+#[tokio::test]
+async fn execution_acquisition_releases_the_admission_lease_first() {
+    let ingress = matrix_ingress();
+    let driver = Arc::new(LeaseDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        available_for_reconnect: Arc::new(AtomicUsize::new(1)),
+    });
+    let host = GoalExecutionHost::new();
+    let submission = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap();
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+
+    let execution = host
+        .acquire_execution(&host_settings(true), submission, &scope)
+        .await
+        .unwrap();
+    assert!(
+        !driver.reconnect_is_allowed(),
+        "the execution lease must replace the released admission lease"
+    );
+    drop(execution);
+    assert!(driver.reconnect_is_allowed());
 }
