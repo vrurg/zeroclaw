@@ -510,6 +510,7 @@ mod tests {
             agent_alias: "test-agent".to_owned(),
             session_generation: 0,
             tui_id: "test-tui".to_owned(),
+            command_lock: Arc::new(Mutex::new(())),
         });
 
         let response = RpcGoalRuntime::default()
