@@ -253,6 +253,14 @@ pub(super) fn migrate_schema(
                  WHEN NEW.kind = 'goal'
                       AND (NEW.session_id IS NULL OR length(trim(NEW.session_id)) = 0)
                  BEGIN SELECT RAISE(ABORT, 'goal tasks require a nonblank session_id'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_epoch_insert
+                 BEFORE INSERT ON tasks FOR EACH ROW
+                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
+                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_epoch_update
+                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
+                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_session_immutable
                  BEFORE UPDATE OF kind, session_id ON tasks FOR EACH ROW
                  WHEN OLD.kind = 'goal'

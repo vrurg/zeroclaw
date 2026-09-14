@@ -275,7 +275,8 @@ async fn migration_normalizes_a_session_bound_goal_epoch_before_operation_admiss
     Connection::open(&database)
         .expect("open provisional migration fixture")
         .execute_batch(
-            "UPDATE tasks SET execution_epoch = 0 WHERE id = 'provisional-epoch';
+            "DROP TRIGGER trg_goal_tasks_require_epoch_update;
+             UPDATE tasks SET execution_epoch = 0 WHERE id = 'provisional-epoch';
              PRAGMA user_version = 9;",
         )
         .expect("write provisional epoch-zero fixture");
@@ -875,6 +876,13 @@ async fn sqlite_guards_session_binding_pending_pairing_and_goal_state_domains() 
         ),
         "raw SQL must not demote a Goal before unbinding it",
     );
+    assert_constraint(
+        connection.execute(
+            "UPDATE tasks SET execution_epoch = 0 WHERE id = 'goal-raw-one'",
+            [],
+        ),
+        "raw SQL must not lower a session Goal execution epoch below one",
+    );
     connection
         .execute(
             "INSERT INTO tasks (
@@ -936,6 +944,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .execute_batch(
             "DROP TRIGGER trg_goal_tasks_require_session_insert;
              DROP TRIGGER trg_goal_tasks_require_session_update;
+             DROP TRIGGER trg_goal_tasks_require_epoch_insert;
              INSERT INTO tasks (
                  id, kind, agent, status, owner_pid, owner_boot_id, session_id,
                  execution_epoch, started_at
