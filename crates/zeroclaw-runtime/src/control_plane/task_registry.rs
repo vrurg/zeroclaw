@@ -54,7 +54,9 @@ impl TaskStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
-    /// Stable task id. Producers validate it at registration boundaries.
+    /// Stable, globally unique, never-reused task id. Producers validate it
+    /// at registration boundaries; hard disposal must not make an id eligible
+    /// for reuse because Goal epoch fences are scoped to this identity.
     pub id: String,
     /// Durable task domain type.
     pub kind: TaskKind,
