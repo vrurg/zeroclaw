@@ -111,7 +111,7 @@ fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
         .filter(|character| character.is_whitespace())
         .map_or(0, char::len_utf8);
     let objective = &objective[separator_len..];
-    validate_objective(objective)?;
+    validate_goal_objective(objective)?;
 
     Ok(GoalCommand::Start {
         budget: parse_budget_selection(flags, true)?,
@@ -119,7 +119,11 @@ fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
     })
 }
 
-fn validate_objective(objective: &str) -> Result<(), GoalCommandParseError> {
+/// Validate an objective supplied through either parsed or typed Goal input.
+///
+/// The runtime also calls this for directly constructed [`GoalCommand::Start`]
+/// values so command parsing and durable admission cannot drift.
+pub fn validate_goal_objective(objective: &str) -> Result<(), GoalCommandParseError> {
     let mut has_non_whitespace = false;
     for (index, character) in objective.chars().enumerate() {
         if index == MAX_GOAL_OBJECTIVE_CHARS {

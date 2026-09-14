@@ -9,13 +9,13 @@
 
 use std::{fmt, sync::Arc};
 
-use anyhow::{Result, bail};
+use anyhow::{Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{
-    GoalBudgetLimits, GoalBudgetSelection, GoalCommand, MAX_GOAL_OBJECTIVE_CHARS,
+    GoalBudgetLimits, GoalBudgetSelection, GoalCommand, validate_goal_objective,
 };
 use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
 
@@ -143,7 +143,7 @@ impl GoalIngressPrincipal {
             Self::Matrix { raw_mxid } => raw_mxid,
             Self::ZeroCode { tui_id } => tui_id,
         };
-        require_nonblank("Goal ingress principal", value)
+        require_canonical_nonblank("Goal ingress principal", value)
     }
 }
 
@@ -556,11 +556,16 @@ fn require_nonblank(name: &str, value: &str) -> Result<()> {
 }
 
 fn canonical_nonblank(name: &str, value: String) -> Result<String> {
-    require_nonblank(name, &value)?;
+    require_canonical_nonblank(name, &value)?;
+    Ok(value)
+}
+
+fn require_canonical_nonblank(name: &str, value: &str) -> Result<()> {
+    require_nonblank(name, value)?;
     if value.trim() != value {
         bail!("{name} is not canonical");
     }
-    Ok(value)
+    Ok(())
 }
 
 /// Process-local settings already validated from the active Goal configuration.
@@ -719,7 +724,7 @@ impl GoalController {
         selection: GoalBudgetSelection,
         objective: &str,
     ) -> Result<GoalResponse> {
-        validate_command_objective(objective)?;
+        validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
         let limits = select_limits(settings.default_limits, selection)?;
         let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
@@ -1052,20 +1057,6 @@ fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits>
     Ok(limits)
 }
 
-fn validate_command_objective(objective: &str) -> Result<()> {
-    let mut has_non_whitespace = false;
-    for (index, character) in objective.chars().enumerate() {
-        if index == MAX_GOAL_OBJECTIVE_CHARS {
-            bail!("Goal objective exceeds the maximum length");
-        }
-        has_non_whitespace |= !character.is_whitespace();
-    }
-    if !has_non_whitespace {
-        bail!("Goal objective must not be blank");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,8 +1106,13 @@ mod tests {
 
     #[test]
     fn typed_start_objective_cannot_bypass_semantic_validation() {
-        assert!(validate_command_objective(" \t\n").is_err());
-        assert!(validate_command_objective(&"a".repeat(MAX_GOAL_OBJECTIVE_CHARS + 1)).is_err());
+        assert!(validate_goal_objective(" \t\n").is_err());
+        assert!(
+            validate_goal_objective(
+                &"a".repeat(zeroclaw_commands::goal::MAX_GOAL_OBJECTIVE_CHARS + 1)
+            )
+            .is_err()
+        );
     }
 
     #[test]
