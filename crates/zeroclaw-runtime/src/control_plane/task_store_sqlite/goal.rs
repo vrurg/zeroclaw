@@ -1430,7 +1430,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, expected_epoch, batch_id],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
@@ -1455,7 +1455,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, admitted_epoch, batch_id],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
@@ -1491,7 +1491,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if cleared == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         let failed = tx.execute(
             "UPDATE tasks
@@ -1509,7 +1509,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if failed == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.commit()
             .context("commit atomic Goal tool-pairing failure")?;
@@ -1537,7 +1537,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, admitted_epoch, batch_id],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
