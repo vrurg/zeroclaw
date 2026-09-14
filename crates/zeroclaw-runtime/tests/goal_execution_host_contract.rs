@@ -727,40 +727,13 @@ fn matrix_history_key_must_already_use_the_canonical_session_form() {
 }
 
 #[test]
-fn trusted_ingress_rejects_invalid_or_cross_principal_authority() {
+fn trusted_ingress_rejects_invalid_or_cross_surface_authority() {
     let matrix_key =
         GoalSessionKey::matrix("matrix_room__room_example_org__alice_example_org").unwrap();
     let matrix_principal = GoalIngressPrincipal::Matrix {
         raw_mxid: "@alice:example.org".into(),
     };
 
-    assert!(
-        GoalIngressContext::trusted(
-            GoalSessionKey::matrix("matrix_room__room_example_org").unwrap(),
-            "main",
-            "matrix:primary",
-            matrix_principal.clone(),
-        )
-        .is_err()
-    );
-    assert!(
-        GoalIngressContext::trusted(
-            GoalSessionKey::matrix("matrix_room__room_example_org__malice_example_org").unwrap(),
-            "main",
-            "matrix:primary",
-            matrix_principal.clone(),
-        )
-        .is_err()
-    );
-    assert!(
-        GoalIngressContext::trusted(
-            GoalSessionKey::matrix("matrix_room_alice_example_org").unwrap(),
-            "main",
-            "matrix:primary",
-            matrix_principal.clone(),
-        )
-        .is_err()
-    );
     assert!(
         GoalIngressContext::trusted(
             matrix_key.clone(),

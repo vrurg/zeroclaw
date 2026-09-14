@@ -55,10 +55,11 @@ impl GoalSessionKey {
     ///
     /// Callers must pass the already-canonical Matrix key and must not
     /// pre-sanitize it. This preserves a one-to-one binding to the session
-    /// identity produced by the Matrix history owner. That owner must scope
-    /// Goal-capable Matrix history to the raw sender; a room-wide or
-    /// reply-target-only history key would incorrectly let multiple principals
-    /// share one Goal control session.
+    /// identity produced by the Matrix history owner. That owner should scope
+    /// Goal-capable Matrix history to the raw sender so independent Matrix
+    /// users do not contend for one session. Goal control additionally checks
+    /// the persisted exact raw MXID, because sanitized history-key components
+    /// are not a sound authorization boundary.
     ///
     /// # Errors
     ///
@@ -182,17 +183,6 @@ impl GoalIngressContext {
             bail!("Goal ingress principal does not match the session surface");
         }
         principal.validate()?;
-        if let (GoalSessionKey::Matrix { history_key }, GoalIngressPrincipal::Matrix { raw_mxid }) =
-            (&session_key, &principal)
-        {
-            let canonical_sender = sanitize_session_key(raw_mxid);
-            let sender_is_final_component = history_key
-                .strip_suffix(&canonical_sender)
-                .is_some_and(|prefix| prefix.ends_with('_'));
-            if !sender_is_final_component {
-                bail!("Matrix Goal history key is not scoped to the raw sender");
-            }
-        }
         Ok(Self {
             session_key,
             agent: required("Goal ingress agent", agent.into())?,
@@ -732,7 +722,7 @@ impl GoalController {
         objective: String,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let limits = select_limits(settings.default_limits, selection);
+        let limits = select_limits(settings.default_limits, selection)?;
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
             id: task_id.clone(),
@@ -1015,26 +1005,43 @@ impl GoalController {
     }
 }
 
-fn select_limits(defaults: GoalBudgetLimits, selection: GoalBudgetSelection) -> GoalBudgetLimits {
+fn select_limits(
+    defaults: GoalBudgetLimits,
+    selection: GoalBudgetSelection,
+) -> Result<GoalBudgetLimits> {
     match selection {
-        GoalBudgetSelection::Defaults => defaults,
-        GoalBudgetSelection::Limits(limits) => limits,
-        GoalBudgetSelection::Unlimited => GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => Ok(defaults),
+        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits),
+        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        },
+        }),
     }
 }
 
 fn select_budget_update_limits(selection: GoalBudgetSelection) -> Result<GoalBudgetLimits> {
     match selection {
         GoalBudgetSelection::Defaults => bail!("Goal budget set cannot use configured defaults"),
-        GoalBudgetSelection::Limits(limits) => Ok(limits),
+        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits),
         GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
         }),
     }
+}
+
+fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits> {
+    if limits
+        .token_limit
+        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+        || limits
+            .cost_limit_usd
+            .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+        || (limits.token_limit.is_none() && limits.cost_limit_usd.is_none())
+    {
+        bail!("Goal finite budget limits are invalid");
+    }
+    Ok(limits)
 }
 
 #[cfg(test)]
@@ -1044,6 +1051,44 @@ mod tests {
     #[test]
     fn typed_budget_update_cannot_smuggle_configured_defaults() {
         assert!(select_budget_update_limits(GoalBudgetSelection::Defaults).is_err());
+    }
+
+    #[test]
+    fn typed_finite_limits_cannot_bypass_semantic_validation() {
+        for limits in [
+            GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: None,
+            },
+            GoalBudgetLimits {
+                token_limit: Some(0),
+                cost_limit_usd: None,
+            },
+            GoalBudgetLimits {
+                token_limit: Some(i64::MAX as u64 + 1),
+                cost_limit_usd: None,
+            },
+            GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(0.0),
+            },
+            GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(f64::NAN),
+            },
+        ] {
+            assert!(
+                select_limits(
+                    GoalBudgetLimits {
+                        token_limit: Some(1),
+                        cost_limit_usd: None,
+                    },
+                    GoalBudgetSelection::Limits(limits),
+                )
+                .is_err()
+            );
+            assert!(select_budget_update_limits(GoalBudgetSelection::Limits(limits)).is_err());
+        }
     }
 
     #[test]
