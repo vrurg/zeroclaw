@@ -80,7 +80,11 @@ fn test_state(config: Config) -> AppState {
             ),
         ),
         auto_save: false,
-        pairing: Arc::new(PairingGuard::new(false, &[])),
+        pairing: Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100)),
         auth_limiter: Arc::new(gateway::auth_rate_limit::AuthRateLimiter::new()),
@@ -311,6 +315,21 @@ fn legacy_colon_alias_config(config_dir: &std::path::Path) -> Config {
     config
 }
 
+fn legacy_explicit_api_key_colon_alias_config(config_dir: &std::path::Path) -> Config {
+    let mut config = legacy_colon_alias_config(config_dir);
+    let provider = config
+        .providers
+        .models
+        .anthropic
+        .get_mut("legacy:subscription")
+        .expect("legacy fixture contains the Anthropic alias");
+    provider.auth_mode = Some(zeroclaw_config::schema::AnthropicAuthMode::ApiKey);
+    let raw = toml::to_string(&config).expect("serialize explicit static-auth fixture");
+    std::fs::write(config_dir.join("config.toml"), raw)
+        .expect("write explicit static-auth fixture");
+    config
+}
+
 fn config_with_unrelated_invalid_ping_interval(config_dir: &std::path::Path) -> Config {
     let mut config = Config {
         locale: Some("en".into()),
@@ -514,6 +533,33 @@ fn config_patch_repairs_another_path_when_a_legacy_colon_alias_is_invalid() {
     assert_eq!(
         warnings[0]["path"],
         "providers.models.anthropic.legacy:subscription"
+    );
+}
+
+#[test]
+fn config_patch_repairs_another_path_when_a_legacy_colon_alias_has_explicit_api_key_mode() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = legacy_explicit_api_key_colon_alias_config(config_dir.path());
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    assert!(envelope["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning["code"] == "legacy_colon_alias_retained"
+                && warning["path"] == "providers.models.anthropic.legacy:subscription"
+        })
+    }));
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    assert_eq!(
+        parsed.providers.models.anthropic["legacy:subscription"].auth_mode,
+        Some(zeroclaw_config::schema::AnthropicAuthMode::ApiKey)
     );
 }
 
@@ -746,6 +792,34 @@ async fn config_patch_http_repairs_referenced_legacy_colon_alias_with_warning() 
     assert_eq!(
         parsed.agents["researcher"].model_provider, "anthropic.legacy:subscription",
         "the referenced legacy alias must stay present for its existing agent"
+    );
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_repairs_explicit_static_legacy_colon_alias_with_warning() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        legacy_explicit_api_key_colon_alias_config(config_dir.path()),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["saved"], true);
+    assert!(envelope["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning["code"] == "legacy_colon_alias_retained"
+                && warning["path"] == "providers.models.anthropic.legacy:subscription"
+        })
+    }));
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    assert_eq!(
+        parsed.providers.models.anthropic["legacy:subscription"].auth_mode,
+        Some(zeroclaw_config::schema::AnthropicAuthMode::ApiKey)
     );
 }
 
@@ -1089,6 +1163,77 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
             .contains("gateway.host must not be empty"),
         "message should describe validation failure: {envelope}"
     );
+}
+
+/// Review follow-up: an out-of-range pairing-code length must be
+/// refused at the write, not clamped later at mint time. `config patch`
+/// runs `Config::validate()` post-apply and before `save_dirty()`, so the
+/// weak value never reaches disk.
+#[test]
+fn config_patch_rejects_a_pairing_code_length_below_the_minimum() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":5}]"#,
+    );
+
+    assert_eq!(envelope["code"], "invalid_numeric_range", "{envelope}");
+    assert_eq!(
+        envelope["path"], "gateway.pairing_code.length",
+        "{envelope}"
+    );
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("out of range"),
+        "message should describe the range violation: {envelope}"
+    );
+
+    // Nothing was written: the file is either absent or still at the default.
+    let written =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).unwrap_or_default();
+    assert!(
+        !written.contains("length = 5"),
+        "a rejected patch must not persist the weak length: {written}"
+    );
+}
+
+#[test]
+fn config_patch_rejects_a_pairing_code_length_above_the_maximum() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":129}]"#,
+    );
+
+    assert_eq!(envelope["code"], "invalid_numeric_range", "{envelope}");
+    assert_eq!(
+        envelope["path"], "gateway.pairing_code.length",
+        "{envelope}"
+    );
+}
+
+/// The companion positive case: an in-range strengthening is accepted and
+/// persisted, so the rejection above is not just "everything fails".
+#[test]
+fn config_patch_accepts_an_in_range_pairing_code_policy() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":24},
+             {"op":"replace","path":"/gateway/pairing_code/charset","value":"unambiguous"}]"#,
+    );
+    assert!(
+        output.status.success(),
+        "in-range patch must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("config written");
+    assert!(written.contains("length = 24"), "{written}");
+    assert!(written.contains("charset = \"unambiguous\""), "{written}");
 }
 
 #[test]

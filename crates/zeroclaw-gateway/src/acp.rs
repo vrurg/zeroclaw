@@ -247,7 +247,7 @@ mod tests {
                     model: Some("claude-haiku-4-5".to_string()),
                     ..Default::default()
                 },
-                auth_mode: None,
+                ..Default::default()
             },
         );
         cfg.risk_profiles
