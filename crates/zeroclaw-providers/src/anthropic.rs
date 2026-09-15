@@ -4218,6 +4218,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .get("https://api.anthropic.com/v1/models"),
                 &credential,
                 false,
+                &[],
             )
             .build()
             .expect("profile-auth request should build");
@@ -4285,6 +4286,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .get("https://api.anthropic.com/v1/messages"),
                 &credential,
                 false,
+                &[],
             )
             .build()
             .expect("request should build");
@@ -4374,6 +4376,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             AnthropicModelProviderConfig {
                 base: Default::default(),
                 auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
             },
         );
         let options = crate::ModelProviderRuntimeOptions {
@@ -4581,6 +4584,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let config = AnthropicModelProviderConfig {
             base: Default::default(),
             auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
         };
         assert!(config.fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()));
         let error = config
@@ -4604,6 +4608,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let config = AnthropicModelProviderConfig {
             base: Default::default(),
             auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
         };
         let options = ModelProviderRuntimeOptions::default();
         config
@@ -4854,6 +4859,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .get("https://api.anthropic.com/v1/messages"),
                 &credential,
                 false,
+                &[],
             )
             .build()
             .expect("request should build");

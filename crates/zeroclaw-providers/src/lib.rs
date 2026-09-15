@@ -3795,6 +3795,7 @@ mod tests {
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig::default(),
                 auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
             },
         );
         config.save().await.expect("persist invalid alias fixture");
