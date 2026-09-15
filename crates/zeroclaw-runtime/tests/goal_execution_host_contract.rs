@@ -2236,16 +2236,18 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
     );
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
-    let histories = parent_histories.lock().unwrap();
-    assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
-    assert!(histories[1].iter().any(|message| {
-        message.role == "assistant" && message.content == "parent:finish the task"
-    }));
-    assert!(
-        histories[1]
-            .iter()
-            .any(|message| message.content.contains("add the missing detail"))
-    );
+    {
+        let histories = parent_histories.lock().unwrap();
+        assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
+        assert!(histories[1].iter().any(|message| {
+            message.role == "assistant" && message.content == "parent:finish the task"
+        }));
+        assert!(
+            histories[1]
+                .iter()
+                .any(|message| message.content.contains("add the missing detail"))
+        );
+    }
     assert_eq!(
         parent_turn_kinds.lock().unwrap().as_slice(),
         &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue]
@@ -2313,7 +2315,7 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
     let pause_driver = driver.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(
                 pause_settings,
@@ -2387,7 +2389,7 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
 
     let session_id = ingress.session_key().durable_id();
     let cancelling = Arc::clone(&supervisor);
-    let mut cancel = tokio::spawn(async move {
+    let mut cancel = zeroclaw_spawn::spawn!(async move {
         cancelling
             .pause_for_external_cancellation(&session_id)
             .await
@@ -2490,7 +2492,7 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
     );
 
     let cancelling = Arc::clone(&supervisor);
-    let mut cancel = tokio::spawn(async move {
+    let mut cancel = zeroclaw_spawn::spawn!(async move {
         cancelling
             .pause_for_external_cancellation(&session_id)
             .await
