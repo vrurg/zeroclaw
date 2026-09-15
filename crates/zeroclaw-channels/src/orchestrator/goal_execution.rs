@@ -31,14 +31,14 @@ use super::{
     build_channel_system_prompt_for_message_with_signal,
     callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
     get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
+    persist_session_routing_context, runtime_defaults_from_config, runtime_defaults_snapshot,
     sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
 
 /// Immutable Matrix facts captured before mutable inbound hooks run.
 #[derive(Clone)]
-struct MatrixGoalSessionDriver {
+pub(super) struct MatrixGoalSessionDriver {
     context: Arc<ChannelRuntimeContext>,
     session_key: GoalSessionKey,
     raw_mxid: String,
@@ -52,7 +52,7 @@ struct MatrixGoalSessionDriver {
 }
 
 impl MatrixGoalSessionDriver {
-    fn new(
+    pub(super) fn new(
         context: Arc<ChannelRuntimeContext>,
         history_key: String,
         raw_mxid: String,
@@ -100,6 +100,14 @@ impl MatrixGoalSessionDriver {
             }
             _ => bail!("Goal ingress principal is stale"),
         }
+    }
+
+    fn persist_execution_routing_context(&self, session_id: &str) -> Result<()> {
+        let Some(store) = self.context.session_store.as_ref() else {
+            return Ok(());
+        };
+        persist_session_routing_context(store.as_ref(), &self.message, session_id)
+            .context("persist Matrix Goal execution routing context")
     }
 }
 
@@ -297,14 +305,18 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
         scope: &GoalExecutionScope,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.assert_ingress(ingress)?;
+        let session_id = self.session_key.durable_id();
         ensure!(
-            scope.session_id() == self.session_key.durable_id(),
+            scope.session_id() == session_id,
             "Goal execution session is stale"
         );
-        let foreground =
-            foreground_lock(&self.context.persist_locks, &self.session_key.durable_id())
-                .lock_owned()
-                .await;
+        let foreground = foreground_lock(&self.context.persist_locks, &session_id)
+            .lock_owned()
+            .await;
+        // A Goal can append canonical history only after this lease is
+        // acquired. Persist the route strictly at the same boundary so an
+        // execution that cannot be discovered after restart never begins.
+        self.persist_execution_routing_context(&session_id)?;
         Ok(Box::new(MatrixGoalExecutionLease {
             _foreground: foreground,
             context: Arc::clone(&self.context),

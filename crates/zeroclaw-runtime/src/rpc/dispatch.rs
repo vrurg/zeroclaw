@@ -2891,12 +2891,7 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        let command = zeroclaw_commands::goal::parse_goal_command(&req.command).map_err(|_| {
-            rpc_err(
-                INVALID_PARAMS,
-                "That is not a valid Goal command. Use /goal help to see the supported commands.",
-            )
-        })?;
+        let command = parse_session_goal_command(&req.command)?;
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
@@ -5779,6 +5774,18 @@ impl Drop for RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+fn parse_session_goal_command(
+    command: &str,
+) -> Result<zeroclaw_commands::goal::GoalCommand, JsonRpcError> {
+    zeroclaw_commands::goal::parse_goal_command(command)
+        .map_err(|_| {
+            rpc_err(
+                INVALID_PARAMS,
+                "That is not a valid Goal command. Use /goal help to see the supported commands.",
+            )
+        })
+}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
@@ -9204,6 +9211,22 @@ mod tests {
         let v = json!({});
         let err = parse_params::<SessionIdParams>(&v).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn invalid_session_goal_command_hides_parser_details() {
+        let err = parse_session_goal_command("/goal budget set --tokens=1")
+            .expect_err("equals-form Goal flags must be rejected");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "That is not a valid Goal command. Use /goal help to see the supported commands."
+        );
+        assert!(
+            !err.message.contains("equals"),
+            "parser details must not cross the RPC boundary"
+        );
     }
 
     #[test]

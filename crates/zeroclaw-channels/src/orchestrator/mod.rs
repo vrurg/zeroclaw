@@ -7151,15 +7151,11 @@ async fn reconcile_early_ack(
 /// nothing authorization-bearing reads this column; representing the full
 /// participant set needs a session-store schema change and is deliberately
 /// out of scope here.
-fn stamp_session_routing_context(
-    ctx: &ChannelRuntimeContext,
+pub(super) fn persist_session_routing_context(
+    store: &dyn SessionBackend,
     msg: &ChannelMessage,
     history_key: &str,
-) {
-    let Some(ref store) = ctx.session_store else {
-        return;
-    };
-
+) -> std::io::Result<()> {
     let channel_id = msg
         .channel_alias
         .as_deref()
@@ -7176,12 +7172,26 @@ fn stamp_session_routing_context(
                 Some(target)
             }
         });
-    let context = zeroclaw_infra::session_backend::SessionContext {
-        channel_id: channel_id.as_deref(),
-        room_id,
-        sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
+    store.set_session_context(
+        history_key,
+        zeroclaw_infra::session_backend::SessionContext {
+            channel_id: channel_id.as_deref(),
+            room_id,
+            sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
+        },
+    )
+}
+
+fn stamp_session_routing_context(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    history_key: &str,
+) {
+    let Some(ref store) = ctx.session_store else {
+        return;
     };
-    if let Err(e) = store.set_session_context(history_key, context) {
+
+    if let Err(e) = persist_session_routing_context(store.as_ref(), msg, history_key) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7350,9 +7360,6 @@ async fn process_channel_message_body(
             Some(ChannelRuntimeCommand::NewSession)
         )
     {
-        // `/new` disposes the current Goal/session state, so capture the
-        // inbound routing context before that disposal removes its owner.
-        stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
         if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
@@ -21575,13 +21582,19 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         let history_key = runtime_conversation_history_key(runtime_ctx.as_ref(), &msg);
+        let ordinary_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "ordinary-matrix-2".into(),
+            content: "ordinary Matrix turn after cancellation".into(),
+            ..msg.clone()
+        };
         let held_foreground = foreground_lock(&runtime_ctx.persist_locks, &history_key)
             .lock_owned()
             .await;
         let cancellation = CancellationToken::new();
         let processing_cancellation = cancellation.clone();
+        let queued_runtime_ctx = Arc::clone(&runtime_ctx);
         let processing = zeroclaw_spawn::spawn!(process_channel_message(
-            Arc::clone(&runtime_ctx),
+            queued_runtime_ctx,
             msg,
             processing_cancellation,
         ));
@@ -21595,6 +21608,136 @@ BTC is currently around $65,000 based on latest tool output."#
             session_store.get_session_metadata(&history_key).is_none(),
             "a cancelled queued Matrix turn must not write session routing metadata"
         );
+
+        process_channel_message(runtime_ctx, ordinary_msg, CancellationToken::new()).await;
+
+        let metadata = session_store
+            .get_session_metadata(&history_key)
+            .expect("an admitted Matrix turn must stamp session routing metadata");
+        assert_eq!(metadata.channel_id.as_deref(), Some("matrix.default"));
+        assert_eq!(metadata.room_id.as_deref(), Some("!room:example.test"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("@alice:example.test"));
+    }
+
+    #[tokio::test]
+    async fn nonexecuting_matrix_goal_command_does_not_stamp_session_routing_context() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+        let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let session_dir = TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_dir.path()).unwrap(),
+        );
+        Arc::get_mut(&mut runtime_ctx)
+            .expect("test runtime is uniquely owned before processing")
+            .session_store = Some(Arc::clone(&session_store));
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "goal-matrix-1".into(),
+            sender: "@alice:example.test".into(),
+            reply_target: "!room:example.test".into(),
+            content: "/goal status".into(),
+            channel: "matrix".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let history_key = runtime_conversation_history_key(runtime_ctx.as_ref(), &msg);
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert!(
+            session_store.get_session_metadata(&history_key).is_none(),
+            "a disabled, nonexecuting Matrix Goal command must not create session metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_execution_stamps_session_routing_context_before_history() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+        let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let session_dir = TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_dir.path()).unwrap(),
+        );
+        Arc::get_mut(&mut runtime_ctx)
+            .expect("test runtime is uniquely owned before execution")
+            .session_store = Some(Arc::clone(&session_store));
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "goal-execution-matrix-1".into(),
+            sender: "@alice:example.test".into(),
+            reply_target: "!room:example.test".into(),
+            content: "/goal start --unlimited -- complete the task".into(),
+            channel: "matrix".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let history_key = runtime_conversation_history_key(runtime_ctx.as_ref(), &msg);
+        let command_lease = foreground::goal_command_lock(&runtime_ctx.persist_locks, &history_key)
+            .lock_owned()
+            .await;
+        let route = format!(
+            "matrix:{}:{}",
+            msg.channel_alias.as_deref().unwrap_or_default(),
+            msg.reply_target
+        );
+        let driver = goal_execution::MatrixGoalSessionDriver::new(
+            Arc::clone(&runtime_ctx),
+            history_key.clone(),
+            msg.sender.clone(),
+            route.clone(),
+            msg,
+            command_lease,
+        )
+        .expect("Matrix Goal driver");
+        let ingress = zeroclaw_runtime::goal_mode::GoalIngressContext::trusted(
+            zeroclaw_runtime::goal_mode::GoalSessionKey::matrix(history_key.clone())
+                .expect("canonical Matrix history key"),
+            runtime_ctx.agent_alias.to_string(),
+            route,
+            zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix {
+                raw_mxid: "@alice:example.test".to_owned(),
+            },
+        )
+        .expect("trusted Matrix Goal ingress");
+        let scope = zeroclaw_runtime::goal_mode::GoalExecutionScope::new(
+            "goal-task",
+            history_key.clone(),
+            1,
+        )
+        .expect("Goal execution scope");
+
+        let _lease = zeroclaw_runtime::goal_mode::GoalSessionDriver::acquire_execution(
+            &driver, &ingress, &scope,
+        )
+        .await
+        .expect("Goal execution lease");
+
+        let metadata = session_store
+            .get_session_metadata(&history_key)
+            .expect("Goal execution must stamp routing metadata before history");
+        assert_eq!(metadata.channel_id.as_deref(), Some("matrix.default"));
+        assert_eq!(metadata.room_id.as_deref(), Some("!room:example.test"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("@alice:example.test"));
     }
 
     struct DelayedHistoryCaptureModelProvider {

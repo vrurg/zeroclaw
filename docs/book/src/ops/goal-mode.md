@@ -153,8 +153,8 @@ failure.
 Goal admission also requires the canonical cost ledger to be structurally
 readable. A malformed or empty ledger row has no trustworthy Goal attribution,
 so Goal Mode fails closed rather than guessing that the row belongs to another
-task. Repair the ledger through the normal operator recovery procedure before
-starting or resuming budgeted Goal work.
+task. Resolve the ledger-integrity error before starting or resuming any
+Goal-owned model operation.
 
 ## Children, tools, and surfaces
 
