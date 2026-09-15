@@ -25212,7 +25212,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::from_millis(50),
+                Duration::ZERO,
             )),
             receipt_generator: None,
             show_receipts_in_response: false,
