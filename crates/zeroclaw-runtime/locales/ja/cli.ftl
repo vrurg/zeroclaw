@@ -869,7 +869,6 @@ channel-runtime-progress-compacting-context = コンテキストを圧縮中
 channel-runtime-progress-finalizing-response = 応答を最終処理中
 channel-runtime-matrix-progress-item-too-large = ⚠️ この行は 1 件の Matrix メッセージに収まらないほど大きすぎます。⚠️
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
-channel-runtime-new-session-failed = 永続セッションをリセットできませんでした。既存のセッションは引き続き有効です。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
 channel-runtime-conversation-busy = この会話には保留中のメッセージが多すぎるため、このメッセージは破棄されました。返信を待つか、/stop を送信して待機中のリクエストを消去してください。

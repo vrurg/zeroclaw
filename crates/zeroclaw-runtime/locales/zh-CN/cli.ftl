@@ -870,7 +870,6 @@ channel-runtime-progress-compacting-context = 正在压缩上下文
 channel-runtime-progress-finalizing-response = 正在完成回复
 channel-runtime-matrix-progress-item-too-large = ⚠️ 此行太大，无法放入单条 Matrix 消息中。⚠️
 channel-runtime-new-session = 对话历史已清除。重新开始。
-channel-runtime-new-session-failed = 无法重置持久会话。现有会话仍处于活动状态。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
 channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。

@@ -1539,6 +1539,7 @@ mod streaming_fallback_tests {
             model: "requested-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,

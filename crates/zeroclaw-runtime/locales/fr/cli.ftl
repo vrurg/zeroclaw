@@ -874,7 +874,6 @@ channel-runtime-progress-compacting-context = Compactage du contexte
 channel-runtime-progress-finalizing-response = Finalisation de la réponse
 channel-runtime-matrix-progress-item-too-large = ⚠️ Cette ligne est trop volumineuse pour tenir dans un seul message Matrix. ⚠️
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
-channel-runtime-new-session-failed = Impossible de réinitialiser la session persistante. La session existante reste active.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
 channel-runtime-conversation-busy = Cette conversation compte trop de messages en attente ; celui-ci a été ignoré. Attendez une réponse ou envoyez /stop pour vider vos demandes en file.
