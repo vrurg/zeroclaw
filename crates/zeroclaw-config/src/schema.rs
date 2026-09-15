@@ -24492,10 +24492,7 @@ impl Config {
                     .anthropic
                     .get(alias)
                     .is_some_and(|provider| {
-                        matches!(
-                            provider.auth_mode,
-                            None | Some(AnthropicAuthMode::ApiKey)
-                        )
+                        matches!(provider.auth_mode, None | Some(AnthropicAuthMode::ApiKey))
                     })
                 {
                     return None;

@@ -3321,7 +3321,7 @@ impl AnthropicModelProvider {
             tools: prepared.tools,
             tool_choice: prepared.tool_choice,
             stream: Some(true),
-                thinking: prepared.thinking,
+            thinking: prepared.thinking,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
         };
