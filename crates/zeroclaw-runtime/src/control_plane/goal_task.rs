@@ -537,18 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn operator_pause_reason_roundtrips_with_control_plane_name() {
-        // `/goal pause` is a controller request, not a human escalation. Its
-        // persisted reason must stay distinguishable for status and resume
-        // policy.
-        let serialized = serde_json::to_string(&GoalPauseReason::OperatorPaused).unwrap();
-        assert_eq!(serialized, "\"operator_paused\"");
-
-        let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed, GoalPauseReason::OperatorPaused);
-    }
-
-    #[test]
     fn every_goal_pause_reason_remains_readable_from_persisted_control_state() {
         let reasons = [
             GoalPauseReason::OperatorPaused,

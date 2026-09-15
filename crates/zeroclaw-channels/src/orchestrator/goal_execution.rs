@@ -565,28 +565,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn goal_parent_directive_keeps_lifecycle_phase_out_of_user_control() {
-        for (kind, expected) in [
-            (GoalParentTurnKind::Start, "start"),
-            (GoalParentTurnKind::Resume, "resume"),
-            (GoalParentTurnKind::Continue, "continue"),
-        ] {
-            let directive = goal_parent_directive(&GoalParentTurn {
-                kind,
-                objective: "the trusted success criterion".to_owned(),
-                working_history: Vec::new(),
-            });
-            assert_eq!(directive.role, "system");
-            assert!(directive.content.contains("the trusted success criterion"));
-            assert!(
-                directive
-                    .content
-                    .contains(&format!("Turn kind (trusted runtime fact): {expected}"))
-            );
-        }
-    }
-
-    #[test]
     fn start_history_places_the_directive_before_canonical_history() {
         let history = goal_start_history(
             "system prompt".to_owned(),

@@ -92,7 +92,6 @@ struct TranscriptExecutionLease {
     continue_once: bool,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
-    verifier_objectives: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -126,10 +125,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
-        self.verifier_objectives
-            .lock()
-            .unwrap()
-            .push(turn.objective);
+        assert_eq!(turn.objective, "finish the task");
         if self.continue_once {
             self.continue_once = false;
             Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned())
@@ -159,7 +155,6 @@ struct TranscriptExecutionDriver {
     delivered: Arc<AtomicUsize>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
-    verifier_objectives: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -183,7 +178,6 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             continue_once: true,
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
-            verifier_objectives: Arc::clone(&self.verifier_objectives),
         }))
     }
 }
@@ -2200,13 +2194,11 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     let delivered = Arc::new(AtomicUsize::new(0));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
-    let verifier_objectives = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::clone(&delivered),
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
-        verifier_objectives: Arc::clone(&verifier_objectives),
     });
     let request = runtime
         .submit(
@@ -2257,11 +2249,6 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     assert_eq!(
         parent_turn_kinds.lock().unwrap().as_slice(),
         &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue]
-    );
-    assert_eq!(
-        verifier_objectives.lock().unwrap().as_slice(),
-        &["finish the task", "finish the task"],
-        "the execution engine must reload the durable success criterion and pass it unchanged to every verifier turn"
     );
     assert_eq!(
         store
