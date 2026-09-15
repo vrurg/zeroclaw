@@ -89,9 +89,10 @@ impl GoalExecutionEngine {
     pub async fn run(
         &self,
         settings: &GoalHostSettings,
-        request: &GoalExecutionRequest,
+        request: GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
+        let resume_response = request.resume_response().map(ToOwned::to_owned);
         let objective = self.current_objective(&scope).await?;
         let accountant: Arc<dyn GoalOperationAccounting> = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.registry),
@@ -101,6 +102,14 @@ impl GoalExecutionEngine {
             scope.clone(),
         ));
         let mut lease = self.runtime.acquire_execution(settings, request).await?;
+
+        if let Some(response) = resume_response {
+            // A resumed answer belongs to the same canonical conversation,
+            // not merely this executor's scratch transcript.  Persist it
+            // before a Goal-owned model call so a restart cannot make the
+            // agent forget the answer it was explicitly given.
+            lease.append_resume_response(response).await?;
+        }
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
@@ -288,12 +297,16 @@ impl GoalExecutionEngine {
     async fn pause_verifier_blocked(
         &self,
         scope: &GoalExecutionScope,
-        reason: String,
+        _reason: String,
         blockers: Vec<GoalBlocker>,
     ) -> Result<()> {
         let pause = GoalPauseState {
-            reason: GoalPauseReason::VerifierBlocked,
-            description: Some(reason),
+            reason: pause_reason_for_verifier_blockers(&blockers),
+            // The verifier's prose is not a second user-facing request. The
+            // surface already receives the worker's original message through
+            // its ordinary event stream; the Goal extension exposes only the
+            // typed lifecycle rationale.
+            description: None,
             blockers,
         };
         match self
@@ -330,6 +343,25 @@ impl GoalExecutionEngine {
                 bail!("Goal failure lost its execution fence")
             }
         }
+    }
+}
+
+fn pause_reason_for_verifier_blockers(blockers: &[GoalBlocker]) -> GoalPauseReason {
+    // A request for direct input is the most actionable classification. The
+    // verifier schema is bounded, so this is a deterministic typed reduction,
+    // not an inference from arbitrary presentation text.
+    if blockers
+        .iter()
+        .any(|blocker| blocker.kind == GoalBlockerKind::NeedsUserInput)
+    {
+        GoalPauseReason::NeedsUserInput
+    } else if blockers
+        .iter()
+        .any(|blocker| blocker.kind == GoalBlockerKind::HumanEscalation)
+    {
+        GoalPauseReason::HumanEscalation
+    } else {
+        GoalPauseReason::ExternalDependency
     }
 }
 
@@ -509,8 +541,10 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .acquire_owned()
             .await
             .context("Goal operation permit closed")?;
-        let mut admitted = self.admitted.lock().await;
-        ensure!(admitted.is_none(), "Goal operation is already admitted");
+        ensure!(
+            self.admitted.lock().await.is_none(),
+            "Goal operation is already admitted"
+        );
 
         let (_task, goal) = self.current_running_goal().await?;
         ensure!(
@@ -529,7 +563,6 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .effective_cost_limit_usd
                 .is_some_and(|limit| cost >= limit)
         {
-            drop(admitted);
             drop(permit);
             self.pause_budget_exhausted().await?;
             bail!("Goal budget is exhausted");
@@ -561,6 +594,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await?
         {
             GoalTransitionResult::Applied => {
+                let mut admitted = self.admitted.lock().await;
+                debug_assert!(admitted.is_none());
                 *admitted = Some(AdmittedOperation {
                     id: operation_id,
                     _permit: permit,
@@ -864,6 +899,27 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_blocker_kind_controls_the_durable_pause_reason() {
+        let blocker = |kind| GoalBlocker {
+            kind,
+            message: "request".to_owned(),
+            payload: None,
+        };
+        assert_eq!(
+            pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::NeedsUserInput)]),
+            GoalPauseReason::NeedsUserInput
+        );
+        assert_eq!(
+            pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::HumanEscalation)]),
+            GoalPauseReason::HumanEscalation
+        );
+        assert_eq!(
+            pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::ExternalDependency)]),
+            GoalPauseReason::ExternalDependency
+        );
     }
 
     #[test]

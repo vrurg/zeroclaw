@@ -98,8 +98,7 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        admit_goal_operation_if_scoped(GoalOperationRequest::new(self.provider_name, self.model))
-            .await?;
+        admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
