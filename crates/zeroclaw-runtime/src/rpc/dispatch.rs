@@ -3141,29 +3141,23 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        if self
+        let goal_cancelled = self
             .ctx
             .goal_runtime
             .pause_for_external_cancellation(&req.session_id)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-        {
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        let session_cancelled = self.ctx.sessions.cancel_session(&req.session_id);
+        if goal_cancelled || session_cancelled {
             return to_result(SessionCancelResult {
                 session_id: req.session_id,
                 cancelled: true,
             });
         }
-        if self.ctx.sessions.cancel_session(&req.session_id) {
-            to_result(SessionCancelResult {
-                session_id: req.session_id,
-                cancelled: true,
-            })
-        } else {
-            Err(rpc_err(
-                SESSION_NOT_FOUND,
-                "No active turn for this session",
-            ))
-        }
+        Err(rpc_err(
+            SESSION_NOT_FOUND,
+            "No active turn for this session",
+        ))
     }
 
     async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {

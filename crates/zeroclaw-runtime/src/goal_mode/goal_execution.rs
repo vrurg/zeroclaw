@@ -471,31 +471,20 @@ impl GoalExecutionSupervisor {
         let Some(scope) = self.scope_for_session_id(session_id).await? else {
             return Ok(GoalTransitionResult::Missing);
         };
-        let current = self
+        let transition = self
             .engine
             .registry
-            .current_goal_for_session(session_id)
+            .pause_session_goal(
+                scope.task_id(),
+                session_id,
+                scope.execution_epoch(),
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
             .await?;
-        let transition = match current {
-            Some(current)
-                if current.id == scope.task_id() && current.status == TaskStatus::Running =>
-            {
-                self.engine
-                    .registry
-                    .pause_session_goal(
-                        &current.id,
-                        session_id,
-                        current.execution_epoch,
-                        GoalPauseState {
-                            reason: GoalPauseReason::OperatorPaused,
-                            description: None,
-                            blockers: Vec::new(),
-                        },
-                    )
-                    .await?
-            }
-            Some(_) | None => GoalTransitionResult::Stale,
-        };
         let _ = self.drain_lifecycle_fence(&scope).await?;
         Ok(transition)
     }
