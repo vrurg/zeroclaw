@@ -1414,7 +1414,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
 
         if let Some(batch) = pending_goal_tool_batch {
-            batch.settle().await?;
+            batch.settle()?;
         }
 
         if cancelled_mid_batch {

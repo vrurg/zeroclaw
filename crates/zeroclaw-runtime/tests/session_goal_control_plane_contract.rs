@@ -91,7 +91,7 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         verify
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        12
+        13
     );
     let columns: Vec<String> = verify
         .prepare("PRAGMA table_info(tasks)")
@@ -160,7 +160,7 @@ fn migration_replaces_v11_epoch_guards_with_integer_domain_checks() {
     drop(connection);
 
     SqliteTaskStore::new(directory.path()).expect("migrate v11 epoch guards");
-    let verify = Connection::open(&database).expect("open migrated v12 database");
+    let verify = Connection::open(&database).expect("open migrated v13 database");
     let migrated: (String, String, i64) = verify
         .query_row(
             "SELECT status, error, execution_epoch FROM tasks WHERE id = 'malformed-v11-goal'",
@@ -180,10 +180,75 @@ fn migration_replaces_v11_epoch_guards_with_integer_domain_checks() {
                        'session-text-epoch', 'not-an-epoch', 'now')",
             [],
         )
-        .expect_err("v12 must replace v11 epoch guards");
+        .expect_err("v13 must replace v11 epoch guards");
     assert_eq!(
         error.sqlite_error_code(),
         Some(ErrorCode::ConstraintViolation)
+    );
+}
+
+#[tokio::test]
+async fn migration_adds_goal_tool_pairing_columns_from_v12() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let initial = SqliteTaskStore::new(directory.path()).expect("initialize v12 fixture");
+    let database = directory.path().join("control_plane.db");
+    drop(initial);
+
+    let connection = Connection::open(&database).expect("open v12 fixture database");
+    connection
+        .execute_batch(
+            "DROP TRIGGER trg_goal_tasks_pending_tool_pair_insert;
+             DROP TRIGGER trg_goal_tasks_pending_tool_pair_update;
+             DROP INDEX IF EXISTS idx_goal_tasks_pending_tool_batch;
+             ALTER TABLE goal_tasks DROP COLUMN pending_tool_batch_id;
+             ALTER TABLE goal_tasks DROP COLUMN pending_tool_epoch;
+             PRAGMA user_version = 12;",
+        )
+        .expect("model the pre-tool-pairing v12 schema");
+    drop(connection);
+
+    let migrated = SqliteTaskStore::new(directory.path()).expect("migrate v12 fixture");
+    let verify = Connection::open(&database).expect("open migrated v12 fixture");
+    let columns: Vec<String> = verify
+        .prepare("PRAGMA table_info(goal_tasks)")
+        .expect("inspect migrated Goal columns")
+        .query_map([], |row| row.get(1))
+        .expect("query migrated Goal columns")
+        .collect::<Result<_, _>>()
+        .expect("read migrated Goal columns");
+    assert!(columns.contains(&"pending_tool_batch_id".to_string()));
+    assert!(columns.contains(&"pending_tool_epoch".to_string()));
+
+    let trigger_count: i64 = verify
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'trigger'
+                AND name IN (
+                    'trg_goal_tasks_pending_tool_pair_insert',
+                    'trg_goal_tasks_pending_tool_pair_update'
+                )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect migrated tool-pairing triggers");
+    assert_eq!(trigger_count, 2);
+
+    let index_count: i64 = verify
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_goal_tasks_pending_tool_batch'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect removed tool-batch index");
+    assert_eq!(index_count, 0);
+
+    assert!(
+        migrated
+            .current_goal_for_session("missing-session")
+            .await
+            .expect("read through migrated Goal schema")
+            .is_none()
     );
 }
 
@@ -1420,7 +1485,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
     assert_eq!(
-        schema_version, 12,
+        schema_version, 13,
         "migration records the final control-plane schema"
     );
     let running: (String, Option<String>, Option<String>) = verify

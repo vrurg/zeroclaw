@@ -87,7 +87,7 @@ pub(crate) async fn admit_goal_tool_batch(
     };
     if nested {
         return Ok(Some(GoalToolBatch {
-            pairing: Arc::clone(&pairing),
+            pairing,
             settled: false,
         }));
     }
@@ -105,19 +105,21 @@ pub(crate) async fn admit_goal_tool_batch(
         .context("admit Goal tool batch")?
     {
         GoalTransitionResult::Applied => {
-            let mut active = pairing.active.lock();
-            ensure!(
-                active.is_none(),
-                "Goal tool batch acquired a nested owner during durable admission"
-            );
-            *active = Some(ActiveGoalToolBatch {
-                batch_id,
-                open_batches: 1,
-                nested_pairing_failed: false,
-                settling: false,
-            });
+            {
+                let mut active = pairing.active.lock();
+                ensure!(
+                    active.is_none(),
+                    "Goal tool batch acquired a nested owner during durable admission"
+                );
+                *active = Some(ActiveGoalToolBatch {
+                    batch_id,
+                    open_batches: 1,
+                    nested_pairing_failed: false,
+                    settling: false,
+                });
+            }
             Ok(Some(GoalToolBatch {
-                pairing: Arc::clone(&pairing),
+                pairing,
                 settled: false,
             }))
         }
@@ -144,7 +146,7 @@ impl GoalToolBatch {
     /// complete working transcript to the Goal executor. That one boundary
     /// covers every sequential or nested round without clearing crash evidence
     /// between an external tool effect and the parent-turn result.
-    pub(crate) async fn settle(mut self) -> Result<()> {
+    pub(crate) fn settle(mut self) -> Result<()> {
         let mut active = self.pairing.active.lock();
         let active_batch = active
             .as_mut()
@@ -309,7 +311,6 @@ mod tests {
             assert_eq!(pending.pending_tool_epoch, Some(1));
             child_batch
                 .settle()
-                .await
                 .expect("settle nested child history pairing");
             let still_pending = pending_store
                 .get_goal_task("goal-tool-pairing")
@@ -320,10 +321,7 @@ mod tests {
                 still_pending.pending_tool_batch_id.is_some(),
                 "the parent history pairing still owns the durable marker"
             );
-            parent_batch
-                .settle()
-                .await
-                .expect("settle outer paired batch");
+            parent_batch.settle().expect("settle outer paired batch");
             let paired_but_unfinalized = pending_store
                 .get_goal_task("goal-tool-pairing")
                 .await
@@ -397,7 +395,7 @@ mod tests {
                 .expect("nested child reuses the parent marker");
             drop(child_batch);
             assert!(
-                parent_batch.settle().await.is_err(),
+                parent_batch.settle().is_err(),
                 "an unpaired nested child must prevent clean outer settlement"
             );
         })
