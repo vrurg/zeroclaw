@@ -1197,7 +1197,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             // after compatibility normalization. A terminal predecessor is
             // still an audit record for its exact durable principal, so only
             // that principal may replace it.
-            if current.principal_id != task.principal_id {
+            if current.principal_id.is_some() && current.principal_id != task.principal_id {
                 return Ok(GoalTransitionResult::Stale);
             }
             let settled = tx
