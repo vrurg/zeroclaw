@@ -151,13 +151,13 @@ pub(super) async fn submit_matrix_goal(
     } else {
         None
     };
-    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope) {
-        if retired_supervisor.owns_scope(&scope).await {
-            retired_supervisor
-                .drain(&scope)
-                .await
-                .context("drain terminal Matrix Goal worker before replacement")?;
-        }
+    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope)
+        && retired_supervisor.owns_scope(&scope).await
+    {
+        retired_supervisor
+            .drain(&scope)
+            .await
+            .context("drain terminal Matrix Goal worker before replacement")?;
     }
     let supervisor = {
         let mut slot = supervisor_slot.lock().await;
