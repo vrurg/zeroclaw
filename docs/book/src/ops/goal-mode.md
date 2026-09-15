@@ -150,6 +150,12 @@ cost limit also fails if pricing cannot be established. This conservative rule
 is intentional: recorded known usage is only a lower bound after an accounting
 failure.
 
+Goal admission also requires the canonical cost ledger to be structurally
+readable. A malformed or empty ledger row has no trustworthy Goal attribution,
+so Goal Mode fails closed rather than guessing that the row belongs to another
+task. Repair the ledger through the normal operator recovery procedure before
+starting or resuming budgeted Goal work.
+
 ## Children, tools, and surfaces
 
 Goal Mode preserves normal authorization and target policy for foreground

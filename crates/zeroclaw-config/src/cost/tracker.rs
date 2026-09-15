@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_task_usage_totals_reject_malformed_task_ledger_rows() {
+    fn strict_task_usage_totals_reject_malformed_rows_without_task_attribution() {
         let tmp = TempDir::new().unwrap();
         let path = resolve_storage_path(tmp.path()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1781,7 +1781,7 @@ mod tests {
             tracker
                 .get_strict_usage_totals_for_task_with_pricing("goal-a")
                 .is_err(),
-            "Goal admission must fail closed rather than treating malformed JSONL as no usage"
+            "an unreadable row has no trustworthy task attribution, so Goal admission must fail closed rather than treating it as no usage"
         );
     }
 
