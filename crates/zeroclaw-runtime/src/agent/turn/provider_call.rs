@@ -536,7 +536,7 @@ mod payload_capture_tests {
                         .get("attributes")
                         .and_then(|a| a.get("trace_id"))
                         .and_then(|v| v.as_str())
-                        == Some("trace-req-test");
+                        == Some(PAYLOAD_CAPTURE_TRACE_ID);
                     if ours && value.get("message").and_then(|v| v.as_str()) == Some("llm_request")
                     {
                         return value;
@@ -566,6 +566,7 @@ mod payload_capture_tests {
     // tail below must NOT survive into the captured payload.
     const SECRET_TAIL: &str = "ABCDEF1234567890SECRET";
     const SESSION_PROMPT_MARKER: &str = "session-prompt-private-marker";
+    const PAYLOAD_CAPTURE_TRACE_ID: &str = "trace-payload-capture-test";
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -593,7 +594,10 @@ mod payload_capture_tests {
         install_writer("redacted");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
@@ -636,7 +640,10 @@ mod payload_capture_tests {
         install_writer("off");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
