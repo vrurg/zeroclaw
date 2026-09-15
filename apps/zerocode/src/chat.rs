@@ -10445,6 +10445,31 @@ mod tests {
     }
 
     #[test]
+    fn read_only_goal_responses_do_not_claim_a_mutation() {
+        let projection = crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "running".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::Status(projection.clone()))
+                .starts_with("Goal status is available.")
+        );
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::Budget(projection))
+                .starts_with("Goal budget is available.")
+        );
+    }
+
+    #[test]
     fn goal_projection_uses_none_for_an_absent_pause_reason() {
         let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
             task_id: "goal-1".to_owned(),

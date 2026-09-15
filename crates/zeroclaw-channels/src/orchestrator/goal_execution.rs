@@ -115,6 +115,10 @@ pub(super) async fn submit_matrix_goal(
     if matches!(command, zeroclaw_commands::goal::GoalCommand::Help) {
         return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Help);
     }
+    let defaults = runtime_defaults_snapshot(context.as_ref());
+    if let Some(response) = disabled_goal_response(defaults.config.goal.enabled) {
+        return Ok(response);
+    }
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
     // serialized lifecycle operation before another command can install a
@@ -137,7 +141,6 @@ pub(super) async fn submit_matrix_goal(
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
-    let defaults = runtime_defaults_snapshot(context.as_ref());
     let settings = zeroclaw_runtime::goal_mode::GoalHostSettings::from_config(
         &defaults.config.goal,
         std::process::id(),
@@ -212,6 +215,11 @@ pub(super) async fn submit_matrix_goal(
         clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
     }
     Ok(submission.into_response())
+}
+
+/// Return a local disabled response before constructing session or execution state.
+fn disabled_goal_response(enabled: bool) -> Option<zeroclaw_runtime::goal_mode::GoalResponse> {
+    (!enabled).then_some(zeroclaw_runtime::goal_mode::GoalResponse::Disabled)
 }
 
 /// Dispose a Matrix session's Goal before the channel resets its history.
@@ -576,5 +584,14 @@ mod tests {
         assert_eq!(history[0].content, "system prompt");
         assert_eq!(history[1].content, "Goal directive");
         assert_eq!(history[2].content, "earlier user message");
+    }
+
+    #[test]
+    fn disabled_goal_mode_short_circuits_before_execution_setup() {
+        assert!(matches!(
+            disabled_goal_response(false),
+            Some(zeroclaw_runtime::goal_mode::GoalResponse::Disabled)
+        ));
+        assert!(disabled_goal_response(true).is_none());
     }
 }
