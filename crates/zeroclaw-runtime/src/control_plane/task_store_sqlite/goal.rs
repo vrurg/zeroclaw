@@ -309,9 +309,7 @@ pub(super) fn converge_schema(conn: &Connection) -> Result<()> {
         add_column_if_missing(conn, "goal_tasks", column, sql)?;
     }
     conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_pending_tool_batch
-                 ON goal_tasks(pending_tool_batch_id)
-                 WHERE pending_tool_batch_id IS NOT NULL;
+        "DROP INDEX IF EXISTS idx_goal_tasks_pending_tool_batch;
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_pending_tool_pair_insert
                  BEFORE INSERT ON goal_tasks FOR EACH ROW
                  WHEN (NEW.pending_tool_batch_id IS NULL) != (NEW.pending_tool_epoch IS NULL)
