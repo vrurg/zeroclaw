@@ -4042,16 +4042,18 @@ async fn matrix_goal_and_rpc_pending_controls_are_revoked_by_one_live_disable() 
                 GoalResponse::Disabled | GoalResponse::Terminal(_)
             )));
 
-            let matrix_final = [
-                channel_runtime_cli_string("goal-mode-disabled"),
-                channel_runtime_cli_string("goal-mode-terminal"),
-            ];
-            tokio::time::timeout(Duration::from_secs(5), async {
+            // Disabled is headline-only. Terminal carries a status projection, so its
+            // headline must be followed by a line break; renderer tests own the text.
+            let final_disabled = channel_runtime_cli_string("goal-mode-disabled");
+            let final_terminal = channel_runtime_cli_string("goal-mode-terminal") + "\n";
+            let is_matrix_final =
+                |content: &str| content == final_disabled || content.starts_with(&final_terminal);
+            let matrix_settled = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let replies = channel.sent_messages.lock().await;
                     if replies
                         .iter()
-                        .any(|reply| matrix_final.contains(&reply.content))
+                        .any(|reply| is_matrix_final(reply.content.as_str()))
                     {
                         break;
                     }
@@ -4059,22 +4061,31 @@ async fn matrix_goal_and_rpc_pending_controls_are_revoked_by_one_live_disable() 
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .expect("Matrix control must receive its final terminal response");
+            .await;
             let replies = channel.sent_messages.lock().await;
+            let emitted = replies
+                .iter()
+                .map(|reply| reply.content.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                matrix_settled.is_ok(),
+                "Matrix control must receive its final terminal response; emitted: {emitted:?}"
+            );
             assert_eq!(
                 replies
                     .iter()
                     .filter(|reply| reply.content == matrix_queued)
                     .count(),
-                1
+                1,
+                "exactly one queued acknowledgement; emitted: {emitted:?}"
             );
             assert_eq!(
                 replies
                     .iter()
-                    .filter(|reply| matrix_final.contains(&reply.content))
+                    .filter(|reply| is_matrix_final(reply.content.as_str()))
                     .count(),
-                1
+                1,
+                "exactly one final response; emitted: {emitted:?}"
             );
             assert_eq!(
                 replies.len(),
@@ -7468,15 +7479,24 @@ async fn assert_matrix_goal_deferred_ingress(
                     .iter()
                     .all(|reply| !reply.content.contains("Goal failed."))
             );
-            let budget_updated = channel_runtime_cli_string("goal-mode-budget-updated");
+            // BudgetUpdated carries a status projection, so its headline must be
+            // followed by a line break; renderer tests own the text.
+            let budget_updated = channel_runtime_cli_string("goal-mode-budget-updated") + "\n";
+            let emitted = replies
+                .iter()
+                .map(|reply| reply.content.as_str())
+                .collect::<Vec<_>>();
             let budget_updates = replies
                 .iter()
-                .filter(|reply| reply.content == budget_updated)
+                .filter(|reply| reply.content.starts_with(&budget_updated))
                 .count();
-            assert_eq!(budget_updates, 1);
+            assert_eq!(
+                budget_updates, 1,
+                "exactly one projected budget response; emitted: {emitted:?}"
+            );
             let final_response = replies
                 .iter()
-                .position(|reply| reply.content == budget_updated)
+                .position(|reply| reply.content.starts_with(&budget_updated))
                 .unwrap();
             assert!(
                 candidate < final_response,
