@@ -1920,9 +1920,9 @@ impl Tool for DelegateTool {
                 });
             }
         };
-        crate::agent::goal_child_fence::scope_goal_child(
+        crate::agent::goal_child_fence::scope_goal_child(Box::pin(
             self.execute_sync(agent_name, prompt, &args),
-        )
+        ))
         .await
     }
 }
