@@ -281,7 +281,8 @@ tokio::task_local! {
 /// Admit an operation only when the enclosing execution is Goal-scoped.
 /// Ordinary turns never enter this branch.
 pub(crate) async fn admit_goal_operation_if_scoped(
-    request: GoalOperationRequest,
+    provider_ref: &str,
+    model: &str,
 ) -> anyhow::Result<()> {
     if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
         .try_with(Clone::clone)
@@ -289,14 +290,16 @@ pub(crate) async fn admit_goal_operation_if_scoped(
         .flatten()
     {
         anyhow::ensure!(
-            !request.model_provider.trim().is_empty(),
+            !provider_ref.trim().is_empty(),
             "Goal operation provider reference must be nonblank"
         );
         anyhow::ensure!(
-            !request.model.trim().is_empty(),
+            !model.trim().is_empty(),
             "Goal operation model must be nonblank"
         );
-        accounting.admit(request).await?;
+        accounting
+            .admit(GoalOperationRequest::new(provider_ref, model))
+            .await?;
     }
     Ok(())
 }
@@ -1128,12 +1131,9 @@ mod tests {
             .scope(
                 Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
                 async {
-                    admit_goal_operation_if_scoped(GoalOperationRequest::new(
-                        "configured.primary",
-                        "configured-model",
-                    ))
-                    .await
-                    .unwrap();
+                    admit_goal_operation_if_scoped("configured.primary", "configured-model")
+                        .await
+                        .unwrap();
                     scope
                         .scope(async {
                             with_exact_dispatch_route(
@@ -1226,7 +1226,7 @@ mod tests {
 
     #[tokio::test]
     async fn unscoped_turns_do_not_run_goal_operation_validation() {
-        admit_goal_operation_if_scoped(GoalOperationRequest::new("", ""))
+        admit_goal_operation_if_scoped("", "")
             .await
             .expect("ordinary turns must not acquire Goal-only validation");
     }

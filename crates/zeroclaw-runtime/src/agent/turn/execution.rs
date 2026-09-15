@@ -8,7 +8,7 @@ use zeroclaw_providers::dispatch::with_exact_dispatch_route;
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
-use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
+use crate::agent::cost::admit_goal_operation_if_scoped;
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -50,8 +50,7 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        admit_goal_operation_if_scoped(GoalOperationRequest::new(self.provider_name, self.model))
-            .await?;
+        admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope

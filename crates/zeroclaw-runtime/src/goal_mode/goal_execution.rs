@@ -89,7 +89,7 @@ impl GoalExecutionEngine {
     pub async fn run(
         &self,
         settings: &GoalHostSettings,
-        request: &GoalExecutionRequest,
+        request: GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let objective = self.current_objective(&scope).await?;
@@ -509,8 +509,10 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .acquire_owned()
             .await
             .context("Goal operation permit closed")?;
-        let mut admitted = self.admitted.lock().await;
-        ensure!(admitted.is_none(), "Goal operation is already admitted");
+        ensure!(
+            self.admitted.lock().await.is_none(),
+            "Goal operation is already admitted"
+        );
 
         let (_task, goal) = self.current_running_goal().await?;
         ensure!(
@@ -529,7 +531,6 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .effective_cost_limit_usd
                 .is_some_and(|limit| cost >= limit)
         {
-            drop(admitted);
             drop(permit);
             self.pause_budget_exhausted().await?;
             bail!("Goal budget is exhausted");
@@ -561,6 +562,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await?
         {
             GoalTransitionResult::Applied => {
+                let mut admitted = self.admitted.lock().await;
+                debug_assert!(admitted.is_none());
                 *admitted = Some(AdmittedOperation {
                     id: operation_id,
                     _permit: permit,

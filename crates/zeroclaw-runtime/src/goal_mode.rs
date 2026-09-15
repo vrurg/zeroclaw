@@ -25,6 +25,10 @@ use crate::control_plane::{
     GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
 
+mod goal_execution;
+
+pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome};
+
 /// The only V1 surfaces permitted to admit a Goal command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalSurface {
@@ -650,7 +654,7 @@ impl GoalRuntime {
     /// control plane and running/accounting it through another.
     pub fn execution_engine(
         &self,
-        tracker: Arc<crate::cost::CostTracker>,
+        tracker: Arc<zeroclaw_config::cost::CostTracker>,
         agent_alias: impl Into<String>,
         pricing: Arc<crate::agent::cost::ModelProviderPricing>,
     ) -> Result<GoalExecutionEngine> {
@@ -664,11 +668,8 @@ impl GoalRuntime {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalRuntimeSubmission> {
-        let submission = self.host.submit(ingress, driver, command).await?;
-        let (response, submission) = self
-            .controller
-            .submit_for_execution(settings, submission)
-            .await?;
+        let submission = self.host.submit(settings, ingress, driver, command).await?;
+        let response = self.controller.submit(settings, &submission).await?;
         let execution = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
                 Some(GoalExecutionRequest {
@@ -695,15 +696,10 @@ impl GoalRuntime {
     pub async fn acquire_execution(
         &self,
         settings: &GoalHostSettings,
-        request: &GoalExecutionRequest,
+        request: GoalExecutionRequest,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.host
-            .acquire_execution(
-                settings,
-                request.submission().ingress(),
-                Arc::clone(request.submission().driver()),
-                request.scope(),
-            )
+            .acquire_execution(settings, request.submission, &request.scope)
             .await
     }
 }

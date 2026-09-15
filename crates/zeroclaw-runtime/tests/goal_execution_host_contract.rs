@@ -15,8 +15,9 @@ use zeroclaw_runtime::control_plane::{
 };
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalVerifierTurn,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -215,7 +216,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_parent_turn(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<String> {
         anyhow::bail!("lease execution test does not run parent turns")
@@ -223,7 +224,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_verifier(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
         anyhow::bail!("lease execution test does not run verifier turns")
@@ -1063,7 +1064,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         )
         .await
         .unwrap();
-    let (response, start) = controller
+    let (response, _start) = controller
         .submit_for_execution(&settings, start)
         .await
         .unwrap();
@@ -1509,8 +1510,7 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
     });
