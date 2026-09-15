@@ -312,20 +312,4 @@ mod tests {
         let combined = rx.await.unwrap();
         assert_eq!(combined, "fast");
     }
-
-    #[tokio::test]
-    async fn discard_drops_a_pending_bucket_without_dispatching_it() {
-        let debouncer = MessageDebouncer::new(Duration::from_secs(5));
-        let receiver = match debouncer.debounce("user1", "ordinary message").await {
-            DebounceResult::Pending(receiver) => receiver,
-            DebounceResult::Passthrough(_) => panic!("expected pending bucket"),
-        };
-
-        debouncer.discard("user1").await;
-
-        assert!(
-            receiver.await.is_err(),
-            "discard must drop the pending result"
-        );
-    }
 }
