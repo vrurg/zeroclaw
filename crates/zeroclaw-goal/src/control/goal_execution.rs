@@ -293,7 +293,7 @@ impl GoalExecutionSupervisor {
         let execution_epoch = scope.execution_epoch();
         let (completion_tx, completion) = watch::channel(None);
         let handle = zeroclaw_spawn::spawn!(async move {
-            let result = engine.run(&settings, &request).await;
+            let result = engine.run(&settings, request).await;
 
             // The engine normally records its own expected execution failures.
             // Acquisition and other unexpected failures can occur before that
