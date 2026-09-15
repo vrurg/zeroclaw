@@ -17154,6 +17154,28 @@ temperature = 0.3
         ));
     }
 
+    #[tokio::test]
+    async fn disabled_matrix_goal_does_not_construct_a_matrix_driver() {
+        // Disabled Goal Mode must answer before driver validation or control-plane
+        // lookup, so malformed execution-only ingress facts cannot mask Disabled.
+        let mut message = channel_message("not-matrix", Some("primary"));
+        message.sender = "different-sender".to_owned();
+
+        let response = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-disabled".to_owned(),
+            message,
+            zeroclaw_commands::goal::GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            zeroclaw_runtime::goal_mode::GoalResponse::Disabled
+        ));
+    }
+
     #[cfg(feature = "channel-webhook")]
     async fn receive_webhook_test_message(
         alias: &str,
