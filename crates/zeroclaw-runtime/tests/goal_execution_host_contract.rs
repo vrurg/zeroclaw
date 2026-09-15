@@ -84,7 +84,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
 
     async fn run_parent_turn(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         Ok(GoalParentTurnResult {
@@ -95,7 +95,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
 
     async fn run_verifier(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
         Ok(GoalVerifierResult {
