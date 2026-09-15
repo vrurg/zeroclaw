@@ -229,23 +229,26 @@ const EPHEMERAL_GRACE_SECS: u64 = 1;
 /// admission and lets the current daemon continue unchanged. Once this
 /// succeeds, the caller must use this exact `Config` value for the successor
 /// generation rather than loading a second, potentially drifted file.
-async fn prepare_reload_config() -> Result<Config> {
-    let successor = Config::load_or_init().await?;
-    let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Ok(successor);
-    };
-    let coordinator = control_plane.goal_execution_restart();
-    coordinator.begin_policy_cutover().await;
-    let result = async {
-        let registry = control_plane.goal_store()?;
-        crate::goal_mode::revoke_goals_under_policy(registry.as_ref(), &successor).await
-    }
-    .await;
-    if let Err(error) = result {
-        coordinator.reopen_for_generation().await;
-        return Err(error.context("apply prospective Goal policy"));
-    }
-    Ok(successor)
+fn prepare_reload_config()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Config>> + Send>> {
+    Box::pin(async {
+        let successor = Config::load_or_init().await?;
+        let Some(control_plane) = crate::control_plane::control_plane() else {
+            return Ok(successor);
+        };
+        let coordinator = control_plane.goal_execution_restart();
+        coordinator.begin_policy_cutover().await;
+        let result = async {
+            let registry = control_plane.goal_store()?;
+            crate::goal_mode::revoke_goals_under_policy(registry.as_ref(), &successor).await
+        }
+        .await;
+        if let Err(error) = result {
+            coordinator.reopen_for_generation().await;
+            return Err(error.context("apply prospective Goal policy"));
+        }
+        Ok(successor)
+    })
 }
 
 #[cfg(test)]
