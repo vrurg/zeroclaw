@@ -93,7 +93,7 @@ impl MatrixGoalSessionDriver {
         ensure!(ingress.route() == self.route, "Goal ingress route is stale");
         match ingress.principal() {
             zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix { raw_mxid }
-                if raw_mxid == &self.raw_mxid =>
+                if raw_mxid.as_str() == self.raw_mxid.as_str() =>
             {
                 Ok(())
             }
@@ -132,16 +132,8 @@ pub(super) async fn submit_matrix_goal(
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
     let defaults = runtime_defaults_snapshot(context.as_ref());
-    let configured_limits =
-        defaults.config.goal.effective_limits().map_err(|error| {
-            anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
-        })?;
-    let settings = zeroclaw_runtime::goal_mode::GoalHostSettings::new(
-        defaults.config.goal.enabled,
-        zeroclaw_commands::goal::GoalBudgetLimits {
-            token_limit: configured_limits.token_limit,
-            cost_limit_usd: configured_limits.cost_limit_usd,
-        },
+    let settings = zeroclaw_runtime::goal_mode::GoalHostSettings::from_config(
+        &defaults.config.goal,
         std::process::id(),
         control_plane.boot_id.clone(),
     )?;
@@ -305,10 +297,6 @@ async fn clear_supervisor_slot_if_current(
 
 #[async_trait]
 impl GoalSessionDriver for MatrixGoalSessionDriver {
-    fn surface(&self) -> GoalSurface {
-        GoalSurface::Matrix
-    }
-
     fn session_key(&self) -> &GoalSessionKey {
         &self.session_key
     }
@@ -440,6 +428,10 @@ fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
 
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
     fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
         Ok(self.history())
     }
