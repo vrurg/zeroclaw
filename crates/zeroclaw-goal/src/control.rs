@@ -27,6 +27,10 @@ use zeroclaw_commands::goal::{
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
 
+mod goal_execution;
+
+pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome};
+
 /// The only V1 surfaces permitted to admit a Goal command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalSurface {
@@ -694,6 +698,7 @@ impl GoalRuntimeSubmission {
 pub struct GoalExecutionRequest {
     submission: GoalSubmission,
     scope: GoalExecutionScope,
+    resume_response: Option<String>,
 }
 
 impl GoalExecutionRequest {
@@ -703,6 +708,13 @@ impl GoalExecutionRequest {
 
     pub fn scope(&self) -> &GoalExecutionScope {
         &self.scope
+    }
+
+    /// The exact optional operator response that accompanied `/goal resume`.
+    /// The execution lease must durably append it before the resumed parent
+    /// turn is allowed to start.
+    pub fn resume_response(&self) -> Option<&str> {
+        self.resume_response.as_deref()
     }
 
     pub fn into_parts(self) -> (GoalSubmission, GoalExecutionScope) {
@@ -730,7 +742,7 @@ impl GoalRuntime {
     /// control plane and running/accounting it through another.
     pub fn execution_engine(
         &self,
-        tracker: Arc<crate::cost::CostTracker>,
+        tracker: Arc<zeroclaw_config::cost::CostTracker>,
         agent_alias: impl Into<String>,
         pricing: Arc<crate::agent::cost::ModelProviderPricing>,
     ) -> Result<GoalExecutionEngine> {
@@ -744,11 +756,12 @@ impl GoalRuntime {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalRuntimeSubmission> {
-        let submission = self.host.submit(ingress, driver, command).await?;
-        let (response, submission) = self
-            .controller
-            .submit_for_execution(settings, submission)
-            .await?;
+        let resume_response = match &command {
+            GoalCommand::Resume { response } => response.clone(),
+            _ => None,
+        };
+        let submission = self.host.submit(settings, ingress, driver, command).await?;
+        let response = self.controller.submit(settings, &submission).await?;
         let execution = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
                 Some(GoalExecutionRequest {
@@ -758,6 +771,7 @@ impl GoalRuntime {
                         projection.execution_epoch,
                     )?,
                     submission,
+                    resume_response,
                 })
             }
             _ => None,
@@ -775,15 +789,10 @@ impl GoalRuntime {
     pub async fn acquire_execution(
         &self,
         settings: &GoalHostSettings,
-        request: &GoalExecutionRequest,
+        request: GoalExecutionRequest,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.host
-            .acquire_execution(
-                settings,
-                request.submission().ingress(),
-                Arc::clone(request.submission().driver()),
-                request.scope(),
-            )
+            .acquire_execution(settings, request.submission, &request.scope)
             .await
     }
 }
