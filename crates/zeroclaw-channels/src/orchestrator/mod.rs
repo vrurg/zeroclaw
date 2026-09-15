@@ -25125,7 +25125,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_new_session_fences_in_flight_turn_and_successors() {
+    async fn message_dispatch_new_session_starts_successors_with_fresh_history() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -25139,7 +25139,11 @@ BTC is currently around $65,000 based on latest tool output."#
             started: Some(Arc::clone(&first_turn_started)),
         });
         let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config.channels.debounce_ms = 50;
+        // Runtime commands deliberately retain the established channel
+        // debounce policy (only `/stop` is an ingress fast path). Disable
+        // debouncing here so this test exercises lane ordering and `/new`
+        // reset semantics, rather than combining the command with text.
+        prompt_config.channels.debounce_ms = 0;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -25239,8 +25243,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
             // Do not race a wall clock: wait until the first turn has really
-            // started, then leave the next ordinary message pending when
-            // `/new` reaches the lifecycle barrier.
+            // started, then queue an ordinary predecessor before `/new`.
             first_turn_started.notified().await;
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-2".to_string(),
@@ -25313,7 +25316,7 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
+        assert_eq!(sent_messages.len(), 5);
         assert!(
             sent_messages
                 .iter()
@@ -25328,8 +25331,30 @@ BTC is currently around $65,000 based on latest tool output."#
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        for successor_call in &calls[1..] {
+        assert_eq!(calls.len(), 4);
+        assert!(
+            calls[0]
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("forwarded content"))
+        );
+        assert!(
+            calls[1].iter().any(|(role, content)| {
+                role == "user" && content.contains("parallel predecessor")
+            })
+        );
+
+        let successor_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.iter().any(|(role, content)| {
+                    role == "user"
+                        && (content.contains("first fresh successor")
+                            || content.contains("second fresh successor"))
+                })
+            })
+            .collect();
+        assert_eq!(successor_calls.len(), 2);
+        for successor_call in successor_calls {
             assert!(
                 !successor_call.iter().any(|(role, content)| {
                     role == "user"
@@ -25339,20 +25364,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 "no successor may overtake /new and observe predecessor history"
             );
         }
-        assert!(
-            calls[1..]
-                .iter()
-                .any(|call| call.iter().any(|(role, content)| {
-                    role == "user" && content.contains("first fresh successor")
-                }))
-        );
-        assert!(
-            calls[1..]
-                .iter()
-                .any(|call| call.iter().any(|(role, content)| {
-                    role == "user" && content.contains("second fresh successor")
-                }))
-        );
     }
 
     #[tokio::test]
