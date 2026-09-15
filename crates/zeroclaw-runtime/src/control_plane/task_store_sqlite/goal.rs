@@ -617,14 +617,12 @@ impl SqliteTaskStore {
             )
             .context("fail exhausted goal epoch")?;
         tx.commit().context("commit goal boot reconciliation")?;
-        Ok(
-            (missing_extension
-                + failed_accounting
-                + failed_tool_pairing
-                + cleared_terminal_pending
-                + paused
-                + exhausted) as u64,
-        )
+        Ok((missing_extension
+            + failed_accounting
+            + failed_tool_pairing
+            + cleared_terminal_pending
+            + paused
+            + exhausted) as u64)
     }
 }
 
@@ -1199,7 +1197,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             // after compatibility normalization. A terminal predecessor is
             // still an audit record for its exact durable principal, so only
             // that principal may replace it.
-            if current.principal_id != task.principal_id {
+            if current.principal_id.is_some() && current.principal_id != task.principal_id {
                 return Ok(GoalTransitionResult::Stale);
             }
             let settled = tx
