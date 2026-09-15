@@ -34,7 +34,7 @@ use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
     GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
-use crate::agent::goal_tool_pairing::scope_goal_tool_pairing;
+use crate::agent::goal_tool_pairing::{finalize_goal_tool_pairing, scope_goal_tool_pairing};
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
     GoalTaskRegistry, GoalTransitionResult, TaskStatus,
@@ -60,7 +60,7 @@ pub enum GoalExecutionOutcome {
 /// command cannot enter the same session until it is dropped.
 pub struct GoalExecutionSubmission {
     response: GoalResponse,
-    _lease: GoalSessionLease,
+    _lease: Option<GoalSessionLease>,
 }
 
 impl std::fmt::Debug for GoalExecutionSubmission {
@@ -308,7 +308,7 @@ impl GoalExecutionSupervisor {
         let execution_epoch = scope.execution_epoch();
         let (completion_tx, completion) = watch::channel(None);
         let handle = zeroclaw_spawn::spawn!(async move {
-            let result = engine.run(&settings, &request).await;
+            let result = engine.run(&settings, request).await;
 
             // The engine normally records its own expected execution failures.
             // Acquisition and other unexpected failures can occur before that
@@ -472,31 +472,20 @@ impl GoalExecutionSupervisor {
         let Some(scope) = self.scope_for_session_id(session_id).await? else {
             return Ok(GoalTransitionResult::Missing);
         };
-        let current = self
+        let transition = self
             .engine
             .registry
-            .current_goal_for_session(session_id)
+            .pause_session_goal(
+                scope.task_id(),
+                session_id,
+                scope.execution_epoch(),
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
             .await?;
-        let transition = match current {
-            Some(current)
-                if current.id == scope.task_id() && current.status == TaskStatus::Running =>
-            {
-                self.engine
-                    .registry
-                    .pause_session_goal(
-                        &current.id,
-                        session_id,
-                        current.execution_epoch,
-                        GoalPauseState {
-                            reason: GoalPauseReason::OperatorPaused,
-                            description: None,
-                            blockers: Vec::new(),
-                        },
-                    )
-                    .await?
-            }
-            Some(_) | None => GoalTransitionResult::Stale,
-        };
         let _ = self.drain_lifecycle_fence(&scope).await?;
         Ok(transition)
     }
@@ -723,115 +712,6 @@ impl GoalExecutionSupervisor {
         scope: &GoalExecutionScope,
     ) -> Result<Option<GoalResponse>> {
         let _ = self.drain(scope).await;
-        let Some((mut current, mut goal)) = self.fenced_goal_state(scope).await? else {
-            return Ok(None);
-        };
-        let mut classified = false;
-
-        if let Some((pending_id, admitted_epoch)) =
-            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-        {
-            match self
-                .engine
-                .registry
-                .settle_pending_operation(
-                    &current.id,
-                    scope.session_id(),
-                    admitted_epoch,
-                    pending_id,
-                    GoalAccountingState::OutcomeUnknown,
-                )
-                .await?
-            {
-                GoalTransitionResult::Applied => {}
-                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-            }
-            classified = true;
-            let Some(state) = self.fenced_goal_state(scope).await? else {
-                return Ok(None);
-            };
-            (current, goal) = state;
-            if current.status == TaskStatus::Paused {
-                match self
-                    .engine
-                    .registry
-                    .finish_session_goal(
-                        &current.id,
-                        scope.session_id(),
-                        current.execution_epoch,
-                        TaskStatus::Failed,
-                        Some("accounting_outcome_unknown".to_owned()),
-                    )
-                    .await?
-                {
-                    GoalTransitionResult::Applied => {}
-                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-                }
-                let Some(state) = self.fenced_goal_state(scope).await? else {
-                    return Ok(None);
-                };
-                (current, goal) = state;
-            }
-        }
-
-        if let Some((batch_id, admitted_epoch)) = goal
-            .pending_tool_batch_id
-            .as_deref()
-            .zip(goal.pending_tool_epoch)
-        {
-            let transition = if current.status.is_terminal() {
-                self.engine
-                    .registry
-                    .clear_terminal_tool_batch(
-                        &current.id,
-                        scope.session_id(),
-                        admitted_epoch,
-                        batch_id,
-                    )
-                    .await?
-            } else {
-                self.engine
-                    .registry
-                    .fail_unpaired_tool_batch(
-                        &current.id,
-                        scope.session_id(),
-                        current.execution_epoch,
-                        admitted_epoch,
-                        batch_id,
-                    )
-                    .await?
-            };
-            match transition {
-                GoalTransitionResult::Applied => {}
-                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-            }
-            classified = true;
-            let Some(state) = self.fenced_goal_state(scope).await? else {
-                return Ok(None);
-            };
-            (current, goal) = state;
-        }
-
-        if !classified {
-            return Ok(None);
-        }
-        let projection = super::GoalStatusProjection::from_parts(&current, goal);
-        Ok(Some(match current.status {
-            TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
-            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
-            _ => GoalResponse::Stale,
-        }))
-    }
-
-    async fn fenced_goal_state(
-        &self,
-        scope: &GoalExecutionScope,
-    ) -> Result<
-        Option<(
-            crate::control_plane::TaskRecord,
-            crate::control_plane::GoalTaskRecord,
-        )>,
-    > {
         let Some(current) = self
             .engine
             .registry
@@ -849,7 +729,74 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared while classifying a fenced operation")?;
-        Ok(Some((current, goal)))
+        let Some((pending_id, admitted_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+        else {
+            return Ok(None);
+        };
+        match self
+            .engine
+            .registry
+            .settle_pending_operation(
+                &current.id,
+                scope.session_id(),
+                admitted_epoch,
+                pending_id,
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        if current.status == TaskStatus::Paused {
+            match self
+                .engine
+                .registry
+                .finish_session_goal(
+                    &current.id,
+                    scope.session_id(),
+                    current.execution_epoch,
+                    TaskStatus::Failed,
+                    Some("accounting_outcome_unknown".to_owned()),
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared after fenced-operation classification")?;
+        let projection = super::GoalStatusProjection::from_parts(&current, goal);
+        Ok(Some(match current.status {
+            TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
+            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
+            _ => GoalResponse::Stale,
+        }))
     }
 }
 
@@ -969,9 +916,10 @@ impl GoalExecutionEngine {
     pub async fn run(
         &self,
         settings: &GoalHostSettings,
-        request: &GoalExecutionRequest,
+        request: GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
+        let initial_turn_kind = request.initial_turn_kind();
         let objective = self.current_objective(&scope).await?;
         let accountant: Arc<dyn GoalOperationAccounting> = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.registry),
@@ -985,13 +933,8 @@ impl GoalExecutionEngine {
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
                 scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
-                    self.run_scoped(
-                        &scope,
-                        &objective,
-                        request.initial_turn_kind(),
-                        lease.as_mut(),
-                    )
-                    .await
+                    self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
+                        .await
                 })
                 .await
             })
@@ -1024,29 +967,35 @@ impl GoalExecutionEngine {
         lease: &mut dyn GoalSessionExecutionLease,
     ) -> Result<GoalExecutionOutcome> {
         let mut working_history = lease.take_canonical_history()?;
-        let operation = GoalOperationScope::new(scope.clone());
         loop {
             // The driver may return from a previously admitted parent call
             // after a pause, cancellation, or replacement fenced this epoch.
             // That call is allowed to settle its already-incurred usage, but
             // its result must never admit a new parent or verifier operation.
             self.exact_running_task(scope).await?;
-            let parent_result = lease
+            let parent = match lease
                 .run_parent_turn(
-                    &operation,
+                    &GoalOperationScope::new(scope.clone()),
                     GoalParentTurn {
                         kind: parent_turn_kind,
                         objective: objective.to_owned(),
-                        working_history: std::mem::take(&mut working_history),
+                        working_history: working_history.clone(),
                     },
                 )
-                .await;
-            self.require_complete_accounting(scope).await?;
-            let parent = match parent_result {
-                Ok(parent) if !parent.candidate.trim().is_empty() => parent,
-                Ok(_) => {
-                    self.fail(scope, "candidate_empty").await?;
-                    bail!("Goal parent returned an empty candidate");
+                .await
+            {
+                Ok(parent) => {
+                    if let Err(error) = finalize_goal_tool_pairing().await {
+                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        return Err(error).context("Goal parent tool pairing failed");
+                    }
+                    self.require_complete_accounting(scope).await?;
+                    if !parent.candidate.trim().is_empty() {
+                        parent
+                    } else {
+                        self.fail(scope, "candidate_empty").await?;
+                        bail!("Goal parent returned an empty candidate");
+                    }
                 }
                 Err(error) => {
                     self.fail(scope, "parent_operation_failed").await?;
@@ -1061,18 +1010,20 @@ impl GoalExecutionEngine {
             // a drained parent result cannot start a second model operation.
             self.exact_running_task(scope).await?;
 
-            let verifier_result = lease
+            let verifier = match lease
                 .run_verifier(
-                    &operation,
+                    &GoalOperationScope::new(scope.clone()),
                     GoalVerifierTurn {
                         objective: objective.to_owned(),
                         candidate: candidate.clone(),
                     },
                 )
-                .await;
-            self.require_complete_accounting(scope).await?;
-            let verifier = match verifier_result {
-                Ok(response) => response,
+                .await
+            {
+                Ok(response) => {
+                    self.require_complete_accounting(scope).await?;
+                    response
+                }
                 Err(error) => {
                     self.fail(scope, "verifier_operation_failed").await?;
                     return Err(error).context("Goal verifier operation failed");
@@ -1106,6 +1057,39 @@ impl GoalExecutionEngine {
         }
     }
 
+    async fn require_complete_accounting(&self, scope: &GoalExecutionScope) -> Result<()> {
+        let goal = self
+            .registry
+            .get_goal_task(scope.task_id())
+            .await?
+            .context("Goal extension disappeared while settling accounting")?;
+        if goal.accounting_state != GoalAccountingState::Complete
+            || goal.pending_call_id.is_some()
+            || goal.pending_call_epoch.is_some()
+        {
+            self.fail(scope, "accounting_missing_or_invalid").await?;
+            bail!("Goal accounting is incomplete");
+        }
+
+        if goal.effective_cost_limit_usd.is_some() {
+            let tracker = Arc::clone(&self.tracker);
+            let task_id = scope.task_id().to_owned();
+            let pricing_complete = tokio::task::spawn_blocking(move || {
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(&task_id)
+                    .map(|(_, _, pricing_complete)| pricing_complete)
+            })
+            .await
+            .context("join strict Goal usage lookup")?
+            .context("Goal accounting ledger is invalid")?;
+            if !pricing_complete {
+                self.fail(scope, "pricing_unavailable").await?;
+                bail!("Goal cost budget lacks complete pricing for actual provider usage");
+            }
+        }
+        Ok(())
+    }
+
     async fn exact_running_task(
         &self,
         scope: &GoalExecutionScope,
@@ -1125,67 +1109,6 @@ impl GoalExecutionEngine {
             "Goal execution epoch is stale"
         );
         Ok(task)
-    }
-
-    /// Stop the exact execution epoch when its just-finished logical operation
-    /// cannot prove complete usage. A verifier's terminal response is not an
-    /// exception: it must never complete or pause a Goal after incomplete
-    /// accounting.
-    async fn require_complete_accounting(&self, scope: &GoalExecutionScope) -> Result<()> {
-        let task = self
-            .registry
-            .current_goal_for_session(scope.session_id())
-            .await?
-            .context("Goal session no longer has a current task")?;
-        ensure!(task.id == scope.task_id(), "Goal task identity is stale");
-        let goal = self
-            .registry
-            .get_goal_task(scope.task_id())
-            .await?
-            .context("Goal extension disappeared after operation settlement")?;
-
-        if task.status != TaskStatus::Running || task.execution_epoch != scope.execution_epoch() {
-            // A lifecycle fence can arrive while a parent or verifier is
-            // unwinding. When that interrupted scope owns a still-unpaired
-            // tool batch, resolve only the immediate paused/terminal task
-            // through `fail`; otherwise discard its stale output.
-            let owns_cleanup = task.status.is_terminal()
-                || (task.status == TaskStatus::Paused
-                    && scope.execution_epoch().checked_add(1) == Some(task.execution_epoch));
-            if owns_cleanup && goal.pending_tool_batch_id.is_some() {
-                self.fail(scope, "parent_operation_failed").await?;
-            }
-            bail!("Goal task is no longer running at this execution epoch");
-        }
-
-        if goal.accounting_state == GoalAccountingState::Complete {
-            if goal.effective_cost_limit_usd.is_some() {
-                let tracker = Arc::clone(&self.tracker);
-                let task_id = scope.task_id().to_owned();
-                let pricing_complete = tokio::task::spawn_blocking(move || {
-                    tracker
-                        .get_strict_usage_totals_for_task_with_pricing(&task_id)
-                        .map(|(_, _, pricing_complete)| pricing_complete)
-                })
-                .await
-                .context("join strict Goal usage lookup")?
-                .context("Goal accounting ledger is invalid")?;
-                if !pricing_complete {
-                    self.fail(scope, "pricing_unavailable").await?;
-                    bail!("Goal cost budget lacks complete pricing for actual provider usage");
-                }
-            }
-            return Ok(());
-        }
-        let reason = match goal.accounting_state {
-            GoalAccountingState::Missing | GoalAccountingState::Invalid => {
-                "accounting_missing_or_invalid"
-            }
-            GoalAccountingState::OutcomeUnknown => "accounting_outcome_unknown",
-            GoalAccountingState::Complete => unreachable!("complete accounting returned early"),
-        };
-        self.fail(scope, reason).await?;
-        bail!("Goal operation settled with incomplete accounting")
     }
 
     async fn complete(
@@ -1248,72 +1171,7 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
-        let mut goal = self.registry.get_goal_task(scope.task_id()).await?;
-        let mut operation_resolved = false;
-        if let Some((pending_call_id, admitted_epoch)) = goal
-            .as_ref()
-            .and_then(|goal| goal.pending_call_id.as_deref().zip(goal.pending_call_epoch))
-        {
-            match self
-                .registry
-                .resolve_unsettled_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    admitted_epoch,
-                    pending_call_id,
-                )
-                .await?
-            {
-                GoalTransitionResult::Applied => {
-                    operation_resolved = true;
-                }
-                GoalTransitionResult::Stale => {
-                    // A pause fences the old executor by incrementing the
-                    // epoch. The exact pending operation remains attributable
-                    // to that just-paused Goal, so classify it before the
-                    // adjacent tool-batch cleanup below.
-                    let current = self
-                        .registry
-                        .current_goal_for_session(scope.session_id())
-                        .await?;
-                    let Some(current) = current.filter(|current| current.id == scope.task_id())
-                    else {
-                        bail!("Goal unsettled-operation resolution lost its execution fence")
-                    };
-                    if current.status == TaskStatus::Paused
-                        && scope.execution_epoch().checked_add(1) == Some(current.execution_epoch)
-                    {
-                        match self
-                            .registry
-                            .resolve_unsettled_operation(
-                                scope.task_id(),
-                                scope.session_id(),
-                                current.execution_epoch,
-                                admitted_epoch,
-                                pending_call_id,
-                            )
-                            .await?
-                        {
-                            GoalTransitionResult::Applied => {
-                                operation_resolved = true;
-                            }
-                            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                                bail!(
-                                    "Goal paused unsettled-operation resolution lost its execution fence"
-                                )
-                            }
-                        }
-                    } else {
-                        bail!("Goal unsettled-operation resolution lost its execution fence")
-                    }
-                }
-                GoalTransitionResult::Missing => {
-                    bail!("Goal unsettled-operation resolution lost its execution fence")
-                }
-            }
-            goal = self.registry.get_goal_task(scope.task_id()).await?;
-        }
+        let goal = self.registry.get_goal_task(scope.task_id()).await?;
         if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
             goal.pending_tool_batch_id
                 .as_deref()
@@ -1342,53 +1200,23 @@ impl GoalExecutionEngine {
                         .await?;
                     if let Some(current) = current
                         && current.id == scope.task_id()
+                        && current.status.is_terminal()
                     {
-                        if current.status.is_terminal() {
-                            return match self
-                                .registry
-                                .clear_terminal_tool_batch(
-                                    scope.task_id(),
-                                    scope.session_id(),
-                                    admitted_epoch,
-                                    batch_id,
-                                )
-                                .await?
-                            {
-                                GoalTransitionResult::Applied => Ok(()),
-                                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                                    bail!(
-                                        "Goal terminal tool-pairing cleanup lost its execution fence"
-                                    )
-                                }
-                            };
-                        }
-                        // A pause fences the old executor by incrementing the
-                        // epoch. Its interrupted tool batch still belongs to
-                        // that exact just-paused Goal, so fail it atomically
-                        // rather than advertising an impossible resume.
-                        if current.status == TaskStatus::Paused
-                            && scope.execution_epoch().checked_add(1)
-                                == Some(current.execution_epoch)
+                        return match self
+                            .registry
+                            .clear_terminal_tool_batch(
+                                scope.task_id(),
+                                scope.session_id(),
+                                admitted_epoch,
+                                batch_id,
+                            )
+                            .await?
                         {
-                            return match self
-                                .registry
-                                .fail_unpaired_tool_batch(
-                                    scope.task_id(),
-                                    scope.session_id(),
-                                    current.execution_epoch,
-                                    admitted_epoch,
-                                    batch_id,
-                                )
-                                .await?
-                            {
-                                GoalTransitionResult::Applied => Ok(()),
-                                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                                    bail!(
-                                        "Goal paused tool-pairing failure lost its execution fence"
-                                    )
-                                }
-                            };
-                        }
+                            GoalTransitionResult::Applied => Ok(()),
+                            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                                bail!("Goal terminal tool-pairing cleanup lost its execution fence")
+                            }
+                        };
                     }
                     bail!("Goal tool-pairing failure lost its execution fence")
                 }
@@ -1396,13 +1224,6 @@ impl GoalExecutionEngine {
                     bail!("Goal tool-pairing failure lost its execution fence")
                 }
             }
-        }
-        if operation_resolved {
-            // Settlement atomically terminalizes or preserves the exact task.
-            // A successor may now legitimately replace it, or disposal may
-            // remove it, before this executor returns; neither event should
-            // obscure the already-successful accounting classification.
-            return Ok(());
         }
         match self
             .registry
@@ -1431,13 +1252,8 @@ struct AdmittedOperation {
 /// One Goal execution epoch's private provider-accounting bridge.
 ///
 /// The permit begins before durable pending-operation admission and remains
-/// held until the matching settlement. Together with the registry's durable
-/// pending slot, this is a reserve-then-reconcile admission fence: a second
-/// logical operation cannot observe pre-settlement totals and overspend from
-/// the same remaining budget. It intentionally is not a numeric reservation:
-/// an already admitted operation may cross an RFC admission limit. This
-/// serializes parent and verifier calls without reaching into Reliable's retry
-/// and fallback graph.
+/// held until the matching settlement.  This serializes parent and verifier
+/// calls without reaching into Reliable's retry and fallback graph.
 struct GoalOperationAccountant {
     registry: Arc<dyn GoalTaskRegistry>,
     tracker: Arc<CostTracker>,
@@ -1604,8 +1420,10 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .acquire_owned()
             .await
             .context("Goal operation permit closed")?;
-        let mut admitted = self.admitted.lock().await;
-        ensure!(admitted.is_none(), "Goal operation is already admitted");
+        ensure!(
+            self.admitted.lock().await.is_none(),
+            "Goal operation is already admitted"
+        );
 
         let (_task, goal) = self.current_running_goal().await?;
         ensure!(
@@ -1624,7 +1442,6 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .effective_cost_limit_usd
                 .is_some_and(|limit| cost >= limit)
         {
-            drop(admitted);
             drop(permit);
             self.pause_budget_exhausted().await?;
             bail!("Goal budget is exhausted");
@@ -1656,6 +1473,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await?
         {
             GoalTransitionResult::Applied => {
+                let mut admitted = self.admitted.lock().await;
+                debug_assert!(admitted.is_none());
                 *admitted = Some(AdmittedOperation {
                     id: operation_id,
                     _permit: permit,
@@ -1837,10 +1656,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::control_plane::{
-        GoalTaskRecord, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry,
-    };
-    use crate::goal_mode::{GoalParentTurnKind, GoalParentTurnResult};
+    use crate::control_plane::{GoalTaskRecord, SqliteTaskStore, TaskKind, TaskRecord};
 
     async fn accountant_fixture() -> (
         Arc<SqliteTaskStore>,
@@ -1848,11 +1664,10 @@ mod tests {
         GoalExecutionScope,
         TempDir,
     ) {
-        accountant_fixture_with_limits(None, None).await
+        accountant_fixture_with_cost_limit(None).await
     }
 
-    async fn accountant_fixture_with_limits(
-        token_limit: Option<u64>,
+    async fn accountant_fixture_with_cost_limit(
         cost_limit_usd: Option<f64>,
     ) -> (
         Arc<SqliteTaskStore>,
@@ -1885,7 +1700,6 @@ mod tests {
         let goal = GoalTaskRecord {
             task_id: task.id.clone(),
             objective: "finish the work".to_owned(),
-            effective_token_limit: token_limit,
             effective_cost_limit_usd: cost_limit_usd,
             ..GoalTaskRecord::default()
         };
@@ -1912,6 +1726,7 @@ mod tests {
         provider_rates.insert("model.input".to_owned(), 1.0);
         provider_rates.insert("model.output".to_owned(), 2.0);
         provider_rates.insert("model.cached_input".to_owned(), 0.5);
+        provider_rates.insert("model.cache_write".to_owned(), 1.5);
         let pricing = Arc::new(HashMap::from([("fallback".to_owned(), provider_rates)]));
         let accountant = GoalOperationAccountant::new(
             store.clone() as Arc<dyn GoalTaskRegistry>,
@@ -1929,404 +1744,6 @@ mod tests {
             output_tokens: Some(output),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
-        }
-    }
-
-    /// Build the production engine with the deliberately disabled ordinary
-    /// tracker used by lifecycle tests. Goal accounting still opens and uses
-    /// its canonical ledger, so keeping this setup in one place avoids tests
-    /// accidentally exercising a different cost configuration.
-    fn execution_engine(
-        registry: Arc<dyn GoalTaskRegistry>,
-        directory: &TempDir,
-    ) -> GoalExecutionEngine {
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        GoalExecutionEngine::new(
-            GoalRuntime::new(registry),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap()
-    }
-
-    /// A narrow registry double that replaces an exact Goal immediately after
-    /// its unsettled operation has been durably classified. This is the
-    /// lifecycle interleaving an executor can observe while unwinding: the
-    /// predecessor is settled, then a new command may replace it before the
-    /// old executor returns.
-    struct ReplaceAfterUnsettledResolutionRegistry {
-        inner: Arc<SqliteTaskStore>,
-        successor: TaskRecord,
-        successor_goal: GoalTaskRecord,
-    }
-
-    #[async_trait]
-    impl GoalTaskRegistry for ReplaceAfterUnsettledResolutionRegistry {
-        async fn latest_active_goal_for_agent(&self, _agent: &str) -> Result<Option<TaskRecord>> {
-            panic!("unexpected legacy agent lookup")
-        }
-
-        async fn latest_active_goal_for_context(
-            &self,
-            _agent: &str,
-            _originator_route: Option<&str>,
-            _principal_id: Option<&str>,
-        ) -> Result<Option<TaskRecord>> {
-            panic!("unexpected legacy context lookup")
-        }
-
-        async fn latest_active_goal_id_for_context(
-            &self,
-            _agent: &str,
-            _originator_route: Option<&str>,
-            _principal_id: Option<&str>,
-        ) -> Result<Option<String>> {
-            panic!("unexpected legacy context-id lookup")
-        }
-
-        async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
-            self.inner.get_goal_task(task_id).await
-        }
-
-        async fn update_goal_limits(
-            &self,
-            _task_id: &str,
-            _token_limit: Option<u64>,
-            _cost_limit_usd: Option<f64>,
-        ) -> Result<()> {
-            panic!("unexpected legacy limits update")
-        }
-
-        async fn update_goal_pause(
-            &self,
-            _task_id: &str,
-            _pause: Option<GoalPauseState>,
-        ) -> Result<()> {
-            panic!("unexpected legacy pause update")
-        }
-
-        async fn set_continuation_context(
-            &self,
-            _task_id: &str,
-            _context: Option<crate::control_plane::TaskContinuationContext>,
-        ) -> Result<()> {
-            panic!("unexpected continuation update")
-        }
-
-        async fn get_continuation_context(
-            &self,
-            _task_id: &str,
-        ) -> Result<Option<crate::control_plane::TaskContinuationContext>> {
-            panic!("unexpected continuation lookup")
-        }
-
-        async fn current_goal_for_session(&self, session_id: &str) -> Result<Option<TaskRecord>> {
-            self.inner.current_goal_for_session(session_id).await
-        }
-
-        async fn terminal_reason_for_session_goal(
-            &self,
-            task_id: &str,
-            session_id: &str,
-        ) -> Result<Option<String>> {
-            self.inner
-                .terminal_reason_for_session_goal(task_id, session_id)
-                .await
-        }
-
-        async fn create_or_replace_session_goal(
-            &self,
-            _task: TaskRecord,
-            _goal: GoalTaskRecord,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected create-or-replace")
-        }
-
-        async fn pause_session_goal(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-            _pause: GoalPauseState,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected pause")
-        }
-
-        async fn resume_session_goal(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-            _owner_pid: u32,
-            _owner_boot_id: &str,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected resume")
-        }
-
-        async fn finish_session_goal(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-            _status: TaskStatus,
-            _error: Option<String>,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected terminal transition")
-        }
-
-        async fn admit_pending_operation(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-            _pending_call_id: &str,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected operation admission")
-        }
-
-        async fn settle_pending_operation(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _admitted_epoch: i64,
-            _pending_call_id: &str,
-            _accounting_state: GoalAccountingState,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected operation settlement")
-        }
-
-        async fn resolve_unsettled_operation(
-            &self,
-            task_id: &str,
-            session_id: &str,
-            expected_epoch: i64,
-            admitted_epoch: i64,
-            pending_call_id: &str,
-        ) -> Result<GoalTransitionResult> {
-            let result = self
-                .inner
-                .resolve_unsettled_operation(
-                    task_id,
-                    session_id,
-                    expected_epoch,
-                    admitted_epoch,
-                    pending_call_id,
-                )
-                .await?;
-            if result == GoalTransitionResult::Applied {
-                assert_eq!(
-                    self.inner
-                        .create_or_replace_session_goal(
-                            self.successor.clone(),
-                            self.successor_goal.clone(),
-                        )
-                        .await?,
-                    GoalTransitionResult::Applied
-                );
-            }
-            Ok(result)
-        }
-
-        async fn update_session_goal_limits(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-            _token_limit: Option<u64>,
-            _cost_limit_usd: Option<f64>,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected session limits update")
-        }
-
-        async fn delete_session_goal(
-            &self,
-            _task_id: &str,
-            _session_id: &str,
-            _expected_epoch: i64,
-        ) -> Result<GoalTransitionResult> {
-            panic!("unexpected deletion")
-        }
-    }
-
-    struct MissingAccountingVerifierLease {
-        store: Arc<SqliteTaskStore>,
-        scope: GoalExecutionScope,
-        appended_candidate: bool,
-    }
-
-    #[async_trait]
-    impl GoalSessionExecutionLease for MissingAccountingVerifierLease {
-        fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-            Ok(Vec::new())
-        }
-
-        async fn run_parent_turn(
-            &mut self,
-            _operation: &GoalOperationScope,
-            _turn: GoalParentTurn,
-        ) -> Result<GoalParentTurnResult> {
-            Ok(GoalParentTurnResult {
-                candidate: "completed work".to_owned(),
-                working_history: Vec::new(),
-            })
-        }
-
-        async fn run_verifier(
-            &mut self,
-            _operation: &GoalOperationScope,
-            _turn: GoalVerifierTurn,
-        ) -> Result<String> {
-            assert_eq!(
-                self.store
-                    .admit_pending_operation(
-                        self.scope.task_id(),
-                        self.scope.session_id(),
-                        self.scope.execution_epoch(),
-                        "missing-verifier-usage",
-                    )
-                    .await?,
-                GoalTransitionResult::Applied
-            );
-            assert_eq!(
-                self.store
-                    .settle_pending_operation(
-                        self.scope.task_id(),
-                        self.scope.session_id(),
-                        self.scope.execution_epoch(),
-                        "missing-verifier-usage",
-                        GoalAccountingState::Missing,
-                    )
-                    .await?,
-                GoalTransitionResult::Applied
-            );
-            Ok(r#"{"decision":"complete","reason":"done"}"#.to_owned())
-        }
-
-        async fn append_verified_candidate(&mut self, _candidate: String) -> Result<()> {
-            self.appended_candidate = true;
-            Ok(())
-        }
-
-        async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct PauseWithDirtyToolBatchLease {
-        store: Arc<SqliteTaskStore>,
-        scope: GoalExecutionScope,
-    }
-
-    struct DurableObjectiveVerifierLease {
-        verifier_objective: Option<String>,
-        delivered: bool,
-    }
-
-    #[async_trait]
-    impl GoalSessionExecutionLease for DurableObjectiveVerifierLease {
-        fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-            Ok(Vec::new())
-        }
-
-        async fn run_parent_turn(
-            &mut self,
-            _operation: &GoalOperationScope,
-            _turn: GoalParentTurn,
-        ) -> Result<GoalParentTurnResult> {
-            Ok(GoalParentTurnResult {
-                candidate: "the completed candidate".to_owned(),
-                working_history: Vec::new(),
-            })
-        }
-
-        async fn run_verifier(
-            &mut self,
-            _operation: &GoalOperationScope,
-            turn: GoalVerifierTurn,
-        ) -> Result<String> {
-            self.verifier_objective = Some(turn.objective);
-            assert_eq!(turn.candidate, "the completed candidate");
-            Ok(r#"{"decision":"complete","reason":"criterion met"}"#.to_owned())
-        }
-
-        async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
-            assert_eq!(candidate, "the completed candidate");
-            self.delivered = true;
-            Ok(())
-        }
-
-        async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl GoalSessionExecutionLease for PauseWithDirtyToolBatchLease {
-        fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-            Ok(Vec::new())
-        }
-
-        async fn run_parent_turn(
-            &mut self,
-            _operation: &GoalOperationScope,
-            _turn: GoalParentTurn,
-        ) -> Result<GoalParentTurnResult> {
-            assert_eq!(
-                self.store
-                    .admit_pending_tool_batch(
-                        self.scope.task_id(),
-                        self.scope.session_id(),
-                        self.scope.execution_epoch(),
-                        "interrupted-batch",
-                    )
-                    .await?,
-                GoalTransitionResult::Applied
-            );
-            assert_eq!(
-                self.store
-                    .pause_session_goal(
-                        self.scope.task_id(),
-                        self.scope.session_id(),
-                        self.scope.execution_epoch(),
-                        GoalPauseState {
-                            reason: GoalPauseReason::BudgetExhausted,
-                            description: None,
-                            blockers: Vec::new(),
-                        },
-                    )
-                    .await?,
-                GoalTransitionResult::Applied
-            );
-            Ok(GoalParentTurnResult {
-                candidate: "stale work".to_owned(),
-                working_history: Vec::new(),
-            })
-        }
-
-        async fn run_verifier(
-            &mut self,
-            _operation: &GoalOperationScope,
-            _turn: GoalVerifierTurn,
-        ) -> Result<String> {
-            bail!("the paused parent result must not reach the verifier")
-        }
-
-        async fn append_verified_candidate(&mut self, _candidate: String) -> Result<()> {
-            bail!("the paused parent result must not be delivered")
-        }
-
-        async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -2361,6 +1778,30 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn accountant_preserves_cache_write_pricing_provenance() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_store, accountant, _scope, _directory) = runtime.block_on(accountant_fixture());
+        let event = GoalUsageEvent {
+            provider_ref: "fallback".to_owned(),
+            model: "model".to_owned(),
+            usage: zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(1_200),
+                output_tokens: Some(500),
+                cached_input_tokens: Some(200),
+                cache_creation_input_tokens: Some(300),
+            },
+        };
+
+        let usage = accountant.validated_cost_usage(&event).unwrap();
+
+        assert_eq!(usage.cache_creation_input_tokens, 300);
+        assert_eq!(usage.unpriced_tokens, 0);
+        assert!(usage.pricing_available);
+        let expected = (700.0 + 300.0 * 1.5 + 200.0 * 0.5 + 500.0 * 2.0) / 1_000_000.0;
+        assert!((usage.cost_usd - expected).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -2422,7 +1863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_accounting_fails_before_completion_check() {
+    async fn incomplete_accounting_fails_instead_of_permitting_completion() {
         let (store, accountant, scope, directory) = accountant_fixture().await;
         accountant
             .admit(GoalOperationRequest::new("primary", "model"))
@@ -2440,7 +1881,23 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = execution_engine(store.clone(), &directory);
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
         let error = engine
             .require_complete_accounting(&scope)
             .await
@@ -2463,56 +1920,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_receives_the_durable_objective_used_by_execution() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
-        let objective = engine.current_objective(&scope).await.unwrap();
-        let mut lease = DurableObjectiveVerifierLease {
-            verifier_objective: None,
-            delivered: false,
-        };
-
-        assert_eq!(
-            engine
-                .run_scoped(&scope, &objective, GoalParentTurnKind::Start, &mut lease)
-                .await
-                .unwrap(),
-            GoalExecutionOutcome::Completed
-        );
-        assert_eq!(lease.verifier_objective.as_deref(), Some("finish the work"));
-        assert!(lease.delivered);
-    }
-
-    #[tokio::test]
-    async fn accountant_allows_one_overshoot_then_pauses_before_the_next_operation() {
-        let (store, accountant, scope, _directory) =
-            accountant_fixture_with_limits(Some(10), None).await;
-
+    async fn cost_limited_goal_fails_after_settling_an_unpriced_actual_route() {
+        let (store, accountant, scope, directory) =
+            accountant_fixture_with_cost_limit(Some(1.0)).await;
         accountant
-            .admit(GoalOperationRequest::new("primary", "model"))
+            .admit(GoalOperationRequest::new("fallback", "model"))
             .await
             .unwrap();
         accountant
             .settle(GoalOperationSettlement {
                 accounting_state: GoalAccountingState::Complete,
                 events: vec![GoalUsageEvent {
-                    provider_ref: "fallback".to_owned(),
+                    provider_ref: "unpriced".to_owned(),
                     model: "model".to_owned(),
                     usage: usage(10, 5),
                 }],
@@ -2520,174 +1939,36 @@ mod tests {
             .await
             .unwrap();
 
-        let error = accountant
-            .admit(GoalOperationRequest::new("primary", "model"))
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("Goal budget is exhausted"),
-            "a settled overshoot must stop the next logical operation at the budget guard"
-        );
-        let task = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.status, TaskStatus::Paused);
-        assert_eq!(
-            store
-                .get_goal_task(scope.task_id())
-                .await
-                .unwrap()
-                .unwrap()
-                .pause_reason,
-            Some(GoalPauseReason::BudgetExhausted)
-        );
-    }
-
-    #[tokio::test]
-    async fn second_accountant_cannot_admit_while_a_pending_operation_is_unsettled() {
-        let (store, accountant, scope, directory) = accountant_fixture().await;
-        accountant
-            .admit(GoalOperationRequest::new("primary", "model"))
-            .await
-            .unwrap();
-
-        let second_tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let mut provider_rates = HashMap::new();
-        provider_rates.insert("model.input".to_owned(), 1.0);
-        provider_rates.insert("model.output".to_owned(), 2.0);
-        provider_rates.insert("model.cached_input".to_owned(), 0.5);
-        let second = GoalOperationAccountant::new(
-            store.clone() as Arc<dyn GoalTaskRegistry>,
-            second_tracker,
-            "main".to_owned(),
-            Arc::new(HashMap::from([("fallback".to_owned(), provider_rates)])),
-            scope,
-        );
-
-        let error = second
-            .admit(GoalOperationRequest::new("primary", "model"))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Goal already has a pending operation"),
-            "the durable pending slot must reject a second executor before it can see stale totals"
-        );
-    }
-
-    #[tokio::test]
-    async fn cost_limited_operation_rejects_an_unpriced_configured_route_before_admission() {
-        let (store, accountant, scope, _directory) =
-            accountant_fixture_with_limits(None, Some(1.0)).await;
-
-        let error = accountant
-            .admit(GoalOperationRequest::new("primary", "model"))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Goal cost budget lacks complete pricing for the configured route"),
-            "a cost-limited Goal must not admit a route whose price is unavailable"
-        );
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_call_id.is_none());
-        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
-    }
-
-    #[tokio::test]
-    async fn verifier_complete_with_missing_usage_fails_before_history_delivery() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        let engine = execution_engine(store.clone(), &directory);
-        let mut lease = MissingAccountingVerifierLease {
-            store: Arc::clone(&store),
-            scope: scope.clone(),
-            appended_candidate: false,
-        };
-
-        assert!(
-            engine
-                .run_scoped(
-                    &scope,
-                    "finish the work",
-                    GoalParentTurnKind::Start,
-                    &mut lease,
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
                 )
-                .await
-                .is_err(),
-            "an incomplete verifier operation must fail before completion"
-        );
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
 
-        let current = store
-            .current_goal_for_session(scope.session_id())
+        let error = engine
+            .require_complete_accounting(&scope)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Failed);
+            .unwrap_err();
+        assert!(error.to_string().contains("complete pricing"));
         assert_eq!(
             store
-                .get_snapshot(scope.task_id())
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
                 .await
                 .unwrap()
-                .unwrap()
-                .error
                 .as_deref(),
-            Some("accounting_missing_or_invalid")
+            Some("pricing_unavailable")
         );
-        assert_eq!(
-            store
-                .get_goal_task(scope.task_id())
-                .await
-                .unwrap()
-                .unwrap()
-                .accounting_state,
-            GoalAccountingState::Missing
-        );
-        assert!(!lease.appended_candidate);
-    }
-
-    #[tokio::test]
-    async fn paused_parent_with_dirty_tool_batch_fails_in_the_production_loop() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        let engine = execution_engine(store.clone(), &directory);
-        let mut lease = PauseWithDirtyToolBatchLease {
-            store: Arc::clone(&store),
-            scope: scope.clone(),
-        };
-
-        assert!(
-            engine
-                .run_scoped(
-                    &scope,
-                    "finish the work",
-                    GoalParentTurnKind::Start,
-                    &mut lease,
-                )
-                .await
-                .is_err()
-        );
-
-        let current = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Failed);
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_tool_batch_id.is_none());
-        assert!(goal.pending_tool_epoch.is_none());
     }
 
     #[tokio::test]
@@ -2784,268 +2065,41 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let engine = execution_engine(store.clone(), &directory);
-
-        engine
-            .fail(&scope, "parent_operation_failed")
-            .await
-            .unwrap();
-        let current = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Cancelled);
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_tool_batch_id.is_none());
-        assert!(goal.pending_tool_epoch.is_none());
-    }
-
-    #[tokio::test]
-    async fn stale_tool_loop_failure_terminalizes_the_exact_pause_fence() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        assert_eq!(
-            store
-                .admit_pending_tool_batch(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "interrupted-batch",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-        assert_eq!(
-            store
-                .pause_session_goal(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    GoalPauseState {
-                        reason: GoalPauseReason::BudgetExhausted,
-                        description: None,
-                        blockers: Vec::new(),
-                    },
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-
-        let engine = execution_engine(store.clone(), &directory);
-
-        engine
-            .fail(&scope, "parent_operation_failed")
-            .await
-            .unwrap();
-
-        let current = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Failed);
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_tool_batch_id.is_none());
-        assert!(goal.pending_tool_epoch.is_none());
-    }
-
-    #[tokio::test]
-    async fn terminal_failure_releases_an_unsettled_operation_fence() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        assert_eq!(
-            store
-                .admit_pending_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "ledger-write-failed",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-
-        let engine = execution_engine(store.clone(), &directory);
-
-        engine
-            .fail(&scope, "parent_operation_failed")
-            .await
-            .unwrap();
-
-        let current = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Failed);
-        assert_eq!(
-            store
-                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("accounting_outcome_unknown")
-        );
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
-        assert!(goal.pending_call_id.is_none());
-        assert!(goal.pending_call_epoch.is_none());
-
-        let successor = TaskRecord {
-            id: "goal-accounting-successor".to_owned(),
-            status: TaskStatus::Running,
-            execution_epoch: 1,
-            started_at: "2026-09-05T00:01:00Z".to_owned(),
-            finished_at: None,
-            ..current
-        };
-        assert_eq!(
-            store
-                .create_or_replace_session_goal(
-                    successor.clone(),
-                    GoalTaskRecord {
-                        task_id: successor.id.clone(),
-                        objective: "finish the replacement work".to_owned(),
-                        ..GoalTaskRecord::default()
-                    },
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-    }
-
-    #[tokio::test]
-    async fn settled_failure_is_not_rejected_when_a_successor_replaces_it() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        assert_eq!(
-            store
-                .admit_pending_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "ledger-write-failed",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-        let predecessor = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        let successor = TaskRecord {
-            id: "goal-accounting-successor-race".to_owned(),
-            status: TaskStatus::Running,
-            execution_epoch: 1,
-            started_at: "2026-09-05T00:01:00Z".to_owned(),
-            finished_at: None,
-            ..predecessor
-        };
-        let registry: Arc<dyn GoalTaskRegistry> =
-            Arc::new(ReplaceAfterUnsettledResolutionRegistry {
-                inner: Arc::clone(&store),
-                successor: successor.clone(),
-                successor_goal: GoalTaskRecord {
-                    task_id: successor.id.clone(),
-                    objective: "finish the replacement work".to_owned(),
-                    ..GoalTaskRecord::default()
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
                 },
-            });
-        let engine = execution_engine(registry, &directory);
-
-        engine
-            .fail(&scope, "parent_operation_failed")
-            .await
-            .expect("the settled predecessor must not be re-fenced after replacement");
-
-        assert_eq!(
-            store
-                .current_goal_for_session(scope.session_id())
-                .await
-                .unwrap()
-                .map(|current| current.id),
-            Some(successor.id)
+                directory.path(),
+            )
+            .unwrap(),
         );
-    }
-
-    #[tokio::test]
-    async fn terminal_failure_releases_both_unsettled_fences() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        assert_eq!(
-            store
-                .admit_pending_tool_batch(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "outer-unpaired-batch",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-        assert_eq!(
-            store
-                .admit_pending_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "child-ledger-write-failed",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-
-        let engine = execution_engine(store.clone(), &directory);
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            tracker,
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
 
         engine
             .fail(&scope, "parent_operation_failed")
             .await
             .unwrap();
-
         let current = store
             .current_goal_for_session(scope.session_id())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(current.status, TaskStatus::Cancelled);
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
-        assert!(goal.pending_call_id.is_none());
-        assert!(goal.pending_call_epoch.is_none());
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_tool_epoch.is_none());
-
-        let successor = TaskRecord {
-            id: "goal-two-fence-successor".to_owned(),
-            status: TaskStatus::Running,
-            execution_epoch: 1,
-            started_at: "2026-09-05T00:02:00Z".to_owned(),
-            finished_at: None,
-            ..current
-        };
-        assert_eq!(
-            store
-                .create_or_replace_session_goal(
-                    successor.clone(),
-                    GoalTaskRecord {
-                        task_id: successor.id.clone(),
-                        objective: "finish the replacement work".to_owned(),
-                        ..GoalTaskRecord::default()
-                    },
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
     }
 
     #[tokio::test]
-    async fn paused_fence_cleanup_releases_both_unsettled_fences() {
+    async fn paused_tool_loop_failure_terminalizes_the_exact_dirty_goal() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
         assert_eq!(
             store
@@ -3053,19 +2107,7 @@ mod tests {
                     scope.task_id(),
                     scope.session_id(),
                     scope.execution_epoch(),
-                    "outer-unpaired-batch",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-        assert_eq!(
-            store
-                .admit_pending_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "child-ledger-write-failed",
+                    "paused-batch",
                 )
                 .await
                 .unwrap(),
@@ -3078,7 +2120,7 @@ mod tests {
                     scope.session_id(),
                     scope.execution_epoch(),
                     GoalPauseState {
-                        reason: GoalPauseReason::BudgetExhausted,
+                        reason: GoalPauseReason::OperatorPaused,
                         description: None,
                         blockers: Vec::new(),
                     },
@@ -3088,13 +2130,27 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let engine = execution_engine(store.clone(), &directory);
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
 
         engine
             .fail(&scope, "parent_operation_failed")
             .await
             .unwrap();
-
         let current = store
             .current_goal_for_session(scope.session_id())
             .await
@@ -3102,66 +2158,7 @@ mod tests {
             .unwrap();
         assert_eq!(current.status, TaskStatus::Failed);
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
-        assert!(goal.pending_call_id.is_none());
-        assert!(goal.pending_call_epoch.is_none());
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_tool_epoch.is_none());
-    }
-
-    #[tokio::test]
-    async fn terminal_cancellation_releases_an_unsettled_operation_fence() {
-        let (store, _accountant, scope, directory) = accountant_fixture().await;
-        assert_eq!(
-            store
-                .admit_pending_operation(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    "cancelled-operation",
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-        assert_eq!(
-            store
-                .finish_session_goal(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    TaskStatus::Cancelled,
-                    Some("policy_revoked".to_owned()),
-                )
-                .await
-                .unwrap(),
-            GoalTransitionResult::Applied
-        );
-
-        let engine = execution_engine(store.clone(), &directory);
-
-        engine
-            .fail(&scope, "parent_operation_failed")
-            .await
-            .unwrap();
-
-        let current = store
-            .current_goal_for_session(scope.session_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.status, TaskStatus::Cancelled);
-        assert_eq!(
-            store
-                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("policy_revoked")
-        );
-        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
-        assert!(goal.pending_call_id.is_none());
-        assert!(goal.pending_call_epoch.is_none());
     }
 }
