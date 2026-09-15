@@ -17,7 +17,7 @@ use crate::control_plane::{GoalTaskRegistry, GoalTransitionResult};
 use crate::goal_mode::GoalExecutionScope;
 
 tokio::task_local! {
-    static GOAL_TOOL_PAIRING: Option<Arc<GoalToolPairing>>;
+    static GOAL_TOOL_PAIRING: Arc<GoalToolPairing>;
 }
 
 struct GoalToolPairing {
@@ -32,7 +32,7 @@ struct GoalToolPairing {
 /// boundary for the exact Goal.
 struct ActiveGoalToolBatch {
     batch_id: String,
-    nested_loops: usize,
+    open_batches: usize,
     nested_pairing_failed: bool,
     settling: bool,
 }
@@ -50,11 +50,11 @@ where
 {
     GOAL_TOOL_PAIRING
         .scope(
-            Some(Arc::new(GoalToolPairing {
+            Arc::new(GoalToolPairing {
                 registry,
                 scope,
                 active: Mutex::new(None),
-            })),
+            }),
             future,
         )
         .await
@@ -69,7 +69,7 @@ pub(crate) async fn admit_goal_tool_batch(
     if executable_call_count == 0 {
         return Ok(None);
     }
-    let Some(pairing) = GOAL_TOOL_PAIRING.try_with(Clone::clone).ok().flatten() else {
+    let Some(pairing) = GOAL_TOOL_PAIRING.try_with(Clone::clone).ok() else {
         return Ok(None);
     };
     let nested = {
@@ -79,7 +79,7 @@ pub(crate) async fn admit_goal_tool_batch(
                 !active.settling,
                 "Goal tool batch admitted while its prior history pairing settles"
             );
-            active.nested_loops += 1;
+            active.open_batches += 1;
             true
         } else {
             false
@@ -112,7 +112,7 @@ pub(crate) async fn admit_goal_tool_batch(
             );
             *active = Some(ActiveGoalToolBatch {
                 batch_id,
-                nested_loops: 1,
+                open_batches: 1,
                 nested_pairing_failed: false,
                 settling: false,
             });
@@ -138,58 +138,27 @@ pub(crate) struct GoalToolBatch {
 }
 
 impl GoalToolBatch {
-    /// Clear this marker after the complete assistant/tool round has been
-    /// appended. A pause may have fenced the Goal to a later epoch meanwhile;
-    /// matching the admitted epoch prevents this settlement from clearing a
-    /// successor batch.
+    /// Mark one assistant/tool round as paired in the isolated transcript.
+    ///
+    /// The durable marker remains until the enclosing parent turn returns its
+    /// complete working transcript to the Goal executor. That one boundary
+    /// covers every sequential or nested round without clearing crash evidence
+    /// between an external tool effect and the parent-turn result.
     pub(crate) async fn settle(mut self) -> Result<()> {
-        let batch_id = {
-            let mut active = self.pairing.active.lock();
-            let active_batch = active
-                .as_mut()
-                .context("Goal tool batch settlement has no active durable marker")?;
-            ensure!(
-                active_batch.nested_loops > 0,
-                "Goal tool batch settlement underflowed its nested-loop count"
-            );
-            active_batch.nested_loops -= 1;
-            self.settled = true;
-            if active_batch.nested_loops > 0 {
-                return Ok(());
-            }
-            ensure!(
-                !active_batch.nested_pairing_failed,
-                "Goal nested tool loop exited before clean history pairing"
-            );
-            active_batch.settling = true;
-            active_batch.batch_id.clone()
-        };
-        let result = self
-            .pairing
-            .registry
-            .settle_pending_tool_batch(
-                self.pairing.scope.task_id(),
-                self.pairing.scope.session_id(),
-                self.pairing.scope.execution_epoch(),
-                &batch_id,
-            )
-            .await
-            .context("settle Goal tool batch after history pairing")?;
-        ensure!(
-            result == GoalTransitionResult::Applied,
-            "Goal tool batch settlement lost its durable pairing fence"
-        );
         let mut active = self.pairing.active.lock();
         let active_batch = active
-            .as_ref()
-            .context("Goal tool batch disappeared while settlement completed")?;
+            .as_mut()
+            .context("Goal tool batch settlement has no active durable marker")?;
         ensure!(
-            active_batch.settling
-                && active_batch.nested_loops == 0
-                && active_batch.batch_id == batch_id,
-            "Goal tool batch changed while settlement completed"
+            active_batch.open_batches > 0,
+            "Goal tool batch settlement underflowed its open-batch count"
         );
-        *active = None;
+        active_batch.open_batches -= 1;
+        self.settled = true;
+        ensure!(
+            !active_batch.nested_pairing_failed,
+            "Goal nested tool loop exited before clean history pairing"
+        );
         Ok(())
     }
 }
@@ -203,19 +172,73 @@ impl Drop for GoalToolBatch {
         let Some(active_batch) = active.as_mut() else {
             return;
         };
-        if active_batch.nested_loops == 0 {
+        if active_batch.open_batches == 0 {
             return;
         }
-        active_batch.nested_loops -= 1;
+        active_batch.open_batches -= 1;
         active_batch.nested_pairing_failed = true;
     }
+}
+
+/// Clear a durable marker only after the complete isolated parent turn has
+/// returned its paired working transcript to the Goal executor.
+pub(crate) async fn finalize_goal_tool_pairing() -> Result<()> {
+    let Some(pairing) = GOAL_TOOL_PAIRING.try_with(Clone::clone).ok() else {
+        return Ok(());
+    };
+    let batch_id = {
+        let mut active = pairing.active.lock();
+        let Some(active_batch) = active.as_mut() else {
+            return Ok(());
+        };
+        ensure!(
+            active_batch.open_batches == 0,
+            "Goal parent turn returned with an unfinished tool batch"
+        );
+        ensure!(
+            !active_batch.nested_pairing_failed,
+            "Goal parent turn returned with an unpaired tool batch"
+        );
+        ensure!(
+            !active_batch.settling,
+            "Goal parent turn attempted duplicate tool-pairing settlement"
+        );
+        active_batch.settling = true;
+        active_batch.batch_id.clone()
+    };
+    let result = pairing
+        .registry
+        .settle_pending_tool_batch(
+            pairing.scope.task_id(),
+            pairing.scope.session_id(),
+            pairing.scope.execution_epoch(),
+            &batch_id,
+        )
+        .await
+        .context("settle Goal tool batch after parent-turn pairing")?;
+    ensure!(
+        result == GoalTransitionResult::Applied,
+        "Goal tool batch settlement lost its durable pairing fence"
+    );
+    let mut active = pairing.active.lock();
+    let active_batch = active
+        .as_ref()
+        .context("Goal tool batch disappeared while settlement completed")?;
+    ensure!(
+        active_batch.settling
+            && active_batch.open_batches == 0
+            && active_batch.batch_id == batch_id,
+        "Goal tool batch changed while settlement completed"
+    );
+    *active = None;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{admit_goal_tool_batch, scope_goal_tool_pairing};
+    use super::{admit_goal_tool_batch, finalize_goal_tool_pairing, scope_goal_tool_pairing};
     use crate::control_plane::{
         GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore, TaskKind,
         TaskRecord, TaskStatus,
@@ -223,7 +246,7 @@ mod tests {
     use crate::goal_mode::GoalExecutionScope;
 
     #[tokio::test]
-    async fn goal_tool_batch_marker_clears_only_after_explicit_settlement() {
+    async fn goal_tool_batch_marker_clears_only_after_parent_turn_finalization() {
         let store = Arc::new(SqliteTaskStore::new_in_memory().expect("create store"));
         let task = TaskRecord {
             id: "goal-tool-pairing".to_owned(),
@@ -301,6 +324,18 @@ mod tests {
                 .settle()
                 .await
                 .expect("settle outer paired batch");
+            let paired_but_unfinalized = pending_store
+                .get_goal_task("goal-tool-pairing")
+                .await
+                .expect("read Goal extension")
+                .expect("Goal extension exists");
+            assert!(
+                paired_but_unfinalized.pending_tool_batch_id.is_some(),
+                "the marker survives until the parent turn returns its complete transcript"
+            );
+            finalize_goal_tool_pairing()
+                .await
+                .expect("finalize the complete parent-turn pairing");
         })
         .await;
         let settled = observed_store

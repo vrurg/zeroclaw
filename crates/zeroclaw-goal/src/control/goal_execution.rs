@@ -1312,6 +1312,19 @@ pub async fn dispose_unowned_session_goal(
             result => return Ok(result),
         }
     }
+    if let Some((batch_id, admitted_epoch)) = goal
+        .pending_tool_batch_id
+        .as_deref()
+        .zip(goal.pending_tool_epoch)
+    {
+        match registry
+            .clear_terminal_tool_batch(&reloaded.id, session_id, admitted_epoch, batch_id)
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            result => return Ok(result),
+        }
+    }
     registry
         .delete_session_goal(&reloaded.id, session_id, reloaded.execution_epoch)
         .await
