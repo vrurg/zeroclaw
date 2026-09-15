@@ -134,10 +134,10 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
     ) -> anyhow::Result<String> {
         if self.continue_once {
             self.continue_once = false;
-            Ok(r#"{\"decision\":\"continue\",\"reason\":\"add the missing detail\"}"#.to_owned())
+            Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned())
         } else {
             Ok(
-                r#"{\"decision\":\"complete\",\"reason\":\"candidate satisfies the objective\"}"#
+                r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
                     .to_owned(),
             )
         }
@@ -534,7 +534,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
         &mut self,
         _notice: zeroclaw_goal::GoalExecutionNotice,
     ) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("lease execution test does not publish Goal notices")
     }
 }
 
