@@ -526,12 +526,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_restart_pause_reason_uses_rfc_name_with_legacy_alias() {
-        // Restart recovery is an RFC-visible persisted reason; old local rows
-        // that used the draft spelling must continue to deserialize.
-        let serialized = serde_json::to_string(&GoalPauseReason::DaemonRestart).unwrap();
-        assert_eq!(serialized, "\"daemon_restarted\"");
-
+    fn daemon_restart_pause_reason_accepts_legacy_alias() {
+        // Restart recovery's current spelling is covered with every other
+        // pause reason below. Old local rows used this draft spelling.
         let legacy: GoalPauseReason = serde_json::from_str("\"daemon_restart\"").unwrap();
         assert_eq!(legacy, GoalPauseReason::DaemonRestart);
     }
@@ -563,8 +560,7 @@ mod tests {
             };
             let serialized = serde_json::to_string(&reason).unwrap();
             assert_eq!(serialized, format!("\"{wire_name}\""));
-            let parsed: GoalPauseReason =
-                serde_json::from_str(&format!("\"{wire_name}\"")).unwrap();
+            let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
             assert_eq!(parsed, reason);
         }
     }
