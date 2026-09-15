@@ -7336,6 +7336,10 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+    // Keep session routing metadata in sync for every inbound message, including
+    // passive context and Matrix `/new`, exactly as the ordinary channel path did
+    // before Goal Mode introduced its foreground-lease ordering.
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -7389,8 +7393,6 @@ async fn process_channel_message_body(
         Some(lease) => lease,
         None => return,
     };
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
-
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
     // any early-return reconciliation can await the add before removing the 👀,
@@ -9280,7 +9282,7 @@ fn render_goal_projection(
 
 #[cfg(test)]
 mod goal_response_render_tests {
-    use super::render_goal_response;
+    use super::{channel_runtime_cli_string, render_goal_response};
     use zeroclaw_runtime::{
         control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus},
         goal_mode::{GoalResponse, GoalStatusProjection},
@@ -9310,6 +9312,24 @@ mod goal_response_render_tests {
         assert!(rendered.contains("pause reason: needs_user_input"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
+
+    #[test]
+    fn goal_help_matches_budget_set_grammar() {
+        let rendered = render_goal_response(&GoalResponse::Help);
+
+        assert!(rendered.contains("budget set --tokens N [--cost-usd D]"));
+        assert!(rendered.contains("budget set --cost-usd D [--tokens N]"));
+        assert!(rendered.contains("budget set --unlimited"));
+        assert!(!rendered.contains("budget set [--tokens N] [--cost-usd D]"));
+    }
+
+    #[test]
+    fn invalid_goal_commands_do_not_expose_parser_debug_output() {
+        assert_eq!(
+            channel_runtime_cli_string("goal-mode-command-invalid"),
+            "Invalid Goal command."
+        );
     }
 }
 
@@ -21411,7 +21431,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
             zeroclaw_config::schema::Config::default(),
@@ -21419,6 +21439,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "test-provider",
             None,
         );
+        let session_dir = TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_dir.path()).unwrap(),
+        );
+        Arc::get_mut(&mut runtime_ctx)
+            .expect("test runtime is uniquely owned before processing")
+            .session_store = Some(Arc::clone(&session_store));
 
         let passive_msg = zeroclaw_api::channel::ChannelMessage {
             id: "passive-1".into(),
@@ -21431,6 +21458,11 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
             ..Default::default()
         };
+        let passive_history_key =
+            runtime_conversation_history_key(runtime_ctx.as_ref(), &passive_msg);
+        session_store
+            .append(&passive_history_key, &ChatMessage::user("previous context"))
+            .expect("seed an existing session for routing metadata");
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -21438,6 +21470,13 @@ BTC is currently around $65,000 based on latest tool output."#
             CancellationToken::new(),
         )
         .await;
+
+        let metadata = session_store
+            .get_session_metadata(&passive_history_key)
+            .expect("passive message stamps session routing metadata");
+        assert_eq!(metadata.channel_id, None);
+        assert_eq!(metadata.room_id.as_deref(), Some("group-1@g.us"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("bob"));
 
         assert!(
             provider_impl

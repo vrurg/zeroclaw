@@ -2211,6 +2211,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_drain_fails_a_paused_goal_with_an_unsettled_operation() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "interrupted-operation",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let supervisor = GoalExecutionSupervisor::new(Arc::new(
+            GoalExecutionEngine::new(
+                GoalRuntime::new(store.clone()),
+                Arc::new(
+                    CostTracker::new(
+                        zeroclaw_config::schema::CostConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        directory.path(),
+                    )
+                    .unwrap(),
+                ),
+                "main",
+                Arc::new(HashMap::new()),
+            )
+            .unwrap(),
+        ));
+
+        let response = supervisor.drain_lifecycle_fence(&scope).await.unwrap();
+        assert!(matches!(response, Some(GoalResponse::Terminal(_))));
+        let current = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("accounting_outcome_unknown")
+        );
+    }
+
+    #[tokio::test]
     async fn paused_tool_loop_failure_terminalizes_the_exact_dirty_goal() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
         assert_eq!(

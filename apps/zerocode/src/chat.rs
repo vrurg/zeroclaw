@@ -74,12 +74,12 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         GoalResponse::Status(projection) => ("zc-goal-status", Some(projection)),
         GoalResponse::Budget(projection) => ("zc-goal-budget", Some(projection)),
         GoalResponse::BudgetUpdated(projection) => ("zc-goal-budget-updated", Some(projection)),
-        GoalResponse::Paused(projection) | GoalResponse::AlreadyPaused(projection) => {
-            ("zc-goal-paused", Some(projection))
-        }
+        GoalResponse::Paused(projection) => ("zc-goal-paused", Some(projection)),
+        GoalResponse::AlreadyPaused(projection) => ("zc-goal-already-paused", Some(projection)),
         GoalResponse::Resumed(projection) => ("zc-goal-resumed", Some(projection)),
-        GoalResponse::Cancelled(projection) | GoalResponse::AlreadyCancelled(projection) => {
-            ("zc-goal-cancelled", Some(projection))
+        GoalResponse::Cancelled(projection) => ("zc-goal-cancelled", Some(projection)),
+        GoalResponse::AlreadyCancelled(projection) => {
+            ("zc-goal-already-cancelled", Some(projection))
         }
         GoalResponse::NoCurrentGoal => ("zc-goal-no-current", None),
         GoalResponse::AlreadyActive => ("zc-goal-already-active", None),
@@ -10466,6 +10466,33 @@ mod tests {
         assert!(
             goal_response_message(&crate::wire::GoalResponse::Budget(projection))
                 .starts_with("Goal budget is available.")
+        );
+    }
+
+    #[test]
+    fn idempotent_goal_controls_do_not_claim_a_mutation() {
+        let projection = crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::AlreadyPaused(
+                projection.clone(),
+            ))
+            .starts_with("Goal is already paused.")
+        );
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::AlreadyCancelled(projection,))
+                .starts_with("Goal is already cancelled.")
         );
     }
 
