@@ -162,6 +162,12 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 // by that immediate reserved record, never ordinary user input
                 // following native results.
                 redact_text_protocol_result = is_sensitive_call;
+            } else if is_native_result {
+                // Native results prove that the text-protocol result cannot
+                // follow this call. Consume its pending state so a later
+                // genuine user message beginning `[Tool results]` remains
+                // ordinary user input at export boundaries.
+                redact_text_protocol_result = false;
             } else if message.role == "user" {
                 redact_text_protocol_result = false;
             }
@@ -1921,6 +1927,7 @@ mod tests {
             )),
             ChatMessage::tool(format!(r#"{{\"content\":\"{marker}\"}}"#)),
             ChatMessage::user("ordinary follow-up"),
+            ChatMessage::user("[Tool results] user-authored follow-up"),
         ];
 
         assert!(escaped_json_tool_protocol(&messages[0].content).is_some());
@@ -1940,6 +1947,10 @@ mod tests {
             )
         );
         assert_eq!(export[2].content, "ordinary follow-up");
+        assert_eq!(
+            export[3].content, "[Tool results] user-authored follow-up",
+            "a native result must consume the text-protocol pending state"
+        );
     }
 
     #[test]

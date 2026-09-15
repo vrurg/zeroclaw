@@ -4339,12 +4339,11 @@ async fn handle_runtime_command_for_delivery(
             // Serialize per-sender persistence to prevent interleaving
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-            clear_sender_history(ctx, &sender_key);
-            ctx.thinking_overrides
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&sender_key);
-            if let Some(ref store) = ctx.session_store
+            let session_prompt_cleanup_failed = if ctx
+                .prompt_config
+                .channels
+                .session_prompts_enabled
+                && let Some(ref store) = ctx.session_store
                 && let Err(e) = store.delete_session(&sender_key)
             {
                 ::zeroclaw_log::record!(
@@ -4356,9 +4355,35 @@ async fn handle_runtime_command_for_delivery(
                         ),
                     "Failed to delete persisted session for"
                 );
+                true
+            } else {
+                false
+            };
+            if session_prompt_cleanup_failed {
+                channel_runtime_cli_string("channel-runtime-new-session-failed")
+            } else {
+                clear_sender_history(ctx, &sender_key);
+                ctx.thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&sender_key);
+                if !ctx.prompt_config.channels.session_prompts_enabled
+                    && let Some(ref store) = ctx.session_store
+                    && let Err(e) = store.delete_session(&sender_key)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
+                            ),
+                        "Failed to delete persisted session for"
+                    );
+                }
+                mark_sender_for_new_session(ctx, &sender_key);
+                channel_runtime_cli_string("channel-runtime-new-session")
             }
-            mark_sender_for_new_session(ctx, &sender_key);
-            channel_runtime_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -22880,6 +22905,104 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message == &format!("r1:{expected}")),
             "the channel must receive the visible prompt-backend failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_does_not_claim_success_when_prompt_cleanup_fails() {
+        struct FailingDeleteBackend {
+            prompts: Vec<zeroclaw_infra::session_prompts::SessionPrompt>,
+        }
+
+        impl SessionBackend for FailingDeleteBackend {
+            fn list_session_prompts(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Vec<zeroclaw_infra::session_prompts::SessionPrompt>> {
+                Ok(self.prompts.clone())
+            }
+
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                vec![]
+            }
+
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+
+            fn list_sessions(&self) -> Vec<String> {
+                vec!["test-channel_r1_u1".to_string()]
+            }
+
+            fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+                Err(std::io::Error::other("synthetic delete failure"))
+            }
+        }
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.session_prompts_enabled = true;
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend {
+            prompts: vec![zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".to_string(),
+                content: "private task context".to_string(),
+                updated_at: "2026-09-15T00:00:00Z".to_string(),
+            }],
+        });
+        let ctx = Arc::new(ChannelRuntimeContext {
+            session_store: Some(backend.clone()),
+            ..(*base).clone()
+        });
+        let mut msg = channel_message("test-channel", None);
+        msg.content = "/new".to_string();
+        let history_key = runtime_conversation_history_key(&ctx, &msg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![ChatMessage::user("existing history")],
+            );
+
+        assert!(
+            handle_runtime_command_if_needed(
+                &ctx,
+                &msg,
+                Some(&(channel_impl.clone() as Arc<dyn Channel>))
+            )
+            .await
+        );
+
+        let expected = channel_runtime_cli_string("channel-runtime-new-session-failed");
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            [format!("r1:{expected}")]
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_some(),
+            "a rejected reset must leave the in-memory session intact"
+        );
+        assert_eq!(
+            backend.list_session_prompts(&history_key).unwrap().len(),
+            1,
+            "the test backend still exposes the attachment after its failed deletion"
         );
     }
 
