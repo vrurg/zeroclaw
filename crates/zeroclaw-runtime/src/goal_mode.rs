@@ -217,6 +217,15 @@ impl GoalIngressContext {
         &self.route
     }
 
+    /// Immutable, adapter-derived principal facts for this admission.
+    ///
+    /// Drivers may use this only to revalidate their own typed binding. It is
+    /// not a hook-mutable channel authority field and must not become model
+    /// authority.
+    pub fn principal(&self) -> &GoalIngressPrincipal {
+        &self.principal
+    }
+
     fn durable_principal_id(&self) -> Option<&str> {
         match &self.principal {
             GoalIngressPrincipal::Matrix { raw_mxid } => Some(raw_mxid),
