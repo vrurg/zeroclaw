@@ -5,6 +5,7 @@
 //! can replace its capacity without changing durable task or ledger state.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -77,7 +78,9 @@ pub(crate) async fn scope_goal_parent<F: Future>(future: F) -> F::Output {
 /// Re-scopes an inline child so it cannot recursively create Goal-owned work.
 /// The child still has no global tool fence: its ordinary tool batch remains
 /// independently parallel according to normal agent configuration.
-pub(crate) async fn scope_goal_child<F: Future>(future: F) -> F::Output {
+pub(crate) async fn scope_goal_child<'a, T>(
+    future: Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+) -> T {
     if is_goal_scoped() {
         GOAL_CHILD_FENCE
             .scope(Some(GoalChildFence::closed()), future)
@@ -132,13 +135,13 @@ mod tests {
     async fn child_scope_rejects_recursive_goal_children() {
         scope_goal_parent(async {
             let _guard = admit_goal_child().await.unwrap().unwrap();
-            scope_goal_child(async {
+            scope_goal_child(Box::pin(async {
                 let error = match admit_goal_child().await {
                     Ok(_) => panic!("nested Goal child admission must be rejected"),
                     Err(error) => error,
                 };
                 assert!(error.to_string().contains("nested foreground child"));
-            })
+            }))
             .await;
         })
         .await;
