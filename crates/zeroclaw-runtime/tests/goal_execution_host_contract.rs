@@ -20,12 +20,11 @@ use zeroclaw_runtime::control_plane::{
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
-    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
-    GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
+    GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -70,6 +69,13 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -121,9 +127,12 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
     ) -> anyhow::Result<String> {
         if self.continue_once {
             self.continue_once = false;
-            Ok(r#"{\"decision\":\"continue\",\"reason\":\"add the missing detail\"}"#.to_owned())
+            Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned())
         } else {
-            Ok(r#"{\"decision\":\"complete\",\"reason\":\"candidate satisfies the objective\"}"#.to_owned())
+            Ok(
+                r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
+                    .to_owned(),
+            )
         }
     }
 
@@ -417,6 +426,13 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         anyhow::bail!("lease execution test does not deliver candidates")
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("lease execution test does not publish Goal notices")
     }
 }
 
@@ -2223,9 +2239,11 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     assert!(histories[1].iter().any(|message| {
         message.role == "assistant" && message.content == "parent:finish the task"
     }));
-    assert!(histories[1]
-        .iter()
-        .any(|message| message.content.contains("add the missing detail")));
+    assert!(
+        histories[1]
+            .iter()
+            .any(|message| message.content.contains("add the missing detail"))
+    );
     assert_eq!(
         parent_turn_kinds.lock().unwrap().as_slice(),
         &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue]

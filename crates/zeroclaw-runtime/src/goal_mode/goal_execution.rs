@@ -857,13 +857,8 @@ impl GoalExecutionEngine {
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
-                self.run_scoped(
-                    &scope,
-                    &objective,
-                    initial_turn_kind,
-                    lease.as_mut(),
-                )
-                .await
+                self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
+                    .await
             })
             .await
     }
