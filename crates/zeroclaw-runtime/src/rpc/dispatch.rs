@@ -8436,19 +8436,13 @@ impl RpcDispatcher {
                 return Err(error);
             }
         };
-        if self
+        let goal_cancelled = self
             .ctx
             .goal_runtime
             .pause_for_external_cancellation(&req.session_id)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-        {
-            return to_result(SessionCancelResult {
-                session_id: req.session_id,
-                cancelled: true,
-            });
-        }
-        match self
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        let session_cancelled = self
             .ctx
             .sessions
             .signal_cancellation_for_incarnation(
@@ -8457,20 +8451,17 @@ impl RpcDispatcher {
                 crate::rpc::session::CancelCause::ClientRpc,
             )
             .await
-        {
-            None => return Err(self.stale_session_incarnation_error()),
-            Some(true) => {}
-            Some(false) => {
-                return Err(rpc_err(
-                    SESSION_NOT_FOUND,
-                    "No active turn for this session",
-                ));
-            }
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        if goal_cancelled || session_cancelled {
+            return to_result(SessionCancelResult {
+                session_id: req.session_id,
+                cancelled: true,
+            });
         }
-        to_result(SessionCancelResult {
-            session_id: req.session_id,
-            cancelled: true,
-        })
+        Err(rpc_err(
+            SESSION_NOT_FOUND,
+            "No active turn for this session",
+        ))
     }
 
     /// Check a grant a composite method needs beyond its own classification.
