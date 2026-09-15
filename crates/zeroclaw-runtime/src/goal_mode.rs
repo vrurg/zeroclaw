@@ -1042,6 +1042,12 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
+    /// Controller-authored explanation for a paused Goal. This is display data
+    /// derived from the canonical Goal extension, not a second lifecycle fact.
+    pub pause_description: Option<String>,
+    /// Human-readable blocker summaries. Durable blocker kind and payload stay
+    /// in the control plane; transport renderers receive only this projection.
+    pub blocker_messages: Vec<String>,
     pub resumable: bool,
 }
 
@@ -1055,6 +1061,12 @@ impl GoalStatusProjection {
             cost_limit_usd: goal.effective_cost_limit_usd,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
+            pause_description: goal.pause_description.clone(),
+            blocker_messages: goal
+                .blockers
+                .iter()
+                .map(|blocker| blocker.message.clone())
+                .collect(),
             resumable: goal_is_resumable(task, goal),
         }
     }
@@ -1551,6 +1563,51 @@ fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_status_projection_keeps_actionable_pause_details() {
+        let task = TaskRecord {
+            id: "goal-status".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            pause_description: Some("Choose the target environment.".to_owned()),
+            blockers: vec![crate::control_plane::GoalBlocker {
+                kind: crate::control_plane::GoalBlockerKind::NeedsUserInput,
+                message: "Which environment should receive the change?".to_owned(),
+                payload: None,
+            }],
+            ..GoalTaskRecord::default()
+        };
+
+        let projection = GoalStatusProjection::from_parts(&task, &goal);
+
+        assert_eq!(
+            projection.pause_description.as_deref(),
+            Some("Choose the target environment.")
+        );
+        assert_eq!(
+            projection.blocker_messages,
+            ["Which environment should receive the change?"]
+        );
+    }
 
     #[test]
     fn goal_parent_directive_marks_the_objective_untrusted() {
