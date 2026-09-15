@@ -117,7 +117,11 @@ impl ZeroCodeGoalSessionDriver {
             "Goal ingress route is stale"
         );
         match ingress.principal() {
-            GoalIngressPrincipal::ZeroCode { tui_id } if tui_id == &self.tui_id => Ok(()),
+            GoalIngressPrincipal::ZeroCode { tui_id }
+                if tui_id.as_str() == self.tui_id.as_str() =>
+            {
+                Ok(())
+            }
             _ => bail!("Goal ingress principal is stale"),
         }
     }
@@ -151,10 +155,6 @@ impl ZeroCodeGoalSessionDriver {
 
 #[async_trait]
 impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
-    fn surface(&self) -> GoalSurface {
-        GoalSurface::ZeroCode
-    }
-
     fn session_key(&self) -> &GoalSessionKey {
         &self.session_key
     }
@@ -199,7 +199,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             canonical_history,
             outbound: Arc::clone(&self.outbound),
             context: Arc::clone(&self.context),
-            session_id: self.raw_session_id().to_owned(),
+            session_key: self.session_key.clone(),
         }))
     }
 }
@@ -210,7 +210,16 @@ struct ZeroCodeGoalExecutionLease {
     canonical_history: Vec<ChatMessage>,
     outbound: Arc<RpcOutbound>,
     context: Arc<RpcContext>,
-    session_id: String,
+    session_key: GoalSessionKey,
+}
+
+impl ZeroCodeGoalExecutionLease {
+    fn raw_session_id(&self) -> Result<&str> {
+        match &self.session_key {
+            GoalSessionKey::ZeroCode { raw_session_id } => Ok(raw_session_id),
+            GoalSessionKey::Matrix { .. } => bail!("ZeroCode Goal lease has a Matrix session key"),
+        }
+    }
 }
 
 fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
@@ -227,12 +236,12 @@ fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
 
 #[async_trait]
 impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
-    fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-        Ok(self.canonical_history.clone())
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
     }
 
-    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
-        Ok(std::mem::take(&mut self.canonical_history))
+    fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
+        Ok(self.canonical_history.clone())
     }
 
     async fn run_parent_turn(
@@ -309,7 +318,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .notify(
                 GOAL_UPDATE_METHOD,
                 serde_json::to_value(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
-                    session_id: self.session_id.clone(),
+                    session_id: self.raw_session_id()?.to_owned(),
                     candidate,
                 })?,
             )
@@ -320,11 +329,11 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
         let update = match notice {
             GoalExecutionNotice::Completed => crate::rpc::types::SessionGoalUpdate::Completed {
-                session_id: self.session_id.clone(),
+                session_id: self.raw_session_id()?.to_owned(),
             },
             GoalExecutionNotice::PausedForBlocker => {
                 crate::rpc::types::SessionGoalUpdate::PausedForBlocker {
-                    session_id: self.session_id.clone(),
+                    session_id: self.raw_session_id()?.to_owned(),
                 }
             }
         };
@@ -375,15 +384,8 @@ impl RpcGoalRuntime {
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
         let restart_coordinator = control_plane.goal_execution_restart();
-        let limits = config.goal.effective_limits().map_err(|error| {
-            anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
-        })?;
-        let settings = GoalHostSettings::new(
-            config.goal.enabled,
-            zeroclaw_commands::goal::GoalBudgetLimits {
-                token_limit: limits.token_limit,
-                cost_limit_usd: limits.cost_limit_usd,
-            },
+        let settings = GoalHostSettings::from_config(
+            &config.goal,
             std::process::id(),
             control_plane.boot_id.clone(),
         )?;
