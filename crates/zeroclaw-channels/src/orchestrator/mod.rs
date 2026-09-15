@@ -7348,7 +7348,7 @@ async fn process_channel_message_body(
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     if msg.passive_context {
         // Passive context does not enter the Matrix foreground domain, but it
-        // still contributes routing metadata to an existing session.
+        // still upserts routing metadata for its session.
         stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -21620,7 +21620,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn nonexecuting_matrix_goal_command_does_not_stamp_session_routing_context() {
+    async fn disabled_matrix_goal_command_does_not_stamp_session_routing_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl;
         let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
