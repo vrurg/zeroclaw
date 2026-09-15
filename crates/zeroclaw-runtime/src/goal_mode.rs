@@ -1070,6 +1070,8 @@ fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
         && goal.accounting_state == GoalAccountingState::Complete
         && goal.pending_call_id.is_none()
         && goal.pending_call_epoch.is_none()
+        && goal.pending_tool_batch_id.is_none()
+        && goal.pending_tool_epoch.is_none()
 }
 
 /// Transport-neutral lifecycle controller. Its input is opaque outside this
@@ -1732,6 +1734,12 @@ mod tests {
 
         goal.pending_call_id = None;
         goal.pending_call_epoch = None;
+        goal.pending_tool_batch_id = Some("tool-batch-1".into());
+        goal.pending_tool_epoch = Some(1);
+        assert!(!goal_is_resumable(&task, &goal));
+
+        goal.pending_tool_batch_id = None;
+        goal.pending_tool_epoch = None;
         task.execution_epoch = i64::MAX;
         assert!(!goal_is_resumable(&task, &goal));
     }

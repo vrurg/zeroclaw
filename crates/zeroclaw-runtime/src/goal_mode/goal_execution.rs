@@ -729,52 +729,51 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared while classifying a fenced operation")?;
-        let Some((pending_id, admitted_epoch)) =
+        if let Some((pending_id, admitted_epoch)) =
             goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-        else {
-            return Ok(None);
-        };
-        match self
-            .engine
-            .registry
-            .settle_pending_operation(
-                &current.id,
-                scope.session_id(),
-                admitted_epoch,
-                pending_id,
-                GoalAccountingState::OutcomeUnknown,
-            )
-            .await?
         {
-            GoalTransitionResult::Applied => {}
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-        }
-        let Some(current) = self
-            .engine
-            .registry
-            .current_goal_for_session(scope.session_id())
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current.id != scope.task_id() {
-            return Ok(None);
-        }
-        if current.status == TaskStatus::Paused {
             match self
                 .engine
                 .registry
-                .finish_session_goal(
+                .settle_pending_operation(
                     &current.id,
                     scope.session_id(),
-                    current.execution_epoch,
-                    TaskStatus::Failed,
-                    Some("accounting_outcome_unknown".to_owned()),
+                    admitted_epoch,
+                    pending_id,
+                    GoalAccountingState::OutcomeUnknown,
                 )
                 .await?
             {
                 GoalTransitionResult::Applied => {}
                 GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+            let Some(current) = self
+                .engine
+                .registry
+                .current_goal_for_session(scope.session_id())
+                .await?
+            else {
+                return Ok(None);
+            };
+            if current.id != scope.task_id() {
+                return Ok(None);
+            }
+            if current.status == TaskStatus::Paused {
+                match self
+                    .engine
+                    .registry
+                    .finish_session_goal(
+                        &current.id,
+                        scope.session_id(),
+                        current.execution_epoch,
+                        TaskStatus::Failed,
+                        Some("accounting_outcome_unknown".to_owned()),
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied => {}
+                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+                }
             }
         }
         let Some(current) = self
@@ -791,6 +790,55 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared after fenced-operation classification")?;
+        if let Some((batch_id, admitted_epoch)) = goal
+            .pending_tool_batch_id
+            .as_deref()
+            .zip(goal.pending_tool_epoch)
+        {
+            let transition = if current.status.is_terminal() {
+                self.engine
+                    .registry
+                    .clear_terminal_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            } else {
+                self.engine
+                    .registry
+                    .fail_unpaired_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            };
+            match transition {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared after fenced-tool classification")?;
         let projection = super::GoalStatusProjection::from_parts(&current, &goal);
         Ok(Some(match current.status {
             TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
@@ -2096,6 +2144,76 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_tool_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_drain_fails_a_paused_goal_with_an_unpaired_tool_batch() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "interrupted-batch",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let engine = Arc::new(
+            GoalExecutionEngine::new(
+                GoalRuntime::new(store.clone()),
+                Arc::new(
+                    CostTracker::new(
+                        zeroclaw_config::schema::CostConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        directory.path(),
+                    )
+                    .unwrap(),
+                ),
+                "main",
+                Arc::new(HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let supervisor = GoalExecutionSupervisor::new(engine);
+
+        let response = supervisor.drain_lifecycle_fence(&scope).await.unwrap();
+        assert!(matches!(response, Some(GoalResponse::Terminal(_))));
+        let current = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("goal_tool_pairing_incomplete")
+        );
     }
 
     #[tokio::test]
