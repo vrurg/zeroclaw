@@ -7336,11 +7336,10 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-    // Keep session routing metadata in sync for every inbound message, including
-    // passive context and Matrix `/new`, exactly as the ordinary channel path did
-    // before Goal Mode introduced its foreground-lease ordering.
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
+        // Passive context does not enter the Matrix foreground domain, but it
+        // still contributes routing metadata to an existing session.
+        stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
     }
@@ -7351,6 +7350,9 @@ async fn process_channel_message_body(
             Some(ChannelRuntimeCommand::NewSession)
         )
     {
+        // `/new` disposes the current Goal/session state, so capture the
+        // inbound routing context before that disposal removes its owner.
+        stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
         if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
@@ -7393,6 +7395,10 @@ async fn process_channel_message_body(
         Some(lease) => lease,
         None => return,
     };
+    // Ordinary Matrix turns must acquire their foreground lease before any
+    // durable session mutation. A cancelled queued turn therefore leaves no
+    // routing metadata behind. Non-Matrix turns use the explicit no-op lease.
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
     // any early-return reconciliation can await the add before removing the 👀,
@@ -21534,6 +21540,60 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             user_history.contains("[Current WhatsApp group message from alice]"),
             "active group turn should preserve current sender attribution, got: {user_history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_matrix_turn_does_not_stamp_session_routing_context() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+        let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let session_dir = TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_dir.path()).unwrap(),
+        );
+        Arc::get_mut(&mut runtime_ctx)
+            .expect("test runtime is uniquely owned before processing")
+            .session_store = Some(Arc::clone(&session_store));
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "queued-matrix-1".into(),
+            sender: "@alice:example.test".into(),
+            reply_target: "!room:example.test".into(),
+            content: "ordinary Matrix turn".into(),
+            channel: "matrix".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let history_key = runtime_conversation_history_key(runtime_ctx.as_ref(), &msg);
+        let held_foreground = foreground_lock(&runtime_ctx.persist_locks, &history_key)
+            .lock_owned()
+            .await;
+        let cancellation = CancellationToken::new();
+        let processing_cancellation = cancellation.clone();
+        let processing = zeroclaw_spawn::spawn!(process_channel_message(
+            Arc::clone(&runtime_ctx),
+            msg,
+            processing_cancellation,
+        ));
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        processing.await.unwrap();
+        drop(held_foreground);
+
+        assert!(
+            session_store.get_session_metadata(&history_key).is_none(),
+            "a cancelled queued Matrix turn must not write session routing metadata"
         );
     }
 
