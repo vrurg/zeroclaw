@@ -16,9 +16,9 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: String,
     pub pause_reason: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocker_messages: Vec<String>,
     pub resumable: bool,
 }
@@ -67,6 +67,27 @@ mod goal_wire_tests {
 
         assert_eq!(projection.pause_description, None);
         assert!(projection.blocker_messages.is_empty());
+    }
+
+    #[test]
+    fn goal_status_projection_omits_empty_detail_fields() {
+        let projection = GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 4,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        let raw = serde_json::to_value(projection).expect("serialize Goal status projection");
+
+        assert!(raw.get("pause_description").is_none());
+        assert!(raw.get("blocker_messages").is_none());
     }
 }
 

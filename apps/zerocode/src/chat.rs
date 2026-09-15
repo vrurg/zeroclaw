@@ -106,7 +106,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     let pause_reason = projection
         .pause_reason
         .clone()
-        .unwrap_or_else(|| crate::i18n::t("zc-goal-none"));
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-value-none"));
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
     } else {
