@@ -1317,6 +1317,11 @@ impl GoalExecutionSupervisor {
     /// operation did not settle. Pausing with unknown spend becomes Failed;
     /// explicit cancellation remains Cancelled but carries the same durable
     /// accounting classification for audit.
+    ///
+    /// Classify once after settlement, using the pre-settlement Goal snapshot
+    /// to retain evidence of an unsettled call. A pause followed by failure
+    /// advances the epoch twice; only the classifier's recorded epoch permits
+    /// recognizing our own transition, without widening the lifecycle fence.
     async fn drain_lifecycle_fence(
         &self,
         scope: &GoalExecutionScope,
@@ -1567,6 +1572,55 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared after fenced-operation classification")?;
+        if let Some((batch_id, admitted_epoch)) = goal
+            .pending_tool_batch_id
+            .as_deref()
+            .zip(goal.pending_tool_epoch)
+        {
+            let transition = if current.status.is_terminal() {
+                self.engine
+                    .registry
+                    .clear_terminal_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            } else {
+                self.engine
+                    .registry
+                    .fail_unpaired_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            };
+            match transition {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared after fenced-tool classification")?;
         let projection = super::GoalStatusProjection::from_parts(&current, &goal);
         Ok(Some(match current.status {
             TaskStatus::Paused => GoalResponse::Paused(projection),
