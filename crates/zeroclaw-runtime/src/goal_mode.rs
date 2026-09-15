@@ -348,6 +348,27 @@ impl GoalExecutionScope {
     }
 }
 
+/// Controller-owned scope for one admitted Goal model operation.
+///
+/// A fenced Goal epoch can contain several sequential parent and verifier
+/// operations. Passing this narrower scope to a session driver prevents a
+/// driver from treating the epoch itself as permission to issue an arbitrary
+/// number of provider calls.
+#[derive(Debug, Clone)]
+pub struct GoalOperationScope {
+    execution: GoalExecutionScope,
+}
+
+impl GoalOperationScope {
+    pub const fn new(execution: GoalExecutionScope) -> Self {
+        Self { execution }
+    }
+
+    pub const fn execution(&self) -> &GoalExecutionScope {
+        &self.execution
+    }
+}
+
 /// Trusted input for a parent Goal turn.
 #[derive(Clone)]
 pub struct GoalParentTurn {
@@ -436,12 +457,12 @@ pub trait GoalSessionExecutionLease: Send {
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
     async fn run_parent_turn(
         &mut self,
-        scope: &GoalExecutionScope,
+        operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult>;
     async fn run_verifier(
         &mut self,
-        scope: &GoalExecutionScope,
+        operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<String>;
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
