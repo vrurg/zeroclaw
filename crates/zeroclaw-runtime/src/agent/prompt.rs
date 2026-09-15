@@ -1926,8 +1926,8 @@ mod tests {
                 r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}]}}"#
             )),
             ChatMessage::tool(format!(r#"{{\"content\":\"{marker}\"}}"#)),
-            ChatMessage::user("ordinary follow-up"),
             ChatMessage::user("[Tool results] user-authored follow-up"),
+            ChatMessage::user("ordinary follow-up"),
         ];
 
         assert!(escaped_json_tool_protocol(&messages[0].content).is_some());
@@ -1946,11 +1946,11 @@ mod tests {
                 r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}]}}"#
             )
         );
-        assert_eq!(export[2].content, "ordinary follow-up");
         assert_eq!(
-            export[3].content, "[Tool results] user-authored follow-up",
+            export[2].content, "[Tool results] user-authored follow-up",
             "a native result must consume the text-protocol pending state"
         );
+        assert_eq!(export[3].content, "ordinary follow-up");
     }
 
     #[test]
