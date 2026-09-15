@@ -34,7 +34,7 @@ use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
     GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
-use crate::agent::goal_tool_pairing::scope_goal_tool_pairing;
+use crate::agent::goal_tool_pairing::{finalize_goal_tool_pairing, scope_goal_tool_pairing};
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
     GoalTaskRegistry, GoalTransitionResult, TaskStatus,
@@ -862,6 +862,19 @@ pub async fn dispose_unowned_session_goal(
             result => return Ok(result),
         }
     }
+    if let Some((batch_id, admitted_epoch)) = goal
+        .pending_tool_batch_id
+        .as_deref()
+        .zip(goal.pending_tool_epoch)
+    {
+        match registry
+            .clear_terminal_tool_batch(&reloaded.id, session_id, admitted_epoch, batch_id)
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            result => return Ok(result),
+        }
+    }
     registry
         .delete_session_goal(&reloaded.id, session_id, reloaded.execution_epoch)
         .await
@@ -972,6 +985,10 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(parent) => {
+                    if let Err(error) = finalize_goal_tool_pairing().await {
+                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        return Err(error).context("Goal parent tool pairing failed");
+                    }
                     self.require_complete_accounting(scope).await?;
                     if !parent.candidate.trim().is_empty() {
                         parent
@@ -2076,6 +2093,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.status, TaskStatus::Cancelled);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_tool_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn paused_tool_loop_failure_terminalizes_the_exact_dirty_goal() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "paused-batch",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        engine
+            .fail(&scope, "parent_operation_failed")
+            .await
+            .unwrap();
+        let current = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_tool_epoch.is_none());

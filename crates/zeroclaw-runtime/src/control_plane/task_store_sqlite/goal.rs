@@ -364,7 +364,9 @@ impl SqliteTaskStore {
                                     SELECT 1 FROM goal_tasks
                                      WHERE task_id = tasks.id
                                        AND (pending_call_id IS NOT NULL
-                                            OR pending_call_epoch IS NOT NULL)
+                                            OR pending_call_epoch IS NOT NULL
+                                            OR pending_tool_batch_id IS NOT NULL
+                                            OR pending_tool_epoch IS NOT NULL)
                                 )
                             )
                         )",
@@ -1478,7 +1480,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
-                       AND status IN ('running', 'paused') AND execution_epoch = ?3
+                       AND ((status = 'running' AND execution_epoch = ?3)
+                            OR status = 'paused')
                 )",
             params![
                 task_id,
@@ -1498,7 +1501,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
-                AND status IN ('running', 'paused') AND execution_epoch = ?3",
+                AND ((status = 'running' AND execution_epoch = ?3)
+                     OR status = 'paused')",
             params![
                 task_id,
                 session_id,
@@ -1681,6 +1685,52 @@ mod tests {
             conversation_scope:
                 crate::control_plane::goal_task::TaskContinuationConversationScope::Sender,
         }
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_clears_a_terminal_tool_marker() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("terminal-tool-marker", "main", 999_999, "old-boot");
+        task.kind = TaskKind::Goal;
+        task.session_id = Some("matrix-terminal-tool-marker".to_owned());
+        task.execution_epoch = 1;
+        let session_id = task.session_id.clone().unwrap();
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal_record("terminal-tool-marker", "finish"))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_tool_batch("terminal-tool-marker", &session_id, 1, "tool-marker")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    "terminal-tool-marker",
+                    &session_id,
+                    1,
+                    TaskStatus::Cancelled,
+                    Some("operator_cancelled".to_owned()),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        store.reconcile_goal_boot_state("new-boot").unwrap();
+        let goal = store
+            .get_goal_task("terminal-tool-marker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_tool_epoch.is_none());
     }
 
     #[tokio::test]
