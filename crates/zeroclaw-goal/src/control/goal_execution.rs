@@ -1006,6 +1006,42 @@ impl GoalExecutionSupervisor {
                     return Ok(None);
                 }
             }
+            let Some(current) = self
+                .engine
+                .registry
+                .current_goal_for_session(scope.session_id())
+                .await?
+            else {
+                self.remove_worker_if_exact(scope.session_id(), &worker)
+                    .await;
+                return Ok(None);
+            };
+            if current.id != scope.task_id() {
+                self.remove_worker_if_exact(scope.session_id(), &worker)
+                    .await;
+                return Ok(None);
+            }
+            if current.status == TaskStatus::Paused {
+                match self
+                    .engine
+                    .registry
+                    .finish_session_goal(
+                        &current.id,
+                        scope.session_id(),
+                        current.execution_epoch,
+                        TaskStatus::Failed,
+                        Some("accounting_outcome_unknown".to_owned()),
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied => {}
+                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                        self.remove_worker_if_exact(scope.session_id(), &worker)
+                            .await;
+                        return Ok(None);
+                    }
+                }
+            }
         }
         let Some(current) = self
             .engine
@@ -1109,6 +1145,55 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared after fenced-operation classification")?;
+        if let Some((batch_id, admitted_epoch)) = goal
+            .pending_tool_batch_id
+            .as_deref()
+            .zip(goal.pending_tool_epoch)
+        {
+            let transition = if current.status.is_terminal() {
+                self.engine
+                    .registry
+                    .clear_terminal_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            } else {
+                self.engine
+                    .registry
+                    .fail_unpaired_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            };
+            match transition {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared after fenced-tool classification")?;
         let projection = super::GoalStatusProjection::from_parts(&current, &goal);
         Ok(Some(match current.status {
             TaskStatus::Paused => GoalResponse::Paused(projection),
