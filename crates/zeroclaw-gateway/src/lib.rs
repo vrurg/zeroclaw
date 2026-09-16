@@ -765,6 +765,7 @@ pub struct AppState {
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    quickstart_config: Option<zeroclaw_runtime::quickstart::QuickstartConfigState>,
 }
 
 impl GatewaySupervision {
@@ -773,10 +774,12 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        quickstart_config: Option<zeroclaw_runtime::quickstart::QuickstartConfigState>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            quickstart_config,
         }
     }
 }
@@ -812,10 +815,10 @@ pub async fn run_gateway(
         canvas_store,
         sop_engine,
         sop_audit,
-        quickstart_config,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            quickstart_config,
         ),
     ))
     .await
@@ -835,12 +838,12 @@ pub async fn run_gateway_with_plugin_webhooks(
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    quickstart_config: Option<zeroclaw_runtime::quickstart::QuickstartConfigState>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        quickstart_config,
     } = supervision;
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)

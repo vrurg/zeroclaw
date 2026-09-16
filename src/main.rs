@@ -6120,10 +6120,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                quickstart_config,
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
+                                    quickstart_config,
                                 ),
                             ))
                             .await
