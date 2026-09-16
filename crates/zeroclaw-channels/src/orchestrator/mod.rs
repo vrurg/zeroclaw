@@ -9331,6 +9331,9 @@ mod goal_response_render_tests {
     fn goal_help_matches_budget_set_grammar() {
         let rendered = render_goal_response(&GoalResponse::Help);
 
+        assert!(rendered.starts_with("Goal commands:\n"));
+        assert!(rendered.contains("\n• /goal start [--tokens N] [--cost-usd D] -- OBJECTIVE"));
+        assert!(rendered.contains("\n• /goal help"));
         assert!(rendered.contains("budget set --tokens N [--cost-usd D]"));
         assert!(rendered.contains("budget set --cost-usd D [--tokens N]"));
         assert!(rendered.contains("budget set --unlimited"));
