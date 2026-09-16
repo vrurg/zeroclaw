@@ -8079,6 +8079,24 @@ mod tests {
                     bot,
                     Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
+                    "@zc-architect: /goal help",
+                ),
+                Some("/goal help".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "@zc-architect /goal status",
+                ),
+                Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
                     "Please ask zc-architect: /goal help",
                 ),
                 None,
