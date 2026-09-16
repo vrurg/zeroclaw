@@ -834,7 +834,7 @@ fn config_patch_human_warning(
         "legacy_colon_alias_retained" => ta(
             "cli-config-patch-warning-legacy-colon-alias",
             &[("path", &warning.path)],
-            &format!(
+            format!(
                 "Warning: {} is a legacy provider alias that remains invalid and must be repaired separately.",
                 warning.path
             ),
@@ -9863,7 +9863,7 @@ async fn collect_anthropic_setup_token_inline(alias: &str) -> Result<Option<Stri
     let skip_hint = ta(
         "cli-quickstart-auth-anthropic-skip-hint",
         &[("alias", alias)],
-        &format!(
+        format!(
             "  Quickstart was not written. Rerun Quickstart and choose `setup_token` to finish Anthropic setup for {alias}."
         ),
     );
