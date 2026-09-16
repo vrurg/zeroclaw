@@ -182,6 +182,67 @@ pub(crate) async fn consume_provider_streaming_response(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
                 );
+                let streamed_refusal = err
+                    .downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+                    .and_then(|error| match error {
+                        zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal) => {
+                            Some(refusal.as_ref().clone())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| zeroclaw_providers::model_refusal_from_error(&err).cloned());
+                if let Some(refusal) = streamed_refusal {
+                    let usage = outcome
+                        .usage
+                        .clone()
+                        .or_else(|| refusal.usage.as_deref().cloned());
+                    let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        zeroclaw_api::model_provider::TerminalCompletionError::Refusal,
+                        usage,
+                    );
+                    let policy = zeroclaw_providers::terminal_completion_context(&err)
+                        .map(zeroclaw_providers::TerminalCompletionContext::policy)
+                        .unwrap_or_else(|| {
+                            if refusal.provider_executed_tool_activity {
+                                zeroclaw_providers::TerminalCompletionPolicy::new(
+                                    zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                                    zeroclaw_providers::TerminalUsageChargeability::Billable,
+                                )
+                            } else if zeroclaw_api::model_provider::normalize_terminal_display_text(
+                                &outcome.response_text,
+                            )
+                            .is_empty()
+                                && outcome.tool_calls.is_empty()
+                                && !outcome.saw_pre_executed_tool_activity
+                            {
+                                // A typed refusal with only reasoning progress
+                                // has no final text or tool activity. It is
+                                // informational even though that progress now
+                                // prevents replay on the immutable event path.
+                                zeroclaw_providers::TerminalCompletionPolicy::new(
+                                    zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate,
+                                    zeroclaw_providers::TerminalUsageChargeability::Informational,
+                                )
+                            } else {
+                                zeroclaw_providers::default_terminal_policy(
+                                    zeroclaw_api::model_provider::TerminalCompletionError::Refusal,
+                                )
+                            }
+                        });
+                    if visible_event_output {
+                        return Err(StreamInterruptedAfterOutput::terminal_with_source(
+                            forwarded_text,
+                            failure,
+                            zeroclaw_providers::TerminalCompletionPolicy::new(
+                                zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                                policy.usage_chargeability(),
+                            ),
+                            err,
+                        )
+                        .into());
+                    }
+                    return Err(StreamTerminalCompletion::with_source(failure, policy, err).into());
+                }
                 if let Some(failure) =
                     zeroclaw_api::model_provider::semantic_empty_terminal_failure(&err)
                 {
@@ -252,7 +313,7 @@ pub(crate) async fn consume_provider_streaming_response(
                         }
                         .into());
                     }
-                    return Err(StreamTerminalCompletion { failure, policy }.into());
+                    return Err(StreamTerminalCompletion::new(failure, policy).into());
                 }
 
                 let message = format!("model_provider stream error: {err}");
@@ -283,16 +344,16 @@ pub(crate) async fn consume_provider_streaming_response(
                     // defense protects direct or legacy providers that report
                     // a generic stream error instead of a typed no-replay
                     // terminal failure after emitting that call.
-                    return Err(StreamTerminalCompletion {
-                        failure: zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                    return Err(StreamTerminalCompletion::new(
+                        zeroclaw_api::model_provider::TerminalCompletionFailure::new(
                             zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason,
                             outcome.usage,
                         ),
-                        policy: zeroclaw_providers::TerminalCompletionPolicy::new(
+                        zeroclaw_providers::TerminalCompletionPolicy::new(
                             zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
                             zeroclaw_providers::TerminalUsageChargeability::Billable,
                         ),
-                    }
+                    )
                     .into());
                 }
                 if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
@@ -873,6 +934,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 })),
                 Ok(StreamEvent::PreExecutedToolCall {
                     name: "search".to_string(),
@@ -2378,6 +2440,7 @@ mod tests {
                 requested_model: "claude-sonnet-4-6".to_string(),
                 category: Some("hate".to_string()),
                 usage: Some(Box::new(refusal_usage)),
+                provider_executed_tool_activity: false,
                 attempted_candidate: None,
                 attempted_candidate_index: None,
             },
@@ -2406,19 +2469,16 @@ mod tests {
             interrupted.partial_text,
             "Visible partial text before refusal"
         );
-        let usage = interrupted
-            .usage
+        let interrupted_usage = interrupted.usage();
+        let usage = interrupted_usage
             .as_ref()
             .expect("refusal usage must be carried through StreamInterruptedAfterOutput");
         assert_eq!(usage.input_tokens, Some(412));
         assert_eq!(usage.output_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(50));
-        let cause_err = interrupted
-            .cause
-            .terminal_cause()
-            .expect("typed terminal cause must be retained");
-        let refusal = cause_err
-            .downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+        let refusal = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>())
             .and_then(|e| match e {
                 zeroclaw_api::model_provider::StreamError::ModelRefusal(r) => Some(r),
                 _ => None,

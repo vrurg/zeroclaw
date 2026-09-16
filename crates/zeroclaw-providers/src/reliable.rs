@@ -1484,7 +1484,11 @@ fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
 /// replay, because repeating an already-completed provider request can
 /// duplicate billable work.
 fn terminal_recovery_disposition(error: &anyhow::Error) -> Option<TerminalRecoveryDisposition> {
-    terminal_completion_context(error)
+    crate::model_refusal_from_error(error)
+        .filter(|refusal| refusal.provider_executed_tool_activity)
+        .map(|_| TerminalRecoveryDisposition::NoReplay)
+        .or_else(|| {
+            terminal_completion_context(error)
         .map(|context| context.policy().recovery())
         .or_else(|| {
             zeroclaw_api::model_provider::semantic_empty_terminal_failure(error)
@@ -1498,6 +1502,7 @@ fn terminal_recovery_disposition(error: &anyhow::Error) -> Option<TerminalRecove
         .or_else(|| {
             zeroclaw_api::model_provider::terminal_completion_error(error)
                 .map(|reason| default_terminal_policy(reason).recovery())
+        })
         })
 }
 
@@ -2261,6 +2266,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -2564,6 +2570,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -2991,6 +2998,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -3353,6 +3361,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -3630,6 +3639,15 @@ impl ModelProvider for ReliableModelProvider {
                     options,
                 ),
             );
+            let stream = stream
+                .map(move |mut event| {
+                    if let Err(StreamError::ModelRefusal(ref mut refusal)) = event {
+                        refusal.attempted_candidate = Some(streamed_candidate.clone());
+                        refusal.attempted_candidate_index = Some(entry_index);
+                    }
+                    event
+                })
+                .boxed();
             let has_distinct_recovery_candidate =
                 self.model_providers
                     .iter()
@@ -3977,6 +3995,7 @@ mod tests {
 
     enum RefusalThenFailureMode {
         Refusal,
+        ProviderToolRefusal,
         Failure,
     }
 
@@ -3987,18 +4006,24 @@ mod tests {
     impl RefusalThenFailureStub {
         fn outcome(&self, model: &str) -> anyhow::Result<ChatResponse> {
             match self.mode {
-                RefusalThenFailureMode::Refusal => Err(anyhow::Error::new(AnthropicRefusalError {
-                    requested_model: model.to_string(),
-                    category: Some("test-category".to_string()),
-                    usage: Some(Box::new(TokenUsage {
-                        input_tokens: Some(7),
-                        output_tokens: Some(3),
-                        cached_input_tokens: None,
-                        cache_creation_input_tokens: None,
-                    })),
-                    attempted_candidate: None,
-                    attempted_candidate_index: None,
-                })),
+                RefusalThenFailureMode::Refusal | RefusalThenFailureMode::ProviderToolRefusal => {
+                    Err(anyhow::Error::new(AnthropicRefusalError {
+                        requested_model: model.to_string(),
+                        category: Some("test-category".to_string()),
+                        usage: Some(Box::new(TokenUsage {
+                            input_tokens: Some(7),
+                            output_tokens: Some(3),
+                            cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                        })),
+                        provider_executed_tool_activity: matches!(
+                            &self.mode,
+                            RefusalThenFailureMode::ProviderToolRefusal
+                        ),
+                        attempted_candidate: None,
+                        attempted_candidate_index: None,
+                    }))
+                }
                 RefusalThenFailureMode::Failure => {
                     anyhow::bail!("500 later provider failure")
                 }
@@ -4181,6 +4206,43 @@ mod tests {
             .await
             .expect_err("chat_with_system must report the later failure");
         assert_later_failure_keeps_refusal_usage(&error);
+    }
+
+    #[tokio::test]
+    async fn provider_tool_refusal_does_not_call_a_later_candidate() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(RefusalThenFailureStub {
+                        mode: RefusalThenFailureMode::ProviderToolRefusal,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "must not run",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = reliable
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("provider-executed work must stop fallback");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::model_refusal_from_error(&error)
+                .is_some_and(|refusal| refusal.provider_executed_tool_activity)
+        );
     }
 
     #[tokio::test]
@@ -6167,6 +6229,7 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let billable = anyhow::Error::new(TerminalCompletionFailure::new(
             TerminalCompletionError::OutputTokenLimit,
@@ -6335,6 +6398,23 @@ mod tests {
         assert_eq!(
             terminal_recovery_disposition(&error),
             Some(TerminalRecoveryDisposition::NextCandidate)
+        );
+    }
+
+    #[test]
+    fn provider_tool_refusal_never_advances_to_a_fallback_candidate() {
+        let error = anyhow::Error::new(AnthropicRefusalError {
+            requested_model: "claude-primary".to_string(),
+            category: None,
+            usage: None,
+            provider_executed_tool_activity: true,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        });
+
+        assert_eq!(
+            terminal_recovery_disposition(&error),
+            Some(TerminalRecoveryDisposition::NoReplay)
         );
     }
 
@@ -10699,6 +10779,7 @@ mod tests {
                         cached_input_tokens: Some(1),
                         cache_creation_input_tokens: None,
                     })),
+                    provider_executed_tool_activity: false,
                     attempted_candidate: None,
                     attempted_candidate_index: None,
                 },

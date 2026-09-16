@@ -42,6 +42,10 @@ pub use reliable::{
     ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
     ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion,
 };
+pub use safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback, visible_provider_fallback,
+};
 pub use terminal::{
     TerminalCompletionContext, TerminalCompletionPolicy, TerminalRecoveryDisposition,
     TerminalUsageChargeability, billable_terminal_usage, default_terminal_policy,

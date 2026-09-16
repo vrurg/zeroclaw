@@ -58,6 +58,7 @@ enum StreamInterruptionCause {
     Terminal {
         failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
         policy: zeroclaw_providers::TerminalCompletionPolicy,
+        source: Option<anyhow::Error>,
     },
     SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
     ReliableProvider {
@@ -86,7 +87,29 @@ impl StreamInterruptedAfterOutput {
     ) -> Self {
         Self {
             partial_text,
-            cause: StreamInterruptionCause::Terminal { failure, policy },
+            cause: StreamInterruptionCause::Terminal {
+                failure,
+                policy,
+                source: None,
+            },
+        }
+    }
+
+    /// Preserve a provider-owned typed terminal source for user-facing
+    /// classification while retaining the normalized terminal policy.
+    pub(crate) fn terminal_with_source(
+        partial_text: String,
+        failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+        policy: zeroclaw_providers::TerminalCompletionPolicy,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::Terminal {
+                failure,
+                policy,
+                source: Some(source),
+            },
         }
     }
 
@@ -162,7 +185,12 @@ impl std::error::Error for StreamInterruptedAfterOutput {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
             StreamInterruptionCause::Transport { .. } => None,
-            StreamInterruptionCause::Terminal { failure, .. } => Some(failure),
+            StreamInterruptionCause::Terminal {
+                failure, source, ..
+            } => source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+                .or(Some(failure)),
             StreamInterruptionCause::SemanticEmpty(failure) => Some(failure),
             StreamInterruptionCause::ReliableProvider { failure, .. } => Some(failure),
         }
@@ -176,6 +204,32 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamTerminalCompletion {
     pub(crate) failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
     pub(crate) policy: zeroclaw_providers::TerminalCompletionPolicy,
+    source: Option<anyhow::Error>,
+}
+
+impl StreamTerminalCompletion {
+    pub(crate) fn new(
+        failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+        policy: zeroclaw_providers::TerminalCompletionPolicy,
+    ) -> Self {
+        Self {
+            failure,
+            policy,
+            source: None,
+        }
+    }
+
+    pub(crate) fn with_source(
+        failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+        policy: zeroclaw_providers::TerminalCompletionPolicy,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            failure,
+            policy,
+            source: Some(source),
+        }
+    }
 }
 
 impl std::fmt::Display for StreamTerminalCompletion {
@@ -186,7 +240,10 @@ impl std::fmt::Display for StreamTerminalCompletion {
 
 impl std::error::Error for StreamTerminalCompletion {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.failure)
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or(Some(&self.failure))
     }
 }
 
@@ -248,7 +305,7 @@ impl std::error::Error for StreamSemanticEmptyCompletion {}
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    pub(crate) source: zeroclaw_api::model_provider::StreamError,
+    pub(crate) source: anyhow::Error,
 }
 
 impl std::fmt::Display for StreamErrorWithUsage {
@@ -259,7 +316,7 @@ impl std::fmt::Display for StreamErrorWithUsage {
 
 impl std::error::Error for StreamErrorWithUsage {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_ref())
     }
 }
 
@@ -443,6 +500,9 @@ fn terminal_completion_error_message_with_renderer(
         return Some(semantic_empty_terminal_completion_message_with_renderer(
             agent_name, render,
         ));
+    }
+    if zeroclaw_providers::model_refusal_from_error(err).is_some() {
+        return Some(render("cli-agent-error-provider-refusal", &[]));
     }
     if let Some(reason) = zeroclaw_api::model_provider::terminal_completion_error(err) {
         return Some(terminal_reason_message(reason, agent_name));
@@ -837,12 +897,10 @@ mod tests {
     fn streamed_terminal_reason_uses_fluent_delivery_projection() {
         use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
 
-        let error = anyhow::Error::new(StreamTerminalCompletion {
-            failure: TerminalCompletionFailure::from(TerminalCompletionError::OutputTokenLimit),
-            policy: zeroclaw_providers::default_terminal_policy(
-                TerminalCompletionError::OutputTokenLimit,
-            ),
-        });
+        let error = anyhow::Error::new(StreamTerminalCompletion::new(
+            TerminalCompletionFailure::from(TerminalCompletionError::OutputTokenLimit),
+            zeroclaw_providers::default_terminal_policy(TerminalCompletionError::OutputTokenLimit),
+        ));
 
         assert_eq!(
             terminal_completion_error_message(&error, None),
@@ -909,6 +967,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(4),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
             ),
             zeroclaw_providers::default_terminal_policy(TerminalCompletionError::OutputTokenLimit),
@@ -1005,6 +1064,7 @@ mod tests {
             requested_model: "claude-primary".into(),
             category: Some("private-category".into()),
             usage: None,
+            provider_executed_tool_activity: false,
             attempted_candidate: None,
             attempted_candidate_index: None,
         }
@@ -1064,7 +1124,8 @@ mod tests {
             usage: None,
             source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
                 private_refusal(),
-            )),
+            ))
+            .into(),
         });
 
         let message = terminal_completion_error_message_in_english(&error, None)

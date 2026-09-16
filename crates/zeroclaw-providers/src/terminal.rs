@@ -227,6 +227,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(0),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
             ),
             TerminalCompletionPolicy::new(

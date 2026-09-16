@@ -13,6 +13,7 @@ use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+pub use zeroclaw_api::model_provider::ModelRefusalError as AnthropicRefusalError;
 use zeroclaw_api::model_provider::{
     TerminalCompletionError, TerminalCompletionFailure, ThinkingDisplay,
 };
@@ -121,6 +122,15 @@ struct StreamingToolState {
     // until an input_json_delta makes the accumulated wire JSON authoritative.
     input_json: String,
     saw_input_json_delta: bool,
+}
+
+/// Incremental arguments for a provider-owned tool invocation.
+///
+/// Anthropic streams `server_tool_use` and `mcp_tool_use` input as JSON
+/// fragments. These blocks are not local executable tool calls, but malformed
+/// input makes the terminal response invalid and cannot be ignored.
+struct StreamingProviderToolInputState {
+    input_json: String,
 }
 
 #[cfg(test)]
@@ -2170,6 +2180,27 @@ impl AnthropicModelProvider {
             ),
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
+        })
+    }
+
+    fn normalize_usage(usage: Option<&AnthropicUsage>) -> Option<TokenUsage> {
+        usage.map(|usage| {
+            let uncached = usage.input_tokens.unwrap_or(0);
+            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+            let cache_create = usage.cache_creation_input_tokens.unwrap_or(0);
+            let total = uncached
+                .saturating_add(cache_read)
+                .saturating_add(cache_create);
+            let any_reported = usage.input_tokens.is_some()
+                || usage.cache_read_input_tokens.is_some()
+                || usage.cache_creation_input_tokens.is_some();
+            TokenUsage {
+                input_tokens: any_reported.then_some(total),
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            }
         })
     }
 
@@ -2270,6 +2301,11 @@ impl AnthropicModelProvider {
                         has_malformed_provider_tool = true;
                     }
                 }
+                // Anthropic's documented server-side fallback block carries
+                // routing metadata, not user-visible output or executable
+                // tool work. `server_fallback_notice` derives the accepted
+                // route before this parser consumes content.
+                "fallback" => {}
                 _ => {
                     // A successful HTTP envelope is not a successful model
                     // response if it contains a block this adapter cannot
@@ -2462,6 +2498,15 @@ impl AnthropicModelProvider {
             requested_model: requested_model.to_string(),
             category,
             usage: Self::normalize_usage(response.usage.as_ref()).map(Box::new),
+            provider_executed_tool_activity: response.content.iter().any(|block| {
+                matches!(
+                    block.kind.as_str(),
+                    "server_tool_use"
+                        | "web_search_tool_result"
+                        | "mcp_tool_use"
+                        | "mcp_tool_result"
+                )
+            }),
             attempted_candidate: None,
             attempted_candidate_index: None,
         })
@@ -2626,6 +2671,7 @@ impl AnthropicModelProvider {
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
         terminal_policy_slot: Option<std::sync::Arc<crate::terminal::TerminalPolicySlot>>,
+        requested_model: &str,
     ) {
         use tokio_util::io::StreamReader;
 
@@ -2633,7 +2679,13 @@ impl AnthropicModelProvider {
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
-        Self::parse_anthropic_sse_from_reader(reader, tx, terminal_policy_slot).await;
+        Self::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            tx,
+            terminal_policy_slot,
+            Some(requested_model),
+        )
+        .await;
     }
 
     /// Emit a provider terminal outcome without letting a later SSE failure
@@ -2696,10 +2748,27 @@ impl AnthropicModelProvider {
 
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
     /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
+    #[cfg(test)]
     async fn parse_anthropic_sse_from_reader<R>(
         reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
         terminal_policy_slot: Option<std::sync::Arc<crate::terminal::TerminalPolicySlot>>,
+    ) where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        Self::parse_anthropic_sse_from_reader_with_model(reader, tx, terminal_policy_slot, None)
+            .await;
+    }
+
+    /// Parser implementation shared by the production stream and fixtures.
+    /// Tests without a request model retain the generic terminal-refusal
+    /// behavior; a real request keeps the typed refusal identity that Reliable
+    /// needs to skip exactly the already-refused candidate.
+    async fn parse_anthropic_sse_from_reader_with_model<R>(
+        reader: R,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        terminal_policy_slot: Option<std::sync::Arc<crate::terminal::TerminalPolicySlot>>,
+        requested_model: Option<&str>,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
@@ -2708,6 +2777,8 @@ impl AnthropicModelProvider {
         let mut lines = reader.lines();
 
         let mut tool_blocks = BTreeMap::<usize, StreamingToolState>::new();
+        let mut provider_tool_input_blocks =
+            BTreeMap::<usize, StreamingProviderToolInputState>::new();
         // A malformed JSON delta invalidates that tool block. Retain only the
         // index so its later stop cannot turn incomplete arguments into an
         // executable tool call.
@@ -3099,6 +3170,26 @@ impl AnthropicModelProvider {
                                 }
                             }
                         }
+                        if started && matches!(block_type, "server_tool_use" | "mcp_tool_use") {
+                            if let Some(index) = content_block_index {
+                                if provider_tool_input_blocks
+                                    .insert(
+                                        index,
+                                        StreamingProviderToolInputState {
+                                            input_json: String::new(),
+                                        },
+                                    )
+                                    .is_some()
+                                {
+                                    terminal_completion_error.get_or_insert(
+                                        TerminalCompletionError::InvalidTerminalReason,
+                                    );
+                                }
+                            } else {
+                                terminal_completion_error
+                                    .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                            }
+                        }
                     }
                 }
                 "content_block_delta" => {
@@ -3171,12 +3262,21 @@ impl AnthropicModelProvider {
                             Some(delta),
                             Some("input_json_delta"),
                         ) => {
-                            if delta
-                                .get("partial_json")
-                                .and_then(serde_json::Value::as_str)
-                                .is_none()
-                            {
-                                invalid();
+                            match (
+                                index,
+                                delta
+                                    .get("partial_json")
+                                    .and_then(serde_json::Value::as_str),
+                            ) {
+                                (Some(index), Some(json)) => {
+                                    if let Some(state) = provider_tool_input_blocks.get_mut(&index)
+                                    {
+                                        state.input_json.push_str(json);
+                                    } else {
+                                        invalid();
+                                    }
+                                }
+                                _ => invalid(),
                             }
                         }
                         (Some("thinking"), Some(delta), Some("thinking_delta")) => {
@@ -3269,6 +3369,21 @@ impl AnthropicModelProvider {
                             terminal_completion_error
                                 .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                         }
+                    }
+                    if closed
+                        && content_block_index.is_some_and(|index| {
+                            provider_tool_input_blocks
+                            .remove(&index)
+                            .is_some_and(|state| {
+                                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                                    &state.input_json,
+                                )
+                                .is_err()
+                            })
+                        })
+                    {
+                        terminal_completion_error
+                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                     }
                     if closed
                         && content_block_index == thinking_block_index
@@ -3421,6 +3536,34 @@ impl AnthropicModelProvider {
                         .and_then(|t| t.as_u64());
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
+                    }
+                    if stop_reason == Some("refusal")
+                        && last_stop_reason.as_deref() == Some("refusal")
+                        && terminal_completion_error == Some(TerminalCompletionError::Refusal)
+                        && let Some(requested_model) = requested_model
+                    {
+                        let usage = Self::streaming_usage(
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            cache_creation_input_tokens,
+                        );
+                        if let Some(usage) = usage.clone() {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
+                        let _ = tx
+                            .send(Err(StreamError::ModelRefusal(Box::new(
+                                AnthropicRefusalError {
+                                    requested_model: requested_model.to_string(),
+                                    category: None,
+                                    usage: usage.map(Box::new),
+                                    provider_executed_tool_activity: saw_server_tool_activity,
+                                    attempted_candidate: None,
+                                    attempted_candidate_index: None,
+                                },
+                            ))))
+                            .await;
+                        return;
                     }
                     if stop_reason == Some("max_tokens") {
                         ::zeroclaw_log::record!(
@@ -3687,7 +3830,11 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
+        Self::check_refusal(&chat_response, model)?;
+        let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response)?;
+        commit_safeguard_fallback(safeguard_notice);
         parsed.text.ok_or_else(|| {
             // `parse_native_response` rejects semantic-empty responses. This
             // guard only protects future response-model changes from erasing
@@ -3810,7 +3957,13 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
+        Self::check_refusal(&native_response, model)?;
+        let safeguard_notice = Self::server_fallback_notice(&native_response, model);
         let parsed = Self::parse_native_response(native_response);
+        if parsed.is_ok() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
         if native_thinking {
             parsed.map_err(Self::preserve_native_thinking_no_replay)
         } else {
@@ -4006,6 +4159,7 @@ impl ModelProvider for AnthropicModelProvider {
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
             let terminal_policy_slot = crate::terminal::capture_terminal_policy_slot();
+            let requested_model = model.to_string();
 
             enum NativeThinkingStreamOutcome {
                 Response(ProviderChatResponse),
@@ -4046,10 +4200,17 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                commit_safeguard_fallback(None);
+                Self::check_refusal(&parsed, &requested_model)
+                    .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
+                let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
                 match Self::parse_native_response(parsed)
                     .map_err(Self::preserve_native_thinking_no_replay)
                 {
-                    Ok(response) => Ok(NativeThinkingStreamOutcome::Response(response)),
+                    Ok(response) => {
+                        commit_safeguard_fallback(safeguard_notice);
+                        Ok(NativeThinkingStreamOutcome::Response(response))
+                    }
                     Err(error) => {
                         if let Some(context) = crate::terminal::terminal_completion_context(&error)
                         {
@@ -4179,6 +4340,7 @@ impl ModelProvider for AnthropicModelProvider {
         let is_oauth = Self::is_setup_token(&credential);
         let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
         let terminal_policy_slot = crate::terminal::capture_terminal_policy_slot();
+        let requested_model = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -4250,7 +4412,7 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx, terminal_policy_slot).await;
+            Self::parse_anthropic_sse(response, &tx, terminal_policy_slot, &requested_model).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
@@ -4738,7 +4900,13 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            &tx,
+            None,
+            Some("claude-sonnet-4-6"),
+        )
+        .await;
 
         let mut saw_partial = false;
         let mut saw_final = false;
@@ -5424,6 +5592,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: message_delta\n\
@@ -5469,6 +5639,8 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: message_delta\n\
@@ -6639,6 +6811,160 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[tokio::test]
+    async fn partial_provider_tool_json_after_text_never_emits_final() {
+        use std::io::Cursor;
+
+        for (provider_tool, content_block) in [
+            (
+                "server_tool_use",
+                r#"{"type":"server_tool_use","id":"srv_1","name":"web_search"}"#,
+            ),
+            (
+                "mcp_tool_use",
+                r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example"}"#,
+            ),
+        ] {
+            let bytes = format!(
+                "event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{content_block}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut text = String::new();
+            let mut final_count = 0;
+            let mut failures = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(text, "answer");
+            assert_eq!(
+                final_count, 0,
+                "{provider_tool} partial JSON must not emit Final"
+            );
+            assert_eq!(
+                failures.len(),
+                1,
+                "{provider_tool} must emit one typed failure"
+            );
+            assert_eq!(
+                failures[0].reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+            assert_eq!(
+                failures[0]
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
+                Some(5)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_fragmented_provider_tool_json_after_text_emits_final() {
+        use std::io::Cursor;
+
+        for content_block in [
+            serde_json::json!({
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "web_search"
+            }),
+            serde_json::json!({
+                "type": "mcp_tool_use",
+                "id": "mcp_1",
+                "name": "echo",
+                "server_name": "example"
+            }),
+        ] {
+            let events = [
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "answer"}
+                }),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": content_block
+                }),
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"query\":"}
+                }),
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": "\"zero\"}"}
+                }),
+                serde_json::json!({"type": "content_block_stop", "index": 1}),
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 5}
+                }),
+                serde_json::json!({"type": "message_stop"}),
+            ];
+            let bytes = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut text = String::new();
+            let mut final_count = 0;
+            let mut failures = 0;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(_)) => failures += 1,
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(text, "answer");
+            assert_eq!(final_count, 1, "valid provider JSON must finalize");
+            assert_eq!(failures, 0, "valid provider JSON must not fail");
+        }
+    }
+
+    #[tokio::test]
     async fn text_delta_without_an_open_text_block_is_invalid_and_not_visible() {
         use std::io::Cursor;
 
@@ -7150,14 +7476,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .expect("test server serves requests");
         });
-        let provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
         let messages = [ChatMessage::user("hello")];
         let mut stream = provider.stream_chat(
             ProviderChatRequest {
@@ -7248,14 +7572,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .expect("test server serves requests");
         });
-        let provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
         let messages = [ChatMessage::user("hello")];
         let mut stream = provider.stream_chat(
             ProviderChatRequest {
@@ -7497,14 +7819,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .await
                 .expect("test server serves requests");
         });
-        let provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
 
         let error = provider
             .chat_with_system(None, "hello", "claude-test", Some(0.0))
@@ -12375,7 +12695,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // The new fields must not cause a normal completion to be flagged.
         AnthropicModelProvider::check_refusal(&resp, "claude-sonnet-4-6")
             .expect("end_turn must not be treated as a refusal");
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp).expect("valid response");
         assert_eq!(result.text.as_deref(), Some("Hello there"));
         let usage = result.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, Some(300));
@@ -12667,8 +12987,13 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(sse));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
-            .await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            &tx,
+            None,
+            Some("claude-sonnet-4-6"),
+        )
+        .await;
 
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
@@ -12695,7 +13020,78 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         assert_eq!(usage.input_tokens, Some(562), "normalized input tokens");
         assert_eq!(usage.output_tokens, Some(0), "output tokens");
         assert_eq!(usage.cached_input_tokens, Some(100), "cache_read tokens");
+        assert_eq!(refusal.requested_model, "claude-sonnet-4-6");
+        assert_eq!(refusal.attempted_candidate, None);
+        assert_eq!(refusal.attempted_candidate_index, None);
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_tool_refusal_retains_no_replay_provenance() {
+        use std::io::Cursor;
+
+        let sse: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"search\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":3}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(sse));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            &tx,
+            None,
+            Some("claude-sonnet-4-6"),
+        )
+        .await;
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final)))
+        );
+        let refusal = events
+            .iter()
+            .find_map(|event| match event {
+                Err(StreamError::ModelRefusal(refusal)) => Some(refusal),
+                _ => None,
+            })
+            .expect("provider-tool refusal must remain typed");
+        assert!(refusal.provider_executed_tool_activity);
+        assert_eq!(
+            refusal.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn native_provider_tool_refusal_retains_no_replay_provenance() {
+        let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+            "content": [{
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "search",
+                "input": {}
+            }]
+        }))
+        .expect("native fixture is valid JSON");
+        let refusal = AnthropicModelProvider::check_refusal(&response, "claude-sonnet-4-6")
+            .expect_err("refusal must remain typed");
+        assert!(refusal.provider_executed_tool_activity);
+        assert_eq!(
+            refusal.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
     }
 
     #[tokio::test]

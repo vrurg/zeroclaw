@@ -537,6 +537,22 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// A provider safety refusal that completed at the transport layer but cannot
+/// be accepted as an assistant response.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("anthropic refusal: model declined this request (safety classifiers)")]
+pub struct ModelRefusalError {
+    pub requested_model: String,
+    pub category: Option<String>,
+    pub usage: Option<Box<TokenUsage>>,
+    /// Anthropic completed provider-owned work before refusing. Replaying the
+    /// request could duplicate that work, even when no client tool call or
+    /// final display text was produced.
+    pub provider_executed_tool_activity: bool,
+    pub attempted_candidate: Option<String>,
+    pub attempted_candidate_index: Option<usize>,
+}
+
 /// Reason a provider completed a response that must not be treated as a final answer.
 ///
 /// These are successful provider protocol terminal states, not transport failures. They
@@ -612,6 +628,9 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    #[error(transparent)]
+    ModelRefusal(#[from] Box<ModelRefusalError>),
+
     /// The provider reached a terminal state that does not yield a complete answer.
     #[error(transparent)]
     TerminalCompletion(#[from] TerminalCompletionFailure),
@@ -645,6 +664,15 @@ pub fn terminal_completion_failure(error: &anyhow::Error) -> Option<&TerminalCom
 pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
     terminal_completion_failure(error)
         .map(|failure| failure.reason)
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                matches!(
+                    cause.downcast_ref::<StreamError>(),
+                    Some(StreamError::ModelRefusal(_))
+                )
+                .then_some(TerminalCompletionError::Refusal)
+            })
+        })
         .or_else(|| error.downcast_ref::<TerminalCompletionError>().copied())
 }
 
@@ -657,6 +685,7 @@ impl StreamError {
             | Self::Json(_)
             | Self::InvalidSse(_)
             | Self::ModelProvider(_)
+            | Self::ModelRefusal(_)
             | Self::SemanticEmpty(_)
             | Self::Io(_) => None,
         }
@@ -671,6 +700,7 @@ impl StreamError {
             | Self::Json(_)
             | Self::InvalidSse(_)
             | Self::ModelProvider(_)
+            | Self::ModelRefusal(_)
             | Self::TerminalCompletion(_)
             | Self::Io(_) => None,
         }
@@ -1390,7 +1420,8 @@ mod capability_tests {
 #[cfg(test)]
 mod turn_order_tests {
     use super::{
-        ChatMessage, ChatResponse, TerminalCompletionError, TerminalCompletionFailure, ToolCall,
+        ChatMessage, ChatResponse, ModelRefusalError, StreamError, TerminalCompletionError,
+        TerminalCompletionFailure, ToolCall, terminal_completion_error,
     };
 
     #[test]
@@ -1402,6 +1433,23 @@ mod turn_order_tests {
 
         assert_eq!(reason, TerminalCompletionError::OutputTokenLimit);
         assert!(usage.is_none());
+    }
+
+    #[test]
+    fn typed_stream_refusal_projects_the_refusal_terminal_reason() {
+        let error = anyhow::Error::from(StreamError::ModelRefusal(Box::new(ModelRefusalError {
+            requested_model: "test-model".to_string(),
+            category: None,
+            usage: None,
+            provider_executed_tool_activity: false,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        })));
+
+        assert_eq!(
+            terminal_completion_error(&error),
+            Some(TerminalCompletionError::Refusal)
+        );
     }
 
     #[test]
