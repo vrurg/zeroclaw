@@ -63,7 +63,20 @@ pub(crate) fn contextualize_terminal_stream_error(
     slot: &Arc<TerminalPolicySlot>,
     error: StreamError,
 ) -> anyhow::Error {
-    let failure = error.terminal_completion_failure().cloned();
+    // A streamed refusal has a richer, typed cause than a plain terminal
+    // failure. It still represents the same terminal decision, however: the
+    // adapter may have observed text or tool activity that makes replay
+    // unsafe. Project it into the one terminal-policy carrier while retaining
+    // the refusal as the source so safety-specific reporting remains intact.
+    let failure = error.terminal_completion_failure().cloned().or_else(|| {
+        matches!(&error, StreamError::ModelRefusal(_)).then(|| {
+            let usage = match &error {
+                StreamError::ModelRefusal(refusal) => refusal.usage.as_deref().cloned(),
+                _ => None,
+            };
+            TerminalCompletionFailure::new(TerminalCompletionError::Refusal, usage)
+        })
+    });
     let published = slot
         .0
         .lock()
@@ -71,7 +84,11 @@ pub(crate) fn contextualize_terminal_stream_error(
         .take();
     match (failure, published) {
         (Some(failure), Some(published)) if failure.reason == published.reason => {
-            terminal_completion_context_error(failure, published.policy)
+            if matches!(&error, StreamError::ModelRefusal(_)) {
+                terminal_completion_context_stream_error(failure, published.policy, error)
+            } else {
+                terminal_completion_context_error(failure, published.policy)
+            }
         }
         _ => anyhow::Error::from(error),
     }
@@ -143,6 +160,27 @@ pub struct TerminalCompletionContext {
     policy: TerminalCompletionPolicy,
 }
 
+/// Internal terminal-policy wrapper for stream errors that must retain a
+/// provider-specific typed cause. The policy remains the canonical recovery
+/// decision; the source is retained only for diagnostic and refusal handling.
+#[derive(Debug)]
+struct TerminalCompletionContextWithStreamSource {
+    context: TerminalCompletionContext,
+    source: StreamError,
+}
+
+impl std::fmt::Display for TerminalCompletionContextWithStreamSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+
+impl std::error::Error for TerminalCompletionContextWithStreamSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl TerminalCompletionContext {
     #[must_use]
     pub fn failure(&self) -> &TerminalCompletionFailure {
@@ -176,10 +214,28 @@ pub(crate) fn terminal_completion_context_error(
 }
 
 #[must_use]
+fn terminal_completion_context_stream_error(
+    failure: TerminalCompletionFailure,
+    policy: TerminalCompletionPolicy,
+    source: StreamError,
+) -> anyhow::Error {
+    anyhow::Error::new(TerminalCompletionContextWithStreamSource {
+        context: TerminalCompletionContext { failure, policy },
+        source,
+    })
+}
+
+#[must_use]
 pub fn terminal_completion_context(error: &anyhow::Error) -> Option<&TerminalCompletionContext> {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<TerminalCompletionContext>())
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalCompletionContext>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<TerminalCompletionContextWithStreamSource>()
+                    .map(|context| &context.context)
+            })
+    })
 }
 
 /// Return terminal usage only when the provider policy marks it billable.
@@ -211,11 +267,13 @@ pub fn billable_terminal_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
-        billable_terminal_usage, terminal_completion_context_error,
+        TerminalCompletionPolicy, TerminalPolicySlot, TerminalRecoveryDisposition,
+        TerminalUsageChargeability, billable_terminal_usage, contextualize_terminal_stream_error,
+        publish_terminal_policy, terminal_completion_context, terminal_completion_context_error,
     };
     use zeroclaw_api::model_provider::{
-        TerminalCompletionError, TerminalCompletionFailure, TokenUsage,
+        ModelRefusalError, StreamError, TerminalCompletionError, TerminalCompletionFailure,
+        TokenUsage,
     };
 
     #[test]
@@ -237,5 +295,46 @@ mod tests {
         );
 
         assert!(billable_terminal_usage(&error).is_none());
+    }
+
+    #[test]
+    fn contextualized_refusal_keeps_its_typed_cause_and_canonical_policy() {
+        let slot = std::sync::Arc::new(TerminalPolicySlot::default());
+        publish_terminal_policy(
+            &Some(std::sync::Arc::clone(&slot)),
+            TerminalCompletionError::Refusal,
+            TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NoReplay,
+                TerminalUsageChargeability::Billable,
+            ),
+        );
+        let error = contextualize_terminal_stream_error(
+            &slot,
+            StreamError::ModelRefusal(Box::new(ModelRefusalError {
+                requested_model: "test-model".into(),
+                category: None,
+                usage: Some(Box::new(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(3),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                })),
+                provider_executed_tool_activity: false,
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            })),
+        );
+
+        assert_eq!(
+            terminal_completion_context(&error)
+                .expect("published refusal policy must survive dispatch")
+                .policy()
+                .recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+        assert!(
+            crate::model_refusal_from_error(&error).is_some(),
+            "terminal projection must retain the typed refusal for safety messaging"
+        );
     }
 }

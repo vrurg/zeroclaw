@@ -3551,6 +3551,24 @@ impl AnthropicModelProvider {
                         if let Some(usage) = usage.clone() {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
                         }
+                        // Refusal is a typed provider error, but its replay
+                        // decision must use the same terminal-policy carrier
+                        // as every other incomplete terminal. In particular,
+                        // an admitted client tool block is already a replay
+                        // boundary even if its JSON never reached a complete
+                        // ToolCall event.
+                        crate::terminal::publish_terminal_policy(
+                            &terminal_policy_slot,
+                            TerminalCompletionError::Refusal,
+                            Self::terminal_completion_policy(
+                                TerminalCompletionError::Refusal,
+                                Self::stream_replay_safe(
+                                    &streamed_text,
+                                    saw_server_tool_activity,
+                                    saw_client_tool_activity,
+                                ),
+                            ),
+                        );
                         let _ = tx
                             .send(Err(StreamError::ModelRefusal(Box::new(
                                 AnthropicRefusalError {

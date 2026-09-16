@@ -744,6 +744,7 @@ mod streaming_fallback_tests {
         visible_text: bool,
         readable_thinking: bool,
         provider_tool_activity: bool,
+        client_tool_activity: bool,
     ) -> (AnthropicModelProvider, tokio::task::JoinHandle<()>) {
         use axum::{Router, http::header, routing::post};
         use tokio::net::TcpListener;
@@ -758,6 +759,17 @@ mod streaming_fallback_tests {
                 "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
                 "event: content_block_stop\n",
                 "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+        } else if client_tool_activity {
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"search\",\"input\":{}}}\n\n",
                 "event: message_delta\n",
                 "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":5}}\n\n",
                 "event: message_stop\n",
@@ -2059,7 +2071,7 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn direct_informational_refusal_stream_does_not_charge_observed_usage() {
-        let (provider, server) = anthropic_refusal_provider(false, true, false).await;
+        let (provider, server) = anthropic_refusal_provider(false, true, false, false).await;
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let cost_context = ToolLoopCostTrackingContext::usage_only();
@@ -2140,7 +2152,7 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn reliable_informational_refusal_stream_does_not_charge_before_fallback() {
-        let (primary, server) = anthropic_refusal_provider(false, false, false).await;
+        let (primary, server) = anthropic_refusal_provider(false, false, false, false).await;
         let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
             calls: AtomicUsize::new(0),
         });
@@ -2230,7 +2242,7 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn reliable_provider_tool_refusal_stream_does_not_fallback_and_is_billed_once() {
-        let (primary, server) = anthropic_refusal_provider(false, false, true).await;
+        let (primary, server) = anthropic_refusal_provider(false, false, true, false).await;
         let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
             calls: AtomicUsize::new(0),
         });
@@ -2314,8 +2326,101 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
+    async fn reliable_open_client_tool_refusal_does_not_replay_and_is_billed_once() {
+        // The client tool block has been admitted but not closed, so no
+        // ToolCall reaches the runtime. Its start is nevertheless a replay
+        // boundary: retrying this request could duplicate a tool turn whose
+        // history is no longer safe to reconstruct.
+        let (primary, server) = anthropic_refusal_provider(false, false, false, true).await;
+        let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(std::sync::Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "anthropic.test",
+            model: "claude-test",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), async {
+                    let outcome = call_provider(
+                        &ctx,
+                        &provider,
+                        "anthropic.test",
+                        "claude-test",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await?;
+                    crate::agent::cost::settle_provider_attempts(&outcome.attempts, Some(1));
+                    Ok::<_, anyhow::Error>(outcome)
+                }),
+            )
+            .await
+            .expect("terminal outcome stays in the provider-call result");
+        server.abort();
+
+        assert_eq!(
+            fallback.calls.load(Ordering::Relaxed),
+            0,
+            "the Reliable fallback must not replay an admitted client tool turn"
+        );
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(
+                &outcome
+                    .chat_result
+                    .expect_err("open client-tool refusal remains terminal"),
+            ),
+            Some(zeroclaw_api::model_provider::TerminalCompletionError::Refusal)
+        );
+        assert_eq!(outcome.attempts.len(), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
     async fn reliable_reasoning_only_refusal_is_informational_without_replay() {
-        let (primary, server) = anthropic_refusal_provider(false, true, false).await;
+        let (primary, server) = anthropic_refusal_provider(false, true, false, false).await;
         let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
             calls: AtomicUsize::new(0),
         });
@@ -2415,7 +2520,7 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn output_bearing_refusal_stream_remains_billable_once() {
-        let (provider, server) = anthropic_refusal_provider(true, false, false).await;
+        let (provider, server) = anthropic_refusal_provider(true, false, false, false).await;
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let cost_context = ToolLoopCostTrackingContext::usage_only();
