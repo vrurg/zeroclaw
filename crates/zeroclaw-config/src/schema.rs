@@ -7102,16 +7102,36 @@ impl CostRatesConfig {
     /// Deliberate zero-cost entries remain valid and distinguish a configured
     /// free resource from one whose pricing is unavailable.
     pub fn validate(&self) -> Result<()> {
-        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
+        self.validate_for_repair(&std::collections::HashSet::new())
+    }
+
+    /// Continue past cost-rate diagnostics already classified as unrelated by
+    /// the config-repair bridge, while preserving strict validation for every
+    /// other rate. A caller-side suppression around this whole validator would
+    /// skip later fields after its first retained error.
+    fn validate_for_repair(
+        &self,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
+    ) -> Result<()> {
+        fn validate_rate(
+            path: String,
+            value: Option<f64>,
+            ignored_errors: &std::collections::HashSet<ConfigApiError>,
+        ) -> Result<()> {
             if let Some(value) = value
                 && !crate::cost::is_sane_usd_rate(value)
             {
                 let max = crate::cost::MAX_SANE_USD_RATE;
-                validation_bail!(
-                    InvalidNumericRange,
-                    path.clone(),
-                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
-                );
+                continue_or_return_repair_validation_error(
+                    ConfigApiError::new(
+                        crate::api_error::ConfigApiCode::InvalidNumericRange,
+                        format!(
+                            "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                        ),
+                    )
+                    .with_path(path),
+                    ignored_errors,
+                )?;
             }
             Ok(())
         }
@@ -7120,15 +7140,25 @@ impl CostRatesConfig {
         model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
         for (provider, model, rates) in model_rates {
             let prefix = format!("cost.rates.providers.models.{provider}.{model}");
-            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
-            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
+            validate_rate(
+                format!("{prefix}.input_per_mtok"),
+                rates.input_per_mtok,
+                ignored_errors,
+            )?;
+            validate_rate(
+                format!("{prefix}.output_per_mtok"),
+                rates.output_per_mtok,
+                ignored_errors,
+            )?;
             validate_rate(
                 format!("{prefix}.cached_input_per_mtok"),
                 rates.cached_input_per_mtok,
+                ignored_errors,
             )?;
             validate_rate(
                 format!("{prefix}.cache_write_per_mtok"),
                 rates.cache_write_per_mtok,
+                ignored_errors,
             )?;
         }
 
@@ -7138,6 +7168,7 @@ impl CostRatesConfig {
             validate_rate(
                 format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
                 rates.per_mchar,
+                ignored_errors,
             )?;
         }
 
@@ -7148,13 +7179,18 @@ impl CostRatesConfig {
             validate_rate(
                 format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
                 rates.per_minute,
+                ignored_errors,
             )?;
         }
 
         let mut tool_rates: Vec<_> = self.tools.iter().collect();
         tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
         for (tool, rates) in tool_rates {
-            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
+            validate_rate(
+                format!("cost.rates.tools.{tool}.per_call"),
+                rates.per_call,
+                ignored_errors,
+            )?;
         }
 
         Ok(())
@@ -22439,7 +22475,7 @@ impl Config {
         }
 
         validate_memory_rerank_config(&self.memory)?;
-        self.cost.rates.validate()?;
+        self.cost.rates.validate_for_repair(ignored_errors)?;
 
         // TOML deserialization inserts provider aliases directly into their
         // maps. Preserve legacy aliases that are broader than the mutation
@@ -46577,6 +46613,60 @@ model_provider = \"ollama.default\"
             error
                 .to_string()
                 .contains("gateway.websocket_ping_interval_secs")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_an_unrelated_invalid_cost_rate() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "invalid-rate".into(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE + 1.0),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated repair should retain an invalid cost rate as a warning");
+        assert!(warnings.iter().any(|warning| {
+            warning.code == "pre_existing_validation_error"
+                && warning.path == "cost.rates.providers.models.openai.invalid-rate.input_per_mtok"
+        }));
+
+        config.mark_dirty("cost.rates.providers.models.openai.invalid-rate.input_per_mtok");
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty invalid cost rate must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("cost.rates.providers.models.openai.invalid-rate.input_per_mtok")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_a_dirty_cost_rate_hidden_by_an_unrelated_cost_rate() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "invalid-rate".into(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE + 1.0),
+                output_per_mtok: Some(-5.0),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("cost.rates.providers.models.openai.invalid-rate.output_per_mtok");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a later dirty cost rate must not be hidden by an unrelated rate");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("cost.rates.providers.models.openai.invalid-rate.output_per_mtok")
         );
     }
 
