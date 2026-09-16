@@ -350,7 +350,7 @@ pub fn build_spec() -> serde_json::Value {
             "get": {
                 "tags": ["config"],
                 "summary": "Pending-reload flag for the running daemon",
-                "description": "Returns `{pending_reload: true}` when a supervised reload request has been dispatched and remains pending. Distinct from `/api/config/drift`, which compares disk to in-memory. Standalone gateway mode has no supervisor and therefore does not retain this flag; its Quickstart response reports `daemon_restarted: false`, meaning the operator must restart the process for daemon-owned subsystems to adopt the change.",
+                "description": "Returns `{pending_reload: true}` after a gateway config mutation marks a daemon reload pending. `/admin/reload` clears it. Quickstart clears it after dispatching a supervised reload, or in standalone mode when its `daemon_restarted: false` response tells the operator to restart. Distinct from `/api/config/drift`, which compares disk to in-memory.",
                 "responses": {
                     "200": {
                         "description": "Pending-reload flag.",

@@ -107,16 +107,17 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 stays the same, but listeners briefly rebind.
 
 Gateway config writes call `persist_and_swap()`: save to disk, then replace the
-gateway-visible in-memory config. When a daemon supervisor is available, a
-dispatchable reload sets `pending_reload`; the reload banner then tells the
-operator that channels, providers, scheduler, or other daemon-owned components
-may still be running from the previous subsystem instance.
+gateway-visible in-memory config and mark `pending_reload`. The reload banner
+then tells the operator that channels, providers, scheduler, or other
+daemon-owned components may still be running from the previous subsystem
+instance. `POST /admin/reload` clears the flag.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
-loop to signal. It does not retain `pending_reload`, because no in-product
-reload action can dispatch; Quickstart instead reports `daemon_restarted:
-false`, which means the operator must restart the process.
+loop to signal. A successful Quickstart submission does not retain
+`pending_reload`, because no in-product reload action can dispatch; Quickstart
+instead reports `daemon_restarted: false`, which means the operator must restart
+the process. Other gateway config-write routes retain their normal reload flag.
 
 ## Reload access
 

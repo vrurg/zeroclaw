@@ -637,7 +637,6 @@ cli-quickstart-error-personality-filename-required = ファイル名が必要で
 cli-quickstart-error-personality-not-editable = `{$filename}` は編集可能な人格ファイルではありません
 cli-quickstart-error-personality-too-large = 内容が {$limit} 文字の制限を超えています
 cli-quickstart-error-personality-stage-failed = {$filename} のステージに失敗しました: {$err}
-cli-quickstart-error-personality-write-failed = {$path} の書き込みに失敗しました: {$err}
 cli-quickstart-warning-personality-write-failed = Quickstart は完了しましたが、パーソナリティファイル {$path} を書き込めませんでした: {$err}
 cli-quickstart-error-agent-name-required = エージェント名が必要です
 cli-quickstart-error-agent-exists = エージェント `{$name}` は既に存在します

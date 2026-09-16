@@ -37,6 +37,11 @@ example, `team:prod` to `team-prod`) and update every reference to it, including
 provider references. This is a manual configuration migration; Quickstart does
 not rewrite existing aliases.
 
+The repair-warning exception for an untouched legacy colon alias is limited to
+Anthropic static-credential aliases. A colon-bearing alias in another provider
+family must be renamed or removed before an unrelated config change can be
+saved.
+
 ## Field resolution order
 
 For most families, the URL is resolved in this order:

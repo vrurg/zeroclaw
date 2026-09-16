@@ -638,7 +638,6 @@ cli-quickstart-error-personality-filename-required = 必须填写文件名
 cli-quickstart-error-personality-not-editable = `{$filename}` 不是可编辑的人格文件
 cli-quickstart-error-personality-too-large = 内容超过 {$limit} 字符限制
 cli-quickstart-error-personality-stage-failed = 暂存 {$filename} 失败：{$err}
-cli-quickstart-error-personality-write-failed = 写入 {$path} 失败：{$err}
 cli-quickstart-warning-personality-write-failed = Quickstart 已完成，但无法写入人格文件 {$path}：{$err}
 cli-quickstart-error-agent-name-required = 必须填写 agent 名称
 cli-quickstart-error-agent-exists = agent `{$name}` 已存在

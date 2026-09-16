@@ -639,7 +639,6 @@ cli-quickstart-error-personality-filename-required = se requiere el nombre de ar
 cli-quickstart-error-personality-not-editable = `{$filename}` no es un archivo de personalidad editable
 cli-quickstart-error-personality-too-large = el contenido supera el límite de {$limit} caracteres
 cli-quickstart-error-personality-stage-failed = preparar {$filename} falló: {$err}
-cli-quickstart-error-personality-write-failed = escribir {$path} falló: {$err}
 cli-quickstart-warning-personality-write-failed = Quickstart se completó, pero no se pudo escribir el archivo de personalidad {$path}: {$err}
 cli-quickstart-error-agent-name-required = se requiere el nombre del agente
 cli-quickstart-error-agent-exists = el agente `{$name}` ya existe

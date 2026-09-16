@@ -1070,6 +1070,8 @@ pub fn all_tools_with_runtime(
             .model
             .clone()
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let llm_task_runtime_options =
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             config.clone(),
@@ -1078,7 +1080,7 @@ pub fn all_tools_with_runtime(
             llm_task_model,
             entry.temperature,
             entry.api_key.clone(),
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias),
+            llm_task_runtime_options,
         )));
     }
 
