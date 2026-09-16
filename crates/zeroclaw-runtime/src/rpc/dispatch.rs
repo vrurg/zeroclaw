@@ -1818,27 +1818,28 @@ impl RpcDispatcher {
 
         // Replacing a cross-mode session is the lifecycle commit point. Every
         // fallible preparation above must complete first so a failed agent or
-        // ACP setup leaves the predecessor usable. Same-mode reconnects
-        // returned through `resume_existing` before this point.
-        if admitted_mode.is_some()
-            && let Some(generation) = self.ctx.sessions.get_generation(&session_id).await
-        {
-            self.ctx
+        // ACP setup leaves the predecessor usable. The replacement itself must
+        // also be one SessionStore operation: removing first would expose a
+        // transient free capacity slot that another session could claim.
+        // Same-mode reconnects returned through `resume_existing` before this
+        // point.
+        let session =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        let admission_error = match admitted_mode {
+            Some(existing_mode) => self
+                .ctx
                 .sessions
-                .remove_at_generation(&session_id, generation)
-                .await;
-        }
-
-        let admission_error = self
-            .ctx
-            .sessions
-            .insert_if_absent(
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .err();
+                .replace_or_insert_if_absent_with_mode(session_id.clone(), &existing_mode, session)
+                .await
+                .err(),
+            None => self
+                .ctx
+                .sessions
+                .insert_if_absent(session_id.clone(), session)
+                .await
+                .err(),
+        };
         if let Some(message) = admission_error {
             // The only durable preparation that can create new state is the
             // ACP Missing -> Created path. Compensate it when map admission
@@ -1862,11 +1863,13 @@ impl RpcDispatcher {
                     }
                 }
             }
-            return Err(if message == "session already exists" {
-                rpc_err(SESSION_BUSY, "Session resume already in progress")
-            } else {
-                rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
-            });
+            return Err(
+                if matches!(message, "session already exists" | "session changed") {
+                    rpc_err(SESSION_BUSY, "Session resume already in progress")
+                } else {
+                    rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+                },
+            );
         }
 
         if let Some(ref tui_id) = self.tui_id
@@ -2131,14 +2134,11 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
 
-        // Preserve kill semantics by signalling the admitted prompt first,
-        // then wait for its finalization before reading mode or tombstoning
-        // and removing this exact session incarnation.
-        let _lifecycle_cancellation = self
-            .ctx
-            .sessions
-            .signal_session_kill_at_generation(sid, expected_generation)
-            .await;
+        // Kill deliberately waits for the current turn before tombstoning the
+        // durable ACP record. A provider cancellation cannot be undone if
+        // tombstoning fails, so interrupt-first semantics need a separate,
+        // durable reservation protocol rather than an incidental lifecycle
+        // change here.
         let _guard = self
             .ctx
             .sessions
@@ -3513,18 +3513,10 @@ impl RpcDispatcher {
             }
             _ => {}
         }
-        // Deletion must terminate an admitted turn before waiting for its
-        // queue permit. Bind cancellation to the captured session generation
-        // so it cannot target a same-ID successor created meanwhile.
-        let _lifecycle_cancellation = match expected_generation {
-            Some(generation) => {
-                self.ctx
-                    .sessions
-                    .signal_session_removal_at_generation(&req.session_id, generation)
-                    .await
-            }
-            None => None,
-        };
+        // Deletion waits for an admitted turn before mutating durable state.
+        // Cancelling first would be irreversible if durable cleanup failed;
+        // preserving interruption would require a separately designed,
+        // durable reservation protocol.
         self.handle_session_delete_at_generation(
             req,
             expected_generation,
@@ -3542,9 +3534,9 @@ impl RpcDispatcher {
         expected_generation: Option<u64>,
         expected_queue_generation: u64,
     ) -> RpcResult {
-        // This is the same finalization authority used by prompt turns. The
-        // entrypoint has already cancelled the captured live incarnation, so
-        // waiting here observes its finalization before deleting durable state.
+        // This is the same finalization authority used by prompt turns. Wait
+        // for the captured incarnation to finish before deleting durable
+        // state, so a storage failure leaves its completed session intact.
         let _guard = self
             .ctx
             .sessions
@@ -3611,20 +3603,18 @@ impl RpcDispatcher {
         // leaving prompt attachments behind.
         let deleted_durable_chat = if should_delete_durable_chat {
             if let Some(ref backend) = self.ctx.session_backend {
-                let mut deleted = false;
-                for key in [
+                let keys = [
                     req.session_id.clone(),
                     format!("rpc_{}", req.session_id),
                     format!("gw_{}", req.session_id),
-                ] {
-                    deleted |= backend.delete_session(&key).map_err(|error| {
-                        rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to delete persistent session: {error}"),
-                        )
-                    })?;
-                }
-                deleted
+                ];
+                let key_refs = [&keys[0][..], &keys[1][..], &keys[2][..]];
+                backend.delete_session_key_set(&key_refs).map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to delete persistent session: {error}"),
+                    )
+                })?
             } else {
                 false
             }
@@ -11718,6 +11708,12 @@ mod tests {
             .expect("session/new should succeed");
         let generation = sessions.get_generation(sid).await;
         let queue_generation = sessions.session_queue.generation(sid).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let _registration = sessions.register_cancel_token_guard_at_session_generation(
+            sid,
+            generation.expect("session/new created a live generation"),
+            token.clone(),
+        );
 
         let error = dispatcher
             .handle_session_delete(&json!({"session_id": sid}))
@@ -11734,13 +11730,65 @@ mod tests {
             "failed deletion must leave the live session usable"
         );
         assert!(
+            !token.is_cancelled(),
+            "failed durable deletion must not cancel the surviving active turn"
+        );
+        assert!(
             !sessions.has_pending_lifecycle_cancellation(sid),
             "a failed delete must not cancel a later prompt for the preserved session"
         );
     }
 
     #[tokio::test]
-    async fn live_session_delete_cancels_the_captured_turn_before_finalization() {
+    async fn failed_live_acp_session_kill_without_durable_backend_preserves_active_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (setup_dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config.clone(), &data_dir);
+        let sid = "live-acp-kill-storage-failure";
+        setup_dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed before testing its lifecycle failure");
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = sessions
+            .get_generation(sid)
+            .await
+            .expect("ACP session/new created a live generation");
+        let _registration = sessions.register_cancel_token_guard_at_session_generation(
+            sid,
+            generation,
+            token.clone(),
+        );
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-kill-no-store".into());
+
+        let error = dispatcher
+            .handle_session_kill(&json!({"session_id": sid}))
+            .await
+            .expect_err("missing durable ACP backend must fail session/kill");
+
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(sessions.get_agent(sid).await.is_some());
+        assert!(
+            !token.is_cancelled(),
+            "failed ACP tombstoning must not cancel the surviving active turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_session_delete_waits_for_the_captured_turn_before_finalization() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -11762,15 +11810,30 @@ mod tests {
             token.clone(),
         );
 
-        dispatcher
-            .handle_session_delete(&json!({"session_id": sid}))
-            .await
-            .expect("Chat session/delete should complete");
+        let admission_guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let delete_handle = dispatcher.spawn_handle();
+        let delete = zeroclaw_spawn::spawn!(async move {
+            delete_handle
+                .handle_session_delete(&json!({"session_id": sid}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete must wait behind the active turn");
 
         assert!(
-            token.is_cancelled(),
-            "delete must cancel the captured in-flight turn before removal"
+            !token.is_cancelled(),
+            "delete must not cancel the captured turn while durable finalization is pending"
         );
+        drop(admission_guard);
+        delete
+            .await
+            .expect("delete task must not panic")
+            .expect("Chat session/delete should complete after the turn finalizes");
         assert!(sessions.get_agent(sid).await.is_none());
     }
 
@@ -16008,7 +16071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removals_cancel_after_prompt_admission_before_fallible_setup() {
+    async fn lifecycle_requests_preserve_their_pre_registration_turn_policy() {
         #[derive(Clone, Copy, Debug)]
         enum Removal {
             Close,
@@ -16016,18 +16079,22 @@ mod tests {
             Delete,
         }
 
+        // The prompt already owns the queue permit but has not registered its
+        // cancellation token. Close retains its interrupt-first contract;
+        // delete and kill must let this admitted turn finish normally before
+        // finalizing their durable lifecycle work.
         for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
             let tmp = tempfile::TempDir::new().unwrap();
             let chat_backend = Arc::new(
                 zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
             );
             let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
-                4, 2, 60,
+                4, 10, 60,
             ));
             let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
             let (provider_started_tx, mut provider_started_rx) =
                 tokio::sync::mpsc::unbounded_channel();
-            let (_provider_release_tx, provider_release_rx) = tokio::sync::oneshot::channel();
+            let (provider_release_tx, provider_release_rx) = tokio::sync::oneshot::channel();
             let sid = format!("pre-setup-removal-{removal:?}").to_ascii_lowercase();
             install_state_test_session(
                 &sessions,
@@ -16099,30 +16166,60 @@ mod tests {
                 }
             })
             .await
-            .expect("removal must signal cancellation before waiting on prompt admission");
+            .expect("removal must wait behind the admitted prompt");
 
             release_prompt.notify_one();
-            let prompt_result =
-                tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+            match removal {
+                Removal::Close => {
+                    let prompt_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+                            .await
+                            .expect("close must cancel the admitted prompt")
+                            .expect("prompt task must not panic");
+                    let prompt_result = prompt_result.expect("prompt should settle as cancelled");
+                    assert_eq!(prompt_result["stop_reason"], "cancelled");
+                    assert!(
+                        provider_started_rx.try_recv().is_err(),
+                        "close must cancel before provider execution begins"
+                    );
+                }
+                Removal::Kill | Removal::Delete => {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        provider_started_rx.recv(),
+                    )
                     .await
-                    .expect("the pre-setup removal signal must cancel the admitted prompt")
-                    .expect("prompt task must not panic");
-            let prompt_result = prompt_result.expect("prompt should settle as cancelled");
-            assert_eq!(prompt_result["stop_reason"], "cancelled");
+                    .expect("queue-first lifecycle must let the admitted prompt start")
+                    .expect("gated provider must report its start");
+                    assert!(
+                        !removal_task.is_finished(),
+                        "{removal:?} must wait while the admitted prompt runs"
+                    );
+                    provider_release_tx
+                        .send(())
+                        .expect("gated provider must still await the release");
+                    let prompt_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+                            .await
+                            .expect("prompt must finish before queue-first finalization")
+                            .expect("prompt task must not panic");
+                    let prompt_result = prompt_result.expect("prompt must finish normally");
+                    assert_eq!(
+                        prompt_result["stop_reason"], "end_turn",
+                        "{removal:?} must not cancel the admitted prompt"
+                    );
+                }
+            }
             let removal_result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), removal_task)
                     .await
-                    .expect("removal must complete instead of timing out behind the prompt")
+                    .expect("removal must complete after the prompt finalizes")
                     .expect("removal task must not panic");
             assert!(
                 removal_result.is_ok(),
-                "{removal:?} should complete after cancelling setup: {removal_result:?}"
+                "{removal:?} should complete after finalizing setup: {removal_result:?}"
             );
             assert!(sessions.chat_mode(&sid).await.is_none());
-            assert!(
-                provider_started_rx.try_recv().is_err(),
-                "{removal:?} must cancel before provider execution begins"
-            );
         }
     }
 

@@ -259,6 +259,22 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Delete every durable spelling owned by one logical session.
+    ///
+    /// Backends with transactional storage should override this operation so a
+    /// failure leaves the whole key set intact. The default preserves the
+    /// established behavior of non-transactional backends, which can only
+    /// delete the individual files in order. Transactional backend decorators
+    /// must forward this operation as well as `delete_session`; forwarding
+    /// only the single-key method would silently weaken the atomic guarantee.
+    fn delete_session_key_set(&self, session_keys: &[&str]) -> std::io::Result<bool> {
+        let mut deleted = false;
+        for session_key in session_keys {
+            deleted |= self.delete_session(session_key)?;
+        }
+        Ok(deleted)
+    }
+
     fn clear_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
         Ok(0)
     }

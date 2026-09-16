@@ -4332,34 +4332,38 @@ async fn handle_runtime_command_for_delivery(
             }
         }
         ChannelRuntimeCommand::NewSession => {
-            // Session-prompt rows share the established session lifetime through
-            // `delete_session`. Do not add dispatcher-specific reset ordering
-            // here: changing that channel lifecycle policy needs a separate,
-            // deliberate design beyond this feature.
             // Serialize per-sender persistence to prevent interleaving
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let session_prompt_cleanup_failed = if ctx
-                .prompt_config
-                .channels
-                .session_prompts_enabled
-                && let Some(ref store) = ctx.session_store
-                && let Err(e) = store.delete_session(&sender_key)
-            {
+            let delete_error = ctx
+                .session_store
+                .as_ref()
+                .map(|store| store.delete_session(&sender_key))
+                .transpose()
+                .err();
+            let missing_required_store =
+                ctx.prompt_config.channels.session_prompts_enabled && ctx.session_store.is_none();
+            if let Some(ref error) = delete_error {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
+                            ::serde_json::json!({"error": error.to_string(), "sender_key": sender_key})
                         ),
                     "Failed to delete persisted session for"
                 );
-                true
-            } else {
-                false
-            };
-            if session_prompt_cleanup_failed {
+            }
+            if missing_required_store {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sender_key": sender_key})),
+                    "Session prompts are enabled but the persisted session backend is unavailable"
+                );
+            }
+            if delete_error.is_some() || missing_required_store {
                 channel_runtime_cli_string("channel-runtime-new-session-failed")
             } else {
                 clear_sender_history(ctx, &sender_key);
@@ -4367,20 +4371,6 @@ async fn handle_runtime_command_for_delivery(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&sender_key);
-                if !ctx.prompt_config.channels.session_prompts_enabled
-                    && let Some(ref store) = ctx.session_store
-                    && let Err(e) = store.delete_session(&sender_key)
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
-                            ),
-                        "Failed to delete persisted session for"
-                    );
-                }
                 mark_sender_for_new_session(ctx, &sender_key);
                 channel_runtime_cli_string("channel-runtime-new-session")
             }
@@ -22909,7 +22899,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn new_session_does_not_claim_success_when_prompt_cleanup_fails() {
+    async fn new_session_does_not_claim_success_when_persistence_cleanup_fails() {
         struct FailingDeleteBackend {
             prompts: Vec<zeroclaw_infra::session_prompts::SessionPrompt>,
         }
@@ -22943,6 +22933,76 @@ BTC is currently around $65,000 based on latest tool output."#
             }
         }
 
+        for session_prompts_enabled in [true, false] {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.channels.session_prompts_enabled = session_prompts_enabled;
+            let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                Arc::new(DummyModelProvider),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+            );
+            let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend {
+                prompts: vec![zeroclaw_infra::session_prompts::SessionPrompt {
+                    id: "task".to_string(),
+                    content: "private task context".to_string(),
+                    updated_at: "2026-09-15T00:00:00Z".to_string(),
+                }],
+            });
+            let ctx = Arc::new(ChannelRuntimeContext {
+                session_store: Some(backend.clone()),
+                ..(*base).clone()
+            });
+            let mut msg = channel_message("test-channel", None);
+            msg.content = "/new".to_string();
+            let history_key = runtime_conversation_history_key(&ctx, &msg);
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(
+                    history_key.clone(),
+                    vec![ChatMessage::user("existing history")],
+                );
+
+            assert!(
+                handle_runtime_command_if_needed(
+                    &ctx,
+                    &msg,
+                    Some(&(channel_impl.clone() as Arc<dyn Channel>))
+                )
+                .await
+            );
+
+            let expected = channel_runtime_cli_string("channel-runtime-new-session-failed");
+            assert_eq!(
+                channel_impl.sent_messages.lock().await.as_slice(),
+                [format!("r1:{expected}")],
+                "session_prompts_enabled={session_prompts_enabled}"
+            );
+            assert!(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .peek(&history_key)
+                    .is_some(),
+                "a rejected reset must leave the in-memory session intact; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
+            assert_eq!(
+                backend.list_session_prompts(&history_key).unwrap().len(),
+                1,
+                "the test backend still exposes the attachment after its failed deletion; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_does_not_claim_success_when_enabled_prompt_backend_is_unavailable() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut config = zeroclaw_config::schema::Config::default();
@@ -22955,15 +23015,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "test-provider",
             None,
         );
-        let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend {
-            prompts: vec![zeroclaw_infra::session_prompts::SessionPrompt {
-                id: "task".to_string(),
-                content: "private task context".to_string(),
-                updated_at: "2026-09-15T00:00:00Z".to_string(),
-            }],
-        });
         let ctx = Arc::new(ChannelRuntimeContext {
-            session_store: Some(backend.clone()),
+            session_store: None,
             ..(*base).clone()
         });
         let mut msg = channel_message("test-channel", None);
@@ -22997,12 +23050,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner())
                 .peek(&history_key)
                 .is_some(),
-            "a rejected reset must leave the in-memory session intact"
-        );
-        assert_eq!(
-            backend.list_session_prompts(&history_key).unwrap().len(),
-            1,
-            "the test backend still exposes the attachment after its failed deletion"
+            "a reset with an unavailable required backend must preserve live history"
         );
     }
 

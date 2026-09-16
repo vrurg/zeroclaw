@@ -316,6 +316,42 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Atomically replace one observed-mode incarnation or admit a session
+    /// whose predecessor was evicted while it was being prepared. A cross-mode
+    /// `session/new` swaps one map entry for another, so it must neither expose
+    /// a free capacity slot nor split the predecessor check from the fallback
+    /// absent-session admission.
+    pub(crate) async fn replace_or_insert_if_absent_with_mode(
+        &self,
+        id: String,
+        expected_mode: &crate::rpc::types::ChatMode,
+        mut session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get_mut(&id) {
+            if &existing.chat_mode != expected_mode {
+                return Err("session changed");
+            }
+            let generation = self
+                .session_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .wrapping_add(1);
+            session.generation = generation;
+            *existing = session;
+            return Ok(());
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
     /// Rebind a caller to the canonical live session without replacing its
     /// `Agent`. A supplied session ID is a resume selector: when the live
     /// incarnation already exists, rebuilding it would fork provider history
@@ -971,32 +1007,6 @@ impl SessionStore {
         self.signal_cancellation(id, CancelCause::ClientRpc)
     }
 
-    /// Signal an administrative kill only if `id` still names the observed
-    /// incarnation. This is intentionally generation-fenced just like Chat
-    /// deletion: an ID-only kill must never reach a replacement session.
-    pub(crate) async fn signal_session_kill_at_generation(
-        &self,
-        id: &str,
-        expected_generation: u64,
-    ) -> Option<LifecycleCancellation<'_>> {
-        let sessions = self.sessions.lock().await;
-        if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
-            return None;
-        }
-        drop(sessions);
-        let pending_cancellation_generation = self.signal_cancellation_at_session_generation(
-            id,
-            expected_generation,
-            CancelCause::AdminKill,
-        );
-        Some(LifecycleCancellation {
-            store: self,
-            session_id: id.to_string(),
-            session_generation: expected_generation,
-            pending_cancellation_generation,
-        })
-    }
-
     fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens
@@ -1224,6 +1234,99 @@ mod tests {
             .workspace_dir(std::env::temp_dir())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_or_insert_if_absent_with_mode_is_capacity_neutral_and_mode_fenced() {
+        use crate::rpc::types::ChatMode;
+
+        let store = Arc::new(make_store(1));
+        store
+            .insert(
+                "shared".to_string(),
+                RpcSession::new(make_agent(), "chat", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let predecessor_generation = store.get_generation("shared").await.unwrap();
+
+        // Start a cross-mode replacement and a distinct-ID admission from the
+        // same barrier. The replacement must keep the predecessor's capacity
+        // occupied throughout its map mutation, regardless of scheduling.
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let replacement_store = Arc::clone(&store);
+        let replacement_barrier = Arc::clone(&barrier);
+        let replacement = zeroclaw_spawn::spawn!(async move {
+            replacement_barrier.wait().await;
+            replacement_store
+                .replace_or_insert_if_absent_with_mode(
+                    "shared".to_string(),
+                    &ChatMode::Chat,
+                    RpcSession::new(make_agent(), "acp", ".", ChatMode::Acp),
+                )
+                .await
+        });
+        let competitor_store = Arc::clone(&store);
+        let competitor_barrier = Arc::clone(&barrier);
+        let competitor = zeroclaw_spawn::spawn!(async move {
+            competitor_barrier.wait().await;
+            competitor_store
+                .insert_if_absent(
+                    "other".to_string(),
+                    RpcSession::new(make_agent(), "other", ".", ChatMode::Chat),
+                )
+                .await
+        });
+        barrier.wait().await;
+        assert_eq!(
+            replacement.await.expect("replacement task must not panic"),
+            Ok(())
+        );
+        assert_eq!(
+            competitor
+                .await
+                .expect("competing admission task must not panic"),
+            Err("session limit reached"),
+            "the replacement must never expose a capacity slot to another ID"
+        );
+
+        let successor_generation = store.get_generation("shared").await.unwrap();
+        assert_ne!(successor_generation, predecessor_generation);
+        assert!(matches!(
+            store.chat_mode("shared").await,
+            Some(ChatMode::Acp)
+        ));
+        assert_eq!(store.count().await, 1);
+        assert_eq!(
+            store
+                .replace_or_insert_if_absent_with_mode(
+                    "shared".to_string(),
+                    &ChatMode::Chat,
+                    RpcSession::new(make_agent(), "stale", ".", ChatMode::Chat),
+                )
+                .await,
+            Err("session changed"),
+            "a mode-changing lifecycle request must not overwrite the successor"
+        );
+
+        // If sibling eviction removes the observed predecessor just before
+        // admission, the same atomic operation must publish the prepared
+        // replacement instead of reporting a misleading resume conflict.
+        store.remove("shared").await;
+        assert_eq!(
+            store
+                .replace_or_insert_if_absent_with_mode(
+                    "shared".to_string(),
+                    &ChatMode::Acp,
+                    RpcSession::new(make_agent(), "chat", ".", ChatMode::Chat),
+                )
+                .await,
+            Ok(())
+        );
+        assert!(matches!(
+            store.chat_mode("shared").await,
+            Some(ChatMode::Chat)
+        ));
     }
 
     /// Minimal provider that satisfies the builder. Never called in these tests.
@@ -1711,7 +1814,7 @@ mod tests {
             .await
             .expect("the live admission must accept the first lifecycle signal");
         let second = store
-            .signal_session_kill_at_generation("admitted", session_generation)
+            .signal_session_removal_at_generation("admitted", session_generation)
             .await
             .expect("the live admission still permits a concurrent lifecycle request");
         drop(second);

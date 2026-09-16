@@ -1179,41 +1179,46 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+    fn delete_session_key_set(&self, session_keys: &[&str]) -> std::io::Result<bool> {
         let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        let mut deleted = false;
+        for session_key in session_keys {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .map_err(std::io::Error::other)?;
+            if !exists {
+                continue;
+            }
 
-        // Check if session exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .map_err(std::io::Error::other)?;
+            // Delete messages (FTS5 trigger handles sessions_fts cleanup).
+            transaction
+                .execute(
+                    "DELETE FROM sessions WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
 
-        if !exists {
-            return Ok(false);
+            // Delete metadata and its cascade-owned prompt attachments.
+            transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
+            deleted = true;
         }
 
-        let transaction = conn.transaction().map_err(std::io::Error::other)?;
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup).
-        transaction
-            .execute(
-                "DELETE FROM sessions WHERE session_key = ?1",
-                params![session_key],
-            )
-            .map_err(std::io::Error::other)?;
-
-        // Delete metadata
-        transaction
-            .execute(
-                "DELETE FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-            )
-            .map_err(std::io::Error::other)?;
-
         transaction.commit().map_err(std::io::Error::other)?;
-        Ok(true)
+        Ok(deleted)
+    }
+
+    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        self.delete_session_key_set(&[session_key])
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
@@ -1815,6 +1820,39 @@ mod tests {
         assert!(backend.session_exists("session"));
         assert_eq!(backend.load("session").len(), 1);
         assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_session_key_set_rolls_back_when_a_later_alias_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-session", "rpc_raw-session", "gw_raw-session"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend
+                .set_session_prompt(key, "task", "current task")
+                .unwrap();
+        }
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_gateway_alias_delete BEFORE DELETE ON session_metadata \
+                 WHEN OLD.session_key = 'gw_raw-session' \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.delete_session_key_set(&keys).is_err());
+        for key in keys {
+            assert!(backend.session_exists(key), "{key} must be rolled back");
+            assert_eq!(backend.load(key).len(), 1, "{key} messages must survive");
+            assert_eq!(
+                backend.list_session_prompts(key).unwrap().len(),
+                1,
+                "{key} prompt attachments must survive"
+            );
+        }
     }
 
     #[test]
