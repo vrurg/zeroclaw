@@ -42,6 +42,14 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
 
+#[cfg(feature = "agent-runtime")]
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -128,14 +136,14 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
@@ -173,6 +181,516 @@ fn qta(key: &str, args: &[(&str, &str)]) -> String {
 #[cfg(feature = "agent-runtime")]
 fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
     qta(key, &[("glyph", glyph), ("summary", summary)])
+}
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
+}
+
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// A narrow terminal whose size is unavailable must not get rows fitted against
+/// a guessed geometry — that would reintroduce the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_frame_lines(
+    labels: &[String],
+    prompt: &str,
+    selected: usize,
+) -> Vec<String> {
+    std::iter::once(format!("? {prompt}"))
+        .chain(labels.iter().enumerate().map(|(index, label)| {
+            let marker = if index == selected { ">" } else { " " };
+            format!("{marker} {label}")
+        }))
+        .collect()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn render_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    lines: &[String],
+) -> std::io::Result<()> {
+    for line in lines {
+        term.write_line(line)?;
+    }
+    term.flush()
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorKey {
+    Down,
+    Up,
+    Select,
+    Cancel,
+    Interrupt,
+    Other,
+}
+
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorTerminal {
+    /// Geometry of the terminal that receives `write_line` output, as
+    /// `(rows, columns)`, or `None` when it cannot be determined.
+    fn size_checked(&mut self) -> Option<(u16, u16)>;
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn clear_screen(&mut self) -> std::io::Result<()>;
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()>;
+    fn hide_cursor(&mut self) -> std::io::Result<()>;
+    fn show_cursor(&mut self) -> std::io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn write_line(&mut self, line: &str) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+/// The input half of the Crossterm selector: raw-mode ownership plus key
+/// decoding. It is separate from the output half so a regression can drive the
+/// production output adapter with injected keys.
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartInput {
+    restore_cooked_mode: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartInput {
+    fn new() -> std::io::Result<Self> {
+        let raw_mode_was_enabled = terminal::is_raw_mode_enabled()?;
+        if !raw_mode_was_enabled {
+            terminal::enable_raw_mode()?;
+        }
+        Ok(Self {
+            restore_cooked_mode: !raw_mode_was_enabled,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl Drop for CrosstermQuickstartInput {
+    fn drop(&mut self) {
+        if self.restore_cooked_mode {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl QuickstartSelectorInput for CrosstermQuickstartInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        loop {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let modified = key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+                    return Ok(match key.code {
+                        KeyCode::Char('c') if control => QuickstartSelectorKey::Interrupt,
+                        KeyCode::Down | KeyCode::Tab => QuickstartSelectorKey::Down,
+                        KeyCode::Char('j') if !modified => QuickstartSelectorKey::Down,
+                        KeyCode::Up | KeyCode::BackTab => QuickstartSelectorKey::Up,
+                        KeyCode::Char('k') if !modified => QuickstartSelectorKey::Up,
+                        KeyCode::Enter => QuickstartSelectorKey::Select,
+                        KeyCode::Char(' ') if !modified => QuickstartSelectorKey::Select,
+                        KeyCode::Esc => QuickstartSelectorKey::Cancel,
+                        KeyCode::Char('q') if !modified => QuickstartSelectorKey::Cancel,
+                        _ => QuickstartSelectorKey::Other,
+                    });
+                }
+                // A resize is returned to the loop so the checked geometry is
+                // sampled immediately rather than waiting for another key.
+                Event::Resize(_, _) => return Ok(QuickstartSelectorKey::Other),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A frame destination whose own terminal geometry can be measured.
+///
+/// Quickstart requires stdin and stderr to be terminals, not the same
+/// terminal. The frame is therefore fitted to the descriptor it is written to
+/// rather than to whichever terminal a process-global query describes.
+#[cfg(all(feature = "agent-runtime", unix))]
+trait QuickstartSelectorOutput: Write + std::os::fd::AsFd {}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<W: Write + std::os::fd::AsFd> QuickstartSelectorOutput for W {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+trait QuickstartSelectorOutput: Write {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+impl<W: Write> QuickstartSelectorOutput for W {}
+
+/// Measure the terminal behind `output` as `(rows, columns)`.
+///
+/// A zero dimension means the driver holds no geometry for that terminal. It
+/// is reported as unknown so the caller fails closed instead of fitting rows
+/// to a zero-width frame.
+#[cfg(all(feature = "agent-runtime", unix))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(output: &W) -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: `size` points to writable `winsize` storage and the borrowed
+    // descriptor stays open for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            output.as_fd().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            size.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+    let size = unsafe { size.assume_init() };
+    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// Measure the active console screen buffer as `(rows, columns)`.
+///
+/// Crossterm offers no per-handle geometry query here. A native console
+/// shares one screen buffer between stdout and stderr, so the measured
+/// surface is the one that receives the frame. Native-console rendering is
+/// not exercised by hosted checks and remains a documented verification gap.
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(_output: &W) -> Option<(u16, u16)> {
+    terminal::size().ok().map(|(columns, rows)| (rows, columns))
+}
+
+/// Crossterm-backed selector terminal: frames go to `output`, keys come from
+/// `input`, and geometry is always read from `output`.
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartTerminal<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> {
+    output: W,
+    input: K,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartTerminal<std::io::Stderr, CrosstermQuickstartInput> {
+    fn stderr() -> std::io::Result<Self> {
+        Ok(Self {
+            output: std::io::stderr(),
+            input: CrosstermQuickstartInput::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> QuickstartSelectorTerminal
+    for CrosstermQuickstartTerminal<W, K>
+{
+    fn size_checked(&mut self) -> Option<(u16, u16)> {
+        quickstart_output_terminal_size(&self.output)
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, EnterAlternateScreen)
+    }
+
+    fn clear_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.output, MoveTo(0, 0))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Hide)
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        // Crossterm uses the native screen-buffer API on legacy Windows
+        // consoles and the ANSI sequence on terminals that support it.
+        execute!(self.output, LeaveAlternateScreen)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
+        // Emit both controls explicitly so every row begins in column zero.
+        write!(self.output, "{line}\r\n")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        self.input.read_key()
+    }
+}
+
+/// Own the alternate screen from before its first fallible operation.
+///
+/// Claiming ownership before `enter_alternate_screen` means a partial write or
+/// flush failure still triggers a best-effort restore. Cleanup attempts are
+/// independent: a cursor error must never strand the alternate screen.
+#[cfg(feature = "agent-runtime")]
+struct QuickstartSelectorScreen<'a, T: QuickstartSelectorTerminal> {
+    term: &'a mut T,
+    restore_needed: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<'a, T: QuickstartSelectorTerminal> QuickstartSelectorScreen<'a, T> {
+    fn enter(term: &'a mut T) -> std::io::Result<Self> {
+        let screen = Self {
+            term,
+            restore_needed: true,
+        };
+        screen.term.enter_alternate_screen()?;
+        screen.term.clear_screen()?;
+        screen.term.move_cursor_to_origin()?;
+        screen.term.hide_cursor()?;
+        screen.term.flush()?;
+        Ok(screen)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.restore_needed {
+            return Ok(());
+        }
+        self.restore_needed = false;
+
+        let mut first_error = None;
+        for result in [
+            self.term.show_cursor(),
+            self.term.leave_alternate_screen(),
+            self.term.flush(),
+        ] {
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<T: QuickstartSelectorTerminal> Drop for QuickstartSelectorScreen<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorOutcome {
+    Pick(Option<usize>),
+    Interrupt,
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. They describe the terminal that receives the frame, and every
+/// input event rechecks them before navigation or selection; a resize exits
+/// the selector-owned alternate screen instead of trying to erase a
+/// main-screen frame whose physical rows the terminal may have reflowed. A
+/// resize of the output terminal alone raises no input event, so it is caught
+/// at the next key. Leaving the alternate screen atomically restores
+/// unrelated output.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<QuickstartSelectorOutcome> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
+
+    let mut screen = QuickstartSelectorScreen::enter(term)?;
+    let interaction = (|| -> Result<QuickstartSelectorOutcome> {
+        let mut selected = 0;
+        let mut frame = quickstart_selector_frame_lines(labels, prompt, selected);
+        render_quickstart_selector(screen.term, &frame)?;
+
+        loop {
+            let key = screen.term.read_key()?;
+            let current_size = quickstart_selector_terminal_size(screen.term);
+            quickstart_selector_recheck_size(initial_size, current_size)?;
+
+            match key {
+                QuickstartSelectorKey::Down => {
+                    selected = (selected + 1) % labels.len();
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Up => {
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Select => {
+                    return Ok(QuickstartSelectorOutcome::Pick(Some(selected)));
+                }
+                QuickstartSelectorKey::Cancel => {
+                    return Ok(QuickstartSelectorOutcome::Pick(None));
+                }
+                QuickstartSelectorKey::Interrupt => {
+                    return Ok(QuickstartSelectorOutcome::Interrupt);
+                }
+                QuickstartSelectorKey::Other => {}
+            }
+        }
+    })();
+    let cleanup = screen.restore();
+    match (interaction, cleanup) {
+        (Ok(QuickstartSelectorOutcome::Interrupt), _) => Ok(QuickstartSelectorOutcome::Interrupt),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -397,6 +915,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -516,7 +1036,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -686,8 +1206,13 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
+  zeroclaw acp --agent fable         # default new sessions to agent fable
   zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
+        /// Process-scoped default agent for alias-less session/new requests
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
         max_sessions: Option<usize>,
@@ -1056,8 +1581,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -1434,19 +1959,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1536,74 +2048,127 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
+        let mut term = CrosstermQuickstartTerminal::stderr()?;
+        // Fail closed when the terminal API cannot report its dimensions;
+        // fitting against a guessed size would reintroduce row overflow.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&mut term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
+        let (terminal_height, terminal_width) = terminal_size;
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
+        };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
+        let prompt = fit_quickstart_selector_row(
+            &t(
                 "cli-quickstart-open-selector-prompt",
                 "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
+            ),
+            row_budget,
+        );
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let outcome = interact_quickstart_selector(&mut term, &labels, &prompt, terminal_size)?;
+        // `process::exit` does not run destructors. Restore cooked mode before
+        // preserving the selector's historical Ctrl+C exit semantics.
+        drop(term);
+        let pick = match outcome {
+            QuickstartSelectorOutcome::Pick(pick) => pick,
+            QuickstartSelectorOutcome::Interrupt => std::process::exit(130),
         };
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1613,7 +2178,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1626,7 +2191,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1792,7 +2357,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1808,7 +2373,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1846,7 +2411,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -2002,7 +2567,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2118,7 +2683,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -2754,7 +3319,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -4030,6 +4595,20 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// Explicit runtime construction instead of `#[tokio::main]` so worker
+/// threads get an 8 MiB stack. Debug builds of the deepest inline RPC
+/// handlers (quickstart apply walks the whole config tree with several
+/// `Config`-sized temporaries) overflow tokio's 2 MiB worker default and
+/// abort the daemon. The size matches the 8 MiB main-thread stacks the
+/// workspace already requests via linker args on other targets.
+fn async_main(command: clap::Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main_inner(command))
+}
+
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
 /// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
 /// Companion"), case-insensitively. Matching the visible application name — not
@@ -4524,9 +5103,8 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     None
 }
 
-#[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn async_main(command: clap::Command) -> Result<()> {
+async fn async_main_inner(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -4682,6 +5260,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -4691,25 +5278,39 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    let running_executable =
+        running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
         .degraded_sections
         .iter()
         .chain(config.degraded_security.iter())
     {
-        eprintln!(
-            "{}",
+        let path = config.config_path.display().to_string();
+        let warning = if let Some(executable) = running_executable.as_deref() {
+            let fallback = format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. Use the \
+                 running executable at `{executable}` with `config migrate` to see the parse \
+                 error, then repair the file."
+            );
             ta(
-                "cli-config-section-degraded",
+                "cli-config-section-degraded-executable",
                 &[
                     ("section", section),
-                    ("path", &config.config_path.display().to_string()),
+                    ("path", &path),
+                    ("executable", executable),
                 ],
-                "warning: config section is malformed and was reset to defaults \
-                 for this run. Values in that section are NOT in effect. Run \
-                 `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+                &fallback,
             )
-        );
+        } else {
+            format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. The running \
+                 executable path could not be resolved; repair the file through a daemon-owned \
+                 config surface instead of an unqualified PATH command."
+            )
+        };
+        eprintln!("{warning}");
     }
     for section in &config.retired_wati_config_sections {
         let fallback = format!(
@@ -4981,6 +5582,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         Commands::Acp {
+            agent,
             max_sessions,
             session_timeout,
         } => {
@@ -5013,17 +5615,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         })
                         .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
+                    channels::acp_server::AcpServer::new_with_store(config, acp_config, store)
                 } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
-                server.run().await
+                    channels::acp_server::AcpServer::new(config, acp_config)
+                }
+                .with_connection_default_agent(agent);
+                std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (agent, max_sessions, session_timeout);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -5181,7 +5782,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 ta(
                                     "cli-pairing-fetch-failed",
                                     &[("endpoint", &endpoint)],
-                                    &format!(
+                                    format!(
                                         "❌ Failed to fetch pairing code from gateway at {endpoint}"
                                     ),
                                 )
@@ -5368,6 +5969,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5401,12 +6010,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -5416,7 +6027,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                ready_tx,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                ),
                             ))
                             .await
                         })
@@ -5426,19 +6040,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
                                 config,
                                 Some(canvas_store),
                                 cancel,
                                 sop_engine,
                                 sop_audit,
-                            ))
-                            .await
+                                plugin_webhooks,
+                            );
+                            Box::pin(channels).await
                         })
                     }
                 }));
@@ -5729,13 +6346,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
                                 cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
                             )
                         };
                         if !enroll_cfg.enabled {
@@ -5835,6 +6459,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
                             true,
                             &[],
+                            startup_pairing_code_policy,
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
@@ -5921,6 +6546,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
                             static_client_pins_configured: wss_cfg
                                 .client_auth
                                 .as_ref()
@@ -5987,6 +6616,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
+            }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
             }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
@@ -6125,8 +6757,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -6152,6 +6799,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -6424,15 +7098,20 @@ Add pricing to the active provider profile or supply a catalog entry."
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -6445,14 +7124,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
@@ -7036,10 +7712,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
@@ -7914,20 +8592,7 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -9467,6 +10132,24 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
+fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        if let Some(executable) = zeroclaw_runtime::restart::recorded_launch_executable() {
+            return Some(executable.to_path_buf());
+        }
+        if zeroclaw_runtime::restart::launch_command_recorded() {
+            return None;
+        }
+        std::env::current_exe().ok()
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -9476,13 +10159,27 @@ fn gate_security_posture(
     }
     let sections = config.degraded_security.join(", ");
     if !allow_degraded {
+        let remediation_executable = running_executable_for_remediation();
+        let remediation = remediation_executable.map_or_else(
+            || {
+                "The running executable path could not be resolved; use a daemon-owned repair \
+                 surface such as the gateway config editor instead of an unqualified PATH command."
+                    .to_string()
+            },
+            |exe| {
+                format!(
+                    "Running executable: {}. Use that executable with `config migrate` to see \
+                     the precise error.",
+                    exe.display()
+                )
+            },
+        );
         anyhow::bail!(
             "Config contains malformed security-critical sections ({sections}); \
              they were reset to defaults, so the running posture may be weaker \
              than intended. Refusing to serve with a degraded security posture. \
-             Repair these sections in {} and restart — run `zeroclaw config \
-             migrate` to see the precise error. To boot anyway (e.g. to reach \
-             the gateway config editor and repair from there), re-run with \
+             Repair these sections in {} and restart — {remediation} To boot anyway \
+             (e.g. to reach the gateway config editor and repair from there), re-run with \
              `--allow-degraded-security`.",
             config.config_path.display()
         );
@@ -10604,6 +11301,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
         fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
             parts
@@ -10697,6 +11417,19 @@ mod tests {
             probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--"])),
             None
         );
+    }
+
+    #[test]
+    fn acp_cli_accepts_process_default_agent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--agent", "fable"])
+            .expect("standalone ACP should accept a process default agent");
+
+        match cli.command {
+            Commands::Acp { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("fable"));
+            }
+            other => panic!("expected ACP command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -12622,6 +13355,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 

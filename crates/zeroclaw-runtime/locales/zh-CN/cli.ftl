@@ -188,6 +188,7 @@ cli-acp-long-about =
 
     示例：
     zeroclaw acp                        # 启动 ACP 服务器
+    zeroclaw acp --agent fable         # 将新会话的默认智能体设为 fable
     zeroclaw acp --max-sessions 5       # 限制并发会话数
 cli-daemon-long-about =
     启动长期运行的自主守护进程。
@@ -520,6 +521,11 @@ cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-needs-tty = Quickstart 是交互式流程，需要 stdin 和 stderr 连接到终端。请从交互式 shell 中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-size-unknown = Quickstart 无法确定终端尺寸，因此无法验证清单能否完整显示。请在会报告尺寸的终端中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-too-narrow = Quickstart 需要终端宽度至少为 {$min_width} 列；当前终端宽度为 {$width} 列。请加宽终端后重试。
+cli-quickstart-terminal-too-short = Quickstart 需要终端高度至少为 {$min_height} 行；当前终端高度为 {$height} 行。请增高终端后重试。
+cli-quickstart-terminal-resized = Quickstart 清单打开期间，终端从 {$initial_width}x{$initial_height} 变为 {$current_width}x{$current_height}。请重新打开清单以继续。
+cli-quickstart-empty-checklist = Quickstart 无法打开空清单。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
 cli-quickstart-create-agent = ── 创建 agent
@@ -708,7 +714,11 @@ cli-status-model = {"   "}模型：         {$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<无 risk_profile>
 cli-status-runtime = ⚙️  运行时：       {$v}
+cli-status-web-ui-found = 🌐 Web UI：        已找到（{$path}）
+cli-status-web-ui-missing = 🌐 Web UI：        缺失
 cli-status-heartbeat = 💓 心跳：      {$v}
 cli-status-heartbeat-every-minutes = 每 {$minutes} 分钟
 cli-status-memory = 🧠 内存：         {$backend}（自动保存：{$auto_save}）
@@ -736,6 +746,8 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
@@ -839,6 +851,8 @@ cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+turn-failed = [回合失败]
+turn-failed-attachment-omitted = [附件已省略：提供方在失败的回合中拒绝了它]
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
 turn-max-iterations-reached = *轮次已停止：已达到最大工具迭代次数（{ $max_iterations }）。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -858,6 +872,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ 此行太大，无法放
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
@@ -1058,6 +1073,7 @@ channel-approval-btn-approve = 批准
 channel-approval-btn-deny = 拒绝
 channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-position = 第 { $index } 个工具调用，共 { $total } 个
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
 channel-approval-group-visibility-warning = 这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
@@ -1067,6 +1083,9 @@ channel-telegram-approval-ack-denied = 已拒绝
 channel-telegram-approval-ack-not-accepted = 审批未被接受
 channel-telegram-approval-ack-unknown = 未知操作
 channel-telegram-approval-ack-already-resolved = 审批已被处理
+channel-telegram-voice-drop-too-long = ⚠️ 已跳过音频消息：时长超过 { $limit_secs } 秒的上限。请发送更短的录音，或分段发送。
+channel-telegram-voice-drop-file-unavailable = ⚠️ 已跳过音频消息：无法从 Telegram 获取该文件——可能文件过大或已不可用。请尝试更小或更短的文件。
+channel-telegram-voice-drop-empty-transcript = ⚠️ 已跳过音频消息：未能从录音中识别出任何内容。请用更清晰的录音重试。
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许

@@ -211,6 +211,7 @@ cli-acp-long-about =
 
     Examples:
       zeroclaw acp                        # start ACP server
+      zeroclaw acp --agent fable         # default new sessions to agent fable
       zeroclaw acp --max-sessions 5       # limit concurrent sessions
 
 cli-daemon-long-about =
@@ -591,6 +592,11 @@ cli-no-command = No command provided.
 cli-press-enter = Press Enter to exit...
 cli-quickstart-title = Quickstart — create one working agent end-to-end.
 cli-quickstart-needs-tty = Quickstart is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `zeroclaw config set <path> <value>` for headless configuration.
+cli-quickstart-terminal-size-unknown = Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration.
+cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_width} columns wide; the current terminal is {$width} columns. Widen the terminal and try again.
+cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
+cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
+cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
 cli-quickstart-cancelled = Quickstart cancelled. No config written.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
@@ -781,7 +787,11 @@ cli-status-model = {"   "}Model:         {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        MISSING
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -810,6 +820,8 @@ cli-status-word-off = off
 cli-status-word-none = (none)
 cli-status-word-configured = configured
 cli-status-word-not-configured = not configured
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
@@ -821,6 +833,13 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-catalog-heading = Plugins:
+cli-plugin-catalog-empty = No installed or cached-registry plugins.
+cli-plugin-catalog-installed = {"  "}● {$name} v{$version} — installed — {$description}
+cli-plugin-catalog-installed-listed = {"  "}● {$name} v{$version} — installed, listed — {$description}
+cli-plugin-catalog-installed-other-version = {"  "}● {$name} v{$installed_version} — installed; registry v{$available_version} — {$description}
+cli-plugin-catalog-available = {"  "}○ {$name} v{$version} — available in cached registry — {$description}
+cli-plugin-catalog-cache-failed = warning: could not read cached plugin registry: {$error}
 cli-plugin-search-none = No plugins matching '{$query}'.
 cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
 cli-plugin-search-result =   {$name} v{$version} — {$description}
@@ -831,7 +850,8 @@ cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
+cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
 cli-plugin-removed = Plugin '{$name}' removed.
@@ -937,6 +957,8 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-failed = [turn failed]
+turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
@@ -973,6 +995,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large t
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-conversation-busy = This conversation has too many pending messages; this one was dropped. Wait for a reply, or send /stop to clear your queued requests.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
@@ -1033,6 +1056,12 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-safeguard-footer-server =
+    🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client =
+    🛡️ Safety safeguards flagged this request — switched to **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client-server =
+    🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
@@ -1163,6 +1192,7 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1221,6 +1251,7 @@ channel-approval-btn-approve = Approve
 channel-approval-btn-deny = Deny
 channel-approval-btn-always = Always
 channel-approval-tap-instruction = Tap a button below:
+channel-approval-position = Tool call { $index } of { $total }
 channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
 channel-approval-group-visibility-warning =
@@ -1231,6 +1262,20 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
+channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
+channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
+channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow

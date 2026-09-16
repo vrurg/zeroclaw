@@ -189,6 +189,7 @@ cli-acp-long-about =
 
     Exemples :
     zeroclaw acp                        # démarrer le serveur ACP
+    zeroclaw acp --agent fable         # utiliser fable comme agent par défaut pour les nouvelles sessions
     zeroclaw acp --max-sessions 5       # limiter les sessions concurrently
 cli-daemon-long-about =
     Démarrer le daemon autonome longue durée.
@@ -524,6 +525,11 @@ cli-no-command = Aucune commande fournie.
 cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
 cli-quickstart-needs-tty = Quickstart est interactif et nécessite un terminal sur stdin et stderr. Lancez-le depuis un shell interactif, ou utilisez `zeroclaw config set <path> <value>` pour une configuration headless.
+cli-quickstart-terminal-size-unknown = Quickstart n'a pas pu déterminer la taille du terminal et ne peut donc pas vérifier que la liste tient à l'écran. Lancez-le depuis un terminal qui indique ses dimensions, ou utilisez `zeroclaw config set <path> <value>` pour une configuration headless.
+cli-quickstart-terminal-too-narrow = Quickstart nécessite un terminal d’au moins {$min_width} colonnes de large ; le terminal actuel en compte {$width}. Élargissez le terminal et réessayez.
+cli-quickstart-terminal-too-short = Quickstart nécessite un terminal d’au moins {$min_height} lignes de haut ; le terminal actuel en compte {$height}. Agrandissez le terminal et réessayez.
+cli-quickstart-terminal-resized = Le terminal est passé de {$initial_width}x{$initial_height} à {$current_width}x{$current_height} pendant que la liste Quickstart était ouverte. Rouvrez la liste pour continuer.
+cli-quickstart-empty-checklist = Quickstart ne peut pas ouvrir une liste vide.
 cli-quickstart-cancelled = Quickstart annulé. Aucune configuration écrite.
 cli-quickstart-incomplete = {"  "}Tous les sélecteurs ne sont pas encore renseignés.
 cli-quickstart-create-agent = ── Créer un agent
@@ -712,7 +718,11 @@ cli-status-model = {"   "}Modèle :         {$model}
 cli-status-observability = 📊 Observabilité :  {$v}
 cli-status-trace-storage = 🧾 Stockage des traces :  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents :        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<aucun risk_profile>
 cli-status-runtime = ⚙️  Runtime :       {$v}
+cli-status-web-ui-found = 🌐 Web UI :        TROUVÉ ({$path})
+cli-status-web-ui-missing = 🌐 Web UI :        MANQUANT
 cli-status-heartbeat = 💓 Battement de cœur :      {$v}
 cli-status-heartbeat-every-minutes = toutes les {$minutes}min
 cli-status-memory = 🧠 Mémoire :         {$backend} (sauvegarde auto : {$auto_save})
@@ -740,6 +750,8 @@ cli-status-word-off = désactivé
 cli-status-word-none = (aucun)
 cli-status-word-configured = configuré
 cli-status-word-not-configured = non configuré
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configuré, non compilé
 cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
 cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
@@ -843,6 +855,8 @@ cli-models-status-none = Aucun modèle par défaut configuré.
 turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
+turn-failed = [échec du tour]
+turn-failed-attachment-omitted = [pièce jointe omise : le fournisseur l'a rejetée lors du tour en échec]
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) était indisponible ; cette réponse a été générée par { $actual_model } ({ $actual_provider }).
 turn-max-iterations-reached = *Tour arrêté : nombre maximal d’itérations d’outils atteint ({ $max_iterations }).*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -862,6 +876,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ Cette ligne est trop vol
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
+channel-runtime-conversation-busy = Cette conversation compte trop de messages en attente ; celui-ci a été ignoré. Attendez une réponse ou envoyez /stop pour vider vos demandes en file.
 channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.
@@ -1062,6 +1077,7 @@ channel-approval-btn-approve = Approuver
 channel-approval-btn-deny = Refuser
 channel-approval-btn-always = Toujours
 channel-approval-tap-instruction = Appuyez sur un bouton ci-dessous :
+channel-approval-position = Appel d'outil { $index } sur { $total }
 channel-approval-reply-instruction-yesno = Répondez : "{ $yes_command }", "{ $no_command }" ou "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Répondez par `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
 channel-approval-group-visibility-warning = Il s'agit d'une discussion de groupe : tout le monde ici peut voir ce code et les arguments de l'outil affichés ci-dessus. Seul un pair autorisé de ce canal peut répondre.
@@ -1071,6 +1087,9 @@ channel-telegram-approval-ack-denied = Refusé
 channel-telegram-approval-ack-not-accepted = Approbation non acceptée
 channel-telegram-approval-ack-unknown = Action inconnue
 channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
+channel-telegram-voice-drop-too-long = ⚠️ Message audio ignoré : il dépasse la limite de { $limit_secs } s. Envoyez un enregistrement plus court ou découpez-le en plusieurs parties.
+channel-telegram-voice-drop-file-unavailable = ⚠️ Message audio ignoré : le fichier n'a pas pu être récupéré depuis Telegram — il est peut-être trop volumineux ou n'est plus disponible. Essayez un fichier plus petit ou plus court.
+channel-telegram-voice-drop-empty-transcript = ⚠️ Message audio ignoré : rien n'a pu être reconnu dans l'enregistrement. Réessayez avec un enregistrement plus clair.
 channel-discord-approval-btn-allow-once = Autoriser une fois
 channel-discord-approval-btn-allow-session = Autoriser pour cette session
 channel-discord-approval-btn-allow-always = Toujours autoriser

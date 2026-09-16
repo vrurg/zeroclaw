@@ -315,21 +315,36 @@ pub(crate) async fn call_provider(
                             );
                             scope.clear_provisional_provider_route();
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                            let request = ChatRequest {
+                                messages: prepared_messages,
+                                tools: request_tools,
+                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                    .try_with(Clone::clone)
+                                    .ok()
+                                    .flatten(),
+                            };
                             let recovery = with_exact_dispatch_route(
                                 active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat(
-                                ChatRequest {
-                                    messages: prepared_messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                async {
+                                    match streamed_refusal {
+                                        Some(refusal) => {
+                                            dispatcher
+                                                .chat_after_stream_refusal(
+                                                    request,
+                                                    active_model,
+                                                    ctx.temperature,
+                                                    refusal,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            dispatcher
+                                                .chat(request, active_model, ctx.temperature)
+                                                .await
+                                        }
+                                    }
                                 },
-                                active_model,
-                                ctx.temperature,
-                                ),
                             );
                             let result = if let Some(token) = ctx.cancellation_token {
                                 tokio::select! {
@@ -683,7 +698,7 @@ mod streaming_fallback_tests {
         atomic::{AtomicUsize, Ordering},
     };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::StreamEvent;
+    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
@@ -704,6 +719,15 @@ mod streaming_fallback_tests {
 
     struct EmptyThenPendingProvider {
         calls: AtomicUsize,
+    }
+
+    struct StreamRefusalProvider {
+        stream_calls: std::sync::Arc<AtomicUsize>,
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    struct RefusalRescueProvider {
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
     }
 
     struct StreamFailureNoReplayProvider {
@@ -820,6 +844,26 @@ mod streaming_fallback_tests {
         }
     }
 
+    impl Attributable for StreamRefusalProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "StreamRefusalProvider"
+        }
+    }
+
+    impl Attributable for RefusalRescueProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "RefusalRescueProvider"
+        }
+    }
+
     impl Attributable for StreamFailureNoReplayProvider {
         fn role(&self) -> Role {
             Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
@@ -886,6 +930,7 @@ mod streaming_fallback_tests {
                     input_tokens: Some(20),
                     output_tokens: Some(7),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -910,6 +955,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     })),
                     Ok(StreamEvent::TextDelta(
                         zeroclaw_api::model_provider::StreamChunk::reasoning("private reasoning"),
@@ -1005,11 +1051,102 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 });
             }
             std::future::pending::<Result<ChatResponse>>().await
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamRefusalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::ModelRefusal(Box::new(ModelRefusalError {
+                    requested_model: model.to_string(),
+                    category: Some("private-safety-category".to_string()),
+                    usage: Some(Box::new(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: Some(1),
+                        cache_creation_input_tokens: None,
+                    })),
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                })),
+            )]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusalRescueProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("rescued".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("rescued".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
         }
     }
 

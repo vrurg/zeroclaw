@@ -147,6 +147,7 @@ keyactions! {
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::primary('r')]                              => "reload daemon",
+        ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -358,6 +359,7 @@ keyactions! {
         OpenFileBrowser    [Chord::primary('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
         DeletePreviousWord [Chord::primary('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
+        DeleteForward      [Chord::key(KeyCode::Delete)] => "delete next character",
         ClearInput         [Chord::primary('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::primary('v')] => "paste",
