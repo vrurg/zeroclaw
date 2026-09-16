@@ -1072,7 +1072,7 @@ pub fn all_tools_with_runtime(
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            Arc::new(root_config.clone()),
+            config.clone(),
             family.to_string(),
             alias.to_string(),
             llm_task_model,

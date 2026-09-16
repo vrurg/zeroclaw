@@ -4091,7 +4091,14 @@ mod tests {
         // The gateway asks for the reload once the connection exists, then
         // parks: an unrelated pending component must not extend shutdown.
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _quickstart_config,
+                  _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
                     let reload_tx = reload_controls

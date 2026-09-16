@@ -10787,6 +10787,12 @@ fn validate_mcp_config_for_repair(
                 format!("mcp.servers[{i}].name"),
                 "mcp.servers[{i}].name must not be empty"
             );
+            // A retained empty-name diagnostic must not participate in the
+            // duplicate-name set. In config-repair mode the macro above
+            // continues after recording the structured warning; treating two
+            // retained empty names as an unstructured duplicate would turn an
+            // unrelated repair into a fatal error.
+            continue;
         }
         if !seen_names.insert(name.to_ascii_lowercase()) {
             anyhow::bail!("mcp.servers contains duplicate name: {name}");
@@ -22790,7 +22796,7 @@ impl Config {
                 validation_bail!(
                     DanglingReference,
                     "heartbeat.agent",
-                    related[format!("heartbeat.enabled"), format!("agents.{hb_agent}")],
+                    related["heartbeat.enabled".to_string(), format!("agents.{hb_agent}")],
                     "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
                 );
             }
@@ -46637,6 +46643,29 @@ model_provider = \"ollama.default\"
             Some("mcp.servers[1].tool_timeout_secs")
         );
         assert_eq!(error.related_paths, vec!["mcp.enabled"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_multiple_unrelated_empty_mcp_names_as_warnings() {
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![
+            stdio_server("", "/usr/bin/mcp-first"),
+            stdio_server("   ", "/usr/bin/mcp-second"),
+        ];
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("unrelated retained MCP names must not become a duplicate-name failure");
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|warning| {
+            warning.code == "pre_existing_validation_error"
+                && matches!(
+                    warning.path.as_str(),
+                    "mcp.servers[0].name" | "mcp.servers[1].name"
+                )
+        }));
     }
 
     #[::core::prelude::v1::test]
