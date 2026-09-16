@@ -200,8 +200,9 @@ export default function Quickstart() {
       return;
     }
     submittedRef.current = true;
-    if (res.warnings.length > 0) {
-      setWarnings(res.warnings);
+    const warnings = res.warnings ?? [];
+    if (warnings.length > 0) {
+      setWarnings(warnings);
       setAppliedAgent(res.agent.alias);
       return;
     }

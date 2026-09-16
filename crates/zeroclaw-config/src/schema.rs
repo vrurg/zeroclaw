@@ -1258,6 +1258,23 @@ pub struct AnthropicModelProviderConfig {
     pub server_fallback_models: Vec<String>,
 }
 
+impl AnthropicModelProviderConfig {
+    /// OAuth setup tokens are accepted only by Anthropic's public API. Keep
+    /// this predicate in the configuration owner so config admission and
+    /// provider construction cannot diverge.
+    pub fn has_official_oauth_endpoint(api_url: Option<&str>) -> bool {
+        api_url.is_none_or(|url| {
+            reqwest::Url::parse(url)
+                .map(|parsed| {
+                    parsed.scheme() == "https"
+                        && parsed.host_str() == Some("api.anthropic.com")
+                        && parsed.port().is_none()
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
 // ── Moonshot (multi-region exemplar) ──
 
 /// Moonshot endpoint variants. Operators pick the region that matches their
@@ -22449,6 +22466,19 @@ impl Config {
                     path,
                     related[format!("providers.models.anthropic.{alias}.auth_mode")],
                     "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+                );
+            }
+            if provider.auth_mode == Some(AnthropicAuthMode::OAuth)
+                && !AnthropicModelProviderConfig::has_official_oauth_endpoint(
+                    provider.base.uri.as_deref(),
+                )
+            {
+                let path = format!("providers.models.anthropic.{alias}.uri");
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    related[format!("providers.models.anthropic.{alias}.auth_mode")],
+                    "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
                 );
             }
         }
@@ -46398,6 +46428,54 @@ model_provider = \"ollama.default\"
 
         let error = config.validate().expect_err("OAuth plus api_key must fail");
         assert!(error.to_string().contains("auth_mode = \"oauth\""));
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_oauth_rejects_nonofficial_uri_at_config_admission() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://proxy.example".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let error = config
+            .validate()
+            .expect_err("OAuth aliases must reject a nonofficial endpoint before persistence");
+        assert!(
+            error
+                .to_string()
+                .contains("official https://api.anthropic.com")
+        );
+
+        config.mark_dirty("providers.models.anthropic.subscription.uri");
+        let repair_error = config
+            .validate_for_config_repair()
+            .expect_err("a config repair may not save a dirty nonofficial OAuth endpoint");
+        assert!(
+            repair_error
+                .to_string()
+                .contains("official https://api.anthropic.com")
+        );
+
+        assert!(AnthropicModelProviderConfig::has_official_oauth_endpoint(
+            None
+        ));
+        assert!(AnthropicModelProviderConfig::has_official_oauth_endpoint(
+            Some("https://api.anthropic.com")
+        ));
+        assert!(!AnthropicModelProviderConfig::has_official_oauth_endpoint(
+            Some("http://api.anthropic.com")
+        ));
+        assert!(!AnthropicModelProviderConfig::has_official_oauth_endpoint(
+            Some("https://api.anthropic.com:444")
+        ));
     }
 
     #[::core::prelude::v1::test]

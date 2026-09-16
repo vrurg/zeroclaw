@@ -1697,7 +1697,9 @@ export type QuickstartApplyResult =
       kind: "applied";
       agent: AppliedAgent;
       daemon_restarted: boolean;
-      warnings: QuickstartWarning[];
+      // A new dashboard can briefly be served against an older gateway during
+      // rollout; omitted additive fields must retain their empty-list meaning.
+      warnings?: QuickstartWarning[];
     }
   | { kind: "errors"; errors: QuickstartError[] };
 

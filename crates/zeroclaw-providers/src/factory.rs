@@ -1103,17 +1103,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
             );
         }
-        if oauth
-            && api_url.is_some_and(|url| {
-                reqwest::Url::parse(url)
-                    .map(|parsed| {
-                        parsed.scheme() != "https"
-                            || parsed.host_str() != Some("api.anthropic.com")
-                            || parsed.port().is_some()
-                    })
-                    .unwrap_or(true)
-            })
-        {
+        if oauth && !AnthropicModelProviderConfig::has_official_oauth_endpoint(api_url) {
             anyhow::bail!(
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
             );
