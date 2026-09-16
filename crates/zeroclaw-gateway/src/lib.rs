@@ -5636,6 +5636,7 @@ path = "{trigger_path}"
                     ..Default::default()
                 },
                 auth_mode: Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth),
+                ..Default::default()
             },
         );
         zeroclaw_providers::auth::AuthService::from_config(&config)

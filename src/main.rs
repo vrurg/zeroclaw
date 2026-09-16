@@ -14429,6 +14429,7 @@ mod tests {
                     ..Default::default()
                 },
                 auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
             },
         );
         config.agents.insert(

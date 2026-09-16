@@ -3421,6 +3421,9 @@ impl AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        // The accepted streaming response supersedes any safeguard attribution
+        // from a prior rejected attempt or tool-loop round in this turn.
+        commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
@@ -9419,6 +9422,37 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     // ----- Server-side fallback detection (§4) -------------------------
+
+    #[tokio::test]
+    async fn stream_chat_clears_a_prior_safeguard_notice() {
+        scope_safeguard_fallback(async {
+            commit_safeguard_fallback(Some(SafeguardFallbackNotice {
+                kind: SafeguardFallbackKind::ServerSide,
+                requested_model: "claude-fable-5".to_string(),
+                served_model: "claude-opus-4-8".to_string(),
+                category: None,
+            }));
+
+            let provider = AnthropicModelProvider::builder("test").build();
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: None,
+            };
+            let events: Vec<StreamResult<StreamEvent>> = provider
+                .stream_chat(request, "claude-fable-5", None, StreamOptions::new(false))
+                .collect()
+                .await;
+
+            assert!(matches!(events.as_slice(), [Ok(StreamEvent::Final)]));
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "a successful streaming entrypoint must not leak an earlier safeguard notice"
+            );
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn served_by_fallback_records_server_side_notice() {
