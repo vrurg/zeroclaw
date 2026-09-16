@@ -904,13 +904,16 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// Whether any config write has landed since the last admin reload and may
-    /// still require subsystem re-instantiation to take effect.
+    /// Whether a supervised config reload has been requested and may still
+    /// require subsystem re-instantiation. Standalone gateway mode does not
+    /// retain this flag because it cannot dispatch a supervisor reload; its
+    /// Quickstart response instead reports `daemon_restarted: false`.
     pub pending_reload: bool,
 }
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
-/// reload banner. Goes true on any config write, false on `/admin/reload`.
+/// reload banner. Goes true for a dispatchable supervised reload, false after
+/// `/admin/reload` and in standalone gateway mode.
 pub async fn handle_reload_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();

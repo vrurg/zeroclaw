@@ -29,6 +29,9 @@ pub enum ValidateResult {
 pub enum ApplyResult {
     Applied {
         agent: AppliedAgent,
+        /// True only when the gateway could dispatch a reload through its
+        /// daemon supervisor. Standalone gateway mode persists the setup but
+        /// returns false because the operator must restart the process.
         daemon_restarted: bool,
         warnings: Vec<QuickstartWarning>,
     },
@@ -147,6 +150,10 @@ pub async fn handle_apply(
 
 fn signal_daemon_reload(state: &AppState) -> bool {
     let Some(reload_tx) = state.reload_tx.clone() else {
+        // `pending_reload` represents a dispatchable supervisor reload, not
+        // every persisted change. A standalone gateway has no supervisor, so
+        // retaining it would create a sticky dashboard action that cannot run;
+        // `daemon_restarted: false` is the explicit restart-required signal.
         state
             .pending_reload
             .store(false, std::sync::atomic::Ordering::Relaxed);
