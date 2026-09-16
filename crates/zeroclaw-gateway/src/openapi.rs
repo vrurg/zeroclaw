@@ -350,7 +350,7 @@ pub fn build_spec() -> serde_json::Value {
             "get": {
                 "tags": ["config"],
                 "summary": "Pending-reload flag for the running daemon",
-                "description": "Returns `{pending_reload: true}` after a gateway config mutation marks a daemon reload pending. `/admin/reload` clears it. Quickstart clears it after dispatching a supervised reload, or in standalone mode when its `daemon_restarted: false` response tells the operator to restart. Distinct from `/api/config/drift`, which compares disk to in-memory.",
+                "description": "Returns `{pending_reload: true}` after a gateway config mutation marks a daemon reload pending. `/admin/reload` clears it. Quickstart clears it after dispatching a supervised reload, or in standalone mode when its `daemon_restarted: false` response tells the operator to restart. Other config-write routes set the same shared flag and do not clear it themselves. Distinct from `/api/config/drift`, which compares disk to in-memory.",
                 "responses": {
                     "200": {
                         "description": "Pending-reload flag.",

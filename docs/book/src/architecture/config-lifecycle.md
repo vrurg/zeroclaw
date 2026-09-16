@@ -117,7 +117,8 @@ endpoint returns a restart-required response because there is no outer daemon
 loop to signal. A successful Quickstart submission does not retain
 `pending_reload`, because no in-product reload action can dispatch; Quickstart
 instead reports `daemon_restarted: false`, which means the operator must restart
-the process. Other gateway config-write routes retain their normal reload flag.
+the process. Other gateway config-write routes set the same shared reload flag
+and do not clear it themselves.
 
 ## Reload access
 

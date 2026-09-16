@@ -904,10 +904,11 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// Whether a gateway config mutation has marked a daemon reload pending.
+    /// Whether a gateway config mutation has marked a daemon reload pending;
+    /// daemon-owned subsystems may still require subsystem re-instantiation.
     /// Quickstart clears the flag after it dispatches a supervised reload, or
     /// when standalone mode reports `daemon_restarted: false`; other gateway
-    /// config writes retain it until `/admin/reload` clears the flag.
+    /// config-write routes set the same shared flag without clearing it.
     pub pending_reload: bool,
 }
 
