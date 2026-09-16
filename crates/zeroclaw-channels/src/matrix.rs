@@ -152,8 +152,10 @@ mod mention {
         }
 
         let (address, command_suffix) = body.split_once("/goal")?;
+        let explicit_mention =
+            m_mentions_user_ids.is_some_and(|ids| ids.iter().any(|id| id == bot_user_id.as_str()));
         if !is_mentioned(bot_user_id, bot_display_name, m_mentions_user_ids, body)
-            || !is_leading_bot_address(address, bot_user_id, bot_display_name)
+            || !is_leading_bot_address(address, bot_user_id, bot_display_name, explicit_mention)
         {
             return None;
         }
@@ -165,6 +167,7 @@ mod mention {
         prefix: &str,
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
+        explicit_mention: bool,
     ) -> bool {
         let address = prefix
             .trim()
@@ -177,11 +180,33 @@ mod mention {
         let localpart = format!("@{}", bot_user_id.localpart());
         if address.eq_ignore_ascii_case(bot_user_id.as_str())
             || address.eq_ignore_ascii_case(&localpart)
+            || matrix_to_mention_matches(address, bot_user_id)
         {
             return true;
         }
         bot_display_name
             .is_some_and(|name| !name.is_empty() && address.eq_ignore_ascii_case(name.trim()))
+            // Some Element clients render a rich mention as only its visible
+            // label in `body`. The event's explicit Matrix mention still
+            // binds that label to this bot; require a single label so prose
+            // such as "please zc-main /goal" cannot become a command.
+            || (explicit_mention && !address.contains(char::is_whitespace))
+    }
+
+    fn matrix_to_mention_matches(address: &str, bot_user_id: &UserId) -> bool {
+        let Some(label_and_url) = address.strip_prefix('[') else {
+            return false;
+        };
+        let Some((label, url)) = label_and_url.split_once("](") else {
+            return false;
+        };
+        if label.is_empty() {
+            return false;
+        }
+        let Some(url) = url.strip_suffix(')') else {
+            return false;
+        };
+        url.eq_ignore_ascii_case(&format!("https://matrix.to/#/{}", bot_user_id.as_str()))
     }
 
     pub(super) fn is_mentioned(
@@ -8091,6 +8116,33 @@ mod tests {
                     "@zc-architect /goal status",
                 ),
                 Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "zc-architect: /goal help",
+                ),
+                Some("/goal help".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "[zc-architect](https://matrix.to/#/@zc-architect:example.org) /goal status",
+                ),
+                Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "Please zc-architect /goal help",
+                ),
+                None,
             );
             assert_eq!(
                 normalize_addressed_goal_command(
