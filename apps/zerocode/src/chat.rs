@@ -15888,6 +15888,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_command_routes_to_session_goal_not_prompt_submission() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let outbound = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active.input_bar.insert_text("/goal help");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await;
+
+            let request = next_rpc_request(&mut rx, "goal command must use session/goal").await;
+            assert_eq!(request["method"], method::SESSION_GOAL);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            assert_eq!(request["params"]["command"], "/goal help");
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({
+                    "response": { "kind": "help" }
+                }),
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                rx.try_recv().is_err(),
+                "goal commands must not fall through to session/prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rtg_9739_approval_enter_approves_without_submitting_composer() {
         use crossterm::event::KeyCode;
 
