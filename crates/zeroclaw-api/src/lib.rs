@@ -36,6 +36,11 @@ pub const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
     "session_prompt_delete",
 ];
 
+/// Content-mutating subset of [`SESSION_PROMPT_TOOL_NAMES`]. Approval and
+/// redaction boundaries use this vocabulary to keep list operations read-only.
+pub const SESSION_PROMPT_MUTATION_TOOL_NAMES: [&str; 2] =
+    ["session_prompt_set", "session_prompt_delete"];
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.

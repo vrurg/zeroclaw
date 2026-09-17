@@ -281,7 +281,7 @@ pub(crate) async fn gate_tool_approval(
 }
 
 fn is_session_prompt_mutation(tool_name: &str) -> bool {
-    matches!(tool_name, "session_prompt_set" | "session_prompt_delete")
+    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
 }
 
 /// Render arguments for ordinary approval and audit exports. The set tool's
@@ -505,7 +505,8 @@ fn is_one_time_session_prompt_approval(
 mod tests {
     use super::{
         ApprovalGateOutcome, escape_prompt_preview, gate_tool_approval, generic_approval_arguments,
-        is_one_time_session_prompt_approval, session_prompt_approval_summary,
+        is_one_time_session_prompt_approval, is_session_prompt_mutation,
+        session_prompt_approval_summary,
     };
     use crate::agent::turn::context::TurnCtx;
     use crate::approval::ApprovalManager;
@@ -813,6 +814,13 @@ mod tests {
         assert_eq!(args["attachment_id"], "current-task");
         assert!(args["content_sha256"].as_str().is_some());
         assert!(!args.to_string().contains(marker));
+    }
+
+    #[test]
+    fn session_prompt_mutation_vocabulary_excludes_list() {
+        assert!(is_session_prompt_mutation("session_prompt_set"));
+        assert!(is_session_prompt_mutation("session_prompt_delete"));
+        assert!(!is_session_prompt_mutation("session_prompt_list"));
     }
 
     #[test]

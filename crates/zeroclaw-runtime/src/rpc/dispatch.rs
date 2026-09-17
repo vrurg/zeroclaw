@@ -2140,25 +2140,19 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // ACP kill is an explicit administrative interruption: stop the
-        // observed live turn before waiting for its queue permit, then retain
-        // the incarnation fence through durable tombstoning. Chat deletion
-        // intentionally keeps its queue-first policy. Other lifecycle policies
-        // are possible, but need a separate architectural decision because
-        // they change the durable-versus-interrupt ordering contract.
-        let _lifecycle_cancellation = if matches!(chat_mode, ChatMode::Acp) {
-            Some(
-                self.ctx
-                    .sessions
-                    .signal_session_kill_at_generation(sid, expected_generation)
-                    .await
-                    .ok_or_else(|| {
-                        rpc_err(SESSION_NOT_FOUND, "Session was replaced before kill")
-                    })?,
-            )
-        } else {
-            None
-        };
+        // Kill is an explicit administrative interruption for either session
+        // mode: stop the observed live turn before waiting for its queue
+        // permit, then retain the incarnation fence through finalization. In
+        // contrast, session/delete intentionally remains queue-first. Other
+        // lifecycle policies are possible, but need a separate architectural
+        // decision because they change the durable-versus-interrupt ordering
+        // contract.
+        let _lifecycle_cancellation = self
+            .ctx
+            .sessions
+            .signal_session_kill_at_generation(sid, expected_generation)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session was replaced before kill"))?;
         let _guard = self
             .ctx
             .sessions
@@ -11890,6 +11884,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_chat_kill_interrupts_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "active-chat-kill";
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({ "session_id": sid, "prompt": "block" }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("the Chat provider must be active before kill")
+            .expect("gated provider must report its start");
+
+        let kill_handle = dispatcher.spawn_handle();
+        let kill = zeroclaw_spawn::spawn!(async move {
+            kill_handle
+                .handle_session_kill(&json!({ "session_id": sid }))
+                .await
+        });
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+            .await
+            .expect("Chat kill must interrupt the active provider turn")
+            .expect("prompt task must not panic")
+            .expect("cancelled prompt should complete its RPC response");
+        assert_eq!(prompt_result["stop_reason"], "cancelled");
+
+        let kill_result = tokio::time::timeout(std::time::Duration::from_secs(2), kill)
+            .await
+            .expect("kill must finish after the cancelled turn releases its queue permit")
+            .expect("kill task must not panic")
+            .expect("Chat kill should remove the live session");
+        assert_eq!(kill_result["killed"], true);
+        assert!(sessions.get_agent(sid).await.is_none());
+    }
+
+    #[tokio::test]
     async fn live_session_delete_waits_for_the_captured_turn_before_finalization() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -16182,9 +16248,9 @@ mod tests {
         }
 
         // The prompt already owns the queue permit but has not registered its
-        // cancellation token. Close retains its interrupt-first contract;
-        // delete and kill must let this admitted turn finish normally before
-        // finalizing their durable lifecycle work.
+        // cancellation token. Close and kill retain their interrupt-first
+        // contracts; delete must let this admitted turn finish normally before
+        // finalizing its durable lifecycle work.
         for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
             let tmp = tempfile::TempDir::new().unwrap();
             let chat_backend = Arc::new(
@@ -16272,20 +16338,20 @@ mod tests {
 
             release_prompt.notify_one();
             match removal {
-                Removal::Close => {
+                Removal::Close | Removal::Kill => {
                     let prompt_result =
                         tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
                             .await
-                            .expect("close must cancel the admitted prompt")
+                            .expect("interrupt-first lifecycle must cancel the admitted prompt")
                             .expect("prompt task must not panic");
                     let prompt_result = prompt_result.expect("prompt should settle as cancelled");
                     assert_eq!(prompt_result["stop_reason"], "cancelled");
                     assert!(
                         provider_started_rx.try_recv().is_err(),
-                        "close must cancel before provider execution begins"
+                        "{removal:?} must cancel before provider execution begins"
                     );
                 }
-                Removal::Kill | Removal::Delete => {
+                Removal::Delete => {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         provider_started_rx.recv(),

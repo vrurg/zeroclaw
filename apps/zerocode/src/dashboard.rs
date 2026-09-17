@@ -595,6 +595,16 @@ impl Dashboard {
                 spans.push(Span::styled(&message.text, style));
                 spans.push(Span::styled(" ", theme::dim_style()));
             }
+            if let Some(message) = self.session_kill_message_for_status_line() {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::dim_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled(&message.text, style));
+                spans.push(Span::styled(" ", theme::dim_style()));
+            }
             spans.push(Span::styled(help, theme::dim_style()));
             Line::from(spans)
         };
@@ -937,6 +947,16 @@ impl Dashboard {
         (self.session_kill_message_id.as_deref() == Some(selected_id))
             .then_some(self.session_kill_message.as_ref())
             .flatten()
+    }
+
+    /// Detail feedback is scoped to its session. Route every result that is
+    /// not currently displayable there to the status line, so completion,
+    /// no-selection, and cross-selection feedback remains visible.
+    fn session_kill_message_for_status_line(&self) -> Option<&DashboardMessage> {
+        (self.tab == Tab::Sessions
+            && !(self.detail_open && self.session_kill_message_for_selected_session().is_some()))
+        .then_some(self.session_kill_message.as_ref())
+        .flatten()
     }
 
     // ── Agents tab ───────────────────────────────────────────────
@@ -3474,6 +3494,7 @@ mod tests {
             crate::jsonrpc::RpcOutbound::new(writer_tx),
         )));
         let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
         dashboard.sessions.push(SessionEntry {
             session_id: "session-1".to_string(),
             session_key: "key-1".to_string(),
@@ -3528,6 +3549,57 @@ mod tests {
                 .session_kill_message_for_selected_session()
                 .is_none(),
             "a kill result must not be attributed to a different selected session"
+        );
+        assert!(
+            dashboard.session_kill_message_for_status_line().is_some(),
+            "a result for another session must remain visible in the status line"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_kill_success_is_visible_after_closing_detail() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
+        dashboard.sessions.push(SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "key-1".to_string(),
+            created_at: String::new(),
+            last_activity: String::new(),
+            message_count: 1,
+            agent_alias: None,
+            channel_id: None,
+            name: None,
+        });
+        dashboard.session_state.select(Some(0));
+        dashboard.detail_open = true;
+        dashboard.session_kill_inflight_id = Some("session-1".to_string());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        dashboard.session_kill_rx = Some(rx);
+        tx.send(SessionKillUpdate {
+            session_id: "session-1".to_string(),
+            result: Ok(crate::client::SessionKillResult {
+                session_id: "session-1".to_string(),
+                killed: true,
+            }),
+        })
+        .unwrap();
+
+        dashboard.drain_session_kill_updates();
+
+        assert!(
+            !dashboard.detail_open,
+            "a successful kill closes the detail pane"
+        );
+        assert!(
+            dashboard
+                .session_kill_message_for_status_line()
+                .expect("the successful result must remain visible")
+                .text
+                .contains("session-1")
         );
     }
 
