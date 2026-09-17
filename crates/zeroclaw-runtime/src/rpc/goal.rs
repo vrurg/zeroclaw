@@ -244,6 +244,24 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(self.canonical_history.clone())
     }
 
+    async fn append_resume_response(&mut self, response: String) -> Result<()> {
+        let session_key = format!("rpc_{}", self.raw_session_id()?);
+        let message = ChatMessage::user(&response);
+        // Persist before changing the live agent. A successful resume must
+        // never be visible only to this process and then vanish when the
+        // same ZeroCode session is reconstructed after daemon restart.
+        let backend = self
+            .context
+            .session_backend
+            .as_ref()
+            .context("cannot resume Goal response: ZeroCode session persistence is disabled")?;
+        backend
+            .append(&session_key, &message)
+            .context("persist ZeroCode Goal resume response")?;
+        self.agent.lock().await.seed_history(&[message]);
+        Ok(())
+    }
+
     async fn run_parent_turn(
         &mut self,
         _operation: &GoalOperationScope,
