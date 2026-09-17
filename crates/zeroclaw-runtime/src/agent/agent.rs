@@ -1264,8 +1264,10 @@ impl Agent {
                     "isolated Goal canonical prefix must not contain system messages"
                 );
                 let mut history = Vec::with_capacity(prefix.len() + 2);
-                history.push(system);
-                history.push(directive);
+                history.push(crate::goal_mode::goal_parent_system_message(
+                    system.content,
+                    &directive.content,
+                ));
                 history.extend(prefix);
                 history.push(crate::goal_mode::goal_parent_execution_request());
                 history
@@ -1277,8 +1279,10 @@ impl Agent {
                         .is_some_and(|message| message.role == "system"),
                     "isolated Goal continuation must retain its system prompt"
                 );
-                history[0] = system;
-                history.push(directive);
+                history[0] = crate::goal_mode::goal_parent_system_message(
+                    system.content,
+                    &directive.content,
+                );
                 history.push(crate::goal_mode::goal_parent_execution_request());
                 history
             }
@@ -1308,8 +1312,9 @@ impl Agent {
             );
         let active_dispatcher =
             tool_dispatcher_for_provider(&self.config, active_provider, active_model);
-        working_history[0] = ChatMessage::system(
+        working_history[0] = crate::goal_mode::goal_parent_system_message(
             self.build_system_prompt_with_dispatcher(active_dispatcher.as_ref())?,
+            directive.content,
         );
         let tool_protocol_prompts = self.tool_protocol_prompts()?;
         let turn_id = Self::new_turn_id();
@@ -3865,6 +3870,54 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "MockModelProvider"
+        }
+    }
+
+    struct GoalTranscriptCaptureProvider {
+        captured_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalTranscriptCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.captured_messages
+                .lock()
+                .push(request.messages.to_vec());
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalTranscriptCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GoalTranscriptCaptureProvider"
         }
     }
 
@@ -7701,8 +7754,9 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_turn_keeps_intermediate_work_out_of_canonical_history() {
-        let model_provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
+        let captured_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(GoalTranscriptCaptureProvider {
+            captured_messages: Arc::clone(&captured_messages),
         });
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -7739,6 +7793,19 @@ mod tests {
             .expect("isolated Goal turn should succeed");
 
         assert_eq!(outcome.response, "done");
+        assert_eq!(
+            outcome
+                .working_history
+                .first()
+                .map(|message| message.role.as_str()),
+            Some("system")
+        );
+        assert!(
+            outcome
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("goal turn directive"))
+        );
         assert!(
             outcome
                 .working_history
@@ -7746,6 +7813,70 @@ mod tests {
                 .any(|message| message.role == "assistant" && message.content == "done")
         );
         assert_eq!(format!("{:?}", agent.history()), canonical_before);
+
+        let continuation = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Continuation(outcome.working_history),
+                ChatMessage::system("continue turn directive"),
+            )
+            .await
+            .expect("continued isolated Goal turn should succeed");
+
+        assert_eq!(
+            continuation
+                .working_history
+                .first()
+                .map(|message| message.role.as_str()),
+            Some("system")
+        );
+        assert!(
+            continuation
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("continue turn directive"))
+        );
+        assert!(
+            !continuation
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("goal turn directive"))
+        );
+        assert_eq!(format!("{:?}", agent.history()), canonical_before);
+
+        let captured_messages = captured_messages.lock();
+        assert_eq!(captured_messages.len(), 2);
+        for request in captured_messages.iter() {
+            assert_eq!(
+                request.first().map(|message| message.role.as_str()),
+                Some("system")
+            );
+            assert_eq!(
+                request
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                request.last().map(|message| message.role.as_str()),
+                Some("user")
+            );
+        }
+        assert!(
+            captured_messages[0][0]
+                .content
+                .contains("goal turn directive")
+        );
+        assert!(
+            captured_messages[1][0]
+                .content
+                .contains("continue turn directive")
+        );
+        assert!(
+            !captured_messages[1][0]
+                .content
+                .contains("goal turn directive")
+        );
     }
 
     #[test]

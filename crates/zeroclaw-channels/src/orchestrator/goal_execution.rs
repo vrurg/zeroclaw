@@ -21,7 +21,8 @@ use zeroclaw_runtime::{
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
         GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_directive,
-        goal_parent_execution_request, goal_verifier_messages, scope_goal_parent_turn,
+        goal_parent_execution_request, goal_parent_system_message, goal_verifier_messages,
+        scope_goal_parent_turn,
     },
 };
 
@@ -344,13 +345,11 @@ impl MatrixGoalExecutionLease {
             .unwrap_or_default()
     }
 
-    fn initial_working_history(
+    fn goal_system_prompt(
         &self,
         provider: &dyn zeroclaw_providers::ModelProvider,
         route: &ChannelRouteSelection,
-        directive: ChatMessage,
-        canonical_history: Vec<ChatMessage>,
-    ) -> Vec<ChatMessage> {
+    ) -> String {
         let excluded_tools: &[String] =
             if self.context.autonomy_level == zeroclaw_config::autonomy::AutonomyLevel::Full {
                 &[]
@@ -380,13 +379,26 @@ impl MatrixGoalExecutionLease {
         );
         let target_channel =
             find_channel_for_message(&self.context.channels_by_name, &self.message);
-        let system_prompt = build_channel_system_prompt_for_message_with_signal(
+        build_channel_system_prompt_for_message_with_signal(
             &base_system_prompt,
             &self.message,
             target_channel,
             native_tool_specs_present,
-        );
-        goal_start_history(system_prompt, directive, canonical_history)
+        )
+    }
+
+    fn initial_working_history(
+        &self,
+        provider: &dyn zeroclaw_providers::ModelProvider,
+        route: &ChannelRouteSelection,
+        directive: ChatMessage,
+        canonical_history: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        goal_start_history(
+            self.goal_system_prompt(provider, route),
+            directive,
+            canonical_history,
+        )
     }
 }
 
@@ -396,11 +408,27 @@ fn goal_start_history(
     canonical_history: Vec<ChatMessage>,
 ) -> Vec<ChatMessage> {
     let mut history = Vec::with_capacity(canonical_history.len() + 2);
-    history.push(ChatMessage::system(system_prompt));
-    history.push(directive);
+    history.push(goal_parent_system_message(system_prompt, directive.content));
     history.extend(canonical_history);
     history.push(goal_parent_execution_request());
     history
+}
+
+fn goal_continue_history(
+    system_prompt: String,
+    directive: ChatMessage,
+    mut history: Vec<ChatMessage>,
+) -> Result<Vec<ChatMessage>> {
+    let first = history
+        .first_mut()
+        .context("Goal continuation lost its system prompt")?;
+    ensure!(
+        first.role == "system",
+        "Goal continuation lost its system prompt"
+    );
+    *first = goal_parent_system_message(system_prompt, directive.content);
+    history.push(goal_parent_execution_request());
+    Ok(history)
 }
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
@@ -439,12 +467,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 directive,
                 turn.working_history,
             ),
-            GoalParentTurnKind::Continue => {
-                let mut history = turn.working_history;
-                history.push(directive);
-                history.push(goal_parent_execution_request());
-                history
-            }
+            GoalParentTurnKind::Continue => goal_continue_history(
+                self.goal_system_prompt(provider.as_ref(), &route),
+                directive,
+                turn.working_history,
+            )?,
         };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let loop_knobs = LoopKnobs::default();
@@ -583,19 +610,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_history_ends_with_a_user_turn_after_an_assistant_prefix() {
+    fn start_history_combines_goal_directive_into_the_system_prompt() {
         let history = goal_start_history(
             "system prompt".to_owned(),
             ChatMessage::system("Goal directive"),
             vec![ChatMessage::assistant("earlier assistant response")],
         );
 
-        assert_eq!(history.len(), 4);
-        assert_eq!(history[0].content, "system prompt");
-        assert_eq!(history[1].content, "Goal directive");
-        assert_eq!(history[2].role, "assistant");
-        assert_eq!(history[2].content, "earlier assistant response");
-        assert_eq!(history[3].role, "user");
-        assert!(history[3].content.contains("Proceed with the Goal work"));
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "system");
+        assert!(history[0].content.contains("system prompt"));
+        assert!(history[0].content.contains("Goal directive"));
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, "earlier assistant response");
+        assert_eq!(history[2].role, "user");
+        assert!(history[2].content.contains("Proceed with the Goal work"));
+    }
+
+    #[test]
+    fn continuation_replaces_the_goal_directive_in_the_only_system_prompt() {
+        let history = goal_continue_history(
+            "rebuilt system prompt".to_owned(),
+            ChatMessage::system("continue Goal directive"),
+            vec![
+                ChatMessage::system("old system prompt\n\nstart Goal directive"),
+                ChatMessage::assistant("earlier assistant response"),
+            ],
+        )
+        .expect("continuation with a system prompt should build");
+
+        assert_eq!(history[0].role, "system");
+        assert!(history[0].content.contains("rebuilt system prompt"));
+        assert!(history[0].content.contains("continue Goal directive"));
+        assert!(!history[0].content.contains("start Goal directive"));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn continuation_rejects_a_transcript_without_a_system_prompt() {
+        let error = goal_continue_history(
+            "rebuilt system prompt".to_owned(),
+            ChatMessage::system("continue Goal directive"),
+            vec![ChatMessage::assistant("earlier assistant response")],
+        )
+        .expect_err("continuation must retain the system prompt at history index zero");
+
+        assert!(error.to_string().contains("lost its system prompt"));
     }
 }

@@ -439,10 +439,27 @@ pub fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
     ))
 }
 
+/// Combine the normal agent system prompt and the Goal-owned directive into
+/// one system message.
+///
+/// Native Anthropic and Bedrock requests accept one system prompt, so keeping
+/// the directive separate would silently omit the Goal objective on those
+/// routes. The runtime directive remains trusted framing; its objective stays
+/// explicitly fenced as untrusted user-declared data.
+pub fn goal_parent_system_message(
+    system_prompt: impl AsRef<str>,
+    directive: impl AsRef<str>,
+) -> ChatMessage {
+    ChatMessage::system(format!(
+        "{}\n\n{}",
+        system_prompt.as_ref(),
+        directive.as_ref()
+    ))
+}
+
 /// Finish a Goal parent request with a user-role turn so every configured
-/// provider can accept the isolated transcript after canonical history.  The
-/// trusted system directive remains the sole owner of the objective and turn
-/// kind; this message merely requests execution under that established scope.
+/// provider can accept the isolated transcript after canonical history.
+/// Objective and lifecycle framing remain in the combined system prompt.
 pub fn goal_parent_execution_request() -> ChatMessage {
     ChatMessage::user("Proceed with the Goal work under the trusted runtime directive.")
 }
@@ -1712,6 +1729,22 @@ mod tests {
         assert!(untrusted_offset < directive.content.find(objective).unwrap());
         assert_eq!(directive.content.matches(objective).count(), 1);
         assert!(directive.content.ends_with("\n---"));
+    }
+
+    #[test]
+    fn goal_parent_system_message_keeps_the_objective_in_the_only_system_message() {
+        let directive = goal_parent_directive(&GoalParentTurn {
+            kind: GoalParentTurnKind::Start,
+            objective: "ship goal mode".to_owned(),
+            working_history: Vec::new(),
+        });
+
+        let system = goal_parent_system_message("agent system prompt", directive.content);
+
+        assert_eq!(system.role, "system");
+        assert!(system.content.contains("agent system prompt"));
+        assert!(system.content.contains("ship goal mode"));
+        assert_eq!(system.content.matches("ship goal mode").count(), 1);
     }
 
     #[test]
