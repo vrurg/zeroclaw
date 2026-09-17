@@ -2712,6 +2712,7 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
 async fn load_runtime_config_and_defaults(
     path: &Path,
     agent_alias: &str,
+    data_dir: &Path,
 ) -> Result<(Config, ChannelRuntimeDefaults)> {
     let contents = tokio::fs::read_to_string(path)
         .await
@@ -2719,6 +2720,11 @@ async fn load_runtime_config_and_defaults(
     let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
         .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
+    // `data_dir` is runtime-owned and skipped by TOML serialization. A hot
+    // reload must retain the daemon's established storage root rather than
+    // replacing it with an empty deserialization default. In particular, the
+    // process-global CostTracker must keep using its canonical ledger.
+    parsed.data_dir = data_dir.to_path_buf();
 
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
@@ -2753,8 +2759,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let (next_config, next_defaults) =
-        load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
+    let (next_config, next_defaults) = load_runtime_config_and_defaults(
+        &config_path,
+        ctx.agent_alias.as_str(),
+        &ctx.prompt_config.data_dir,
+    )
+    .await?;
     let next_config = Arc::new(next_config);
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
@@ -16638,7 +16648,7 @@ temperature = 0.3
         // before returning. The value is synthetic and not a real credential.
         unsafe { std::env::set_var(env_name, "sk-or-v1-test-channel-reload") };
 
-        let result = load_runtime_config_and_defaults(&config_path, "demo").await;
+        let result = load_runtime_config_and_defaults(&config_path, "demo", tmp.path()).await;
 
         // SAFETY: undo the test-only process env mutation above.
         unsafe { std::env::remove_var(env_name) };
@@ -16652,6 +16662,37 @@ temperature = 0.3
             config
                 .env_overridden_paths
                 .contains("providers.models.openrouter.agent_demo.api_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_runtime_reload_keeps_the_established_data_directory() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[agents.demo]
+model_provider = "openrouter.hot"
+
+[providers.models.openrouter.hot]
+model = "hot-model"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let established_data_dir = tmp.path().join("established-data");
+        let (config, _) =
+            load_runtime_config_and_defaults(&config_path, "demo", &established_data_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            config.data_dir, established_data_dir,
+            "a reload must preserve the daemon's established storage root"
         );
     }
 
@@ -18241,9 +18282,10 @@ api_key = "cold-key"
         .await
         .unwrap();
 
-        let (_config, defaults) = load_runtime_config_and_defaults(&config_path, "agent_a")
-            .await
-            .unwrap();
+        let (_config, defaults) =
+            load_runtime_config_and_defaults(&config_path, "agent_a", tmp.path())
+                .await
+                .unwrap();
 
         assert_eq!(defaults.default_model_provider, "openrouter.hot");
         assert_eq!(defaults.model, "hot-model");
@@ -18273,7 +18315,7 @@ api_key = "cold-key"
         .await
         .unwrap();
 
-        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a", tmp.path())
             .await
             .expect_err("unresolved agent provider should reject reload");
 
@@ -18301,7 +18343,7 @@ api_key = "cold-key"
         .await
         .unwrap();
 
-        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a", tmp.path())
             .await
             .expect_err("runtime reload should reject a config missing the active agent");
 
@@ -18330,7 +18372,7 @@ api_key = "second-key"
         .await
         .unwrap();
 
-        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a", tmp.path())
             .await
             .expect_err("empty agent provider should reject reload");
 
