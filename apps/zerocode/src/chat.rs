@@ -112,18 +112,33 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     } else {
         "zc-goal-no"
     });
-    let mut message = crate::i18n::t_args(
-        "zc-goal-details",
+    let mut message =
+        crate::i18n::t_args("zc-goal-summary-status", &[("status", &projection.status)]);
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-budget",
+        &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
+    ));
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-accounting",
+        &[("accounting", &projection.accounting_state)],
+    ));
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-execution",
         &[
-            ("status", &projection.status),
             ("epoch", &projection.execution_epoch.to_string()),
-            ("accounting", &projection.accounting_state),
             ("resumable", &resumable),
-            ("token_limit", &token_limit),
-            ("cost_limit", &cost_limit),
-            ("pause_reason", &pause_reason),
         ],
-    );
+    ));
+    if projection.pause_reason.is_some() {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-pause",
+            &[("pause_reason", &pause_reason)],
+        ));
+    }
     if let Some(description) = projection.pause_description.as_deref() {
         message.push('\n');
         message.push_str(&crate::i18n::t_args(
@@ -2282,15 +2297,27 @@ impl Chat {
                             blocker_messages, ..
                         } => {
                             let mut message = crate::i18n::t("zc-goal-paused");
-                            for blocker in blocker_messages {
-                                message.push('\n');
+                            message.push('\n');
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
+                            for (index, blocker) in blocker_messages.into_iter().enumerate() {
+                                if index == 0 {
+                                    message.push(' ');
+                                } else {
+                                    message.push_str("\n• ");
+                                }
                                 message.push_str(&crate::i18n::t_args(
-                                    "zc-goal-blocker",
+                                    "zc-goal-paused-notice-blocker",
                                     &[("blocker", blocker)],
                                 ));
                             }
                             message.push('\n');
+                            message.push_str(&crate::i18n::t("zc-goal-paused-next-heading"));
+                            message.push(' ');
                             message.push_str(&crate::i18n::t("zc-goal-paused-blocked-guidance"));
+                            message.push_str("\n• ");
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-cancel"));
+                            message.push_str("\n• ");
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-status"));
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
@@ -10473,9 +10500,8 @@ mod tests {
 
         assert!(rendered.contains("⏸️ Goal paused."));
         assert!(rendered.contains("Status: paused"));
-        assert!(rendered.contains("token limit: 12000"));
-        assert!(rendered.contains("cost limit USD: unlimited"));
-        assert!(rendered.contains("pause reason: needs_user_input"));
+        assert!(rendered.contains("Budget: 12000 tokens · USD unlimited"));
+        assert!(rendered.contains("Pause: needs_user_input"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
     }
@@ -21523,8 +21549,8 @@ mod tests {
         let ChatEntry::SystemMessage(text) = &entries[0] else {
             panic!("expected blocked Goal system message");
         };
-        assert!(text.contains("Blocker: Provide the task packet reference."));
-        assert!(text.contains("`/goal resume`"));
+        assert!(text.contains("\nBlocker: Provide the task packet reference."));
+        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
     }
 
     #[test]

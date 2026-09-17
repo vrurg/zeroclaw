@@ -609,16 +609,36 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
         GoalExecutionNotice::PausedForBlocker { blocker_messages } => {
             let mut message =
                 zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-paused-blocked");
-            for blocker in blocker_messages {
-                message.push('\n');
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-blocker-heading",
+            ));
+            for (index, blocker) in blocker_messages.into_iter().enumerate() {
+                if index == 0 {
+                    message.push(' ');
+                } else {
+                    message.push_str("\n• ");
+                }
                 message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                    "goal-mode-blocker",
+                    "goal-mode-paused-notice-blocker",
                     &[("blocker", blocker.as_str())],
                 ));
             }
             message.push('\n');
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-next-heading",
+            ));
+            message.push(' ');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-blocked-guidance",
+            ));
+            message.push_str("\n• ");
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-blocked-cancel",
+            ));
+            message.push_str("\n• ");
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-blocked-status",
             ));
             message
         }
@@ -638,9 +658,12 @@ mod tests {
         });
 
         assert!(rendered.starts_with("⏸️ Goal paused."));
-        assert!(rendered.contains("Blocker: Provide the task packet reference."));
+        assert!(rendered.contains("\n**Blocker:** Provide the task packet reference."));
         assert!(!rendered.contains("verifier requires resolution"));
-        assert!(rendered.contains("`/goal resume`"));
+        assert!(
+            rendered
+                .contains("\n**Next:** Resolve the blocker, then run /goal resume to continue.")
+        );
     }
 
     #[test]

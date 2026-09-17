@@ -9274,18 +9274,33 @@ fn render_goal_projection(
     } else {
         "goal-mode-no"
     });
-    let mut message = channel_runtime_cli_string_with_args(
-        "goal-mode-details",
+    let mut message =
+        channel_runtime_cli_string_with_args("goal-mode-summary-status", &[("status", status)]);
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-budget",
+        &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
+    ));
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-accounting",
+        &[("accounting", accounting)],
+    ));
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-execution",
         &[
-            ("status", status),
             ("epoch", &projection.execution_epoch.to_string()),
-            ("accounting", accounting),
             ("resumable", &resumable),
-            ("token_limit", &token_limit),
-            ("cost_limit", &cost_limit),
-            ("pause_reason", &pause_reason),
         ],
-    );
+    ));
+    if projection.pause_reason.is_some() {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-pause",
+            &[("pause_reason", &pause_reason)],
+        ));
+    }
     if let Some(description) = projection.pause_description.as_deref() {
         message.push('\n');
         message.push_str(&channel_runtime_cli_string_with_args(
@@ -9329,12 +9344,13 @@ mod goal_response_render_tests {
         let rendered = render_goal_response(&response);
 
         assert!(rendered.contains("⏸️ Goal paused."));
-        assert!(rendered.contains("Status: paused"));
-        assert!(rendered.contains("token limit: 12000"));
-        assert!(rendered.contains("cost limit USD: unlimited"));
-        assert!(rendered.contains("pause reason: needs_user_input"));
-        assert!(rendered.contains("Details: Select a target."));
-        assert!(rendered.contains("Blocker: Which target should receive the change?"));
+        assert!(rendered.contains("**Status:** paused"));
+        assert!(rendered.contains("**Budget:** 12000 tokens · USD unlimited"));
+        assert!(rendered.contains("**Accounting:** complete"));
+        assert!(rendered.contains("**Execution:** epoch 4 · resumable yes"));
+        assert!(rendered.contains("**Pause:** needs_user_input"));
+        assert!(rendered.contains("**Details:** Select a target."));
+        assert!(rendered.contains("**Blocker:** Which target should receive the change?"));
     }
 
     #[test]
