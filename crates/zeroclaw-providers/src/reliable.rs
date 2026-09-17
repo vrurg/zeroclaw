@@ -14,7 +14,8 @@ use super::traits::{
     StreamResult, TokenUsage,
 };
 use crate::terminal::{
-    TerminalRecoveryDisposition, default_terminal_policy, terminal_completion_context,
+    TerminalRecoveryDisposition, TerminalUsageChargeability, default_terminal_policy,
+    terminal_completion_context,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -371,8 +372,16 @@ fn remember_refusal(
     rejected_attempt_usage: &mut Option<TokenUsage>,
     error: &anyhow::Error,
 ) {
-    if let Some(refusal) = error.downcast_ref::<AnthropicRefusalError>() {
-        accumulate_usage(rejected_attempt_usage, refusal.usage.as_deref());
+    if let Some(refusal) = crate::model_refusal_from_error(error) {
+        // A canonical terminal context is authoritative for rejected-attempt
+        // accounting. In particular, a pre-output refusal can advance to a
+        // different candidate while remaining informational rather than being
+        // folded into either a later accepted response or an exhaustion sidecar.
+        if terminal_completion_context(error).is_none_or(|context| {
+            context.policy().usage_chargeability() == TerminalUsageChargeability::Billable
+        }) {
+            accumulate_usage(rejected_attempt_usage, refusal.usage.as_deref());
+        }
         if refusal_seen.is_none() {
             *refusal_seen = Some(refusal.clone());
         }
@@ -569,7 +578,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     // A typed model refusal cannot be repaired by replaying the same request
     // against the same candidate. Advance directly to the next configured
     // provider/model entry.
-    if err.downcast_ref::<AnthropicRefusalError>().is_some() {
+    if crate::model_refusal_from_error(err).is_some() {
         return true;
     }
 
@@ -6248,6 +6257,52 @@ mod tests {
             ),
         );
         assert!(terminal_error_usage(&informational).is_none());
+    }
+
+    #[test]
+    fn informational_refusal_does_not_enter_rejected_usage_aggregation() {
+        use crate::terminal::{
+            TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
+            terminal_completion_context_error_with_source,
+        };
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let refusal = AnthropicRefusalError {
+            requested_model: "claude-primary".to_string(),
+            category: None,
+            usage: Some(Box::new(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(0),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })),
+            provider_executed_tool_activity: false,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        };
+        let error = terminal_completion_context_error_with_source(
+            TerminalCompletionFailure::new(
+                TerminalCompletionError::Refusal,
+                refusal.usage.as_deref().cloned(),
+            ),
+            TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NextCandidate,
+                TerminalUsageChargeability::Informational,
+            ),
+            refusal,
+        );
+        let mut refusal_seen = None;
+        let mut rejected_usage = None;
+        remember_refusal(&mut refusal_seen, &mut rejected_usage, &error);
+
+        assert!(
+            refusal_seen.is_some(),
+            "fallback messaging keeps the refusal"
+        );
+        assert!(
+            rejected_usage.is_none(),
+            "informational refusal usage must not enter rejected-attempt accounting"
+        );
     }
 
     fn reliable_with_output_limit_primary()

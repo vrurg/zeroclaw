@@ -1,6 +1,7 @@
 use crate::terminal::{
     TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
-    terminal_completion_context_error,
+    terminal_completion_context, terminal_completion_context_error,
+    terminal_completion_context_error_with_source,
 };
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -2114,6 +2115,47 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Classify provider-supplied terminal metadata before it reaches logs.
+    ///
+    /// Terminal reasons and content-block types are protocol strings, but an
+    /// unknown value is still provider-controlled data. Diagnostics retain the
+    /// bounded protocol class, never the raw value.
+    fn diagnostic_terminal_reason(stop_reason: Option<&str>) -> &'static str {
+        match stop_reason {
+            Some("end_turn") => "end_turn",
+            Some("stop_sequence") => "stop_sequence",
+            Some("tool_use") => "tool_use",
+            Some("max_tokens") => "max_tokens",
+            Some("model_context_window_exceeded") => "context_window",
+            Some("pause_turn") => "paused_turn",
+            Some("refusal") => "refusal",
+            Some(_) => "unknown",
+            None => "missing",
+        }
+    }
+
+    fn diagnostic_content_block_type(kind: &str) -> &'static str {
+        match kind {
+            "text" => "text",
+            "thinking" => "thinking",
+            "redacted_thinking" => "redacted_thinking",
+            "tool_use" => "tool_use",
+            "server_tool_use" => "server_tool_use",
+            "web_search_tool_result" => "web_search_tool_result",
+            "mcp_tool_use" => "mcp_tool_use",
+            "mcp_tool_result" => "mcp_tool_result",
+            "fallback" => "fallback",
+            _ => "unknown",
+        }
+    }
+
+    /// Refusal categories are provider-controlled metadata. Preserve only the
+    /// fact that one was supplied so logs and fallback notices cannot retain
+    /// arbitrary provider text.
+    fn diagnostic_refusal_category(value: Option<&str>) -> Option<&'static str> {
+        value.map(|_| "provider_refusal")
+    }
+
     fn terminal_completion_policy(
         error: TerminalCompletionError,
         replay_safe: bool,
@@ -2204,6 +2246,92 @@ impl AnthropicModelProvider {
         })
     }
 
+    /// Decode a successful Messages envelope through a raw JSON boundary.
+    ///
+    /// A syntactically valid HTTP response can still contain wrong-typed
+    /// terminal fields. Those must be classified as an incomplete response,
+    /// not escape as a generic serde error that loses retry, replay, and usage
+    /// policy before the provider/runtime boundary.
+    fn invalid_native_response(usage: Option<TokenUsage>) -> anyhow::Error {
+        terminal_completion_context_error(
+            TerminalCompletionFailure::new(TerminalCompletionError::InvalidTerminalReason, usage),
+            Self::terminal_completion_policy(TerminalCompletionError::InvalidTerminalReason, false),
+        )
+    }
+
+    /// Salvage only independently well-typed token counters from an otherwise
+    /// malformed native envelope. Ancillary usage fields must not erase the
+    /// rejected-attempt accounting that is still trustworthy.
+    fn usage_from_native_envelope(envelope: &serde_json::Value) -> Option<TokenUsage> {
+        let usage = envelope.get("usage")?;
+        Self::streaming_usage(
+            usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64),
+            usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(serde_json::Value::as_u64),
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(serde_json::Value::as_u64),
+        )
+    }
+
+    fn decode_native_response(envelope: serde_json::Value) -> anyhow::Result<NativeChatResponse> {
+        let usage = Self::usage_from_native_envelope(&envelope);
+        serde_json::from_value(envelope).map_err(|_| Self::invalid_native_response(usage))
+    }
+
+    /// Decode a complete HTTP-success body before interpreting it as a native
+    /// Messages envelope. Invalid JSON is still an incomplete response, not a
+    /// retryable transport error: a provider may have completed work before
+    /// sending malformed terminal framing.
+    fn decode_native_response_body(body: &[u8]) -> anyhow::Result<NativeChatResponse> {
+        serde_json::from_slice(body)
+            .map_err(|_| Self::invalid_native_response(None))
+            .and_then(Self::decode_native_response)
+    }
+
+    /// Preserve a native refusal's typed diagnostic source while projecting
+    /// its recovery and chargeability through the canonical terminal context.
+    fn parse_native_completion(
+        response: NativeChatResponse,
+        requested_model: &str,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let refusal = Self::check_refusal(&response, requested_model).err();
+        let parsed = Self::parse_native_response(response);
+        match (refusal, parsed) {
+            (Some(refusal), Err(error)) => {
+                let Some(context) = terminal_completion_context(&error) else {
+                    return Err(error);
+                };
+                Err(terminal_completion_context_error_with_source(
+                    context.failure().clone(),
+                    context.policy(),
+                    refusal,
+                ))
+            }
+            (None, parsed) => parsed,
+            // `stop_reason: refusal` is a terminal state, so the canonical
+            // parser must not accept it. Retain a defensive typed error if a
+            // future parser change violates that invariant.
+            (Some(refusal), Ok(_)) => Err(terminal_completion_context_error_with_source(
+                TerminalCompletionFailure::new(
+                    TerminalCompletionError::Refusal,
+                    refusal.usage.as_deref().cloned(),
+                ),
+                Self::terminal_completion_policy(
+                    TerminalCompletionError::Refusal,
+                    !refusal.provider_executed_tool_activity,
+                ),
+                refusal,
+            )),
+        }
+    }
+
     /// The stub `tool_result` for one unanswered call, worded for why it is
     /// unanswered.
     fn orphan_tool_result_stub(
@@ -2224,13 +2352,15 @@ impl AnthropicModelProvider {
 
     fn parse_native_response(response: NativeChatResponse) -> anyhow::Result<ProviderChatResponse> {
         let stop_reason = response.stop_reason.as_deref();
-        let diagnostic_stop_reason = stop_reason.unwrap_or("missing");
+        let diagnostic_stop_reason = Self::diagnostic_terminal_reason(stop_reason);
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut has_unsupported_content_block = false;
+        let mut has_malformed_text = false;
+        let mut has_malformed_thinking = false;
         let mut has_malformed_client_tool = false;
         let mut has_malformed_provider_tool = false;
 
@@ -2240,12 +2370,20 @@ impl AnthropicModelProvider {
             let kind = block.kind.as_str();
             match kind {
                 "text" => {
-                    if let Some(text) = block
-                        .text
-                        .map(|text| text.trim().to_string())
-                        .filter(|text| !text.is_empty())
-                    {
-                        text_parts.push(text);
+                    match block.text {
+                        Some(text) => {
+                            let text = text.trim().to_string();
+                            if !text.is_empty() {
+                                text_parts.push(text);
+                            }
+                        }
+                        None => {
+                            // The streaming parser rejects a text block that
+                            // lacks its required text field. A completed
+                            // native envelope must fail closed the same way,
+                            // even when another block carries valid text.
+                            has_malformed_text = true;
+                        }
                     }
                 }
                 "thinking" => {
@@ -2263,12 +2401,16 @@ impl AnthropicModelProvider {
                             "signature": signature,
                         });
                         thinking_parts.push(json_block.to_string());
+                    } else {
+                        has_malformed_thinking = true;
                     }
                 }
                 "redacted_thinking" => {
                     if let Some(data) = block.data.as_deref().filter(|data| !data.is_empty()) {
                         thinking_parts
                             .push(serde_json::json!({ "redacted_thinking": data }).to_string());
+                    } else {
+                        has_malformed_thinking = true;
                     }
                 }
                 "tool_use" => {
@@ -2315,7 +2457,7 @@ impl AnthropicModelProvider {
                     has_unsupported_content_block = true;
                 }
             }
-            content_block_types.push(block.kind);
+            content_block_types.push(Self::diagnostic_content_block_type(&block.kind).to_string());
         }
 
         let reasoning_content = if thinking_parts.is_empty() {
@@ -2335,7 +2477,11 @@ impl AnthropicModelProvider {
             reasoning_content,
         };
 
-        if has_unsupported_content_block || has_malformed_client_tool || has_malformed_provider_tool
+        if has_unsupported_content_block
+            || has_malformed_text
+            || has_malformed_thinking
+            || has_malformed_client_tool
+            || has_malformed_provider_tool
         {
             let error = TerminalCompletionError::InvalidTerminalReason;
             ::zeroclaw_log::record!(
@@ -2466,10 +2612,8 @@ impl AnthropicModelProvider {
     }
 
     /// Detect a native Anthropic safety-classifier refusal. Returns `Err` iff
-    /// the API set `stop_reason: "refusal"`, capturing the optional category
-    /// token. The category is retained for structured logs and reliability
-    /// handling but omitted from the error's `Display` output; the unstable
-    /// `explanation` is never deserialized. Must run before
+    /// the API set `stop_reason: "refusal"`, retaining only a bounded category
+    /// presence marker. The unstable `explanation` is never deserialized. Must run before
     /// `parse_native_response` so a refusal carrying partial `content` still
     /// errors.
     fn check_refusal(
@@ -2482,7 +2626,8 @@ impl AnthropicModelProvider {
         let category = response
             .stop_details
             .as_ref()
-            .and_then(|details| details.category.clone());
+            .and_then(|details| Self::diagnostic_refusal_category(details.category.as_deref()))
+            .map(str::to_owned);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -2815,6 +2960,12 @@ impl AnthropicModelProvider {
         // The block summary only feeds the DEBUG `message_stop` event. Avoid
         // per-block String and map allocations when that event is disabled.
         let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
+        // Anthropic streams begin with one `message_start` envelope. Keep the
+        // raw event sequence as protocol evidence: a terminal marker without
+        // that opening frame may still have exposed partial output, but it
+        // cannot establish a clean, reusable completion.
+        let mut saw_message_start = false;
+        let mut saw_non_start_event = false;
         let mut last_stop_reason: Option<String> = None;
         let mut content_block_count = 0usize;
         // Anthropic emits a `content_block_stop` for every indexed block it
@@ -2940,6 +3091,23 @@ impl AnthropicModelProvider {
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
 
+            // `ping` and future extension events are explicitly allowed
+            // anywhere in the stream. They carry no lifecycle state, so they
+            // must not make an otherwise valid later message_start appear
+            // out of order. Only the documented ordered events establish the
+            // opening-frame boundary.
+            if matches!(
+                event_type,
+                "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+                    | "error"
+            ) {
+                saw_non_start_event = true;
+            }
+
             match event_type {
                 "content_block_start" | "content_block_delta" | "content_block_stop"
                     if last_stop_reason.is_some() =>
@@ -2960,12 +3128,23 @@ impl AnthropicModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "event_type": event_type,
-                                "stop_reason": last_stop_reason,
+                                "stop_reason": Self::diagnostic_terminal_reason(
+                                    last_stop_reason.as_deref(),
+                                ),
                             })),
                         "stream: content block after terminal message_delta; stream remains non-final"
                     );
                 }
                 "message_start" => {
+                    let valid_message_start = event
+                        .get("message")
+                        .is_some_and(serde_json::Value::is_object);
+                    if saw_message_start || saw_non_start_event || !valid_message_start {
+                        terminal_completion_error
+                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                    } else {
+                        saw_message_start = true;
+                    }
                     let model = event
                         .get("message")
                         .and_then(|m| m.get("model"))
@@ -3091,7 +3270,7 @@ impl AnthropicModelProvider {
                         {
                             content_block_count = content_block_count.saturating_add(1);
                             *content_block_type_counts
-                                .entry(block_type.to_string())
+                                .entry(Self::diagnostic_content_block_type(block_type).to_string())
                                 .or_default() += 1;
                         }
                         if started && thinking_block_active {
@@ -3476,8 +3655,12 @@ impl AnthropicModelProvider {
                                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                     .with_attrs(
                                         ::serde_json::json!({
-                                            "first_stop_reason": first_stop_reason,
-                                            "later_stop_reason": stop_reason,
+                                            "first_stop_reason": Self::diagnostic_terminal_reason(
+                                                Some(first_stop_reason),
+                                            ),
+                                            "later_stop_reason": Self::diagnostic_terminal_reason(
+                                                Some(stop_reason),
+                                            ),
                                         })
                                     ),
                                     "stream: conflicting message_delta stop_reason; stream remains non-final"
@@ -3595,7 +3778,7 @@ impl AnthropicModelProvider {
                             "response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
                     } else {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": stop_reason.unwrap_or("missing"), "output_tokens": observed_output})), "stream: message_delta");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": Self::diagnostic_terminal_reason(stop_reason), "output_tokens": observed_output})), "stream: message_delta");
                     }
                 }
                 "message_stop" => {
@@ -3610,7 +3793,9 @@ impl AnthropicModelProvider {
                                 ::zeroclaw_log::Action::Note
                             )
                             .with_attrs(::serde_json::json!({
-                                "stop_reason": last_stop_reason.as_deref().unwrap_or("unknown"),
+                                "stop_reason": Self::diagnostic_terminal_reason(
+                                    last_stop_reason.as_deref(),
+                                ),
                                 "content_block_count": content_block_count,
                                 "open_content_block_count": open_content_block_indices.len(),
                                 "content_block_types": content_block_type_counts,
@@ -3625,6 +3810,10 @@ impl AnthropicModelProvider {
                         cache_creation_input_tokens,
                     );
                     let error = terminal_completion_error
+                        .or_else(|| {
+                            (!saw_message_start)
+                                .then_some(TerminalCompletionError::InvalidTerminalReason)
+                        })
                         .or_else(|| {
                             (!open_content_block_indices.is_empty())
                                 .then_some(TerminalCompletionError::InvalidTerminalReason)
@@ -3847,11 +4036,10 @@ impl ModelProvider for AnthropicModelProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: NativeChatResponse = response.json().await?;
+        let chat_response = Self::decode_native_response_body(&response.bytes().await?)?;
         commit_safeguard_fallback(None);
-        Self::check_refusal(&chat_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
-        let parsed = Self::parse_native_response(chat_response)?;
+        let parsed = Self::parse_native_completion(chat_response, model)?;
         commit_safeguard_fallback(safeguard_notice);
         parsed.text.ok_or_else(|| {
             // `parse_native_response` rejects semantic-empty responses. This
@@ -3974,11 +4162,10 @@ impl ModelProvider for AnthropicModelProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let native_response = Self::decode_native_response_body(&response.bytes().await?)?;
         commit_safeguard_fallback(None);
-        Self::check_refusal(&native_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&native_response, model);
-        let parsed = Self::parse_native_response(native_response);
+        let parsed = Self::parse_native_completion(native_response, model);
         if parsed.is_ok() {
             commit_safeguard_fallback(safeguard_notice);
         }
@@ -4214,15 +4401,30 @@ impl ModelProvider for AnthropicModelProvider {
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
                     return Err(StreamError::ModelProvider(format!("{status}: {body}")));
                 }
-                let parsed: NativeChatResponse = response
-                    .json()
+                let body = response
+                    .bytes()
                     .await
-                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                    .map_err(|e| StreamError::ModelProvider(format!("response body: {e}")))?;
+                let parsed = match Self::decode_native_response_body(&body) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        if let Some(context) = crate::terminal::terminal_completion_context(&error)
+                        {
+                            crate::terminal::publish_terminal_policy(
+                                &terminal_policy_slot,
+                                context.failure().reason,
+                                context.policy(),
+                            );
+                        }
+                        return Err(zeroclaw_api::model_provider::terminal_completion_failure(&error)
+                            .cloned()
+                            .map(StreamError::TerminalCompletion)
+                            .unwrap_or_else(|| StreamError::ModelProvider(error.to_string())));
+                    }
+                };
                 commit_safeguard_fallback(None);
-                Self::check_refusal(&parsed, &requested_model)
-                    .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
                 let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
-                match Self::parse_native_response(parsed)
+                match Self::parse_native_completion(parsed, &requested_model)
                     .map_err(Self::preserve_native_thinking_no_replay)
                 {
                     Ok(response) => {
@@ -4237,6 +4439,20 @@ impl ModelProvider for AnthropicModelProvider {
                                 context.failure().reason,
                                 context.policy(),
                             );
+                            // A malformed native envelope can also carry a
+                            // refusal marker. The parser's invalid-terminal
+                            // classification is more conservative than the
+                            // marker: it preserves the no-replay boundary for
+                            // unrecognized provider work and must not be
+                            // replaced by a typed refusal stream error.
+                            if context.failure().reason != TerminalCompletionError::Refusal {
+                                return Err(StreamError::TerminalCompletion(
+                                    context.failure().clone(),
+                                ));
+                            }
+                        }
+                        if let Some(refusal) = crate::model_refusal_from_error(&error) {
+                            return Err(StreamError::ModelRefusal(Box::new(refusal.clone())));
                         }
                         if error
                             .downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
@@ -5396,7 +5612,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn streaming_without_terminal_reason_is_invalid() {
         use std::io::Cursor;
 
-        let bytes = b"event: content_block_start\n\
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
@@ -5468,7 +5686,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn streaming_redacted_thinking_reaches_tool_continuation_in_order() {
         use std::io::Cursor;
 
-        let bytes = b"event: content_block_start\n\
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{}}\n\n\
+event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-provider-payload\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
@@ -5647,7 +5867,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn streaming_server_tool_with_split_think_only_text_is_not_final() {
         use std::io::Cursor;
 
-        let bytes = b"event: content_block_start\n\
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<think>internal\"}}\n\n\
@@ -5868,7 +6090,9 @@ data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\"}}\n\n";
             ),
         ] {
             let bytes = format!(
-                "event: content_block_start\n\
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
 data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\
 event: content_block_delta\n\
 data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n\
@@ -6347,7 +6571,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             post(|| async {
                 let first = futures_util::stream::once(async {
                     Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
-                        b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                        b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
                     ))
                 });
                 let terminal = futures_util::stream::once(async {
@@ -6646,7 +6870,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn interleaved_content_blocks_finalize_only_the_matching_tool() {
         use std::io::Cursor;
 
-        let bytes = b"event: content_block_start\n\
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-0\",\"name\":\"lookup\",\"input\":{}}}\n\n\
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -6921,6 +7147,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         ] {
             let events = [
                 serde_json::json!({
+                    "type": "message_start",
+                    "message": {"usage": {"input_tokens": 10}}
+                }),
+                serde_json::json!({
                     "type": "content_block_start",
                     "index": 0,
                     "content_block": {"type": "text", "text": ""}
@@ -6979,6 +7209,132 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             assert_eq!(text, "answer");
             assert_eq!(final_count, 1, "valid provider JSON must finalize");
             assert_eq!(failures, 0, "valid provider JSON must not fail");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_without_message_start_preserves_partial_and_fails_closed() {
+        use std::io::Cursor;
+
+        // The raw SSE envelope is incomplete: Anthropic documents
+        // `message_start` as the first event. Preserve text already exposed
+        // before detection, but never turn the later message_stop into Final.
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut text = String::new();
+        let mut final_count = 0;
+        let mut failures = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(StreamEvent::Final) => final_count += 1,
+                Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(text, "partial", "already-exposed output is preserved");
+        assert_eq!(final_count, 0, "missing message_start must not emit Final");
+        assert_eq!(failures.len(), 1, "one typed failure must be emitted");
+        assert_eq!(
+            failures[0].reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+    }
+
+    #[tokio::test]
+    async fn control_or_extension_events_before_message_start_preserve_a_valid_stream() {
+        use std::io::Cursor;
+
+        // Anthropic permits pings anywhere and requires clients to tolerate
+        // future event types. Neither control event owns message lifecycle
+        // state, so the subsequent documented sequence remains clean.
+        let bytes = b"event: ping\n\
+data: {\"type\":\"ping\"}\n\n\
+event: future_extension\n\
+data: {\"type\":\"future_extension\"}\n\n\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut text = String::new();
+        let mut final_count = 0;
+        let mut failures = 0;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(StreamEvent::Final) => final_count += 1,
+                Err(StreamError::TerminalCompletion(_)) => failures += 1,
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(text, "ok");
+        assert_eq!(final_count, 1, "valid terminal sequence must remain final");
+        assert_eq!(failures, 0, "control events must not invalidate the stream");
+    }
+
+    #[tokio::test]
+    async fn malformed_or_duplicate_message_start_cannot_emit_final() {
+        use std::io::Cursor;
+
+        for opening in [
+            "data: {\"type\":\"message_start\"}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        ] {
+            let bytes = format!(
+                "{opening}data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut failures = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(final_count, 0, "invalid opening frame must not finalize");
+            assert_eq!(failures.len(), 1, "one typed failure must be emitted");
+            assert_eq!(
+                failures[0].reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
         }
     }
 
@@ -8915,6 +9271,318 @@ data: {\"type\":\"message_stop\"}\n\n";
             context.policy().usage_chargeability(),
             TerminalUsageChargeability::Informational
         );
+    }
+
+    #[test]
+    fn native_refusal_keeps_typed_cause_inside_canonical_terminal_context() {
+        let response = AnthropicModelProvider::decode_native_response(serde_json::json!({
+            "stop_reason": "refusal",
+            "content": [],
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        }))
+        .expect("fixture envelope must decode");
+
+        let error = AnthropicModelProvider::parse_native_completion(response, "claude-test")
+            .expect_err("a refusal is not a complete answer");
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("refusal must use the canonical terminal policy carrier");
+        assert_eq!(context.failure().reason, TerminalCompletionError::Refusal);
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NextCandidate
+        );
+        assert_eq!(
+            context.policy().usage_chargeability(),
+            TerminalUsageChargeability::Informational
+        );
+        assert!(
+            crate::model_refusal_from_error(&error).is_some(),
+            "the terminal context must retain the typed refusal for reliability"
+        );
+    }
+
+    #[test]
+    fn native_raw_envelope_rejects_wrong_typed_content_without_losing_usage() {
+        let error = AnthropicModelProvider::decode_native_response(serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "server_tool_use", "id": 7}],
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        }))
+        .expect_err("a wrong-typed native field must fail closed");
+
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("raw-envelope rejection must carry terminal policy");
+        assert_eq!(
+            context.failure().reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+        assert_eq!(
+            context
+                .failure()
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn native_response_rejects_missing_text_beside_valid_text() {
+        let response = AnthropicModelProvider::decode_native_response(serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "text", "text": "valid sibling"},
+                {"type": "text"},
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        }))
+        .expect("raw envelope retains an absent optional text field for parser validation");
+
+        let error = AnthropicModelProvider::parse_native_response(response)
+            .expect_err("a malformed text sibling must not be silently discarded");
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("malformed text must use the terminal policy carrier");
+        assert_eq!(
+            context.failure().reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+        assert_eq!(
+            context
+                .failure()
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn native_response_rejects_malformed_thinking_beside_valid_content() {
+        for malformed in [
+            serde_json::json!({"type": "thinking"}),
+            serde_json::json!({"type": "redacted_thinking"}),
+        ] {
+            let response = AnthropicModelProvider::decode_native_response(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "text", "text": "valid sibling"},
+                    malformed,
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 3},
+            }))
+            .expect(
+                "raw envelope retains malformed optional thinking fields for parser validation",
+            );
+
+            let error = AnthropicModelProvider::parse_native_response(response)
+                .expect_err("malformed thinking must not be silently discarded");
+            let context = crate::terminal::terminal_completion_context(&error)
+                .expect("malformed thinking must use the terminal policy carrier");
+            assert_eq!(
+                context.failure().reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+            assert_eq!(
+                context.policy().recovery(),
+                TerminalRecoveryDisposition::NoReplay
+            );
+        }
+    }
+
+    #[test]
+    fn native_terminal_diagnostic_metadata_is_bounded() {
+        assert_eq!(
+            AnthropicModelProvider::diagnostic_terminal_reason(Some("user@example.com")),
+            "unknown"
+        );
+        assert_eq!(
+            AnthropicModelProvider::diagnostic_content_block_type("acct-12345"),
+            "unknown"
+        );
+        assert_eq!(
+            AnthropicModelProvider::diagnostic_terminal_reason(Some("max_tokens")),
+            "max_tokens"
+        );
+        assert_eq!(
+            AnthropicModelProvider::diagnostic_refusal_category(Some("user@example.com")),
+            Some("provider_refusal")
+        );
+    }
+
+    #[test]
+    fn malformed_native_refusal_keeps_invalid_terminal_authoritative() {
+        let response = AnthropicModelProvider::decode_native_response(serde_json::json!({
+            "stop_reason": "refusal",
+            "content": [{"type": "unknown_provider_work"}],
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        }))
+        .expect("fixture envelope must decode");
+        let error = AnthropicModelProvider::parse_native_completion(response, "claude-test")
+            .expect_err("unknown content must fail closed");
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+        assert!(
+            crate::model_refusal_from_error(&error).is_none(),
+            "typed refusal provenance must not override invalid terminal framing"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_success_with_malformed_json_is_no_replay_terminal_failure() {
+        let (addr, server) = spawn_messages_raw_server("{\"content\": [").await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let error = provider
+            .chat(request, "claude-sonnet-4-6", None)
+            .await
+            .expect_err("malformed HTTP-success JSON must fail closed");
+        server.abort();
+
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("malformed native JSON must carry terminal policy");
+        assert_eq!(
+            context.failure().reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn http_success_with_invalid_utf8_is_no_replay_terminal_failure() {
+        let (addr, server) = spawn_messages_raw_server(
+            b"{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"ok\xff\"}]}"
+                .to_vec(),
+        )
+        .await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let error = provider
+            .chat(request, "claude-sonnet-4-6", None)
+            .await
+            .expect_err("invalid UTF-8 must not be repaired into a successful response");
+        server.abort();
+
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("invalid native bytes must carry terminal policy");
+        assert_eq!(
+            context.failure().reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_fallback_malformed_json_preserves_invalid_terminal_outcome() {
+        let (addr, server) = spawn_messages_raw_server("{\"content\": [").await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 10_000,
+                display: None,
+            }),
+        };
+
+        let events: Vec<StreamResult<StreamEvent>> = provider
+            .stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Err(StreamError::TerminalCompletion(failure))
+                    if failure.reason == TerminalCompletionError::InvalidTerminalReason
+            )),
+            "malformed native JSON must keep the typed no-replay terminal outcome: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_fallback_invalid_utf8_preserves_invalid_terminal_outcome() {
+        let (addr, server) = spawn_messages_raw_server(
+            b"{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"ok\xff\"}]}"
+                .to_vec(),
+        )
+        .await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 10_000,
+                display: None,
+            }),
+        };
+
+        let events: Vec<StreamResult<StreamEvent>> = provider
+            .stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Err(StreamError::TerminalCompletion(failure))
+                    if failure.reason == TerminalCompletionError::InvalidTerminalReason
+            )),
+            "invalid native bytes must keep the typed no-replay terminal outcome: {events:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_ancillary_usage_preserves_independent_token_counters() {
+        let error = AnthropicModelProvider::decode_native_response(serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "server_tool_use", "id": 7}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "iterations": {}
+            },
+        }))
+        .expect_err("wrong-typed content must fail closed");
+
+        let usage = crate::terminal::terminal_completion_context(&error)
+            .expect("invalid envelope must retain terminal context")
+            .failure()
+            .usage
+            .as_ref()
+            .expect("independently valid token counters must survive");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(3));
     }
 
     #[test]
@@ -12028,6 +12696,35 @@ data: {\"type\":\"message_stop\"}\n\n";
         (addr, handle)
     }
 
+    /// Spin up a mock `/v1/messages` server with a deliberately raw JSON
+    /// response body for malformed-envelope regression coverage.
+    async fn spawn_messages_raw_server(
+        body: impl Into<Vec<u8>>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::header, response::Response, routing::post};
+        use tokio::net::TcpListener;
+
+        let body = body.into();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
     /// Spin up a mock `/v1/messages` server that streams raw SSE events.
     async fn spawn_messages_sse_server(
         body: &'static str,
@@ -12548,10 +13245,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error");
-        let typed = err
-            .downcast_ref::<AnthropicRefusalError>()
-            .expect("error must downcast to AnthropicRefusalError");
-        assert_eq!(typed.category.as_deref(), Some("cyber"));
+        let typed = crate::model_refusal_from_error(&err)
+            .expect("error must retain AnthropicRefusalError in its cause chain");
+        assert_eq!(typed.category.as_deref(), Some("provider_refusal"));
     }
 
     #[tokio::test]
@@ -12574,9 +13270,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error even without stop_details");
-        let typed = err
-            .downcast_ref::<AnthropicRefusalError>()
-            .expect("error must downcast to AnthropicRefusalError");
+        let typed = crate::model_refusal_from_error(&err)
+            .expect("error must retain AnthropicRefusalError in its cause chain");
         assert_eq!(typed.category, None);
     }
 
@@ -12605,10 +13300,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error");
-        let typed = err
-            .downcast_ref::<AnthropicRefusalError>()
-            .expect("error must downcast to AnthropicRefusalError");
-        assert_eq!(typed.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        let typed = crate::model_refusal_from_error(&err)
+            .expect("error must retain AnthropicRefusalError in its cause chain");
+        assert_eq!(typed.category.as_deref(), Some("provider_refusal"));
         assert_eq!(format!("{err}"), ANTHROPIC_REFUSAL_MESSAGE);
         assert_eq!(format!("{typed}"), ANTHROPIC_REFUSAL_MESSAGE);
         assert!(!format!("{err}").contains("CATEGORY_SENTINEL"));
@@ -12631,8 +13325,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// match can only come from interpolating `category` itself.
     const CATEGORY_SENTINEL: &str = "zc-category-sentinel";
 
-    /// Build the typed refusal error the way the provider does, carrying
-    /// [`CATEGORY_SENTINEL`] as the native refusal category.
+    /// Build the typed refusal error the way the provider does, proving that
+    /// [`CATEGORY_SENTINEL`] is reduced to a bounded diagnostic class.
     fn refusal_error_with_sentinel_category() -> AnthropicRefusalError {
         let json = format!(
             r#"{{
@@ -12689,15 +13383,15 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
-    /// The fix removes the category from rendered text only — it must not
-    /// silently drop the structured-logging / reliability signal.
+    /// The provider retains category presence only as a bounded diagnostic
+    /// signal; arbitrary provider text must not escape the boundary.
     #[test]
-    fn refusal_error_retains_category_for_logging() {
+    fn refusal_error_bounds_category_for_diagnostics() {
         let err = refusal_error_with_sentinel_category();
         assert_eq!(
             err.category.as_deref(),
-            Some(CATEGORY_SENTINEL),
-            "category must stay on the typed error for structured logs"
+            Some("provider_refusal"),
+            "typed diagnostics retain a fixed presence class, never raw provider text"
         );
         assert_eq!(err.requested_model, "claude-sonnet-4-6");
     }
@@ -12737,10 +13431,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error");
-        let typed = err
-            .downcast_ref::<AnthropicRefusalError>()
-            .expect("error must downcast to AnthropicRefusalError");
-        assert_eq!(typed.category.as_deref(), Some("frontier_llm"));
+        let typed = crate::model_refusal_from_error(&err)
+            .expect("error must retain AnthropicRefusalError in its cause chain");
+        assert_eq!(typed.category.as_deref(), Some("provider_refusal"));
         assert_eq!(
             typed.usage.as_ref().and_then(|usage| usage.input_tokens),
             Some(5)
@@ -12783,13 +13476,60 @@ data: {\"type\":\"message_stop\"}\n\n";
                 _ => None,
             })
             .expect("stream must yield a typed refusal");
-        assert_eq!(refusal.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        assert_eq!(refusal.category.as_deref(), Some("provider_refusal"));
         assert_eq!(
             refusal.usage.as_ref().and_then(|usage| usage.input_tokens),
             Some(5)
         );
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
         assert!(!refusal.to_string().contains("CATEGORY_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn thinking_fallback_malformed_refusal_preserves_invalid_terminal_outcome() {
+        let body = serde_json::json!({
+            "content": [{"type": "provider_work_with_untrusted_shape"}],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 5, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 10_000,
+                display: None,
+            }),
+        };
+
+        let events: Vec<StreamResult<StreamEvent>> = provider
+            .stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        server.abort();
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "a malformed native refusal must not emit Final"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Err(StreamError::TerminalCompletion(failure))
+                    if failure.reason == TerminalCompletionError::InvalidTerminalReason
+            )),
+            "malformed content must keep the canonical invalid-terminal outcome: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Err(StreamError::ModelRefusal(_)))),
+            "the refusal marker must not replace an invalid terminal envelope"
+        );
     }
 
     // ----- Server-side fallback detection (§4) -------------------------
@@ -12905,8 +13645,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .chat_with_system(None, "hello", "claude-fable-5", None)
                 .await;
             let err = result.expect_err("a whole-chain refusal must surface as an error");
-            err.downcast_ref::<AnthropicRefusalError>()
-                .expect("error must downcast to AnthropicRefusalError");
+            crate::model_refusal_from_error(&err)
+                .expect("error must retain AnthropicRefusalError in its cause chain");
             assert!(
                 take_last_safeguard_fallback().is_none(),
                 "a refusal must NOT record a server-side fallback notice"
@@ -13175,8 +13915,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         server.abort();
 
         assert!(
-            err.downcast_ref::<AnthropicRefusalError>().is_some(),
-            "returned error must be the typed refusal: {err}"
+            crate::model_refusal_from_error(&err).is_some(),
+            "returned error must retain the typed refusal: {err}"
         );
         let report = scope.take();
         assert_eq!(

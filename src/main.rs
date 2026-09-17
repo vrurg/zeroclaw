@@ -10710,6 +10710,289 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
 
+    /// Deterministic terminal double for the selector's interaction contract.
+    ///
+    /// The terminal-delivery PR must not discard the selector regression
+    /// coverage that guards geometry, cleanup, and selection identity.
+    #[cfg(feature = "agent-runtime")]
+    struct QuickstartSelectorTestTerminal {
+        sizes: std::collections::VecDeque<Option<(u16, u16)>>,
+        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
+        actions: Vec<&'static str>,
+        fail_action: Option<&'static str>,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl QuickstartSelectorTestTerminal {
+        fn new(
+            sizes: impl IntoIterator<Item = Option<(u16, u16)>>,
+            keys: impl IntoIterator<Item = std::io::Result<QuickstartSelectorKey>>,
+        ) -> Self {
+            Self {
+                sizes: sizes.into_iter().collect(),
+                keys: keys.into_iter().collect(),
+                actions: Vec::new(),
+                fail_action: None,
+            }
+        }
+
+        fn perform(&mut self, action: &'static str) -> std::io::Result<()> {
+            self.actions.push(action);
+            if self.fail_action == Some(action) {
+                return Err(std::io::Error::other(format!("injected {action} failure")));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl QuickstartSelectorTerminal for QuickstartSelectorTestTerminal {
+        fn size_checked(&mut self) -> Option<(u16, u16)> {
+            self.sizes.pop_front().flatten()
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("enter_alternate_screen")
+        }
+
+        fn clear_screen(&mut self) -> std::io::Result<()> {
+            self.perform("clear_screen")
+        }
+
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            self.perform("move_cursor_to_origin")
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("hide_cursor")
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("show_cursor")
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("leave_alternate_screen")
+        }
+
+        fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+            self.perform("write_line")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.perform("flush")
+        }
+
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            self.actions.push("read_key");
+            self.keys.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no injected selector key",
+                ))
+            })
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_resize_fails_closed_and_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 40))],
+            [Ok(QuickstartSelectorKey::Down)],
+        );
+        let error = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect_err("a changed output geometry must abort the selector");
+
+        assert!(error.to_string().contains("40"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_partial_entry_failure_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80))],
+            std::iter::empty::<std::io::Result<QuickstartSelectorKey>>(),
+        );
+        term.fail_action = Some("clear_screen");
+
+        let error = match QuickstartSelectorScreen::enter(&mut term) {
+            Ok(_) => panic!("injected entry failure must be returned"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("clear_screen"));
+        assert_eq!(
+            term.actions,
+            [
+                "enter_alternate_screen",
+                "clear_screen",
+                "show_cursor",
+                "leave_alternate_screen",
+                "flush",
+            ]
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_uses_index_when_fitted_labels_match() {
+        let choices = [
+            (QuickstartChecklistAction::Provider, String::new()),
+            (QuickstartChecklistAction::Risk, String::new()),
+            (QuickstartChecklistAction::Create, String::new()),
+        ];
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(1)),
+            QuickstartChecklistAction::Risk
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_unknown_or_unsafe_geometry() {
+        assert!(!quickstart_selector_size_is_usable(None));
+        assert!(quickstart_selector_size_is_usable(Some((20, 80))));
+        assert!(quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some());
+        assert!(quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH - 1).is_none());
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_navigation_redraws_and_preserves_selected_identity() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [
+                Some((20, 80)),
+                Some((20, 80)),
+                Some((20, 80)),
+                Some((20, 80)),
+            ],
+            [
+                Ok(QuickstartSelectorKey::Down),
+                Ok(QuickstartSelectorKey::Up),
+                Ok(QuickstartSelectorKey::Select),
+            ],
+        );
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("navigation should complete");
+
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(Some(0)));
+        assert_eq!(
+            term.actions
+                .iter()
+                .filter(|action| **action == "clear_screen")
+                .count(),
+            3,
+            "initial frame plus both navigation redraws must clear the old frame"
+        );
+        assert_eq!(
+            term.actions
+                .iter()
+                .filter(|action| **action == "move_cursor_to_origin")
+                .count(),
+            3,
+            "every redraw must begin from the terminal origin"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_size_during_interaction_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), None],
+            [Ok(QuickstartSelectorKey::Other)],
+        );
+        let error =
+            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
+                .expect_err("loss of output geometry must abort the selector");
+
+        assert!(error.to_string().contains("terminal"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_interrupt_and_read_failure_restore_screen() {
+        let mut interrupt = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 80))],
+            [Ok(QuickstartSelectorKey::Interrupt)],
+        );
+        interrupt.fail_action = Some("show_cursor");
+        assert_eq!(
+            interact_quickstart_selector(
+                &mut interrupt,
+                &["first".to_string()],
+                "Choose",
+                (20, 80),
+            )
+            .expect("cleanup failure must not replace interrupt semantics"),
+            QuickstartSelectorOutcome::Interrupt
+        );
+        assert!(interrupt.actions.contains(&"leave_alternate_screen"));
+
+        let mut read_failure = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 80))],
+            [Err(std::io::Error::other("injected read failure"))],
+        );
+        let error = interact_quickstart_selector(
+            &mut read_failure,
+            &["first".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect_err("read failure must surface");
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(read_failure.actions.contains(&"show_cursor"));
+        assert!(read_failure.actions.contains(&"leave_alternate_screen"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_fits_rows_without_erasing_action_labels() {
+        let rows = [
+            "[ ] Model provider — not yet chosen",
+            "[ ] Risk profile — not yet chosen",
+            "[ ] Memory — not yet chosen",
+            "── Create agent",
+        ];
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH)
+            .expect("the minimum accepted width has a usable row budget");
+        let fitted: Vec<String> = rows
+            .iter()
+            .map(|row| fit_quickstart_selector_row(row, budget))
+            .collect();
+        assert!(
+            fitted
+                .iter()
+                .all(|row| row.chars().any(char::is_alphanumeric))
+        );
+        assert_eq!(
+            fitted
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            fitted.len(),
+            "accepted-width labels must remain distinguishable"
+        );
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn sop_provider_identity_keeps_same_family_aliases_distinct() {

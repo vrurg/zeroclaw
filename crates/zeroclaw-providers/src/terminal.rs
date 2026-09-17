@@ -85,7 +85,7 @@ pub(crate) fn contextualize_terminal_stream_error(
     match (failure, published) {
         (Some(failure), Some(published)) if failure.reason == published.reason => {
             if matches!(&error, StreamError::ModelRefusal(_)) {
-                terminal_completion_context_stream_error(failure, published.policy, error)
+                terminal_completion_context_error_with_source(failure, published.policy, error)
             } else {
                 terminal_completion_context_error(failure, published.policy)
             }
@@ -160,24 +160,29 @@ pub struct TerminalCompletionContext {
     policy: TerminalCompletionPolicy,
 }
 
-/// Internal terminal-policy wrapper for stream errors that must retain a
-/// provider-specific typed cause. The policy remains the canonical recovery
-/// decision; the source is retained only for diagnostic and refusal handling.
+/// Internal terminal-policy wrapper that retains a provider-specific typed
+/// cause. The policy remains the canonical recovery decision; the source is
+/// retained for diagnostic, accounting, and refusal handling.
 #[derive(Debug)]
-struct TerminalCompletionContextWithStreamSource {
+struct TerminalCompletionContextWithSource {
     context: TerminalCompletionContext,
-    source: StreamError,
+    typed_source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-impl std::fmt::Display for TerminalCompletionContextWithStreamSource {
+impl std::fmt::Display for TerminalCompletionContextWithSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.context.fmt(f)
+        // The context owns recovery and accounting policy; the typed source
+        // owns its established, sanitized diagnostic wording.
+        self.typed_source.fmt(f)
     }
 }
 
-impl std::error::Error for TerminalCompletionContextWithStreamSource {
+impl std::error::Error for TerminalCompletionContextWithSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        // Keep the stable terminal failure in the public error chain. Typed
+        // provider provenance has a separate internal accessor below because
+        // `std::error::Error` has only one source edge.
+        Some(&self.context)
     }
 }
 
@@ -214,14 +219,30 @@ pub(crate) fn terminal_completion_context_error(
 }
 
 #[must_use]
-fn terminal_completion_context_stream_error(
+pub(crate) fn terminal_completion_context_error_with_source<E>(
     failure: TerminalCompletionFailure,
     policy: TerminalCompletionPolicy,
-    source: StreamError,
-) -> anyhow::Error {
-    anyhow::Error::new(TerminalCompletionContextWithStreamSource {
+    source: E,
+) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    anyhow::Error::new(TerminalCompletionContextWithSource {
         context: TerminalCompletionContext { failure, policy },
-        source,
+        typed_source: Box::new(source),
+    })
+}
+
+/// Return provider-specific provenance retained beside a canonical terminal
+/// context. Public consumers follow the normal error chain for the terminal
+/// failure; provider-local consumers use this accessor for typed diagnostics.
+pub(crate) fn terminal_completion_typed_source(
+    error: &anyhow::Error,
+) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalCompletionContextWithSource>()
+            .map(|context| context.typed_source.as_ref())
     })
 }
 
@@ -232,7 +253,7 @@ pub fn terminal_completion_context(error: &anyhow::Error) -> Option<&TerminalCom
             .downcast_ref::<TerminalCompletionContext>()
             .or_else(|| {
                 cause
-                    .downcast_ref::<TerminalCompletionContextWithStreamSource>()
+                    .downcast_ref::<TerminalCompletionContextWithSource>()
                     .map(|context| &context.context)
             })
     })
@@ -335,6 +356,12 @@ mod tests {
         assert!(
             crate::model_refusal_from_error(&error).is_some(),
             "terminal projection must retain the typed refusal for safety messaging"
+        );
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_failure(&error)
+                .map(|failure| failure.reason),
+            Some(TerminalCompletionError::Refusal),
+            "the public terminal-failure extractor must survive provenance wrapping"
         );
     }
 }
