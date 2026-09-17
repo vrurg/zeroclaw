@@ -3603,6 +3603,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_kill_without_selection_is_visible_in_status_line() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
+
+        dashboard.kill_selected_session();
+
+        assert!(
+            dashboard
+                .session_kill_message_for_status_line()
+                .expect("the no-selection warning must remain visible")
+                .text
+                .contains("No session selected")
+        );
+    }
+
     fn lines_text(lines: &[Line<'static>]) -> String {
         lines
             .iter()
