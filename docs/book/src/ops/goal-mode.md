@@ -110,6 +110,14 @@ success criterion and candidate response and returns `Complete`. A verifier
 blockers. Provider, protocol, attribution, malformed-output, and verifier
 failures fail the Goal rather than becoming a semantic blocker.
 
+A verifier-blocked Goal releases the session's foreground slot. If a blocker
+needs more information, send that information as an ordinary message in the
+same session, wait for its normal reply, then run `/goal resume`. The fresh
+Goal executor reads the resulting canonical session history. Do not immediately
+resume an unchanged session: it is likely to repeat the same blocked assessment.
+For an external dependency or any other blocker, resolve it first and then
+resume.
+
 `/goal pause` first durably fences the Goal as paused, then waits for an
 already-admitted operation to settle before returning. `/goal resume` starts a
 fresh executor after the persisted checks pass. `/goal cancel` retains the

@@ -9359,12 +9359,24 @@ mod goal_command_message_tests {
     fn goal_command_errors_are_actionable_without_internal_details() {
         assert_eq!(
             channel_runtime_cli_string("goal-mode-command-invalid"),
-            "That is not a valid Goal command. Use `/goal help` to see the supported commands."
+            "⚠️ That is not a valid Goal command. Use `/goal help` to see the supported commands."
         );
         assert_eq!(
             channel_runtime_cli_string("goal-mode-command-failed"),
-            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+            "⚠️ Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
         );
+    }
+
+    #[test]
+    fn verifier_blocker_notice_covers_every_recovery_path() {
+        let notice = channel_runtime_cli_string("goal-mode-paused-blocked");
+
+        assert!(notice.contains("`/goal status`"));
+        assert!(notice.contains("send it as a normal message in this session"));
+        assert!(notice.contains("external dependency"));
+        assert!(notice.contains("Otherwise resolve the blocker"));
+        assert!(notice.contains("`/goal resume`"));
+        assert!(notice.contains("`/goal cancel`"));
     }
 }
 
