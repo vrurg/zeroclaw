@@ -755,8 +755,8 @@ fn enabled_host_settings_reject_unproven_unlimited_defaults() {
 fn explicitly_unlimited_enabled_config_retains_its_declaration_provenance() {
     let config = GoalConfig {
         enabled: true,
-        default_token_limit: Some(0),
-        default_cost_limit_usd: Some(0.0),
+        default_token_limit: 0,
+        default_cost_limit_usd: 0.0,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
@@ -887,6 +887,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         delivered: delivered.clone(),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let operation = GoalOperationScope::new(scope.clone());
     let settings = host_settings(true);
     let host = GoalExecutionHost::new();
     let submission = host
@@ -908,7 +909,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     assert_eq!(
         lease
             .run_parent_turn(
-                &scope,
+                &operation,
                 GoalParentTurn {
                     kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
@@ -923,7 +924,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     assert_eq!(
         lease
             .run_verifier(
-                &scope,
+                &operation,
                 GoalVerifierTurn {
                     objective: "finish the task".into(),
                     candidate: "candidate".into(),
@@ -1194,8 +1195,8 @@ fn host_settings_rejects_a_blank_boot_id() {
 
     let config = GoalConfig {
         enabled: true,
-        default_token_limit: Some(0),
-        default_cost_limit_usd: Some(0.0),
+        default_token_limit: 0,
+        default_cost_limit_usd: 0.0,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
