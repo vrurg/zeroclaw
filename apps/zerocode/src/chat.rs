@@ -2291,7 +2291,7 @@ impl Chat {
                         GoalUpdate::PausedForBlocker {
                             blocker_messages, ..
                         } => {
-                            let mut message = crate::i18n::t("zc-goal-paused");
+                            let mut message = crate::i18n::t("zc-goal-paused-blocked");
                             if !blocker_messages.is_empty() {
                                 message.push('\n');
                                 message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
@@ -2304,9 +2304,7 @@ impl Chat {
                                 }
                             }
                             message.push('\n');
-                            message.push_str(&crate::i18n::t("zc-goal-paused-next-heading"));
-                            message.push(' ');
-                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-guidance"));
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-next"));
                             for action_key in [
                                 "zc-goal-paused-blocked-cancel",
                                 "zc-goal-paused-blocked-status",

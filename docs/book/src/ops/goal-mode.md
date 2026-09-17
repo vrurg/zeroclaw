@@ -114,10 +114,9 @@ A verifier-blocked Goal names its blocker in the pause notification and releases
 the session's foreground slot. If it needs more information, send that
 information as an ordinary message in the same session, wait for its normal
 reply, then run `/goal resume`. The fresh Goal executor reads the resulting
-canonical session history. Do not immediately
-resume an unchanged session: it is likely to repeat the same blocked assessment.
-For an external dependency or any other blocker, resolve it first and then
-resume.
+canonical session history. Do not immediately resume an unchanged session: it
+is likely to repeat the same blocked assessment. For an external dependency or
+any other blocker, resolve it first and then resume.
 
 `/goal pause` first durably fences the Goal as paused, then waits for an
 already-admitted operation to settle before returning. `/goal resume` starts a

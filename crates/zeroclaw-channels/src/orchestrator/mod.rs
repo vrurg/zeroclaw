@@ -9403,7 +9403,7 @@ mod goal_command_message_tests {
     #[test]
     fn verifier_blocker_guidance_explains_the_recovery_actions() {
         let notice = channel_runtime_cli_string("goal-mode-paused-blocked");
-        let guidance = channel_runtime_cli_string("goal-mode-paused-blocked-guidance");
+        let guidance = channel_runtime_cli_string("goal-mode-paused-blocked-next");
         let cancel = channel_runtime_cli_string("goal-mode-paused-blocked-cancel");
         let status = channel_runtime_cli_string("goal-mode-paused-blocked-status");
 

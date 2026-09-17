@@ -624,11 +624,7 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
             }
             message.push('\n');
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
-                "goal-mode-paused-next-heading",
-            ));
-            message.push(' ');
-            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
-                "goal-mode-paused-blocked-guidance",
+                "goal-mode-paused-blocked-next",
             ));
             for action_key in [
                 "goal-mode-paused-blocked-cancel",
