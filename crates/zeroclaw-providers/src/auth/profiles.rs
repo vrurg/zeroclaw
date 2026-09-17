@@ -237,6 +237,14 @@ impl AuthProfilesStore {
         &self,
         mut profile: AuthProfile,
     ) -> Result<StagedProfileBinding> {
+        // Staging is a persistent write path. Prepare and verify the parent
+        // before creating its lock entry, so a rejected onboarding submission
+        // cannot create even a transient file in an unsafe directory.
+        //
+        // Keep this at the staged-write boundary rather than `acquire_lock`:
+        // read-only profile access deliberately avoids key-material
+        // preparation when no key initialization is needed.
+        self.prepare_profile_directory_for_persistence().await?;
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
         let snapshot = ProfileBindingSnapshot {
@@ -1502,6 +1510,43 @@ mod tests {
         assert!(
             std::fs::read_dir(&state_dir).unwrap().next().is_none(),
             "the public write must leave no lock, key, or profile residue"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_profile_binding_rejects_unsafe_parent_before_lock_creation() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override = Some(|parent| {
+            assert!(
+                std::fs::read_dir(parent).unwrap().next().is_none(),
+                "parent preflight must run before any lock, key, or profile entry exists"
+            );
+            anyhow::bail!("synthetic parent-integrity failure")
+        });
+
+        let err = store
+            .stage_profile_binding(AuthProfile::new_token(
+                "anthropic",
+                "subscription",
+                "test-token".into(),
+            ))
+            .await
+            .expect_err("staged profile binding must fail before lock creation");
+
+        assert!(
+            err.to_string()
+                .contains("synthetic parent-integrity failure"),
+            "the staged operation must surface the parent-integrity failure"
+        );
+        assert!(
+            std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+            "a rejected staged binding must leave no lock, key, or profile residue"
         );
     }
 
