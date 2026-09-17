@@ -630,14 +630,17 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-blocked-guidance",
             ));
-            message.push_str("\n• ");
-            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+            for action_key in [
                 "goal-mode-paused-blocked-cancel",
-            ));
-            message.push_str("\n• ");
-            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-blocked-status",
-            ));
+            ] {
+                message.push('\n');
+                let action = zeroclaw_runtime::i18n::get_required_cli_string(action_key);
+                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "goal-mode-paused-notice-action",
+                    &[("action", action.as_str())],
+                ));
+            }
             message
         }
         GoalExecutionNotice::Failed => {

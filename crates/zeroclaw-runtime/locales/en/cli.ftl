@@ -1289,6 +1289,7 @@ goal-mode-paused = ⏸️ Goal paused.
 goal-mode-paused-blocked = ⏸️ Goal paused.
 goal-mode-paused-blocker-heading = **Blocker:**
 goal-mode-paused-notice-blocker = • { $blocker }
+goal-mode-paused-notice-action = • { $action }
 goal-mode-paused-next-heading = **Next:**
 goal-mode-paused-blocked-guidance = Resolve the blocker, then run `/goal resume` to continue.
 goal-mode-paused-blocked-cancel = Or run `/goal cancel` to dismiss this Goal.

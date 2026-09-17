@@ -132,6 +132,7 @@ zc-goal-budget-updated = 📝 Goal budget updated.
 zc-goal-paused = ⏸️ Goal paused.
 zc-goal-paused-blocker-heading = Blocker:
 zc-goal-paused-notice-blocker = • { $blocker }
+zc-goal-paused-notice-action = • { $action }
 zc-goal-paused-next-heading = Next:
 zc-goal-paused-blocked-guidance = Resolve the blocker, then run /goal resume to continue.
 zc-goal-paused-blocked-cancel = Or run /goal cancel to dismiss this Goal.

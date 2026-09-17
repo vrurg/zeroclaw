@@ -2307,10 +2307,17 @@ impl Chat {
                             message.push_str(&crate::i18n::t("zc-goal-paused-next-heading"));
                             message.push(' ');
                             message.push_str(&crate::i18n::t("zc-goal-paused-blocked-guidance"));
-                            message.push_str("\n• ");
-                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-cancel"));
-                            message.push_str("\n• ");
-                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-status"));
+                            for action_key in [
+                                "zc-goal-paused-blocked-cancel",
+                                "zc-goal-paused-blocked-status",
+                            ] {
+                                message.push('\n');
+                                let action = crate::i18n::t(action_key);
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-paused-notice-action",
+                                    &[("action", &action)],
+                                ));
+                            }
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
@@ -10552,7 +10559,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_projection_uses_none_for_an_absent_pause_reason() {
+    fn goal_projection_omits_pause_for_an_absent_pause_reason() {
         let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
             task_id: "goal-1".to_owned(),
             status: "running".to_owned(),
@@ -10566,7 +10573,7 @@ mod tests {
             resumable: true,
         });
 
-        assert!(goal_response_message(&response).contains("pause reason: none"));
+        assert!(!goal_response_message(&response).contains("Pause:"));
     }
 
     fn draw_todo_close(chat: &mut Chat) -> Rect {

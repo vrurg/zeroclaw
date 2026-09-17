@@ -9351,6 +9351,26 @@ mod goal_response_render_tests {
     }
 
     #[test]
+    fn running_goal_response_omits_the_pause_line() {
+        let response = GoalResponse::Started(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Running,
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: false,
+        });
+
+        let rendered = render_goal_response(&response);
+
+        assert!(!rendered.contains("**Pause:**"));
+    }
+
+    #[test]
     fn goal_help_matches_budget_set_grammar() {
         let rendered = render_goal_response(&GoalResponse::Help);
 
