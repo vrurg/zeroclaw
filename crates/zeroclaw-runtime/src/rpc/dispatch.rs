@@ -2891,8 +2891,12 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        let command = zeroclaw_commands::goal::parse_goal_command(&req.command)
-            .map_err(|error| rpc_err(INVALID_PARAMS, format!("invalid Goal command: {error:?}")))?;
+        let command = zeroclaw_commands::goal::parse_goal_command(&req.command).map_err(|_| {
+            rpc_err(
+                INVALID_PARAMS,
+                "That is not a valid Goal command. Use /goal help to see the supported commands.",
+            )
+        })?;
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
@@ -2902,14 +2906,44 @@ impl RpcDispatcher {
                 tui_id,
             )
             .await
-            .map_err(|error| rpc_err(SESSION_NOT_FOUND, error.to_string()))?,
+            .map_err(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": req.session_id.as_str(),
+                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                        })),
+                    "ZeroCode Goal session driver construction failed"
+                );
+                rpc_err(
+                    SESSION_NOT_FOUND,
+                    "The requested session is no longer available. Refresh it and try again.",
+                )
+            })?,
         );
         let response = self
             .ctx
             .goal_runtime
             .submit(Arc::clone(&self.ctx), driver, command)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            .map_err(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": req.session_id.as_str(),
+                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                        })),
+                    "ZeroCode Goal command submission failed"
+                );
+                rpc_err(
+                    INTERNAL_ERROR,
+                    "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.",
+                )
+            })?;
         to_result(SessionGoalResult { response })
     }
 

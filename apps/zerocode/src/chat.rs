@@ -2283,7 +2283,7 @@ impl Chat {
             };
             let message = match completion.result {
                 Ok(response) => goal_response_message(&response),
-                Err(error) => crate::i18n::t_args("zc-goal-command-failed", &[("error", &error)]),
+                Err(_) => crate::i18n::t("zc-goal-command-failed"),
             };
             state
                 .entries

@@ -194,7 +194,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Goal,
         name: "goal",
         aliases: &[],
-        usage: "/goal start [--tokens N] [--cost-usd D] -- OBJECTIVE",
+        usage: "/goal start [--tokens N] [--cost-usd D] OBJECTIVE",
         description_key: "command-goal-description",
         surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
@@ -348,5 +348,10 @@ mod tests {
         for surface in [CommandSurface::Cli, CommandSurface::Web] {
             assert!(parse_command_token("/goal", surface).is_none());
         }
+
+        assert_eq!(
+            command_by_name("/goal").map(|command| command.usage),
+            Some("/goal start [--tokens N] [--cost-usd D] OBJECTIVE")
+        );
     }
 }
