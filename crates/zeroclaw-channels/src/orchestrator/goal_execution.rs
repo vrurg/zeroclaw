@@ -21,7 +21,7 @@ use zeroclaw_runtime::{
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
         GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_directive,
-        goal_verifier_messages, scope_goal_parent_turn,
+        goal_parent_execution_request, goal_verifier_messages, scope_goal_parent_turn,
     },
 };
 
@@ -399,6 +399,7 @@ fn goal_start_history(
     history.push(ChatMessage::system(system_prompt));
     history.push(directive);
     history.extend(canonical_history);
+    history.push(goal_parent_execution_request());
     history
 }
 #[async_trait]
@@ -441,6 +442,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             GoalParentTurnKind::Continue => {
                 let mut history = turn.working_history;
                 history.push(directive);
+                history.push(goal_parent_execution_request());
                 history
             }
         };
@@ -581,16 +583,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_history_places_the_directive_before_canonical_history() {
+    fn start_history_ends_with_a_user_turn_after_an_assistant_prefix() {
         let history = goal_start_history(
             "system prompt".to_owned(),
             ChatMessage::system("Goal directive"),
-            vec![ChatMessage::user("earlier user message")],
+            vec![ChatMessage::assistant("earlier assistant response")],
         );
 
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0].content, "system prompt");
         assert_eq!(history[1].content, "Goal directive");
-        assert_eq!(history[2].content, "earlier user message");
+        assert_eq!(history[2].role, "assistant");
+        assert_eq!(history[2].content, "earlier assistant response");
+        assert_eq!(history[3].role, "user");
+        assert!(history[3].content.contains("Proceed with the Goal work"));
     }
 }

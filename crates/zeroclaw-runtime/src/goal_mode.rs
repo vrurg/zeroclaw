@@ -439,6 +439,14 @@ pub fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
     ))
 }
 
+/// Finish a Goal parent request with a user-role turn so every configured
+/// provider can accept the isolated transcript after canonical history.  The
+/// trusted system directive remains the sole owner of the objective and turn
+/// kind; this message merely requests execution under that established scope.
+pub fn goal_parent_execution_request() -> ChatMessage {
+    ChatMessage::user("Proceed with the Goal work under the trusted runtime directive.")
+}
+
 /// Process-local result of one Goal parent turn.
 ///
 /// The transcript is returned to the controller rather than persisted in

@@ -1267,6 +1267,7 @@ impl Agent {
                 history.push(system);
                 history.push(directive);
                 history.extend(prefix);
+                history.push(crate::goal_mode::goal_parent_execution_request());
                 history
             }
             IsolatedTranscriptSource::Continuation(mut history) => {
@@ -1278,6 +1279,7 @@ impl Agent {
                 );
                 history[0] = system;
                 history.push(directive);
+                history.push(crate::goal_mode::goal_parent_execution_request());
                 history
             }
         };
