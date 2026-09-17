@@ -436,6 +436,23 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         Ok(self.history())
     }
 
+    async fn append_resume_response(&mut self, response: String) -> Result<()> {
+        // `/goal resume <response>` is a user turn, not Goal metadata.  Use
+        // the ordinary Matrix canonical-history append path so the exact
+        // multiline response survives a daemon restart and reaches the next
+        // resumed parent turn just like any other user message.
+        let appended = append_sender_turn(
+            self.context.as_ref(),
+            &self.session_key.durable_id(),
+            ChatMessage::user(&response),
+        );
+        ensure!(
+            appended.is_some(),
+            "cannot resume Goal because the Matrix session transcript could not be persisted"
+        );
+        Ok(())
+    }
+
     async fn run_parent_turn(
         &mut self,
         operation: &GoalOperationScope,
