@@ -937,6 +937,29 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through this OpenAI-compatible
+    /// provider. When true, request bodies on the structured paths (agent
+    /// turns, tool calls, structured streaming) gain an Anthropic-shaped
+    /// `cache_control` breakpoint on the system prompt and on the last
+    /// message once the conversation has more than one non-system message,
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage populates the cached-token counters.
+    /// With `merge_system_into_user`, the merged first user message carries
+    /// the system breakpoint instead. The text-only helpers (`chat_with_system`,
+    /// `chat_with_history`, the legacy chunk-stream APIs) deliberately emit
+    /// no breakpoints: their responses drop usage, so a premium cache write
+    /// they triggered could never be accounted for.
+    /// Only gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic Messages API forward these breakpoints (e.g. LiteLLM).
+    /// Default `false`: request bodies and response handling are unchanged.
+    ///
+    /// Before relying on it, verify the configured route serves cache reads:
+    /// an immediate repeat of a cache-creating request must report
+    /// `cache_read_input_tokens > 0`. Some gateway routes accept and bill
+    /// cache writes without ever serving reads.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -16155,7 +16178,14 @@ pub enum MattermostListenMode {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived, for the same reason as
+/// [`DiscordConfig`]: a derived `Default` zeroes every field, which disagrees
+/// with the serde defaults, and for `approval_timeout_secs` that disagreement
+/// is load-bearing. `0` is an already-elapsed deadline, so an alias built in
+/// Rust would deny every approval while an alias parsed from a file waits the
+/// documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
@@ -16259,6 +16289,37 @@ pub struct MattermostConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+    /// Seconds to wait for operator approval on `always_ask` tools before
+    /// auto-denying. Mattermost prompts by posting a token-prefixed message and
+    /// reading the operator's reply, so this budget covers a human noticing the
+    /// post and typing back.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+impl Default for MattermostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bot_token: None,
+            login_id: None,
+            password: None,
+            channel_ids: Vec::new(),
+            team_ids: Vec::new(),
+            discover_dms: None,
+            thread_replies: None,
+            mention_only: None,
+            interrupt_on_new_message: false,
+            proxy_url: None,
+            listen_mode: MattermostListenMode::default(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+        }
+    }
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -26087,6 +26148,18 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn cache_passthrough_deserializes_and_defaults_to_omitted() {
+        let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
+        assert!(enabled.cache_passthrough);
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_passthrough"),
+            "default cache_passthrough must be omitted from serialized config"
+        );
+    }
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
