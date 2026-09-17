@@ -10435,7 +10435,7 @@ mod tests {
 
         let rendered = goal_response_message(&response);
 
-        assert!(rendered.contains("Goal paused."));
+        assert!(rendered.contains("⏸️ Goal paused."));
         assert!(rendered.contains("Status: paused"));
         assert!(rendered.contains("token limit: 12000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
@@ -10461,11 +10461,11 @@ mod tests {
 
         assert!(
             goal_response_message(&crate::wire::GoalResponse::Status(projection.clone()))
-                .starts_with("Goal status is available.")
+                .starts_with("ℹ️ Goal status is available.")
         );
         assert!(
             goal_response_message(&crate::wire::GoalResponse::Budget(projection))
-                .starts_with("Goal budget is available.")
+                .starts_with("ℹ️ Goal budget is available.")
         );
     }
 
@@ -10488,11 +10488,11 @@ mod tests {
             goal_response_message(&crate::wire::GoalResponse::AlreadyPaused(
                 projection.clone(),
             ))
-            .starts_with("Goal is already paused.")
+            .starts_with("⏸️ Goal is already paused.")
         );
         assert!(
             goal_response_message(&crate::wire::GoalResponse::AlreadyCancelled(projection,))
-                .starts_with("Goal is already cancelled.")
+                .starts_with("🛑 Goal is already cancelled.")
         );
     }
 
