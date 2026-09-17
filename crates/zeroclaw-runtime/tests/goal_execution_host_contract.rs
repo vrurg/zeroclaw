@@ -1035,6 +1035,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         delivered: delivered.clone(),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let operation = GoalOperationScope::new(scope.clone());
     let settings = host_settings(true);
     let host = GoalExecutionHost::new();
     let submission = host
@@ -1057,7 +1058,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     assert_eq!(
         lease
             .run_parent_turn(
-                &scope,
+                &operation,
                 GoalParentTurn {
                     kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
@@ -1072,7 +1073,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     assert_eq!(
         lease
             .run_verifier(
-                &scope,
+                &operation,
                 GoalVerifierTurn {
                     objective: "finish the task".into(),
                     candidate: "candidate".into(),
