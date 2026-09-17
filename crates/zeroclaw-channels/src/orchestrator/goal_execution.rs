@@ -609,20 +609,22 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
         GoalExecutionNotice::PausedForBlocker { blocker_messages } => {
             let mut message =
                 zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-paused-blocked");
-            message.push('\n');
-            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
-                "goal-mode-paused-blocker-heading",
-            ));
-            for (index, blocker) in blocker_messages.into_iter().enumerate() {
-                if index == 0 {
-                    message.push(' ');
-                } else {
-                    message.push_str("\n• ");
-                }
-                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                    "goal-mode-paused-notice-blocker",
-                    &[("blocker", blocker.as_str())],
+            if !blocker_messages.is_empty() {
+                message.push('\n');
+                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                    "goal-mode-paused-blocker-heading",
                 ));
+                for (index, blocker) in blocker_messages.into_iter().enumerate() {
+                    if index == 0 {
+                        message.push(' ');
+                    } else {
+                        message.push_str("\n• ");
+                    }
+                    message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "goal-mode-paused-notice-blocker",
+                        &[("blocker", blocker.as_str())],
+                    ));
+                }
             }
             message.push('\n');
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
@@ -662,8 +664,19 @@ mod tests {
         assert!(!rendered.contains("verifier requires resolution"));
         assert!(
             rendered
-                .contains("\n**Next:** Resolve the blocker, then run /goal resume to continue.")
+                .contains("\n**Next:** Resolve the blocker, then run `/goal resume` to continue.")
         );
+    }
+
+    #[test]
+    fn blocked_notice_without_blocker_details_stays_compact() {
+        let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
+            blocker_messages: Vec::new(),
+        });
+
+        assert!(rendered.starts_with("⏸️ Goal paused."));
+        assert!(!rendered.contains("**Blocker:**"));
+        assert!(rendered.contains("\n**Next:**"));
     }
 
     #[test]

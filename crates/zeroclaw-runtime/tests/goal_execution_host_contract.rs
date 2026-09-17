@@ -90,6 +90,8 @@ struct TranscriptExecutionLease {
     session_key: GoalSessionKey,
     delivered: Arc<AtomicUsize>,
     continue_once: bool,
+    blocked: bool,
+    notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
@@ -126,7 +128,9 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
         assert_eq!(turn.objective, "finish the task");
-        if self.continue_once {
+        if self.blocked {
+            Ok(r#"{"decision":"blocked","reason":"task context is missing","blockers":[{"kind":"needs_user_input","message":"Provide the task packet reference."}]}"#.to_owned())
+        } else if self.continue_once {
             self.continue_once = false;
             Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned())
         } else {
@@ -144,8 +148,9 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
 
     async fn publish_goal_notice(
         &mut self,
-        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
+        notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
     ) -> anyhow::Result<()> {
+        self.notices.lock().unwrap().push(notice);
         Ok(())
     }
 }
@@ -153,6 +158,8 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
 struct TranscriptExecutionDriver {
     binding: GoalSessionBinding,
     delivered: Arc<AtomicUsize>,
+    blocked: bool,
+    notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
@@ -176,6 +183,8 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             session_key: self.binding.session_key().clone(),
             delivered: Arc::clone(&self.delivered),
             continue_once: true,
+            blocked: self.blocked,
+            notices: Arc::clone(&self.notices),
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
         }))
@@ -2260,11 +2269,14 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
+    let notices = Arc::new(Mutex::new(Vec::new()));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::clone(&delivered),
+        blocked: false,
+        notices,
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
     });
@@ -2328,6 +2340,63 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
             .unwrap()
             .status,
         TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn verifier_blocked_notice_carries_the_parsed_blockers() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        blocked: true,
+        notices: Arc::clone(&notices),
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::VerifierBlocked
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::PausedForBlocker {
+            blocker_messages: vec!["Provide the task packet reference.".to_owned()],
+        }]
     );
 }
 

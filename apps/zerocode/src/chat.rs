@@ -192,11 +192,9 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
             session_id,
-            blocker_messages: match payload
-                .get("blocker_messages")
-                .and_then(serde_json::Value::as_array)
-            {
-                Some(messages) => messages
+            blocker_messages: match payload.get("blocker_messages") {
+                Some(value) => value
+                    .as_array()?
                     .iter()
                     .map(serde_json::Value::as_str)
                     .collect::<Option<Vec<_>>>()?,
@@ -2297,18 +2295,20 @@ impl Chat {
                             blocker_messages, ..
                         } => {
                             let mut message = crate::i18n::t("zc-goal-paused");
-                            message.push('\n');
-                            message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
-                            for (index, blocker) in blocker_messages.into_iter().enumerate() {
-                                if index == 0 {
-                                    message.push(' ');
-                                } else {
-                                    message.push_str("\n• ");
+                            if !blocker_messages.is_empty() {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
+                                for (index, blocker) in blocker_messages.into_iter().enumerate() {
+                                    if index == 0 {
+                                        message.push(' ');
+                                    } else {
+                                        message.push_str("\n• ");
+                                    }
+                                    message.push_str(&crate::i18n::t_args(
+                                        "zc-goal-paused-notice-blocker",
+                                        &[("blocker", blocker)],
+                                    ));
                                 }
-                                message.push_str(&crate::i18n::t_args(
-                                    "zc-goal-paused-notice-blocker",
-                                    &[("blocker", blocker)],
-                                ));
                             }
                             message.push('\n');
                             message.push_str(&crate::i18n::t("zc-goal-paused-next-heading"));
@@ -21551,6 +21551,45 @@ mod tests {
         };
         assert!(text.contains("\nBlocker: Provide the task packet reference."));
         assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_update_without_blockers_stays_compatible_and_compact() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": { "session_id": "sess-1" }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        let ChatEntry::SystemMessage(text) = &entries[0] else {
+            panic!("expected blocked Goal system message");
+        };
+        assert!(!text.contains("\nBlocker:"));
+        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+    }
+
+    #[test]
+    fn malformed_blocker_messages_goal_update_is_rejected() {
+        assert!(
+            parse_goal_update(&serde_json::json!({
+                "paused_for_blocker": {
+                    "session_id": "sess-1",
+                    "blocker_messages": "not an array"
+                }
+            }))
+            .is_none()
+        );
     }
 
     #[test]

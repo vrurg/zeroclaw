@@ -9387,12 +9387,15 @@ mod goal_command_message_tests {
     fn verifier_blocker_guidance_explains_the_recovery_actions() {
         let notice = channel_runtime_cli_string("goal-mode-paused-blocked");
         let guidance = channel_runtime_cli_string("goal-mode-paused-blocked-guidance");
+        let cancel = channel_runtime_cli_string("goal-mode-paused-blocked-cancel");
+        let status = channel_runtime_cli_string("goal-mode-paused-blocked-status");
 
         assert_eq!(notice, "⏸️ Goal paused.");
         assert!(guidance.contains("Resolve the blocker"));
         assert!(guidance.contains("`/goal resume`"));
-        assert!(guidance.contains("`/goal cancel`"));
-        assert!(guidance.contains("`/goal status`"));
+        assert!(cancel.contains("`/goal cancel`"));
+        assert!(status.contains("`/goal status`"));
+        assert!(!guidance.contains("verifier requires resolution"));
     }
 }
 
