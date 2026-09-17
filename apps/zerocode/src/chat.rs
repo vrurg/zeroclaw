@@ -154,6 +154,7 @@ enum GoalUpdate<'a> {
     },
     PausedForBlocker {
         session_id: &'a str,
+        blocker_messages: Vec<&'a str>,
     },
     Failed {
         session_id: &'a str,
@@ -174,7 +175,19 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
             candidate: payload.get("candidate")?.as_str()?,
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
-        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
+            session_id,
+            blocker_messages: match payload
+                .get("blocker_messages")
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(messages) => messages
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?,
+                None => Vec::new(),
+            },
+        }),
         "failed" => Some(GoalUpdate::Failed { session_id }),
         _ => None,
     }
@@ -2244,7 +2257,7 @@ impl Chat {
                     let session_id = match &update {
                         GoalUpdate::VerifiedCandidate { session_id, .. }
                         | GoalUpdate::Completed { session_id }
-                        | GoalUpdate::PausedForBlocker { session_id }
+                        | GoalUpdate::PausedForBlocker { session_id, .. }
                         | GoalUpdate::Failed { session_id } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
@@ -2265,12 +2278,22 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        GoalUpdate::PausedForBlocker { .. } => {
+                        GoalUpdate::PausedForBlocker {
+                            blocker_messages, ..
+                        } => {
+                            let mut message = crate::i18n::t("zc-goal-paused");
+                            for blocker in blocker_messages {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-blocker",
+                                    &[("blocker", blocker)],
+                                ));
+                            }
+                            message.push('\n');
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-guidance"));
                             state
                                 .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-paused",
-                                ))));
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
                             state.mark_dirty_append();
                         }
                         GoalUpdate::Failed { .. } => {
@@ -21473,6 +21496,35 @@ mod tests {
         assert!(
             matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-failed"))
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_update_displays_the_verifier_blocker() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": {
+                        "session_id": "sess-1",
+                        "blocker_messages": ["Provide the task packet reference."]
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        let ChatEntry::SystemMessage(text) = &entries[0] else {
+            panic!("expected blocked Goal system message");
+        };
+        assert!(text.contains("Blocker: Provide the task packet reference."));
+        assert!(text.contains("`/goal resume`"));
     }
 
     #[test]

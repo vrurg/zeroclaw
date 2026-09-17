@@ -9368,15 +9368,15 @@ mod goal_command_message_tests {
     }
 
     #[test]
-    fn verifier_blocker_notice_covers_every_recovery_path() {
+    fn verifier_blocker_guidance_explains_the_recovery_actions() {
         let notice = channel_runtime_cli_string("goal-mode-paused-blocked");
+        let guidance = channel_runtime_cli_string("goal-mode-paused-blocked-guidance");
 
-        assert!(notice.contains("`/goal status`"));
-        assert!(notice.contains("send it as a normal message in this session"));
-        assert!(notice.contains("external dependency"));
-        assert!(notice.contains("Otherwise resolve the blocker"));
-        assert!(notice.contains("`/goal resume`"));
-        assert!(notice.contains("`/goal cancel`"));
+        assert_eq!(notice, "⏸️ Goal paused.");
+        assert!(guidance.contains("Resolve the blocker"));
+        assert!(guidance.contains("`/goal resume`"));
+        assert!(guidance.contains("`/goal cancel`"));
+        assert!(guidance.contains("`/goal status`"));
     }
 }
 

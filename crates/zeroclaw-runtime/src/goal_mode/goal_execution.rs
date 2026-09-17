@@ -1127,9 +1127,15 @@ impl GoalExecutionEngine {
                     parent_turn_kind = super::GoalParentTurnKind::Continue;
                 }
                 Ok(VerifierDecision::Blocked { reason, blockers }) => {
+                    let blocker_messages = blockers
+                        .iter()
+                        .map(|blocker| blocker.message.clone())
+                        .collect();
                     self.pause_verifier_blocked(scope, reason, blockers).await?;
                     lease
-                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker)
+                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
+                            blocker_messages,
+                        })
                         .await?;
                     return Ok(GoalExecutionOutcome::VerifierBlocked);
                 }

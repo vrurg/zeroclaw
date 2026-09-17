@@ -521,10 +521,10 @@ pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
 /// The executor supplies semantics only. Each admitted surface renders the
 /// message through its own Fluent boundary and must not substitute ordinary
 /// turn-progress output for these notices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalExecutionNotice {
     Completed,
-    PausedForBlocker,
+    PausedForBlocker { blocker_messages: Vec<String> },
     Failed,
 }
 

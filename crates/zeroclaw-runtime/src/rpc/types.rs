@@ -294,7 +294,11 @@ rpc_type! {
     pub enum SessionGoalUpdate {
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
-        PausedForBlocker { session_id: String },
+        PausedForBlocker {
+            session_id: String,
+            #[serde(default)]
+            blocker_messages: Vec<String>,
+        },
         Failed { session_id: String },
     }
 }

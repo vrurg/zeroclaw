@@ -130,6 +130,7 @@ zc-goal-status = ℹ️ Goal status is available.
 zc-goal-budget = ℹ️ Goal budget is available.
 zc-goal-budget-updated = 📝 Goal budget updated.
 zc-goal-paused = ⏸️ Goal paused.
+zc-goal-paused-blocked-guidance = Resolve the blocker, then use `/goal resume` to continue, or `/goal cancel` to dismiss this Goal. Use `/goal status` to review the current Goal.
 zc-goal-already-paused = ⏸️ Goal is already paused.
 zc-goal-resumed = ▶️ Goal resumed.
 zc-goal-cancelled = 🛑 Goal cancelled.

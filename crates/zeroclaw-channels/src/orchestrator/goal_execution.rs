@@ -589,25 +589,59 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
-        let key = match notice {
-            GoalExecutionNotice::Completed => "goal-mode-completed",
-            GoalExecutionNotice::PausedForBlocker => "goal-mode-paused-blocked",
-            GoalExecutionNotice::Failed => "goal-mode-failed",
-        };
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
         channel
             .send(&zeroclaw_api::channel::SendMessage::reply_to(
                 &self.message,
-                zeroclaw_runtime::i18n::get_required_cli_string(key),
+                goal_notice_message(notice),
             ))
             .await
             .context("deliver Matrix Goal lifecycle notice")
     }
 }
+
+fn goal_notice_message(notice: GoalExecutionNotice) -> String {
+    match notice {
+        GoalExecutionNotice::Completed => {
+            zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-completed")
+        }
+        GoalExecutionNotice::PausedForBlocker { blocker_messages } => {
+            let mut message =
+                zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-paused-blocked");
+            for blocker in blocker_messages {
+                message.push('\n');
+                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "goal-mode-blocker",
+                    &[("blocker", blocker.as_str())],
+                ));
+            }
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-blocked-guidance",
+            ));
+            message
+        }
+        GoalExecutionNotice::Failed => {
+            zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failed")
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_notice_includes_the_verifier_blocker() {
+        let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
+            blocker_messages: vec!["Provide the task packet reference.".to_owned()],
+        });
+
+        assert!(rendered.starts_with("⏸️ Goal paused."));
+        assert!(rendered.contains("Blocker: Provide the task packet reference."));
+        assert!(!rendered.contains("verifier requires resolution"));
+        assert!(rendered.contains("`/goal resume`"));
+    }
 
     #[test]
     fn start_history_combines_goal_directive_into_the_system_prompt() {
