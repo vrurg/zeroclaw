@@ -2806,11 +2806,6 @@ mod tests {
             .iter()
             .find(|row| row.key == "auth_mode")
             .expect("auth_mode row");
-        assert_eq!(
-            rows.iter().filter(|row| row.key == "auth_mode").count(),
-            1,
-            "Quickstart must retain exactly its synthetic Anthropic auth selector"
-        );
         assert!(auth.required);
         assert_eq!(
             auth.enum_variants.as_deref(),
@@ -2848,6 +2843,11 @@ mod tests {
         assert!(
             keys.contains(&"auth_mode"),
             "field_shape for claude/anthropic must include `auth_mode`; got {keys:?}",
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.key == "auth_mode").count(),
+            1,
+            "Quickstart must retain exactly one synthetic Anthropic auth selector"
         );
         let auth = rows
             .iter()
