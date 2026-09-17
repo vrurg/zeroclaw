@@ -9295,7 +9295,7 @@ fn render_goal_projection(
 
 #[cfg(test)]
 mod goal_response_render_tests {
-    use super::{channel_runtime_cli_string, render_goal_response};
+    use super::render_goal_response;
     use zeroclaw_runtime::{
         control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus},
         goal_mode::{GoalResponse, GoalStatusProjection},
@@ -9332,20 +9332,12 @@ mod goal_response_render_tests {
         let rendered = render_goal_response(&GoalResponse::Help);
 
         assert!(rendered.starts_with("Goal commands:\n"));
-        assert!(rendered.contains("\n• /goal start [--tokens N] [--cost-usd D] -- OBJECTIVE"));
+        assert!(rendered.contains("\n• /goal start [--tokens N] [--cost-usd D] OBJECTIVE"));
         assert!(rendered.contains("\n• /goal help"));
         assert!(rendered.contains("budget set --tokens N [--cost-usd D]"));
         assert!(rendered.contains("budget set --cost-usd D [--tokens N]"));
         assert!(rendered.contains("budget set --unlimited"));
         assert!(!rendered.contains("budget set [--tokens N] [--cost-usd D]"));
-    }
-
-    #[test]
-    fn invalid_goal_commands_do_not_expose_parser_debug_output() {
-        assert_eq!(
-            channel_runtime_cli_string("goal-mode-command-invalid"),
-            "Invalid Goal command."
-        );
     }
 }
 

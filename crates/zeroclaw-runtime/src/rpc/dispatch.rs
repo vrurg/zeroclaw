@@ -5778,13 +5778,12 @@ impl Drop for RpcDispatcher {
 fn parse_session_goal_command(
     command: &str,
 ) -> Result<zeroclaw_commands::goal::GoalCommand, JsonRpcError> {
-    zeroclaw_commands::goal::parse_goal_command(command)
-        .map_err(|_| {
-            rpc_err(
-                INVALID_PARAMS,
-                "That is not a valid Goal command. Use /goal help to see the supported commands.",
-            )
-        })
+    zeroclaw_commands::goal::parse_goal_command(command).map_err(|_| {
+        rpc_err(
+            INVALID_PARAMS,
+            "That is not a valid Goal command. Use /goal help to see the supported commands.",
+        )
+    })
 }
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {

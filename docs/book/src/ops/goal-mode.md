@@ -64,8 +64,8 @@ Use these commands in an existing Matrix conversation or a zerocode Chat
 session. Goal Mode is unavailable for zerocode ACP sessions:
 
 ```text
-/goal start [--tokens N] [--cost-usd D] -- SUCCESS CRITERION
-/goal start --unlimited -- SUCCESS CRITERION
+/goal start [--tokens N] [--cost-usd D] SUCCESS CRITERION
+/goal start --unlimited SUCCESS CRITERION
 /goal status
 /goal budget
 /goal budget set --tokens N [--cost-usd D]
@@ -77,11 +77,13 @@ session. Goal Mode is unavailable for zerocode ACP sessions:
 /goal help
 ```
 
-The `--` delimiter is required. The text after it is the declared success
-criterion, not an additional authority source or a task identifier. ZeroClaw
-injects that exact criterion into the Goal parent prompt and presents it to the
-verifier with the exact candidate response. It is not editable after start and
-is limited to 4096 characters.
+The first non-option word begins the declared success criterion. It is not an
+additional authority source or a task identifier. All options must come before
+it; the legacy `--` delimiter and unknown `--flags` are rejected rather than
+silently becoming part of the criterion. ZeroClaw injects the exact criterion
+into the Goal parent prompt and presents it to the verifier with the exact
+candidate response. It is not editable after start and is limited to 4096
+characters.
 
 With no `start` flags, Goal Mode copies both configured defaults. Supplying a
 finite flag replaces both defaults: an omitted dimension becomes unlimited.
