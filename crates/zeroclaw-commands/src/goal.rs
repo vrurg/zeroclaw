@@ -44,7 +44,6 @@ pub enum GoalCommandParseError {
     NotGoalCommand,
     MissingSubcommand,
     UnknownSubcommand(String),
-    MissingObjectiveDelimiter,
     MissingObjective,
     MissingFlagValue(&'static str),
     InvalidTokenLimit(String),
@@ -91,30 +90,51 @@ fn split_token(input: &str) -> (&str, &str) {
 }
 
 fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
-    let Some(delimiter) = arguments.match_indices("--").find_map(|(index, _)| {
-        let before = arguments[..index].chars().next_back();
-        let after = arguments[index + 2..].chars().next();
-        (before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace))
-            .then_some(index)
-    }) else {
-        return Err(GoalCommandParseError::MissingObjectiveDelimiter);
-    };
+    let mut remaining = arguments;
+    let mut flags = String::new();
 
-    let (flags, objective) = arguments.split_at(delimiter);
-    let objective = &objective[2..];
-    // The delimiter's separator is grammar, not objective content. Preserve
-    // every subsequent byte so the durable declared success criterion is not
-    // silently rewritten before it reaches the future prompt builder.
-    let separator_len = objective
-        .chars()
-        .next()
-        .filter(|character| character.is_whitespace())
-        .map_or(0, char::len_utf8);
-    let objective = &objective[separator_len..];
+    loop {
+        let trimmed = remaining.trim_start();
+        let (word, rest) = split_token(trimmed);
+        if word.is_empty() {
+            validate_objective(remaining)?;
+            return Err(GoalCommandParseError::MissingObjective);
+        }
+
+        match word {
+            "--unlimited" => {
+                flags.push_str(word);
+                flags.push(' ');
+                remaining = rest;
+            }
+            "--tokens" | "--cost-usd" => {
+                let flag: &'static str = if word == "--tokens" {
+                    "--tokens"
+                } else {
+                    "--cost-usd"
+                };
+                let (value, after_value) = split_token(rest.trim_start());
+                if value.is_empty() {
+                    return Err(GoalCommandParseError::MissingFlagValue(flag));
+                }
+                flags.push_str(word);
+                flags.push(' ');
+                flags.push_str(value);
+                flags.push(' ');
+                remaining = after_value;
+            }
+            _ if word.starts_with("--") => {
+                return Err(GoalCommandParseError::UnknownFlag(word.to_string()));
+            }
+            _ => break,
+        }
+    }
+
+    let objective = remaining;
     validate_objective(objective)?;
 
     Ok(GoalCommand::Start {
-        budget: parse_budget_selection(flags, true)?,
+        budget: parse_budget_selection(&flags, true)?,
         objective: objective.to_string(),
     })
 }
@@ -238,14 +258,14 @@ mod tests {
     #[test]
     fn accepts_the_complete_v1_grammar() {
         assert_eq!(
-            parse_goal_command("/goal start -- finish the task"),
+            parse_goal_command("/goal start finish the task"),
             Ok(GoalCommand::Start {
                 budget: GoalBudgetSelection::Defaults,
                 objective: "finish the task".into(),
             })
         );
         assert_eq!(
-            parse_goal_command("/goal start --tokens 12 --cost-usd 1.5 -- complete"),
+            parse_goal_command("/goal start --tokens 12 --cost-usd 1.5 complete"),
             Ok(GoalCommand::Start {
                 budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
                     token_limit: Some(12),
@@ -255,7 +275,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_goal_command("/goal start --unlimited -- complete"),
+            parse_goal_command("/goal start --unlimited complete"),
             Ok(GoalCommand::Start {
                 budget: GoalBudgetSelection::Unlimited,
                 objective: "complete".into(),
@@ -287,16 +307,49 @@ mod tests {
     }
 
     #[test]
+    fn start_accepts_an_objective_without_a_delimiter() {
+        assert_eq!(
+            parse_goal_command("/goal start finish the task"),
+            Ok(GoalCommand::Start {
+                budget: GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            })
+        );
+        assert_eq!(
+            parse_goal_command("/goal start --tokens 12 --cost-usd 1.5 complete"),
+            Ok(GoalCommand::Start {
+                budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(12),
+                    cost_limit_usd: Some(1.5),
+                }),
+                objective: "complete".into(),
+            })
+        );
+        assert_eq!(
+            parse_goal_command("/goal start --unlimited complete"),
+            Ok(GoalCommand::Start {
+                budget: GoalBudgetSelection::Unlimited,
+                objective: "complete".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn start_rejects_the_retired_objective_delimiter() {
+        assert!(parse_goal_command("/goal start -- finish the task").is_err());
+        assert!(parse_goal_command("/goal start --unlimited -- complete").is_err());
+    }
+
+    #[test]
     fn rejects_retired_ambiguous_and_non_positive_forms() {
         for command in [
-            "/goal start objective",
-            "/goal start --",
+            "/goal start -- objective",
             "/goal objective amend",
             "/goal resume note",
-            "/goal start --tokens=1 -- objective",
-            "/goal start --tokens 0 -- objective",
-            "/goal start --cost-usd 0 -- objective",
-            "/goal start --unlimited --tokens 1 -- objective",
+            "/goal start --tokens=1 objective",
+            "/goal start --tokens 0 objective",
+            "/goal start --cost-usd 0 objective",
+            "/goal start --unlimited --tokens 1 objective",
             "/goal budget set",
             "/goal budget set --cost-usd NaN",
             "/goal budget set --tokens 1 extra",
@@ -306,11 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_the_objective_after_the_delimiter() {
+    fn preserves_the_objective_after_budget_flags() {
         assert_eq!(
-            parse_goal_command("/goal start --  \u{2003}complete -- exactly\u{2002}"),
+            parse_goal_command("/goal start --tokens 1  \u{2003}complete -- exactly\u{2002}"),
             Ok(GoalCommand::Start {
-                budget: GoalBudgetSelection::Defaults,
+                budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(1),
+                    cost_limit_usd: None,
+                }),
                 objective: " \u{2003}complete -- exactly\u{2002}".into(),
             })
         );
@@ -328,7 +384,7 @@ mod tests {
     fn bounds_objective_validation_before_scanning_unbounded_whitespace() {
         let overlong_whitespace = " ".repeat(MAX_GOAL_OBJECTIVE_CHARS + 2);
         assert_eq!(
-            parse_goal_command(&format!("/goal start --{overlong_whitespace}")),
+            parse_goal_command(&format!("/goal start {overlong_whitespace}")),
             Err(GoalCommandParseError::TextTooLong {
                 max: MAX_GOAL_OBJECTIVE_CHARS,
             })
@@ -339,9 +395,9 @@ mod tests {
     fn objective_length_limit_counts_unicode_scalar_values() {
         let within_limit = "🦀".repeat(MAX_GOAL_OBJECTIVE_CHARS);
         let over_limit = "🦀".repeat(MAX_GOAL_OBJECTIVE_CHARS + 1);
-        assert!(parse_goal_command(&format!("/goal start -- {within_limit}")).is_ok());
+        assert!(parse_goal_command(&format!("/goal start {within_limit}")).is_ok());
         assert_eq!(
-            parse_goal_command(&format!("/goal start -- {over_limit}")),
+            parse_goal_command(&format!("/goal start {over_limit}")),
             Err(GoalCommandParseError::TextTooLong {
                 max: MAX_GOAL_OBJECTIVE_CHARS,
             })
