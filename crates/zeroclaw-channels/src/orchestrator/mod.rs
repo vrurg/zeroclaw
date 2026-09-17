@@ -7291,18 +7291,20 @@ async fn process_channel_message_body(
             .await
             {
                 Ok(response) => render_goal_response(&response),
-                Err(error) => channel_runtime_cli_string_with_args(
-                    "goal-mode-command-failed",
-                    &[(
-                        "error",
-                        zeroclaw_providers::sanitize_api_error(&error.to_string()).as_str(),
-                    )],
-                ),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                            })),
+                        "Goal command submission failed"
+                    );
+                    channel_runtime_cli_string("goal-mode-command-failed")
+                }
             },
-            Err(error) => channel_runtime_cli_string_with_args(
-                "goal-mode-command-invalid",
-                &[("error", &format!("{error:?}"))],
-            ),
+            Err(_) => channel_runtime_cli_string("goal-mode-command-invalid"),
         };
         if let Some(channel) =
             find_channel_for_message(&ctx.channels_by_name, &original_goal_message)
@@ -7348,16 +7350,23 @@ async fn process_channel_message_body(
         if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::reply_to(
-                        &msg,
-                        channel_runtime_cli_string_with_args(
-                            "goal-mode-command-failed",
-                            &[(
-                                "error",
-                                zeroclaw_providers::sanitize_api_error(&error.to_string()).as_str(),
-                            )],
-                        ),
-                    ))
+                    .send(&SendMessage::reply_to(&msg, {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(
+                                    &error.to_string(),
+                                ),
+                            })),
+                            "Matrix Goal disposal failed"
+                        );
+                        channel_runtime_cli_string("goal-mode-command-failed")
+                    }))
                     .await;
             }
             return;
@@ -9181,6 +9190,23 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
         GoalResponse::Stale => "goal-mode-stale",
     };
     channel_runtime_cli_string(key)
+}
+
+#[cfg(test)]
+mod goal_command_message_tests {
+    use super::channel_runtime_cli_string;
+
+    #[test]
+    fn goal_command_errors_are_actionable_without_internal_details() {
+        assert_eq!(
+            channel_runtime_cli_string("goal-mode-command-invalid"),
+            "That is not a valid Goal command. Use `/goal help` to see the supported commands."
+        );
+        assert_eq!(
+            channel_runtime_cli_string("goal-mode-command-failed"),
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+        );
+    }
 }
 
 /// Claim the sender's interruption slot for a message that is about to be
