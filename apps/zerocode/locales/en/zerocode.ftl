@@ -135,6 +135,7 @@ zc-goal-resumed = ▶️ Goal resumed.
 zc-goal-cancelled = 🛑 Goal cancelled.
 zc-goal-already-cancelled = 🛑 Goal is already cancelled.
 zc-goal-completed = ✅ Goal completed.
+zc-goal-failed = ❌ Goal failed. Use `/goal status` for its terminal reason.
 zc-goal-no-current = ⚠️ No current goal.
 zc-goal-already-active = ⚠️ A goal is already active.
 zc-goal-terminal = ⚠️ Goal is no longer resumable.

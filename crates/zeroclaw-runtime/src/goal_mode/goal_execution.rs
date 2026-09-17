@@ -972,7 +972,7 @@ impl GoalExecutionEngine {
         ));
         let mut lease = self.runtime.acquire_execution(settings, request).await?;
 
-        GOAL_OPERATION_ACCOUNTING
+        let result = GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
                 scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
                     self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
@@ -980,7 +980,48 @@ impl GoalExecutionEngine {
                 })
                 .await
             })
-            .await
+            .await;
+        if let Err(error) = &result {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": scope.task_id(),
+                        "session_id": scope.session_id(),
+                        "execution_epoch": scope.execution_epoch(),
+                        "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
+                    })),
+                "Goal execution failed"
+            );
+            let terminalized_exact_scope = self
+                .registry
+                .current_goal_for_session(scope.session_id())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|task| {
+                    task.id == scope.task_id() && task.status == TaskStatus::Failed
+                });
+            if terminalized_exact_scope {
+                if let Err(notice_error) =
+                    lease.publish_goal_notice(GoalExecutionNotice::Failed).await
+                {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": scope.task_id(),
+                                "session_id": scope.session_id(),
+                                "error": zeroclaw_providers::sanitize_api_error(&format!("{notice_error:#}")),
+                            })),
+                        "Goal failure notice delivery failed"
+                    );
+                }
+            }
+        }
+        result
     }
 
     async fn current_objective(&self, scope: &GoalExecutionScope) -> Result<String> {

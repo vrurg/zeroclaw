@@ -1281,6 +1281,7 @@ goal-mode-help =
 goal-mode-disabled = 🚫 Goal Mode is disabled.
 goal-mode-started = 🟢 Goal started.
 goal-mode-completed = ✅ Goal completed.
+goal-mode-failed = ❌ Goal failed. Use `/goal status` for its terminal reason.
 goal-mode-status = ℹ️ Goal status is available.
 goal-mode-budget = ℹ️ Goal budget is available.
 goal-mode-budget-updated = 📝 Goal budget updated.

@@ -155,6 +155,9 @@ enum GoalUpdate<'a> {
     PausedForBlocker {
         session_id: &'a str,
     },
+    Failed {
+        session_id: &'a str,
+    },
 }
 
 fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
@@ -172,6 +175,7 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "failed" => Some(GoalUpdate::Failed { session_id }),
         _ => None,
     }
 }
@@ -2240,7 +2244,8 @@ impl Chat {
                     let session_id = match &update {
                         GoalUpdate::VerifiedCandidate { session_id, .. }
                         | GoalUpdate::Completed { session_id }
-                        | GoalUpdate::PausedForBlocker { session_id } => session_id,
+                        | GoalUpdate::PausedForBlocker { session_id }
+                        | GoalUpdate::Failed { session_id } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
@@ -2265,6 +2270,14 @@ impl Chat {
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                                     "zc-goal-paused",
+                                ))));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::Failed { .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                    "zc-goal-failed",
                                 ))));
                             state.mark_dirty_append();
                         }
@@ -21437,6 +21450,7 @@ mod tests {
                 }
             }),
             serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+            serde_json::json!({ "failed": { "session_id": "sess-1" } }),
         ] {
             notif_tx
                 .send(RpcNotification {
@@ -21449,12 +21463,15 @@ mod tests {
         chat.drain_notifications();
 
         let entries = active_state(&mut chat).entries();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(
             matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
         );
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+        assert!(
+            matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-failed"))
         );
     }
 

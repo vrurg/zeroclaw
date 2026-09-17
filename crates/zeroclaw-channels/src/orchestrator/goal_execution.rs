@@ -563,6 +563,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         let key = match notice {
             GoalExecutionNotice::Completed => "goal-mode-completed",
             GoalExecutionNotice::PausedForBlocker => "goal-mode-paused-blocked",
+            GoalExecutionNotice::Failed => "goal-mode-failed",
         };
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;

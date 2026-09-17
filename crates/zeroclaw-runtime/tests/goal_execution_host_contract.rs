@@ -20,11 +20,11 @@ use zeroclaw_runtime::control_plane::{
     GoalTransitionResult, SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-    GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionNotice, GoalExecutionScope,
+    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
+    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
+    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -260,6 +260,74 @@ impl GoalSessionDriver for PausingExecutionDriver {
             parent_started: Arc::clone(&self.parent_started),
             release_parent: Arc::clone(&self.release_parent),
             verifier_calls: Arc::clone(&self.verifier_calls),
+        }))
+    }
+}
+
+struct FailingExecutionLease {
+    session_key: GoalSessionKey,
+    notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for FailingExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalParentTurn,
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        anyhow::bail!("simulated parent failure")
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("parent failure must skip the verifier")
+    }
+
+    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        anyhow::bail!("parent failure must not deliver a candidate")
+    }
+
+    async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> anyhow::Result<()> {
+        self.notices.lock().unwrap().push(notice);
+        Ok(())
+    }
+}
+
+struct FailingExecutionDriver {
+    binding: GoalSessionBinding,
+    notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
+}
+
+#[async_trait]
+impl GoalSessionDriver for FailingExecutionDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(FailingExecutionLease {
+            session_key: self.binding.session_key().clone(),
+            notices: Arc::clone(&self.notices),
         }))
     }
 }
@@ -2260,6 +2328,74 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
             .unwrap()
             .status,
         TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the_goal() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        notices: Arc::clone(&notices),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let scope = request.scope().clone();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    let error = engine.run(&settings, request).await.unwrap_err();
+
+    assert!(error.to_string().contains("Goal parent operation failed"));
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::Failed]
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("parent_operation_failed")
     );
 }
 

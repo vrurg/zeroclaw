@@ -295,6 +295,7 @@ rpc_type! {
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
+        Failed { session_id: String },
     }
 }
 

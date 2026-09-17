@@ -500,6 +500,7 @@ pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
 pub enum GoalExecutionNotice {
     Completed,
     PausedForBlocker,
+    Failed,
 }
 
 /// Surface-owned foreground execution bridge. It retains the live-session

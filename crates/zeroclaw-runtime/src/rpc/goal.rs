@@ -316,6 +316,9 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     session_id: self.raw_session_id()?.to_owned(),
                 }
             }
+            GoalExecutionNotice::Failed => crate::rpc::types::SessionGoalUpdate::Failed {
+                session_id: self.raw_session_id()?.to_owned(),
+            },
         };
         self.outbound
             .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
