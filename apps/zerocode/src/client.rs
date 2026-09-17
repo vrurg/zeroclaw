@@ -3589,19 +3589,10 @@ pub enum QuickstartApplyResult {
     Applied {
         agent: AppliedAgent,
         daemon_restarted: bool,
-        #[serde(default)]
-        warnings: Vec<QuickstartWarning>,
     },
     Errors {
         errors: Vec<QuickstartError>,
     },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QuickstartWarning {
-    pub step: QuickstartStep,
-    pub field: String,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

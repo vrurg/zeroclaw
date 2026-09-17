@@ -4,7 +4,6 @@
 pub mod v1;
 pub mod v2;
 
-use crate::api_error::ConfigApiError;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
@@ -706,34 +705,6 @@ pub struct Config {
     pub escalation: EscalationConfig,
 }
 
-/// Result of a config replacement that reached the destination path.
-///
-/// A directory fsync can fail after the atomic rename has replaced the old
-/// config. Callers that coordinate another durable resource must preserve that
-/// resource in this case: the new config is already visible at its path, even
-/// though durability could not be confirmed.
-#[derive(Debug)]
-pub enum ConfigSaveOutcome {
-    /// The config replacement and directory metadata sync completed.
-    Durable,
-    /// The replacement completed, but syncing the parent directory failed.
-    CommittedWithDurabilityWarning(anyhow::Error),
-}
-
-impl ConfigSaveOutcome {
-    /// Return the legacy `Result<()>` view used by callers that do not need to
-    /// distinguish an uncommitted write from a post-rename warning.
-    pub fn into_legacy_result(self) -> Result<()> {
-        match self {
-            // A legacy caller cannot recover a pre-rename outcome from this
-            // result.  Once rename succeeded, returning `Err` prompts many
-            // existing callers to restore state that is already visible on
-            // disk.  Callers that need the warning must use the outcome API.
-            Self::Durable | Self::CommittedWithDurabilityWarning(_) => Ok(()),
-        }
-    }
-}
-
 /// Multi-client workspace isolation configuration.
 ///
 /// When enabled, each client engagement gets an isolated workspace with
@@ -862,11 +833,8 @@ pub enum AuthMode {
 
 /// Authentication mode for Anthropic aliases.
 ///
-/// This provider-local type is intentional: the shared [`AuthMode`] has the
-/// established `o_auth` wire spelling for existing provider families, while
-/// Anthropic introduced this field with the operator-facing `oauth` spelling.
-/// Keeping the type local makes serde, schema-derived configuration metadata,
-/// and Web/TUI enum choices agree without rewriting other providers' configs.
+/// This provider-local type deliberately serializes OAuth as `oauth`, without
+/// changing the established spelling used by other provider families.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -876,7 +844,7 @@ pub enum AnthropicAuthMode {
     /// Standard API key authentication via the `api_key` field.
     #[default]
     ApiKey,
-    /// Stored OAuth setup-token profile with the same name as the alias.
+    /// A stored setup-token profile named after the alias.
     #[serde(rename = "oauth")]
     OAuth,
 }
@@ -1092,8 +1060,8 @@ pub struct ModelProviderConfig {
 // that support multiple auth flows additionally carry an `auth_mode` field.
 //
 // Pattern reference for adding a new family:
-// - Single-endpoint family with no extras: see `GroqModelProviderConfig`
-// - Family with extras: see `AnthropicModelProviderConfig` or `OpenAIModelProviderConfig`
+// - Single-endpoint family with no extras: see `AnthropicModelProviderConfig`
+// - Family with extras: see `OpenAIModelProviderConfig`
 // - Family with computed-endpoint template: see `AzureModelProviderConfig`
 // - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
 //
@@ -1248,10 +1216,6 @@ impl ModelEndpoint for AnthropicEndpoint {
 }
 
 /// Anthropic model provider config.
-///
-/// Omitting `auth_mode` deliberately preserves the legacy static-credential
-/// path, including setup tokens stored in `api_key`. Set `auth_mode = "oauth"`
-/// only to resolve the stored Anthropic auth profile with the same alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1259,11 +1223,8 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Resolve credentials from the same-named stored Anthropic auth profile.
-    ///
-    /// `None` (the compatibility default) and `api_key` use `base.api_key`.
-    /// OAuth mode must leave `api_key` unset so the credential source is
-    /// unambiguous.
+    /// Selects the credential source. Omitting this field preserves the legacy
+    /// `api_key` path, including existing inline setup tokens.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AnthropicAuthMode>,
@@ -1282,9 +1243,7 @@ pub struct AnthropicModelProviderConfig {
 }
 
 impl AnthropicModelProviderConfig {
-    /// OAuth setup tokens are accepted only by Anthropic's public API. Keep
-    /// this predicate in the configuration owner so config admission and
-    /// provider construction cannot diverge.
+    /// OAuth setup tokens are accepted only by Anthropic's public API.
     pub fn has_official_oauth_endpoint(api_url: Option<&str>) -> bool {
         api_url.is_none_or(|url| {
             reqwest::Url::parse(url)
@@ -7125,36 +7084,16 @@ impl CostRatesConfig {
     /// Deliberate zero-cost entries remain valid and distinguish a configured
     /// free resource from one whose pricing is unavailable.
     pub fn validate(&self) -> Result<()> {
-        self.validate_for_repair(&std::collections::HashSet::new())
-    }
-
-    /// Continue past cost-rate diagnostics already classified as unrelated by
-    /// the config-repair bridge, while preserving strict validation for every
-    /// other rate. A caller-side suppression around this whole validator would
-    /// skip later fields after its first retained error.
-    fn validate_for_repair(
-        &self,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
-        fn validate_rate(
-            path: String,
-            value: Option<f64>,
-            ignored_errors: &std::collections::HashSet<ConfigApiError>,
-        ) -> Result<()> {
+        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
             if let Some(value) = value
                 && !crate::cost::is_sane_usd_rate(value)
             {
                 let max = crate::cost::MAX_SANE_USD_RATE;
-                continue_or_return_repair_validation_error(
-                    ConfigApiError::new(
-                        crate::api_error::ConfigApiCode::InvalidNumericRange,
-                        format!(
-                            "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
-                        ),
-                    )
-                    .with_path(path),
-                    ignored_errors,
-                )?;
+                validation_bail!(
+                    InvalidNumericRange,
+                    path.clone(),
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                );
             }
             Ok(())
         }
@@ -7163,25 +7102,15 @@ impl CostRatesConfig {
         model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
         for (provider, model, rates) in model_rates {
             let prefix = format!("cost.rates.providers.models.{provider}.{model}");
-            validate_rate(
-                format!("{prefix}.input_per_mtok"),
-                rates.input_per_mtok,
-                ignored_errors,
-            )?;
-            validate_rate(
-                format!("{prefix}.output_per_mtok"),
-                rates.output_per_mtok,
-                ignored_errors,
-            )?;
+            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
+            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
             validate_rate(
                 format!("{prefix}.cached_input_per_mtok"),
                 rates.cached_input_per_mtok,
-                ignored_errors,
             )?;
             validate_rate(
                 format!("{prefix}.cache_write_per_mtok"),
                 rates.cache_write_per_mtok,
-                ignored_errors,
             )?;
         }
 
@@ -7191,7 +7120,6 @@ impl CostRatesConfig {
             validate_rate(
                 format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
                 rates.per_mchar,
-                ignored_errors,
             )?;
         }
 
@@ -7202,18 +7130,13 @@ impl CostRatesConfig {
             validate_rate(
                 format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
                 rates.per_minute,
-                ignored_errors,
             )?;
         }
 
         let mut tool_rates: Vec<_> = self.tools.iter().collect();
         tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
         for (tool, rates) in tool_rates {
-            validate_rate(
-                format!("cost.rates.tools.{tool}.per_call"),
-                rates.per_call,
-                ignored_errors,
-            )?;
+            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
         }
 
         Ok(())
@@ -10831,44 +10754,16 @@ fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
-    validate_mcp_config_for_repair(config, &std::collections::HashSet::new())
-}
-
-fn validate_mcp_config_for_repair(
-    config: &McpConfig,
-    ignored_errors: &std::collections::HashSet<ConfigApiError>,
-) -> Result<()> {
-    macro_rules! mcp_validation_bail {
-        ($code:ident, $path:expr, $($msg:tt)*) => {{
-            continue_or_return_repair_validation_error(
-                ConfigApiError::new(
-                    crate::api_error::ConfigApiCode::$code,
-                    format!($($msg)*),
-                )
-                .with_path($path)
-                .with_related_paths(["mcp.enabled"]),
-                ignored_errors,
-            )?;
-        }};
-    }
-
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
         let name = server.name.trim();
         if name.is_empty() {
-            mcp_validation_bail!(
+            validation_bail!(
                 RequiredFieldEmpty,
                 format!("mcp.servers[{i}].name"),
                 "mcp.servers[{i}].name must not be empty"
             );
-            // A retained empty-name diagnostic must not participate in the
-            // duplicate-name set. In config-repair mode the macro above
-            // continues after recording the structured warning; treating two
-            // retained empty names as an unstructured duplicate would turn an
-            // unrelated repair into a fatal error.
-            continue;
         }
         if !seen_names.insert(name.to_ascii_lowercase()) {
             anyhow::bail!("mcp.servers contains duplicate name: {name}");
@@ -10876,7 +10771,7 @@ fn validate_mcp_config_for_repair(
 
         if let Some(timeout) = server.tool_timeout_secs {
             if timeout == 0 {
-                mcp_validation_bail!(
+                validation_bail!(
                     InvalidNumericRange,
                     format!("mcp.servers[{i}].tool_timeout_secs"),
                     "mcp.servers[{i}].tool_timeout_secs must be greater than 0"
@@ -10933,7 +10828,7 @@ fn validate_mcp_config_for_repair(
                 }
                 if let Some(ca_path) = server.tls_ca_cert_path.as_deref() {
                     if ca_path.trim().is_empty() {
-                        mcp_validation_bail!(
+                        validation_bail!(
                             RequiredFieldEmpty,
                             format!("mcp.servers[{i}].tls_ca_cert_path"),
                             "mcp.servers[{i}].tls_ca_cert_path must not be empty"
@@ -11013,64 +10908,28 @@ fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Preserve a structured validation error while declaring fields that caused
-/// its enclosing conditional validator to run. Unstructured errors remain
-/// unchanged and therefore fail closed in config repair.
-fn with_validation_related_paths(
-    error: anyhow::Error,
-    related_paths: impl IntoIterator<Item = impl Into<String>>,
-) -> anyhow::Error {
-    match error.downcast::<ConfigApiError>() {
-        Ok(structured) => anyhow::Error::from(structured.with_related_paths(related_paths)),
-        Err(error) => error,
-    }
-}
-
 /// Shared bot-token rule for channel structs whose `bot_token` is required
 /// once the alias is enabled (Telegram, Discord). `field_path` must be the
 /// `channels.<type>.<alias>.bot_token` leaf; the enabled-state message
 /// derives the sibling `.enabled` path from it.
-fn continue_or_return_repair_validation_error(
-    error: ConfigApiError,
-    ignored_errors: &std::collections::HashSet<ConfigApiError>,
-) -> Result<()> {
-    if ignored_errors.contains(&error) {
-        Ok(())
-    } else {
-        Err(anyhow::Error::from(error))
-    }
-}
-
-fn validate_required_bot_token(
-    field_path: &str,
-    enabled: bool,
-    token: &str,
-    ignored_errors: &std::collections::HashSet<ConfigApiError>,
-) -> Result<()> {
+fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> Result<()> {
     if token.trim() == crate::traits::UNSET_DISPLAY {
-        continue_or_return_repair_validation_error(
-            ConfigApiError::new(
-                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
-                format!("{field_path} must not contain the unset display placeholder"),
-            )
-            .with_path(field_path),
-            ignored_errors,
-        )?;
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
     }
     if enabled && crate::traits::is_unset_display_value(token) {
         let enabled_path = field_path.strip_suffix("bot_token").map_or_else(
             || field_path.to_string(),
             |prefix| format!("{prefix}enabled"),
         );
-        continue_or_return_repair_validation_error(
-            ConfigApiError::new(
-                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
-                format!("{field_path} is required when {enabled_path} = true"),
-            )
-            .with_path(field_path)
-            .with_related_paths([enabled_path]),
-            ignored_errors,
-        )?;
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
     }
     Ok(())
 }
@@ -11088,28 +10947,20 @@ pub(crate) fn validate_required_field(
     enabled_path: &str,
     enabled: bool,
     value: &str,
-    ignored_errors: &std::collections::HashSet<ConfigApiError>,
 ) -> Result<()> {
     if value.trim() == crate::traits::UNSET_DISPLAY {
-        continue_or_return_repair_validation_error(
-            ConfigApiError::new(
-                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
-                format!("{field_path} must not contain the unset display placeholder"),
-            )
-            .with_path(field_path),
-            ignored_errors,
-        )?;
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
     }
     if enabled && crate::traits::is_unset_display_value(value) {
-        continue_or_return_repair_validation_error(
-            ConfigApiError::new(
-                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
-                format!("{field_path} is required when {enabled_path} = true"),
-            )
-            .with_path(field_path)
-            .with_related_paths([enabled_path]),
-            ignored_errors,
-        )?;
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
     }
     Ok(())
 }
@@ -15924,19 +15775,10 @@ impl Default for TelegramConfig {
 impl TelegramConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
-        self.validate_bot_token_for_repair(alias, &std::collections::HashSet::new())
-    }
-
-    fn validate_bot_token_for_repair(
-        &self,
-        alias: &str,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
         validate_required_bot_token(
             &format!("channels.telegram.{alias}.bot_token"),
             self.enabled,
             &self.bot_token,
-            ignored_errors,
         )
     }
 }
@@ -16136,19 +15978,10 @@ impl DiscordConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     /// Mirrors `TelegramConfig::validate_bot_token`.
     pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
-        self.validate_bot_token_for_repair(alias, &std::collections::HashSet::new())
-    }
-
-    fn validate_bot_token_for_repair(
-        &self,
-        alias: &str,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
         validate_required_bot_token(
             &format!("channels.discord.{alias}.bot_token"),
             self.enabled,
             &self.bot_token,
-            ignored_errors,
         )
     }
 }
@@ -17031,28 +16864,18 @@ impl SignalConfig {
     /// never connects and crashloops its per-channel supervisor, so reject
     /// it at config-load time instead.
     pub fn validate_required(&self, alias: &str) -> Result<()> {
-        self.validate_required_for_repair(alias, &std::collections::HashSet::new())
-    }
-
-    fn validate_required_for_repair(
-        &self,
-        alias: &str,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
         let enabled_path = format!("channels.signal.{alias}.enabled");
         validate_required_field(
             &format!("channels.signal.{alias}.http_url"),
             &enabled_path,
             self.enabled,
             &self.http_url,
-            ignored_errors,
         )?;
         validate_required_field(
             &format!("channels.signal.{alias}.account"),
             &enabled_path,
             self.enabled,
             &self.account,
-            ignored_errors,
         )
     }
 }
@@ -20015,13 +19838,6 @@ impl Default for CloudOpsConfig {
 
 impl CloudOpsConfig {
     pub fn validate(&self) -> Result<()> {
-        self.validate_for_repair(&std::collections::HashSet::new())
-    }
-
-    fn validate_for_repair(
-        &self,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
         if self.enabled {
             if self.default_cloud.trim().is_empty() {
                 anyhow::bail!(
@@ -20035,14 +19851,11 @@ impl CloudOpsConfig {
             }
             for (i, cloud) in self.supported_clouds.iter().enumerate() {
                 if cloud.trim().is_empty() {
-                    continue_or_return_repair_validation_error(
-                        ConfigApiError::new(
-                            crate::api_error::ConfigApiCode::RequiredFieldEmpty,
-                            format!("cloud_ops.supported_clouds[{i}] must not be empty"),
-                        )
-                        .with_path(format!("cloud_ops.supported_clouds[{i}]")),
-                        ignored_errors,
-                    )?;
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("cloud_ops.supported_clouds[{i}]"),
+                        "cloud_ops.supported_clouds[{i}] must not be empty"
+                    );
                 }
             }
             if !self.supported_clouds.contains(&self.default_cloud) {
@@ -22474,108 +22287,28 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
-        self.validate_allowing_legacy_colon_aliases(
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        )
-    }
-
-    fn validate_allowing_legacy_colon_aliases(
-        &self,
-        allowed_legacy_colon_alias_paths: &std::collections::HashSet<String>,
-        ignored_errors: &std::collections::HashSet<ConfigApiError>,
-    ) -> Result<()> {
-        // `validate_for_config_repair` supplies only paths it has already
-        // classified as unrelated to the pending mutation. Keep those values
-        // intact and continue checking subsequent invariants, including any
-        // dirty path. This is deliberately local to the repair bridge: a
-        // centralized multi-error validation API should replace it rather than
-        // widening normal configuration validation semantics.
-        macro_rules! validation_bail {
-            ($code:ident, $path:expr, related [$($related:expr),* $(,)?], $($msg:tt)*) => {{
-                let err = $crate::api_error::ConfigApiError::new(
-                    $crate::api_error::ConfigApiCode::$code,
-                    format!($($msg)*),
-                )
-                .with_path($path)
-                .with_related_paths([$($related),*]);
-                if !ignored_errors.contains(&err) {
-                    return Err(::anyhow::Error::from(err));
-                }
-            }};
-            ($code:ident, $path:expr, $($msg:tt)*) => {{
-                let err = $crate::api_error::ConfigApiError::new(
-                    $crate::api_error::ConfigApiCode::$code,
-                    format!($($msg)*),
-                )
-                .with_path($path);
-                if !ignored_errors.contains(&err) {
-                    return Err(::anyhow::Error::from(err));
-                }
-            }};
-        }
-
-        // Caller-side suppression is safe only when every reachable
-        // structured failure has the same affected-path set: retaining one
-        // cannot hide a later dirty causal path. `validate_http_base_url`
-        // satisfies that rule (and Gitea adds the same related paths before
-        // suppression). Multi-check helpers receive `ignored_errors`
-        // directly. Errors without an exact structured identity remain fatal:
-        // they cannot be safely attributed to an unrelated field.
-        macro_rules! validation_try {
-            ($result:expr) => {
-                if let Err(error) = $result {
-                    if !error
-                        .downcast_ref::<ConfigApiError>()
-                        .is_some_and(|structured| ignored_errors.contains(structured))
-                    {
-                        return Err(error);
-                    }
-                }
-            };
-        }
-
         validate_memory_rerank_config(&self.memory)?;
-        self.cost.rates.validate_for_repair(ignored_errors)?;
-
-        // TOML deserialization inserts provider aliases directly into their
-        // maps. Preserve legacy aliases that are broader than the mutation
-        // API grammar, but reject ':' because it is an auth-profile-id
-        // separator and can change credential ownership.
-        for (family, alias, _) in self.providers.models.iter_entries() {
-            let path = format!("providers.models.{family}.{alias}");
-            if alias.contains(':') && !allowed_legacy_colon_alias_paths.contains(&path) {
-                validation_bail!(
-                    InvalidFormat,
-                    path,
-                    "provider alias `{alias}` must not contain ':'"
-                );
-            }
-        }
+        self.cost.rates.validate()?;
 
         for (alias, provider) in &self.providers.models.anthropic {
-            if provider.auth_mode == Some(AnthropicAuthMode::OAuth)
-                && provider.base.api_key.is_some()
-            {
-                let path = format!("providers.models.anthropic.{alias}.api_key");
+            if provider.auth_mode != Some(AnthropicAuthMode::OAuth) {
+                continue;
+            }
+            let path = format!("providers.models.anthropic.{alias}");
+            if provider.base.api_key.is_some() {
                 validation_bail!(
                     InvalidFormat,
                     path,
-                    related[format!("providers.models.anthropic.{alias}.auth_mode")],
-                    "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+                    "{path}: auth_mode = \"oauth\" must not be combined with api_key"
                 );
             }
-            if provider.auth_mode == Some(AnthropicAuthMode::OAuth)
-                && !AnthropicModelProviderConfig::has_official_oauth_endpoint(
-                    provider.base.uri.as_deref(),
-                )
-            {
-                let path = format!("providers.models.anthropic.{alias}.uri");
+            if !AnthropicModelProviderConfig::has_official_oauth_endpoint(
+                provider.base.uri.as_deref(),
+            ) {
                 validation_bail!(
                     InvalidFormat,
                     path,
-                    related[format!("providers.models.anthropic.{alias}.auth_mode")],
-                    "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
+                    "{path}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
                 );
             }
         }
@@ -22620,7 +22353,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "tunnel.openvpn.config_file",
-                    related["tunnel.tunnel_provider"],
                     "tunnel.openvpn.config_file must not be empty"
                 );
             }
@@ -22628,7 +22360,6 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
-                    related["tunnel.tunnel_provider"],
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
                 );
             }
@@ -22690,11 +22421,11 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
-            tg.validate_bot_token_for_repair(alias, ignored_errors)?;
-            validation_try!(validate_http_base_url(
+            tg.validate_bot_token(alias)?;
+            validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
-            ));
+            )?;
         }
 
         for (alias, matrix) in &self.channels.matrix {
@@ -22716,7 +22447,7 @@ impl Config {
         }
 
         for (alias, dc) in &self.channels.discord {
-            dc.validate_bot_token_for_repair(alias, ignored_errors)?;
+            dc.validate_bot_token(alias)?;
         }
 
         // Signal and Voice Call: like Telegram/Discord's bot_token, these
@@ -22725,7 +22456,7 @@ impl Config {
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
         for (alias, sig) in &self.channels.signal {
-            sig.validate_required_for_repair(alias, ignored_errors)?;
+            sig.validate_required(alias)?;
         }
 
         for (alias, vc) in &self.channels.voice_call {
@@ -22735,21 +22466,18 @@ impl Config {
                 &enabled_path,
                 vc.enabled,
                 &vc.account_id,
-                ignored_errors,
             )?;
             validate_required_field(
                 &format!("channels.voice_call.{alias}.auth_token"),
                 &enabled_path,
                 vc.enabled,
                 &vc.auth_token,
-                ignored_errors,
             )?;
             validate_required_field(
                 &format!("channels.voice_call.{alias}.from_number"),
                 &enabled_path,
                 vc.enabled,
                 &vc.from_number,
-                ignored_errors,
             )?;
         }
 
@@ -22767,23 +22495,12 @@ impl Config {
                     None => validation_bail!(
                         RequiredFieldEmpty,
                         path,
-                        related [format!("channels.git.{alias}.enabled"), format!("channels.git.{alias}.provider")],
                         "{path} is required when provider = \"{provider}\": set the \
                          instance's API base URL including /api/v1 (e.g. \
                          https://git.example.org/api/v1); no default host is assumed \
                          because API requests carry the access token"
                     ),
-                    Some(url) => {
-                        validation_try!(validate_http_base_url(&path, url).map_err(|error| {
-                            with_validation_related_paths(
-                                error,
-                                [
-                                    format!("channels.git.{alias}.enabled"),
-                                    format!("channels.git.{alias}.provider"),
-                                ],
-                            )
-                        }))
-                    }
+                    Some(url) => validate_http_base_url(&path, url)?,
                 }
             }
         }
@@ -22836,7 +22553,6 @@ impl Config {
             validation_bail!(
                 InvalidNumericRange,
                 "nodes.mdns.peer_ttl_secs",
-                related["nodes.mdns.announce_interval_secs"],
                 "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
             );
         }
@@ -22881,7 +22597,6 @@ impl Config {
                 validation_bail!(
                     InvalidFormat,
                     flag_path,
-                    related["memory.backend"],
                     "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
@@ -22892,7 +22607,6 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
-                        related[flag_path],
                         "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
@@ -22915,7 +22629,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "heartbeat.agent",
-                    related["heartbeat.enabled"],
                     "heartbeat.agent must reference a configured agent when heartbeat.enabled = true"
                 );
             }
@@ -22923,7 +22636,6 @@ impl Config {
                 validation_bail!(
                     DanglingReference,
                     "heartbeat.agent",
-                    related["heartbeat.enabled".to_string(), format!("agents.{hb_agent}")],
                     "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
                 );
             }
@@ -23331,7 +23043,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("model_routes[{i}].model_provider"),
-                            related[format!("providers.models.{ty}.{inner}")],
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -23376,7 +23087,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("embedding_routes[{i}].model_provider"),
-                            related[format!("providers.models.{ty}.{inner}")],
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -23617,7 +23327,7 @@ impl Config {
 
         // MCP
         if self.mcp.enabled {
-            validate_mcp_config_for_repair(&self.mcp, ignored_errors)?;
+            validate_mcp_config(&self.mcp)?;
         }
 
         // Knowledge graph
@@ -23626,7 +23336,6 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "knowledge.max_nodes",
-                    related["knowledge.enabled"],
                     "knowledge.max_nodes must be greater than 0"
                 );
             }
@@ -23634,7 +23343,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "knowledge.db_path",
-                    related["knowledge.enabled"],
                     "knowledge.db_path must not be empty"
                 );
             }
@@ -23809,7 +23517,7 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-        self.cloud_ops.validate_for_repair(ignored_errors)?;
+        self.cloud_ops.validate()?;
 
         // Skills — extra registries
         {
@@ -23858,18 +23566,12 @@ impl Config {
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    "notion.database_id",
-                    related["notion.enabled"],
-                    "notion.database_id must not be empty when notion.enabled = true"
-                );
+                anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
             if self.notion.poll_interval_secs == 0 {
                 validation_bail!(
                     InvalidNumericRange,
                     "notion.poll_interval_secs",
-                    related["notion.enabled"],
                     "notion.poll_interval_secs must be greater than 0"
                 );
             }
@@ -23877,7 +23579,6 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "notion.max_concurrent",
-                    related["notion.enabled"],
                     "notion.max_concurrent must be greater than 0"
                 );
             }
@@ -23885,7 +23586,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.status_property",
-                    related["notion.enabled"],
                     "notion.status_property must not be empty"
                 );
             }
@@ -23893,7 +23593,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.input_property",
-                    related["notion.enabled"],
                     "notion.input_property must not be empty"
                 );
             }
@@ -23901,7 +23600,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.result_property",
-                    related["notion.enabled"],
                     "notion.result_property must not be empty"
                 );
             }
@@ -24001,7 +23699,6 @@ impl Config {
                             format!(
                                 "runtime_profiles.{palias}.context_compression.summary_provider"
                             ),
-                            related[format!("providers.models.{ty}.{inner}")],
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -24039,7 +23736,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
-                            related[format!("providers.models.{ty}")],
                             "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
                         );
                     }
@@ -24050,7 +23746,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
-                            related[format!("providers.models.{ty}.{inner}")],
                             "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
@@ -24081,7 +23776,6 @@ impl Config {
                             validation_bail!(
                                 DanglingReference,
                                 format!("agents.{alias}.channels[{i}]"),
-                                related[format!("channels.{ty}.{inner}")],
                                 "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
                             );
                         }
@@ -24134,7 +23828,6 @@ impl Config {
                             validation_bail!(
                                 DanglingReference,
                                 format!("agents.{alias}.{field}"),
-                                related[format!("{section_prefix}.{ty}.{inner}")],
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
@@ -24176,7 +23869,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.{field}[{i}]"),
-                            related[format!("{section}.{trimmed}")],
                             "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
                         );
                     }
@@ -24202,7 +23894,6 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.{field}"),
-                        related[format!("{section}.{trimmed}")],
                         "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
                     );
                 }
@@ -24216,7 +23907,6 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("agents.{alias}.risk_profile"),
-                    related[format!("agents.{alias}.enabled")],
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
                 );
             }
@@ -24247,7 +23937,6 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.delegates[{i}].agent"),
-                        related[format!("agents.{target_str}")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -24275,7 +23964,6 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.workspace.access.{target_str}"),
-                        related[format!("agents.{target_str}")],
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -24319,16 +24007,11 @@ impl Config {
                     );
                 }
                 let Some(target_agent) = self.agents.get(target_str) else {
-                    let path = format!("agents.{alias}.workspace.read_memory_from[{i}]");
                     validation_bail!(
                         DanglingReference,
-                        path,
-                        related[format!("agents.{target_str}")],
+                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
-                    // An explicitly ignored missing target has no remaining
-                    // same-target invariant to inspect in this iteration.
-                    continue;
                 };
                 if target.categories().is_some()
                     && matches!(
@@ -24347,7 +24030,6 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        related [format!("agents.{alias}.memory.backend"), format!("agents.{target_str}.memory.backend")],
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
                     );
                 }
@@ -24389,7 +24071,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
-                            related[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -24405,7 +24086,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
-                            related[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -24413,7 +24093,6 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
-                            related[format!("channels.{channel_type}.{alias}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
                         );
                     }
@@ -24422,16 +24101,11 @@ impl Config {
             for (i, member) in group.agents.iter().enumerate() {
                 let member_str = member.as_str();
                 let Some(member_agent) = self.agents.get(member_str) else {
-                    let path = format!("peer_groups.{group_name}.agents[{i}]");
                     validation_bail!(
                         DanglingReference,
-                        path,
-                        related[format!("agents.{member_str}")],
+                        format!("peer_groups.{group_name}.agents[{i}]"),
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
                     );
-                    // An explicitly ignored missing member has no remaining
-                    // same-member invariant to inspect in this iteration.
-                    continue;
                 };
                 let has_channel_match = member_agent.channels.iter().any(|ch| {
                     let ch_str = ch.as_str();
@@ -24448,7 +24122,6 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
-                        related [format!("agents.{member_str}.channels"), format!("peer_groups.{group_name}.channel")],
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
                     );
                 }
@@ -24518,22 +24191,7 @@ impl Config {
                     &path,
                 ) {
                     Ok(patterns) => patterns,
-                    Err(e) => {
-                        // A malformed host grant prevents the dependent
-                        // carveout checks below from running. Declare that
-                        // dependency so config repair cannot retain this
-                        // diagnostic while admitting a dirty carveout.
-                        validation_bail!(
-                            InvalidFormat,
-                            path,
-                            related[format!("plugins.entries.{}.egress_allow_private", entry.name)],
-                            "{}",
-                            e
-                        );
-                        // The ignored malformed host list cannot safely feed
-                        // the dependent private-carveout validation below.
-                        continue;
-                    }
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
             };
             let private = {
@@ -24543,12 +24201,7 @@ impl Config {
                     &path,
                 ) {
                     Ok(patterns) => patterns,
-                    Err(e) => {
-                        validation_bail!(InvalidFormat, path, "{}", e);
-                        // The ignored malformed carveout list cannot safely
-                        // participate in containment validation below.
-                        continue;
-                    }
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
             };
 
@@ -24563,7 +24216,6 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
-                        related[format!("plugins.entries.{}.egress_hosts", entry.name)],
                         "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
@@ -24572,153 +24224,6 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    /// Validate a configuration mutation while allowing an unrelated legacy
-    /// provider alias that the current mutation grammar deliberately rejects.
-    ///
-    /// An error affecting a dirty path remains fatal. An unrelated retained
-    /// error is returned as a structured warning so an operator can repair a
-    /// valid field without being locked out by a separate pre-existing defect.
-    /// The provider entries stay in the validation graph, so agents and routes
-    /// that already reference them continue to resolve.
-    /// Replace this compatibility bridge when configuration validation and
-    /// warning transport are centralized.
-    pub fn validate_for_config_repair(
-        &self,
-    ) -> Result<Vec<crate::validation_warnings::ValidationWarning>> {
-        // Public mutations address `#[natural_key]` list entries by key
-        // (`mcp.servers.filesystem.tool_timeout_secs`), but validators retain
-        // their stable positional display paths (`mcp.servers[0]...`). Capture
-        // the live natural-key metadata once per repair attempt, then compare
-        // the two spellings against that stable view. Calling
-        // `map_key_sections()` per comparison would repeatedly materialize
-        // generated schema metadata. A centralized validation model should
-        // eventually own this translation instead.
-        let natural_key_sections = config_repair_natural_key_sections(self);
-
-        let paths_overlap = |left: &str, right: &str| -> bool {
-            let left = canonical_config_repair_path(&natural_key_sections, left);
-            let right = canonical_config_repair_path(&natural_key_sections, right);
-            left == right
-                || left
-                    .strip_prefix(right.as_ref())
-                    .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
-                || right
-                    .strip_prefix(left.as_ref())
-                    .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
-        };
-
-        let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
-            .providers
-            .models
-            .iter_entries()
-            .filter_map(|(family, alias, _)| {
-                if family != "anthropic" || !alias.contains(':') {
-                    return None;
-                }
-                // OAuth aliases participate in profile ownership, so they are
-                // never grandfathered by this static-credential bridge.
-                if !self
-                    .providers
-                    .models
-                    .anthropic
-                    .get(alias)
-                    .is_some_and(|provider| {
-                        matches!(provider.auth_mode, None | Some(AnthropicAuthMode::ApiKey))
-                    })
-                {
-                    return None;
-                }
-                let path = format!("providers.models.{family}.{alias}");
-                let touches_dirty = self
-                    .dirty_paths
-                    .iter()
-                    .any(|dirty| paths_overlap(dirty, &path));
-                if touches_dirty {
-                    return None;
-                }
-                // Do not allow a config-patch request to create a new direct
-                // reference to a colon alias. Existing references are safe to
-                // retain while another field is repaired because their paths
-                // are not dirty.
-                let alias_kind = crate::alias_refs::AliasKind::Provider {
-                    category: crate::alias_refs::ProviderCategory::Models,
-                    family: family.to_string(),
-                };
-                let dirty_path_references_alias =
-                    crate::alias_refs::find_all_references(self, &alias_kind, alias)
-                        .iter()
-                        .any(|reference| {
-                            self.dirty_paths
-                                .iter()
-                                .any(|dirty| paths_overlap(dirty, &reference.path))
-                        });
-                (!dirty_path_references_alias).then_some(path)
-            })
-            .collect();
-        let mut warnings = Vec::new();
-        let mut ignored_errors = std::collections::HashSet::new();
-        loop {
-            let Err(error) = self.validate_allowing_legacy_colon_aliases(
-                &excluded_legacy_alias_paths,
-                &ignored_errors,
-            ) else {
-                break;
-            };
-            let api_error = ConfigApiError::from_validation(error);
-            let error_path = api_error.path.as_deref().unwrap_or("");
-            let touches_dirty = api_error.affected_paths().any(|affected_path| {
-                self.dirty_paths
-                    .iter()
-                    .any(|dirty| paths_overlap(affected_path, dirty))
-            });
-            // Alias-name validation reports the alias path rather than a
-            // distinct dirty reference that introduced it. Any remaining
-            // colon alias here was deliberately not grandfathered above:
-            // it is OAuth, non-Anthropic, touched, or newly referenced. Keep
-            // that ownership-sensitive rejection fatal instead of hiding it
-            // behind an unrelated-path warning.
-            let rejected_colon_alias =
-                self.providers
-                    .models
-                    .iter_entries()
-                    .any(|(family, alias, _)| {
-                        alias.contains(':')
-                            && error_path == format!("providers.models.{family}.{alias}")
-                            && !excluded_legacy_alias_paths
-                                .contains(&format!("providers.models.{family}.{alias}"))
-                    });
-            if touches_dirty || rejected_colon_alias || error_path.is_empty() {
-                return Err(anyhow::Error::from(api_error));
-            }
-
-            // `validate_allowing_legacy_colon_aliases` reports one error at a
-            // time. Suppress only this full, already-classified diagnostic,
-            // rather than every error with its primary display path: a later
-            // cross-field error can legitimately share that path while adding
-            // a dirty causal sibling. A centralized multi-error validation API
-            // must eventually replace this bounded repair bridge.
-            if !ignored_errors.insert(api_error.clone()) {
-                return Err(anyhow::Error::from(api_error));
-            }
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "pre_existing_validation_error",
-                api_error.message,
-                error_path,
-            ));
-        }
-        let mut excluded_legacy_alias_paths: Vec<_> =
-            excluded_legacy_alias_paths.into_iter().collect();
-        excluded_legacy_alias_paths.sort();
-        warnings.extend(excluded_legacy_alias_paths.into_iter().map(|path| {
-            crate::validation_warnings::ValidationWarning::new(
-                "legacy_colon_alias_retained",
-                "unrelated legacy provider alias contains `:` and must be repaired separately",
-                path,
-            )
-        }));
-        Ok(warnings)
     }
 
     pub fn mark_dirty(&mut self, path: &str) {
@@ -24915,14 +24420,6 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
-        self.save_with_outcome().await?.into_legacy_result()
-    }
-
-    /// Save the complete config and report whether a post-rename directory
-    /// sync warning occurred. Most callers should use [`Self::save`]; callers
-    /// coordinating another durable resource can keep that resource when the
-    /// config has already been committed.
-    pub async fn save_with_outcome(&self) -> Result<ConfigSaveOutcome> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -25006,20 +24503,13 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
-        self.save_dirty_with_outcome().await?.into_legacy_result()
-    }
-
-    /// Incrementally save dirty paths and report whether a post-rename
-    /// directory sync warning occurred. A returned warning still means the
-    /// new config has replaced the old file and the dirty set is cleared.
-    pub async fn save_dirty_with_outcome(&mut self) -> Result<ConfigSaveOutcome> {
         if self.dirty_paths.is_empty() {
-            return Ok(ConfigSaveOutcome::Durable);
+            return Ok(());
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save_with_outcome().await;
+            let result = self.save().await;
             if result.is_ok() {
                 self.clear_dirty();
             }
@@ -25083,59 +24573,10 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
-        let outcome = write_config_atomically(&config_path, &toml_str).await?;
+        write_config_atomically(&config_path, &toml_str).await?;
         self.clear_dirty();
-        Ok(outcome)
+        Ok(())
     }
-}
-
-/// Snapshot the current names of list-backed config entries addressed by a
-/// natural key. A repair validation uses one snapshot so every comparison sees
-/// the same mutation state without repeatedly materializing schema metadata.
-fn config_repair_natural_key_sections(config: &Config) -> Vec<(&'static str, Vec<String>)> {
-    Config::map_key_sections()
-        .into_iter()
-        .filter(|section| {
-            section.kind == crate::traits::MapKeyKind::List && section.natural_key.is_some()
-        })
-        .map(|section| {
-            (
-                section.path,
-                config.get_map_keys(section.path).unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-/// Translate a validator's positional list path into the public natural-key
-/// spelling used by persistent config mutations. Paths that do not identify a
-/// current non-empty natural key remain unchanged.
-fn canonical_config_repair_path<'a>(
-    natural_key_sections: &[(&str, Vec<String>)],
-    path: &'a str,
-) -> std::borrow::Cow<'a, str> {
-    for (section_path, keys) in natural_key_sections {
-        let Some(after_section) = path.strip_prefix(section_path) else {
-            continue;
-        };
-        let Some(index_and_suffix) = after_section.strip_prefix('[') else {
-            continue;
-        };
-        let Some((index, suffix)) = index_and_suffix.split_once(']') else {
-            continue;
-        };
-        if !suffix.is_empty() && !suffix.starts_with('.') {
-            continue;
-        }
-        let Ok(index) = index.parse::<usize>() else {
-            continue;
-        };
-        let Some(key) = keys.get(index).filter(|key| !key.is_empty()) else {
-            continue;
-        };
-        return std::borrow::Cow::Owned(format!("{section_path}.{key}{suffix}"));
-    }
-    std::borrow::Cow::Borrowed(path)
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -25228,7 +24669,7 @@ fn take_post_replace_sync_failure(config_path: &Path) -> bool {
 }
 
 /// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<ConfigSaveOutcome> {
+async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
     #[cfg(any(test, feature = "test-helpers"))]
     if take_post_replace_sync_failure(config_path) {
         return write_config_atomically_with_sync(
@@ -25245,7 +24686,7 @@ async fn write_config_atomically_with_sync(
     config_path: &Path,
     toml_str: &str,
     post_replace_sync: PostReplaceSync,
-) -> Result<ConfigSaveOutcome> {
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -25364,7 +24805,7 @@ async fn write_config_atomically_with_sync(
             "injected post-replace directory sync failure",
         )),
     };
-    let outcome = if let Err(err) = post_replace_sync_result {
+    if let Err(err) = post_replace_sync_result {
         // The rename is already visible and the replacement file itself was
         // fsynced before it moved. Returning an error here would make callers
         // keep the old live snapshot even though disk contains the new one.
@@ -25384,15 +24825,11 @@ async fn write_config_atomically_with_sync(
                 })),
             "Config replacement committed but directory durability sync failed; keeping backup"
         );
-        ConfigSaveOutcome::CommittedWithDurabilityWarning(err)
     } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
-        ConfigSaveOutcome::Durable
-    } else {
-        ConfigSaveOutcome::Durable
-    };
+    }
 
-    Ok(outcome)
+    Ok(())
 }
 
 /// Write the in-memory value at `dotted` into the doc, or delete the leaf
@@ -31459,15 +30896,6 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
-    async fn legacy_save_result_accepts_committed_warning() {
-        ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::Error::msg(
-            "injected directory sync failure",
-        ))
-        .into_legacy_result()
-        .expect("a post-rename warning is already committed for legacy callers");
-    }
-
-    #[tokio::test]
     async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
         let dir = std::env::temp_dir().join(format!(
             "zeroclaw_test_post_replace_sync_failure_{}",
@@ -31488,11 +30916,8 @@ default_temperature = 0.7
         .await;
 
         assert!(
-            matches!(
-                result.expect("rename completed, so the write must report an outcome"),
-                ConfigSaveOutcome::CommittedWithDurabilityWarning(_)
-            ),
-            "a post-replace sync fault must report a committed warning"
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
         );
         assert_eq!(
             fs::read_to_string(&config_path).await.unwrap(),
@@ -31538,11 +30963,8 @@ default_temperature = 0.7
         .await;
 
         assert!(
-            matches!(
-                result.expect("ordinary save must return an outcome"),
-                ConfigSaveOutcome::Durable
-            ),
-            "saving over an existing config must report durable completion"
+            result.is_ok(),
+            "saving over an existing config must not fail while syncing the backup: {result:?}"
         );
         assert_eq!(
             fs::read_to_string(&config_path).await.unwrap(),
@@ -46501,29 +45923,24 @@ model_provider = \"ollama.default\"
         assert!(agent.is_dispatchable());
     }
 
-    #[::core::prelude::v1::test]
-    fn anthropic_legacy_alias_omits_auth_mode_on_round_trip() {
+    #[test]
+    async fn anthropic_legacy_alias_omits_auth_mode_on_round_trip() {
         let legacy: AnthropicModelProviderConfig =
             toml::from_str("model = \"claude-sonnet-4-5\"\napi_key = \"sk-ant-oat01-legacy\"\n")
                 .expect("legacy Anthropic alias should deserialize");
-        assert_eq!(legacy.auth_mode, None);
-        assert_eq!(legacy.base.api_key.as_deref(), Some("sk-ant-oat01-legacy"));
 
+        assert_eq!(legacy.auth_mode, None);
         let serialized = toml::to_string(&legacy).expect("legacy alias should serialize");
         assert!(
             !serialized.contains("auth_mode"),
             "legacy aliases must not be rewritten with auth_mode: {serialized}"
         );
-        let round_trip: AnthropicModelProviderConfig =
-            toml::from_str(&serialized).expect("serialized alias should deserialize");
-        assert_eq!(round_trip.auth_mode, None);
-        assert_eq!(round_trip.base.api_key, legacy.base.api_key);
     }
 
-    #[::core::prelude::v1::test]
-    fn anthropic_oauth_rejects_inline_api_key() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
+    #[test]
+    async fn anthropic_oauth_rejects_inline_key_and_nonofficial_endpoint() {
+        let mut inline_key = Config::default();
+        inline_key.providers.models.anthropic.insert(
             "subscription".into(),
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
@@ -46534,15 +45951,16 @@ model_provider = \"ollama.default\"
                 ..Default::default()
             },
         );
+        assert!(
+            inline_key
+                .validate()
+                .expect_err("OAuth plus api_key must fail")
+                .to_string()
+                .contains("must not be combined")
+        );
 
-        let error = config.validate().expect_err("OAuth plus api_key must fail");
-        assert!(error.to_string().contains("auth_mode = \"oauth\""));
-    }
-
-    #[::core::prelude::v1::test]
-    fn anthropic_oauth_rejects_nonofficial_uri_at_config_admission() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
+        let mut proxy = Config::default();
+        proxy.providers.models.anthropic.insert(
             "subscription".into(),
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
@@ -46553,704 +45971,12 @@ model_provider = \"ollama.default\"
                 ..Default::default()
             },
         );
-
-        let error = config
-            .validate()
-            .expect_err("OAuth aliases must reject a nonofficial endpoint before persistence");
         assert!(
-            error
+            proxy
+                .validate()
+                .expect_err("OAuth must use the official endpoint")
                 .to_string()
                 .contains("official https://api.anthropic.com")
-        );
-
-        config.mark_dirty("providers.models.anthropic.subscription.uri");
-        let repair_error = config
-            .validate_for_config_repair()
-            .expect_err("a config repair may not save a dirty nonofficial OAuth endpoint");
-        assert!(
-            repair_error
-                .to_string()
-                .contains("official https://api.anthropic.com")
-        );
-
-        assert!(AnthropicModelProviderConfig::has_official_oauth_endpoint(
-            None
-        ));
-        assert!(AnthropicModelProviderConfig::has_official_oauth_endpoint(
-            Some("https://api.anthropic.com")
-        ));
-        assert!(!AnthropicModelProviderConfig::has_official_oauth_endpoint(
-            Some("http://api.anthropic.com")
-        ));
-        assert!(!AnthropicModelProviderConfig::has_official_oauth_endpoint(
-            Some("https://api.anthropic.com:444")
-        ));
-    }
-
-    #[::core::prelude::v1::test]
-    fn validation_rejects_colon_bearing_provider_aliases() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "subscription:other-provider".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-
-        let error = config
-            .validate()
-            .expect_err("provider aliases must not contain the profile-id separator");
-        assert!(error.to_string().contains("must not contain ':'"));
-        assert!(error.to_string().contains("subscription:other-provider"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_allows_only_untouched_static_colon_aliases() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "legacy:subscription".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated repair may retain a static legacy alias");
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "legacy_colon_alias_retained");
-        assert_eq!(
-            warnings[0].path,
-            "providers.models.anthropic.legacy:subscription"
-        );
-
-        let mut explicit_api_key_config = Config::default();
-        explicit_api_key_config.providers.models.anthropic.insert(
-            "legacy:explicit-api-key".into(),
-            AnthropicModelProviderConfig {
-                auth_mode: Some(AnthropicAuthMode::ApiKey),
-                ..Default::default()
-            },
-        );
-        explicit_api_key_config.mark_dirty("gateway.host");
-        let warnings = explicit_api_key_config
-            .validate_for_config_repair()
-            .expect("explicit static auth mode retains the same legacy repair path");
-        assert!(warnings.iter().any(|warning| {
-            warning.code == "legacy_colon_alias_retained"
-                && warning.path == "providers.models.anthropic.legacy:explicit-api-key"
-        }));
-
-        let mut oauth_config = Config::default();
-        oauth_config.providers.models.anthropic.insert(
-            "oauth:subscription".into(),
-            AnthropicModelProviderConfig {
-                auth_mode: Some(AnthropicAuthMode::OAuth),
-                ..Default::default()
-            },
-        );
-        oauth_config.mark_dirty("gateway.host");
-        let error = oauth_config
-            .validate_for_config_repair()
-            .expect_err("OAuth aliases must retain the colon validation");
-        assert!(error.to_string().contains("oauth:subscription"));
-
-        let mut non_anthropic_config = Config::default();
-        non_anthropic_config
-            .providers
-            .models
-            .custom
-            .insert("legacy:custom".into(), CustomModelProviderConfig::default());
-        non_anthropic_config.mark_dirty("gateway.host");
-        let error = non_anthropic_config
-            .validate_for_config_repair()
-            .expect_err("only Anthropic static aliases may use the repair bridge");
-        assert!(error.to_string().contains("legacy:custom"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_warns_for_an_unrelated_existing_validation_error() {
-        let mut config = Config::default();
-        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated repair should retain the existing invalid value as a warning");
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "pre_existing_validation_error");
-        assert_eq!(warnings[0].path, "gateway.websocket_ping_interval_secs");
-
-        config.mark_dirty("gateway.websocket_ping_interval_secs");
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty invalid value must still be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("gateway.websocket_ping_interval_secs")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_an_unrelated_invalid_cost_rate() {
-        let mut config = Config::default();
-        config.cost.rates.providers.models.openai.insert(
-            "invalid-rate".into(),
-            ModelCostRates {
-                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE + 1.0),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated repair should retain an invalid cost rate as a warning");
-        assert!(warnings.iter().any(|warning| {
-            warning.code == "pre_existing_validation_error"
-                && warning.path == "cost.rates.providers.models.openai.invalid-rate.input_per_mtok"
-        }));
-
-        config.mark_dirty("cost.rates.providers.models.openai.invalid-rate.input_per_mtok");
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty invalid cost rate must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("cost.rates.providers.models.openai.invalid-rate.input_per_mtok")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_a_dirty_cost_rate_hidden_by_an_unrelated_cost_rate() {
-        let mut config = Config::default();
-        config.cost.rates.providers.models.openai.insert(
-            "invalid-rate".into(),
-            ModelCostRates {
-                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE + 1.0),
-                output_per_mtok: Some(-5.0),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("cost.rates.providers.models.openai.invalid-rate.output_per_mtok");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a later dirty cost rate must not be hidden by an unrelated rate");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("cost.rates.providers.models.openai.invalid-rate.output_per_mtok")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_an_unrelated_helper_validation_error() {
-        let mut config = Config::default();
-        config.channels.telegram.insert(
-            "bad".into(),
-            TelegramConfig {
-                enabled: false,
-                api_base_url: "not a URL".into(),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated helper validation error remains repairable elsewhere");
-        assert!(warnings.iter().any(|warning| {
-            warning.code == "pre_existing_validation_error"
-                && warning.path == "channels.telegram.bad.api_base_url"
-        }));
-
-        config.mark_dirty("channels.telegram.bad.api_base_url");
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty helper-validated field must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("channels.telegram.bad.api_base_url")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_an_unrelated_gitea_wrapper_error() {
-        let mut config = Config::default();
-        config.channels.git.insert(
-            "gitea".into(),
-            GitConfig {
-                enabled: true,
-                provider: "gitea".into(),
-                api_base_url: Some("not a URL".into()),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated Gitea wrapper error remains repairable elsewhere");
-        assert!(warnings.iter().any(|warning| {
-            warning.code == "pre_existing_validation_error"
-                && warning.path == "channels.git.gitea.api_base_url"
-        }));
-
-        config.mark_dirty("channels.git.gitea.api_base_url");
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty Gitea wrapper error must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("channels.git.gitea.api_base_url")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_does_not_hide_a_dirty_signal_field_after_an_unrelated_one() {
-        let mut config = Config::default();
-        config.channels.signal.insert(
-            "bad".into(),
-            SignalConfig {
-                enabled: true,
-                http_url: " ".into(),
-                account: " ".into(),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("channels.signal.bad.account");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty Signal account must remain fatal after retaining http_url");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(error.path.as_deref(), Some("channels.signal.bad.account"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_does_not_hide_a_dirty_channel_enable_after_a_placeholder_error() {
-        let mut config = Config::default();
-        config.channels.telegram.insert(
-            "bad".into(),
-            TelegramConfig {
-                enabled: true,
-                bot_token: crate::traits::UNSET_DISPLAY.into(),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("channels.telegram.bad.enabled");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("enabling a channel with an unset token must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("channels.telegram.bad.bot_token")
-        );
-        assert_eq!(error.related_paths, vec!["channels.telegram.bad.enabled"]);
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_does_not_hide_a_dirty_mcp_field_after_an_unrelated_one() {
-        let mut config = Config::default();
-        config.mcp.enabled = true;
-        config.mcp.servers = vec![
-            stdio_server("", "/usr/bin/mcp-first"),
-            McpServerConfig {
-                name: "later".into(),
-                transport: McpTransport::Stdio,
-                command: "/usr/bin/mcp-later".into(),
-                tool_timeout_secs: Some(30),
-                ..Default::default()
-            },
-        ];
-        // Exercise the public natural-key mutation grammar. Validators report
-        // `mcp.servers[1]...`, so repair classification must canonicalize that
-        // display path back to this dirty path rather than demoting this new
-        // invalid value to a pre-existing warning.
-        config
-            .set_prop_persistent("mcp.servers.later.tool_timeout_secs", "0")
-            .expect("natural-key MCP edit applies before validation");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty MCP timeout must remain fatal after retaining another server");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("mcp.servers[1].tool_timeout_secs")
-        );
-        assert_eq!(error.related_paths, vec!["mcp.enabled"]);
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_multiple_unrelated_empty_mcp_names_as_warnings() {
-        let mut config = Config::default();
-        config.mcp.enabled = true;
-        config.mcp.servers = vec![
-            stdio_server("", "/usr/bin/mcp-first"),
-            stdio_server("   ", "/usr/bin/mcp-second"),
-        ];
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("unrelated retained MCP names must not become a duplicate-name failure");
-        assert_eq!(warnings.len(), 2);
-        assert!(warnings.iter().all(|warning| {
-            warning.code == "pre_existing_validation_error"
-                && matches!(
-                    warning.path.as_str(),
-                    "mcp.servers[0].name" | "mcp.servers[1].name"
-                )
-        }));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_canonicalizes_model_route_validator_paths_by_hint() {
-        let mut config = Config::default();
-        config.model_routes.push(ModelRouteConfig {
-            hint: "fast".into(),
-            model_provider: "openai.default".into(),
-            model: "gpt-4.1-mini".into(),
-            api_key: None,
-        });
-        config
-            .set_prop_persistent("model_routes.fast.model_provider", "openai.default")
-            .expect("public natural-key model-route mutation applies before validation");
-
-        let natural_key_sections = config_repair_natural_key_sections(&config);
-        assert_eq!(
-            canonical_config_repair_path(&natural_key_sections, "model_routes[0].model_provider"),
-            "model_routes.fast.model_provider",
-            "validator display paths must match the public natural-key dirty path"
-        );
-
-        config.model_routes[0].hint.clear();
-        let empty_key_sections = config_repair_natural_key_sections(&config);
-        assert_eq!(
-            canonical_config_repair_path(&empty_key_sections, "model_routes[0].model_provider"),
-            "model_routes[0].model_provider",
-            "an empty natural key must not create a degenerate public path"
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_does_not_hide_a_dirty_cloud_ops_field_after_an_unrelated_one() {
-        let mut config = Config::default();
-        config.cloud_ops.enabled = true;
-        config.cloud_ops.supported_clouds = vec![" ".into(), " ".into()];
-        config.mark_dirty("cloud_ops.supported_clouds[1]");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty CloudOps entry must remain fatal after retaining another entry");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(error.path.as_deref(), Some("cloud_ops.supported_clouds[1]"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_oauth_auth_mode_when_a_sibling_api_key_exists() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "subscription".into(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    api_key: Some("legacy-inline-key".into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        config
-            .set_prop_persistent("providers.models.anthropic.subscription.auth_mode", "oauth")
-            .expect("auth_mode patch applies before validation");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("OAuth must not be saved beside an existing API key");
-        assert!(error.to_string().contains("auth_mode = \"oauth\""));
-        assert!(
-            config
-                .dirty_paths
-                .contains("providers.models.anthropic.subscription.auth_mode")
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_a_dirty_mdns_interval_that_breaks_a_sibling_bound() {
-        let mut config = Config::default();
-        config
-            .set_prop_persistent("nodes.mdns.announce_interval_secs", "999")
-            .expect("interval patch applies before validation");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a dirty sibling of a cross-field bound must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(error.path.as_deref(), Some("nodes.mdns.peer_ttl_secs"));
-        assert_eq!(
-            error.related_paths,
-            vec!["nodes.mdns.announce_interval_secs"]
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_a_dirty_mdns_interval_when_an_earlier_ttl_error_shares_its_path() {
-        let mut config = Config::default();
-        config.nodes.mdns.peer_ttl_secs = 0;
-        config
-            .set_prop_persistent("nodes.mdns.announce_interval_secs", "999")
-            .expect("interval patch applies before validation");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a suppressed unrelated TTL error must not hide a dirty sibling bound");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(error.path.as_deref(), Some("nodes.mdns.peer_ttl_secs"));
-        assert_eq!(
-            error.related_paths,
-            vec!["nodes.mdns.announce_interval_secs"]
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_enabling_gitea_with_an_invalid_staged_api_url() {
-        let mut config = Config::default();
-        config.channels.git.insert(
-            "gitea".into(),
-            GitConfig {
-                enabled: false,
-                provider: "gitea".into(),
-                api_base_url: Some("not a URL".into()),
-                ..Default::default()
-            },
-        );
-        config
-            .set_prop_persistent("channels.git.gitea.enabled", "true")
-            .expect("enable patch applies before validation");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("enabling a staged invalid Gitea URL must remain fatal");
-        let error = ConfigApiError::from_validation(error);
-        assert_eq!(
-            error.path.as_deref(),
-            Some("channels.git.gitea.api_base_url")
-        );
-        assert_eq!(
-            error.related_paths,
-            vec!["channels.git.gitea.enabled", "channels.git.gitea.provider"]
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_an_unrelated_mdns_cross_field_failure() {
-        let mut config = Config::default();
-        config.nodes.mdns.peer_ttl_secs = 10;
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unchanged cross-field failure remains repairable elsewhere");
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "pre_existing_validation_error");
-        assert_eq!(warnings[0].path, "nodes.mdns.peer_ttl_secs");
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_retains_an_unrelated_dynamic_alias_error_without_mutating_it() {
-        let mut config = Config::default();
-        config.agents.insert(
-            "orphan".into(),
-            AliasedAgentConfig {
-                model_provider: "anthropic.missing".into(),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("gateway.host");
-
-        let warnings = config
-            .validate_for_config_repair()
-            .expect("an unrelated dynamic alias error must not block a repair");
-        assert!(warnings.iter().any(|warning| {
-            warning.code == "pre_existing_validation_error"
-                && warning.path == "agents.orphan.model_provider"
-        }));
-        assert_eq!(
-            config.agents["orphan"].model_provider, "anthropic.missing",
-            "repair admission must not rewrite an unrelated dynamic alias"
-        );
-
-        config.gateway.host.clear();
-        config.mark_dirty("gateway.host");
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a later dirty error must still be reached");
-        assert!(error.to_string().contains("gateway.host"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn config_repair_rejects_dirty_reference_to_legacy_colon_alias() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "legacy:subscription".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-        config.agents.insert(
-            "researcher".into(),
-            AliasedAgentConfig {
-                model_provider: "anthropic.legacy:subscription".into(),
-                ..Default::default()
-            },
-        );
-        config.mark_dirty("agents.researcher.model_provider");
-
-        let error = config
-            .validate_for_config_repair()
-            .expect_err("a patch may not create a colon-alias reference");
-        assert!(error.to_string().contains("legacy:subscription"));
-
-        let mut padded_reference_config = Config::default();
-        padded_reference_config.providers.models.anthropic.insert(
-            "legacy:subscription".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-        padded_reference_config.agents.insert(
-            "researcher".into(),
-            AliasedAgentConfig {
-                model_provider: "  anthropic.legacy:subscription  ".into(),
-                ..Default::default()
-            },
-        );
-        padded_reference_config.mark_dirty("agents.researcher.model_provider");
-
-        let error = padded_reference_config
-            .validate_for_config_repair()
-            .expect_err("trimmed model-provider resolution must not bypass colon-alias ownership");
-        assert!(error.to_string().contains("legacy:subscription"));
-
-        let mut fallback_config = Config::default();
-        fallback_config.providers.models.anthropic.insert(
-            "legacy:subscription".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-        fallback_config.providers.models.anthropic.insert(
-            "primary".into(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    fallback: vec!["anthropic.legacy:subscription".into()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        fallback_config.mark_dirty("providers.models.anthropic.primary.fallback");
-
-        let error = fallback_config
-            .validate_for_config_repair()
-            .expect_err("a patch may not add a colon alias to a fallback list");
-        assert!(error.to_string().contains("legacy:subscription"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn validation_preserves_legacy_hyphenated_provider_aliases() {
-        let mut config = Config::default();
-        config
-            .providers
-            .models
-            .custom
-            .insert("kimi-k2-5".into(), CustomModelProviderConfig::default());
-
-        config
-            .validate()
-            .expect("legacy hyphenated provider aliases must remain valid");
-    }
-
-    #[::core::prelude::v1::test]
-    fn shared_oauth_modes_preserve_the_legacy_o_auth_wire_spelling() {
-        let parsed: AuthMode = serde_json::from_str("\"o_auth\"").expect("legacy spelling parses");
-        assert_eq!(parsed, AuthMode::OAuth);
-        assert_eq!(
-            serde_json::to_string(&parsed).expect("serialize mode"),
-            "\"o_auth\""
-        );
-
-        for (family, serialized) in [
-            (
-                "qwen",
-                toml::to_string(&QwenModelProviderConfig {
-                    auth_mode: Some(AuthMode::OAuth),
-                    ..Default::default()
-                })
-                .expect("Qwen config serializes"),
-            ),
-            (
-                "minimax",
-                toml::to_string(&MinimaxModelProviderConfig {
-                    auth_mode: Some(AuthMode::OAuth),
-                    ..Default::default()
-                })
-                .expect("MiniMax config serializes"),
-            ),
-            (
-                "gemini",
-                toml::to_string(&GeminiModelProviderConfig {
-                    auth_mode: Some(AuthMode::OAuth),
-                    ..Default::default()
-                })
-                .expect("Gemini config serializes"),
-            ),
-        ] {
-            assert!(
-                serialized.contains("auth_mode = \"o_auth\""),
-                "{family} must retain its downgrade-compatible auth mode: {serialized}"
-            );
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn anthropic_oauth_uses_its_provider_local_wire_spelling() {
-        let config: AnthropicModelProviderConfig =
-            toml::from_str("auth_mode = \"oauth\"").expect("Anthropic OAuth spelling parses");
-        assert_eq!(config.auth_mode, Some(AnthropicAuthMode::OAuth));
-        assert_eq!(
-            toml::to_string(&config).expect("Anthropic config serializes"),
-            "auth_mode = \"oauth\"\n"
-        );
-        assert!(
-            toml::from_str::<AnthropicModelProviderConfig>("auth_mode = \"o_auth\"").is_err(),
-            "Anthropic has no legacy auth_mode field and must not inherit another family's spelling"
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn anthropic_auth_mode_metadata_advertises_the_accepted_oauth_spelling() {
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "subscription".into(),
-            AnthropicModelProviderConfig::default(),
-        );
-        let field = config
-            .prop_fields()
-            .into_iter()
-            .find(|field| field.name == "providers.models.anthropic.subscription.auth_mode")
-            .expect("configured Anthropic alias must expose auth_mode metadata");
-        assert_eq!(
-            (field.enum_variants.expect("auth_mode is an enum"))(),
-            vec!["api_key", "oauth"],
-            "Web/TUI must only advertise values accepted by Anthropic config"
-        );
-
-        config
-            .set_prop_persistent("providers.models.anthropic.subscription.auth_mode", "oauth")
-            .expect("the advertised OAuth spelling must be writable");
-        assert_eq!(
-            config.providers.models.anthropic["subscription"].auth_mode,
-            Some(AnthropicAuthMode::OAuth)
         );
     }
 }

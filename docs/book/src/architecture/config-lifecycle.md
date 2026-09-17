@@ -107,18 +107,14 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 stays the same, but listeners briefly rebind.
 
 Gateway config writes call `persist_and_swap()`: save to disk, then replace the
-gateway-visible in-memory config and mark `pending_reload`. The reload banner
-then tells the operator that channels, providers, scheduler, or other
-daemon-owned components may still be running from the previous subsystem
-instance. `POST /admin/reload` clears the flag.
+gateway-visible in-memory config and set `pending_reload`. This makes the config
+editor reflect the write immediately, while the reload banner tells the operator
+that channels, providers, scheduler, or other daemon-owned components may still
+be running from the previous subsystem instance.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
-loop to signal. A successful Quickstart submission does not retain
-`pending_reload`, because no in-product reload action can dispatch; Quickstart
-instead reports `daemon_restarted: false`, which means the operator must restart
-the process. Other gateway config-write routes set the same shared reload flag
-and do not clear it themselves.
+loop to signal.
 
 ## Reload access
 
@@ -142,15 +138,6 @@ When replacing an existing file, the writer creates a same-directory
 `config.toml.bak` during the replace and removes it after a successful write.
 Gateway writes also snapshot the pre-write file and best-effort restore it if
 persistence fails before swapping in-memory state.
-
-On Unix, auth-profile persistence verifies that the shared config directory is
-owned by the daemon's effective user and owner-only (`0700`) before writing a
-credential profile. The same verification runs before decrypting an encrypted
-profile only when the local key is absent and decryption would create
-replacement key material. This can tighten an existing looser config-directory
-mode; if ownership or the mode cannot be verified, the profile write or that
-key-recreating read fails rather than placing credential state under an unsafe
-parent.
 
 There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`

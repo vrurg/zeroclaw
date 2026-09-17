@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
-use crate::quickstart::QuickstartConfigState;
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
@@ -29,7 +28,6 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
-            Option<QuickstartConfigState>,
             Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
@@ -204,7 +202,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {

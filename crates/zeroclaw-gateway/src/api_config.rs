@@ -348,29 +348,38 @@ fn lookup_prop_field(
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
-    let warnings = working
-        .validate_for_config_repair()
-        .map_err(ConfigApiError::from_validation)?;
-    for warning in &warnings {
-        let message = match warning.code.as_str() {
-            "legacy_colon_alias_retained" => format!(
-                "saving a config repair while retaining an unrelated legacy provider alias with `:`: {}",
-                warning.path
-            ),
-            _ => format!(
-                "saving a config repair while retaining a pre-existing validation error at {}: {}",
-                warning.path, warning.message
-            ),
-        };
+    if let Err(e) = working.validate() {
+        let api_err = ConfigApiError::from_validation(e);
+        let err_path = api_err.path.as_deref().unwrap_or("");
+        let touches_dirty = !err_path.is_empty()
+            && working.dirty_paths.iter().any(|d| {
+                err_path == d.as_str()
+                    || err_path.starts_with(&format!("{d}."))
+                    || d.starts_with(&format!("{err_path}."))
+            });
+        if touches_dirty || err_path.is_empty() {
+            return Err(api_err);
+        }
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": warning.path})),
-            &message
+                .with_attrs(::serde_json::json!({"path": err_path})),
+            &format!(
+                "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
+             surfacing as a warning: {}",
+                api_err.message
+            )
         );
+        return Ok(vec![
+            zeroclaw_config::validation_warnings::ValidationWarning::new(
+                "pre_existing_validation_error",
+                api_err.message,
+                err_path.to_string(),
+            ),
+        ]);
     }
-    Ok(warnings)
+    Ok(Vec::new())
 }
 
 /// Save `new_config` to disk, then install it as the live config.
@@ -904,18 +913,13 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// Whether a gateway config mutation has marked a daemon reload pending;
-    /// daemon-owned subsystems may still require subsystem re-instantiation.
-    /// Quickstart clears the flag after it dispatches a supervised reload, or
-    /// when standalone mode reports `daemon_restarted: false`; other gateway
-    /// config-write routes set the same shared flag without clearing it.
+    /// Whether any config write has landed since the last admin reload and may
+    /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
 }
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
-/// reload banner. Gateway config writes set it; `/admin/reload` clears it.
-/// Quickstart also clears it when it dispatches the reload or reports that a
-/// standalone gateway requires the operator to restart.
+/// reload banner. Goes true on any config write, false on `/admin/reload`.
 pub async fn handle_reload_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -2617,7 +2621,6 @@ mod tests {
             Arc::new(zeroclaw_memory::NoneMemory::new("api-config-test"));
         AppState {
             config: Arc::new(RwLock::new(config)),
-            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),

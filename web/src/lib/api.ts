@@ -39,7 +39,12 @@ export class UnauthorizedError extends Error {
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    public readonly envelope: ConfigApiError,
+    public readonly envelope: {
+      code: string;
+      message: string;
+      path?: string;
+      op_index?: number;
+    },
   ) {
     super(`[${envelope.code}] ${envelope.message}`);
     this.name = "ApiError";
@@ -566,8 +571,6 @@ export interface ConfigApiError {
   code: string;
   message: string;
   path?: string;
-  /** Other fields that participate in a cross-field validation failure. */
-  related_paths?: string[];
   op_index?: number;
 }
 
@@ -1665,12 +1668,6 @@ export interface QuickstartError {
   message: string;
 }
 
-export interface QuickstartWarning {
-  step: string;
-  field: string;
-  message: string;
-}
-
 export type QuickstartValidateResult =
   | { kind: "ok" }
   | { kind: "errors"; errors: QuickstartError[] };
@@ -1693,14 +1690,7 @@ export interface AppliedAgent {
 }
 
 export type QuickstartApplyResult =
-  | {
-      kind: "applied";
-      agent: AppliedAgent;
-      daemon_restarted: boolean;
-      // A new dashboard can briefly be served against an older gateway during
-      // rollout; omitted additive fields must retain their empty-list meaning.
-      warnings?: QuickstartWarning[];
-    }
+  | { kind: "applied"; agent: AppliedAgent; daemon_restarted: boolean }
   | { kind: "errors"; errors: QuickstartError[] };
 
 export function quickstartApply(submission: unknown): Promise<QuickstartApplyResult> {

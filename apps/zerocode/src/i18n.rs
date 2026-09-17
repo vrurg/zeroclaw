@@ -443,40 +443,6 @@ mod tests {
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
 
-            let warnings = format_ftl_message(
-                source,
-                locale,
-                "zc-quickstart-status-more-warnings",
-                &[("count", "2")],
-            )
-            .unwrap_or_else(|| panic!("quickstart warnings message must format for {locale}"));
-            assert!(warnings.contains('2'));
-        }
-    }
-
-    #[test]
-    fn anthropic_setup_token_messages_format_in_all_builtin_catalogues() {
-        let catalogues = [
-            ("en", EN_FTL),
-            ("es", include_str!("../locales/es/zerocode.ftl")),
-            ("fr", include_str!("../locales/fr/zerocode.ftl")),
-            ("ja", include_str!("../locales/ja/zerocode.ftl")),
-            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
-        ];
-
-        for (locale, source) in catalogues {
-            for key in [
-                "zc-quickstart-anthropic-setup-token-label",
-                "zc-quickstart-anthropic-setup-token-help",
-            ] {
-                let rendered = format_ftl_message(source, locale, key, &[])
-                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
-                assert!(
-                    !rendered.trim().is_empty(),
-                    "{key} must not be empty for {locale}"
-                );
-            }
-
             for key in [
                 "zc-chat-status-working",
                 "zc-chat-status-thinking",
@@ -498,6 +464,7 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("calling-tool status must format for {locale}"));
             assert!(calling_tool.contains("git_diff"));
+
             let picker_error = format_ftl_message(
                 source,
                 locale,
