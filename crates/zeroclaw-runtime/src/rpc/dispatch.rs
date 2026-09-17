@@ -2133,12 +2133,32 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // Kill deliberately waits for the current turn before tombstoning the
-        // durable ACP record. A provider cancellation cannot be undone if
-        // tombstoning fails, so interrupt-first semantics need a separate,
-        // durable reservation protocol rather than an incidental lifecycle
-        // change here.
+        // ACP kill is an explicit administrative interruption: stop the
+        // observed live turn before waiting for its queue permit, then retain
+        // the incarnation fence through durable tombstoning. Chat deletion
+        // intentionally keeps its queue-first policy. Other lifecycle policies
+        // are possible, but need a separate architectural decision because
+        // they change the durable-versus-interrupt ordering contract.
+        let _lifecycle_cancellation = if matches!(chat_mode, ChatMode::Acp) {
+            Some(
+                self.ctx
+                    .sessions
+                    .signal_session_kill_at_generation(sid, expected_generation)
+                    .await
+                    .ok_or_else(|| {
+                        rpc_err(SESSION_NOT_FOUND, "Session was replaced before kill")
+                    })?,
+            )
+        } else {
+            None
+        };
         let _guard = self
             .ctx
             .sessions
@@ -2154,12 +2174,6 @@ impl RpcDispatcher {
                 "Session was replaced while kill was pending",
             ));
         }
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let agent_alias = self
             .ctx
@@ -11740,7 +11754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_live_acp_session_kill_without_durable_backend_preserves_active_turn() {
+    async fn failed_live_acp_session_kill_interrupts_active_turn_without_removing_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -11780,10 +11794,98 @@ mod tests {
             .expect_err("missing durable ACP backend must fail session/kill");
 
         assert_eq!(error.code, INTERNAL_ERROR);
-        assert!(sessions.get_agent(sid).await.is_some());
         assert!(
-            !token.is_cancelled(),
-            "failed ACP tombstoning must not cancel the surviving active turn"
+            token.is_cancelled(),
+            "ACP kill must interrupt the observed active turn before durable tombstoning"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "failed ACP tombstoning must retain the live session so the operator can retry"
+        );
+        assert!(
+            !sessions.has_pending_lifecycle_cancellation(sid),
+            "a failed ACP kill must not cancel a later prompt after its active turn finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_acp_kill_interrupts_turn_and_tombstones_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "active-acp-kill";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .expect("ACP durable row must exist before kill");
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({ "session_id": sid, "prompt": "block" }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("the ACP provider must be active before kill")
+            .expect("gated provider must report its start");
+
+        let kill_handle = dispatcher.spawn_handle();
+        let kill = zeroclaw_spawn::spawn!(async move {
+            kill_handle
+                .handle_session_kill(&json!({ "session_id": sid }))
+                .await
+        });
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+            .await
+            .expect("ACP kill must interrupt the active provider turn")
+            .expect("prompt task must not panic")
+            .expect("cancelled prompt should complete its RPC response");
+        assert_eq!(prompt_result["stop_reason"], "cancelled");
+
+        let kill_result = tokio::time::timeout(std::time::Duration::from_secs(2), kill)
+            .await
+            .expect("kill must finish after the cancelled turn releases its queue permit")
+            .expect("kill task must not panic")
+            .expect("ACP kill should tombstone the durable row");
+        assert_eq!(kill_result["killed"], true);
+        assert!(sessions.get_agent(sid).await.is_none());
+        assert!(
+            acp_store
+                .is_session_killed(sid)
+                .expect("killed marker query must succeed"),
+            "successful kill must persist the ACP tombstone"
         );
     }
 

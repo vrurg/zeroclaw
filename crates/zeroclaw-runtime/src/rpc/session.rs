@@ -1066,16 +1066,40 @@ impl SessionStore {
         id: &str,
         expected_generation: u64,
     ) -> Option<LifecycleCancellation<'_>> {
+        self.signal_session_lifecycle_at_generation(
+            id,
+            expected_generation,
+            CancelCause::SessionRemoved,
+        )
+        .await
+    }
+
+    /// Signal an ACP administrative kill only for the observed live
+    /// incarnation. The returned guard clears an unconsumed pre-registration
+    /// signal when durable ACP tombstoning fails; an already registered turn
+    /// remains interrupted because that provider cancellation is irreversible.
+    pub(crate) async fn signal_session_kill_at_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<LifecycleCancellation<'_>> {
+        self.signal_session_lifecycle_at_generation(id, expected_generation, CancelCause::AdminKill)
+            .await
+    }
+
+    async fn signal_session_lifecycle_at_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        cause: CancelCause,
+    ) -> Option<LifecycleCancellation<'_>> {
         let sessions = self.sessions.lock().await;
         if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
             return None;
         }
         drop(sessions);
-        let pending_cancellation_generation = self.signal_cancellation_at_session_generation(
-            id,
-            expected_generation,
-            CancelCause::SessionRemoved,
-        );
+        let pending_cancellation_generation =
+            self.signal_cancellation_at_session_generation(id, expected_generation, cause);
         Some(LifecycleCancellation {
             store: self,
             session_id: id.to_string(),
@@ -1843,6 +1867,42 @@ mod tests {
         drop(registration);
         drop(admission);
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn failed_acp_kill_clears_its_unconsumed_pre_registration_signal() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "admitted".to_string(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Acp),
+            )
+            .await
+            .unwrap();
+        let session_generation = store.get_generation("admitted").await.unwrap();
+        let admission = store.begin_pre_registration_admission("admitted", session_generation);
+        let kill = store
+            .signal_session_kill_at_generation("admitted", session_generation)
+            .await
+            .expect("the live ACP admission must accept kill");
+        assert!(store.has_pending_lifecycle_cancellation("admitted"));
+
+        // Model a durable tombstone failure before a token was registered.
+        // Dropping the handler guard must leave the preserved session's next
+        // turn live rather than inheriting a stale administrative kill.
+        drop(kill);
+        assert!(!store.has_pending_lifecycle_cancellation("admitted"));
+        let token = tokio_util::sync::CancellationToken::new();
+        let registration = store.register_cancel_token_guard_at_session_generation(
+            "admitted",
+            session_generation,
+            token.clone(),
+        );
+        assert!(!token.is_cancelled());
+        drop(registration);
+        drop(admission);
     }
 
     #[tokio::test]
