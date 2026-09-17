@@ -614,12 +614,8 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
                 message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                     "goal-mode-paused-blocker-heading",
                 ));
-                for (index, blocker) in blocker_messages.into_iter().enumerate() {
-                    if index == 0 {
-                        message.push(' ');
-                    } else {
-                        message.push_str("\n• ");
-                    }
+                for blocker in blocker_messages {
+                    message.push('\n');
                     message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                         "goal-mode-paused-notice-blocker",
                         &[("blocker", blocker.as_str())],
@@ -660,7 +656,7 @@ mod tests {
         });
 
         assert!(rendered.starts_with("⏸️ Goal paused."));
-        assert!(rendered.contains("\n**Blocker:** Provide the task packet reference."));
+        assert!(rendered.contains("\n**Blocker:**\n• Provide the task packet reference."));
         assert!(!rendered.contains("verifier requires resolution"));
         assert!(
             rendered
@@ -677,6 +673,22 @@ mod tests {
         assert!(rendered.starts_with("⏸️ Goal paused."));
         assert!(!rendered.contains("**Blocker:**"));
         assert!(rendered.contains("\n**Next:**"));
+    }
+
+    #[test]
+    fn blocked_notice_renders_each_blocker_as_a_uniform_localized_item() {
+        let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
+            blocker_messages: vec![
+                "Provide the task packet reference.".to_owned(),
+                "State its scope.".to_owned(),
+            ],
+        });
+
+        assert!(
+            rendered.contains(
+                "\n**Blocker:**\n• Provide the task packet reference.\n• State its scope."
+            )
+        );
     }
 
     #[test]

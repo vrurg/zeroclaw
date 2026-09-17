@@ -103,10 +103,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         .cost_limit_usd
         .map(|value| format!("{value:.6}"))
         .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
-    let pause_reason = projection
-        .pause_reason
-        .clone()
-        .unwrap_or_else(|| crate::i18n::t("zc-goal-value-none"));
+    let pause_reason = projection.pause_reason.as_deref();
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
     } else {
@@ -132,11 +129,11 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             ("resumable", &resumable),
         ],
     ));
-    if projection.pause_reason.is_some() {
+    if let Some(pause_reason) = pause_reason {
         message.push('\n');
         message.push_str(&crate::i18n::t_args(
             "zc-goal-summary-pause",
-            &[("pause_reason", &pause_reason)],
+            &[("pause_reason", pause_reason)],
         ));
     }
     if let Some(description) = projection.pause_description.as_deref() {
@@ -2298,12 +2295,8 @@ impl Chat {
                             if !blocker_messages.is_empty() {
                                 message.push('\n');
                                 message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
-                                for (index, blocker) in blocker_messages.into_iter().enumerate() {
-                                    if index == 0 {
-                                        message.push(' ');
-                                    } else {
-                                        message.push_str("\n• ");
-                                    }
+                                for blocker in blocker_messages {
+                                    message.push('\n');
                                     message.push_str(&crate::i18n::t_args(
                                         "zc-goal-paused-notice-blocker",
                                         &[("blocker", blocker)],
@@ -21536,7 +21529,10 @@ mod tests {
                 params: serde_json::json!({
                     "paused_for_blocker": {
                         "session_id": "sess-1",
-                        "blocker_messages": ["Provide the task packet reference."]
+                        "blocker_messages": [
+                            "Provide the task packet reference.",
+                            "State its scope."
+                        ]
                     }
                 }),
             })
@@ -21549,7 +21545,9 @@ mod tests {
         let ChatEntry::SystemMessage(text) = &entries[0] else {
             panic!("expected blocked Goal system message");
         };
-        assert!(text.contains("\nBlocker: Provide the task packet reference."));
+        assert!(
+            text.contains("\nBlocker:\n• Provide the task packet reference.\n• State its scope.")
+        );
         assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
     }
 

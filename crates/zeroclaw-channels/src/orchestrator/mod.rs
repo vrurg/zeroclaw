@@ -9252,23 +9252,20 @@ fn render_goal_projection(
         GoalAccountingState::Invalid => "invalid",
         GoalAccountingState::OutcomeUnknown => "outcome_unknown",
     };
-    let pause_reason = projection
-        .pause_reason
-        .map(|reason| {
-            match reason {
-                GoalPauseReason::OperatorPaused => "operator_paused",
-                GoalPauseReason::NeedsUserInput => "needs_user_input",
-                GoalPauseReason::HumanEscalation => "human_escalation",
-                GoalPauseReason::ExternalDependency => "external_dependency",
-                GoalPauseReason::ProviderUnavailable => "provider_unavailable",
-                GoalPauseReason::VerifierBlocked => "verifier_blocked",
-                GoalPauseReason::BudgetExhausted => "budget_exhausted",
-                GoalPauseReason::BudgetUnavailable => "budget_unavailable",
-                GoalPauseReason::DaemonRestart => "daemon_restarted",
-            }
-            .to_owned()
-        })
-        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-none"));
+    let pause_reason = projection.pause_reason.map(|reason| {
+        match reason {
+            GoalPauseReason::OperatorPaused => "operator_paused",
+            GoalPauseReason::NeedsUserInput => "needs_user_input",
+            GoalPauseReason::HumanEscalation => "human_escalation",
+            GoalPauseReason::ExternalDependency => "external_dependency",
+            GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+            GoalPauseReason::VerifierBlocked => "verifier_blocked",
+            GoalPauseReason::BudgetExhausted => "budget_exhausted",
+            GoalPauseReason::BudgetUnavailable => "budget_unavailable",
+            GoalPauseReason::DaemonRestart => "daemon_restarted",
+        }
+        .to_owned()
+    });
     let resumable = channel_runtime_cli_string(if projection.resumable {
         "goal-mode-yes"
     } else {
@@ -9294,11 +9291,11 @@ fn render_goal_projection(
             ("resumable", &resumable),
         ],
     ));
-    if projection.pause_reason.is_some() {
+    if let Some(pause_reason) = pause_reason.as_deref() {
         message.push('\n');
         message.push_str(&channel_runtime_cli_string_with_args(
             "goal-mode-summary-pause",
-            &[("pause_reason", &pause_reason)],
+            &[("pause_reason", pause_reason)],
         ));
     }
     if let Some(description) = projection.pause_description.as_deref() {
