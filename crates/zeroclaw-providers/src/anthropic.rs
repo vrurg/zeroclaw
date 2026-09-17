@@ -107,10 +107,19 @@ pub struct AnthropicModelProvider {
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
 }
 
-#[derive(Debug, Clone)]
 struct ResolvedAnthropicCredential {
     token: String,
     auth_kind: AnthropicAuthKind,
+}
+
+impl std::fmt::Debug for ResolvedAnthropicCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedAnthropicCredential")
+            .field("token", &"[REDACTED]")
+            .field("auth_kind", &self.auth_kind)
+            .finish()
+    }
 }
 
 /// Owned request data prepared before asynchronous credential resolution.
@@ -761,7 +770,7 @@ impl AnthropicModelProvider {
         profile_name: &str,
     ) -> anyhow::Result<ResolvedAnthropicCredential> {
         let profile = auth_service
-            .get_profile("anthropic", Some(profile_name))
+            .get_profile_by_name("anthropic", profile_name)
             .await?
             .ok_or_else(Self::missing_credentials_error)?;
         // Anthropic's alias-bound OAuth contract currently supports the
@@ -785,6 +794,9 @@ impl AnthropicModelProvider {
                 anyhow::Error::msg("Anthropic profile has unsupported auth_kind metadata")
             })?,
         };
+        if auth_kind != AnthropicAuthKind::Authorization {
+            anyhow::bail!("Anthropic OAuth aliases require a stored setup-token profile")
+        }
 
         Ok(ResolvedAnthropicCredential { token, auth_kind })
     }
@@ -804,13 +816,11 @@ impl AnthropicModelProvider {
         extra_betas: &[&str],
     ) -> reqwest::RequestBuilder {
         let authorization = credential.auth_kind == AnthropicAuthKind::Authorization;
-        let credential_len = credential.token.len();
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
                     "header": if authorization { "Authorization" } else { "x-api-key" },
-                    "credential_len": credential_len,
                 })
             ),
             "Anthropic auth header applied"
@@ -4236,6 +4246,32 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn oauth_mode_resolves_a_same_named_profile_with_a_colon_in_its_alias() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "team:subscription",
+                "sk-ant-oat01-profile-token",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("team:subscription")
+            .auth_profile(auth_service)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve exact same-named profile");
+
+        assert_eq!(credential.token, "sk-ant-oat01-profile-token");
+    }
+
+    #[tokio::test]
     async fn stored_profile_without_auth_kind_retains_jwt_bearer_fallback() {
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         let auth_service = AuthService::new(state_dir.path(), false);
@@ -4330,6 +4366,36 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await
             .expect_err("invalid stored metadata must not fall back to token inference");
         assert!(error.to_string().contains("unsupported auth_kind metadata"));
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_rejects_a_stored_api_key_profile() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "sk-ant-api03-profile-key",
+                std::collections::HashMap::from([("auth_kind".to_string(), "api-key".to_string())]),
+                false,
+            )
+            .await
+            .expect("store API-key profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("OAuth aliases must reject stored API-key profiles");
+
+        assert!(
+            error
+                .to_string()
+                .contains("require a stored setup-token profile")
+        );
     }
 
     #[tokio::test]
@@ -4796,10 +4862,6 @@ data: {\"type\":\"message_stop\"}\n\n";
                     let matches_auth = event.get("attributes").is_some_and(|attributes| {
                         attributes.get("header").and_then(|value| value.as_str())
                             == Some(expected_header)
-                            && attributes
-                                .get("credential_len")
-                                .and_then(|value| value.as_u64())
-                                == Some(token.len() as u64)
                     });
                     if matches_message && matches_source && matches_auth {
                         break 'search event;
@@ -4815,7 +4877,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
             let attrs = event.get("attributes").expect("attributes present");
             assert_eq!(attrs["header"].as_str(), Some(expected_header));
-            assert_eq!(attrs["credential_len"].as_u64(), Some(token.len() as u64));
+            assert!(attrs.get("credential_len").is_none());
             assert!(attrs.get("credential_head").is_none());
             assert!(attrs.get("credential_tail").is_none());
             let former_head: String = token.chars().take(8).collect();

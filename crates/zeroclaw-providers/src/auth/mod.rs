@@ -190,6 +190,32 @@ impl AuthService {
         Ok(Some(profile.clone()))
     }
 
+    /// Return the profile with this provider-local name exactly as written.
+    ///
+    /// Unlike [`Self::get_profile`], this does not accept a fully-qualified
+    /// profile ID. Alias-bound callers use it when a colon is a valid part of
+    /// the alias rather than a separator supplied by a user profile override.
+    pub async fn get_profile_by_name(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+    ) -> Result<Option<AuthProfile>> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let profile_id = profile_id(&model_provider, profile_name);
+        let data = self.store.load().await?;
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.model_provider != model_provider {
+            anyhow::bail!(
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
+            );
+        }
+        Ok(Some(profile.clone()))
+    }
+
     pub async fn get_provider_bearer_token(
         &self,
         model_provider: &str,
