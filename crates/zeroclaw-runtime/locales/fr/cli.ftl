@@ -889,6 +889,7 @@ channel-runtime-new-session = Historique de conversation effacé. Nouveau dépar
 channel-runtime-new-session-failed = Impossible de réinitialiser la conversation. Veuillez réessayer.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
+channel-runtime-stop-folded-followup = Rien à arrêter ici : cette réponse a été fusionnée avec le message précédent auquel elle répond, toujours en cours de traitement. Envoyez /stop dans cette conversation pour l'annuler.
 channel-runtime-conversation-busy = Cette conversation compte trop de messages en attente ; celui-ci a été ignoré. Attendez une réponse ou envoyez /stop pour vider vos demandes en file.
 channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
