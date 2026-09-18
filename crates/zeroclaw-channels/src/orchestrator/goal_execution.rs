@@ -5,13 +5,13 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
-    channel::ChannelMessage,
+    channel::{Channel, ChannelMessage},
     model_provider::{ChatMessage, ChatRequest},
 };
 use zeroclaw_runtime::{
@@ -327,6 +327,7 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
             message: self.message.clone(),
+            parent_candidate_presented: false,
         }))
     }
 }
@@ -336,6 +337,10 @@ struct MatrixGoalExecutionLease {
     context: Arc<ChannelRuntimeContext>,
     session_key: GoalSessionKey,
     message: ChannelMessage,
+    /// A parent candidate may already have reached the normal Matrix response
+    /// surface before the verifier accepts it. Completion still appends it to
+    /// canonical history, but must not send that same response twice.
+    parent_candidate_presented: bool,
 }
 
 impl MatrixGoalExecutionLease {
@@ -460,20 +465,19 @@ fn goal_continue_history(
     Ok(history)
 }
 
-/// Forward parent-loop events through the ordinary channel presentation path.
+/// Forward every parent-loop event through the ordinary channel presentation
+/// path.
 ///
-/// The parent response is a verifier-gated candidate, so it is the sole event
-/// that cannot enter the channel's regular stream before verification. Every
-/// other event, including configuration-selected reasoning, remains intact so
-/// the normal channel presentation policy decides what is visible.
+/// Goal Mode is a lifecycle and verification layer, not a second presentation
+/// policy.  The channel's existing renderer remains the sole authority on
+/// whether an event is visible and how it is formatted.  Verification gates
+/// canonical history and Goal completion; it must not suppress an event that
+/// an ordinary parent turn would give to that renderer.
 async fn relay_goal_parent_events(
     mut source: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
     destination: tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>,
 ) {
     while let Some(event) = source.recv().await {
-        if matches!(event, zeroclaw_runtime::agent::loop_::StreamDelta::Text(_)) {
-            continue;
-        }
         if destination.send(event).await.is_err() {
             break;
         }
@@ -483,10 +487,18 @@ async fn relay_goal_parent_events(
 /// The normal channel presentation plumbing for one Goal parent operation.
 ///
 /// Goal execution uses the same draft and tool-notification paths as an
-/// ordinary channel turn. Keeping the configuration and rendering decision in
-/// the existing helpers is deliberate: Goal Mode only protects unverified
-/// candidate text; it must not become a second presentation policy.
+/// ordinary channel turn. Keeping configuration and rendering decisions in the
+/// existing helpers is deliberate: Goal Mode must not become a second
+/// presentation policy.
 struct GoalParentPresentation {
+    context: Arc<ChannelRuntimeContext>,
+    message: ChannelMessage,
+    channel: Option<Arc<dyn Channel>>,
+    draft_id: Option<String>,
+    /// Per-turn receipts use the same collector as an ordinary channel turn.
+    /// Keeping it here lets a Goal parent operation present every enabled
+    /// tool-result surface before the verifier decides lifecycle state.
+    receipts: Arc<Mutex<Vec<String>>>,
     on_delta: Option<tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>>,
     observer: Arc<super::ChannelNotifyObserver>,
     relay: Option<tokio::task::JoinHandle<()>>,
@@ -495,15 +507,16 @@ struct GoalParentPresentation {
 }
 
 impl GoalParentPresentation {
-    async fn start(context: &ChannelRuntimeContext, message: &ChannelMessage) -> Self {
+    async fn start(context: Arc<ChannelRuntimeContext>, message: &ChannelMessage) -> Self {
+        let receipts = Arc::new(Mutex::new(Vec::new()));
         let channel = find_channel_for_message(&context.channels_by_name, message).cloned();
         let use_draft_streaming = channel
             .as_ref()
             .is_some_and(|channel| channel.supports_draft_updates());
         let matrix_single_message_streaming =
-            super::matrix_single_message_streaming_enabled(context, message);
+            super::matrix_single_message_streaming_enabled(&context, message);
 
-        let (on_delta, relay, draft_updater) = if use_draft_streaming {
+        let (on_delta, relay, draft_updater, draft_id) = if use_draft_streaming {
             let (source_tx, source_rx) = tokio::sync::mpsc::channel(64);
             let (visible_tx, visible_rx) = tokio::sync::mpsc::channel(64);
             let relay = Some(zeroclaw_spawn::spawn!(relay_goal_parent_events(
@@ -534,14 +547,14 @@ impl GoalParentPresentation {
             } else {
                 None
             };
-            let draft_updater = match (channel.as_ref(), draft_id) {
+            let draft_updater = match (channel.as_ref(), draft_id.clone()) {
                 (Some(channel), Some(draft_id)) if matrix_single_message_streaming => {
                     let channel = Arc::clone(channel);
                     let reply_target = message.reply_target.clone();
                     let matrix_config = Arc::clone(&context.prompt_config);
                     let matrix_alias = message.channel_alias.clone().unwrap_or_default();
-                    let interval_ms = super::matrix_draft_update_interval_ms(context, message);
-                    let stream_draft_lines = super::matrix_stream_draft_lines(context, message);
+                    let interval_ms = super::matrix_draft_update_interval_ms(&context, message);
+                    let stream_draft_lines = super::matrix_stream_draft_lines(&context, message);
                     Some(zeroclaw_spawn::spawn!(async move {
                         super::run_matrix_single_message_draft_updater(
                             visible_rx,
@@ -577,9 +590,9 @@ impl GoalParentPresentation {
                 }
                 _ => None,
             };
-            (Some(source_tx), relay, draft_updater)
+            (Some(source_tx), relay, draft_updater, draft_id)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let is_partial_draft = channel.as_ref().is_some_and(|channel| {
@@ -615,6 +628,11 @@ impl GoalParentPresentation {
         };
 
         Self {
+            context: Arc::clone(&context),
+            message: message.clone(),
+            channel,
+            draft_id,
+            receipts,
             on_delta,
             observer: Arc::new(super::ChannelNotifyObserver {
                 inner: Arc::clone(&context.observer),
@@ -627,8 +645,23 @@ impl GoalParentPresentation {
         }
     }
 
-    async fn finish(self) {
+    /// Finish the same response presentation an ordinary Matrix turn uses.
+    ///
+    /// This does not append an unverified candidate to canonical history. It
+    /// only makes the already-emitted parent response visible through the
+    /// configured channel surface, then lets the Goal verifier govern durable
+    /// completion separately.
+    async fn finish(
+        self,
+        candidate: Option<&str>,
+        turn_route: Option<zeroclaw_runtime::tools::TurnRoutingEntry>,
+    ) -> bool {
         let Self {
+            context,
+            message,
+            channel,
+            draft_id,
+            receipts,
             on_delta,
             observer,
             relay,
@@ -642,9 +675,246 @@ impl GoalParentPresentation {
         if let Some(draft_updater) = draft_updater {
             let _ = draft_updater.await;
         }
+        let tools_used = observer.tools_used.load(Ordering::Relaxed);
         drop(observer);
         if let Some(notify_task) = notify_task {
             let _ = notify_task.await;
+        }
+        Self::present_parent_result(
+            context.as_ref(),
+            &message,
+            channel.as_ref(),
+            draft_id.as_deref(),
+            candidate,
+            tools_used,
+            receipts,
+            turn_route,
+        )
+        .await
+    }
+
+    async fn present_parent_result(
+        context: &ChannelRuntimeContext,
+        message: &ChannelMessage,
+        channel: Option<&Arc<dyn Channel>>,
+        draft_id: Option<&str>,
+        candidate: Option<&str>,
+        tools_used: bool,
+        receipts: Arc<Mutex<Vec<String>>>,
+        turn_route: Option<zeroclaw_runtime::tools::TurnRoutingEntry>,
+    ) -> bool {
+        let Some(channel) = channel else {
+            return false;
+        };
+        let Some(candidate) = candidate else {
+            if let Some(draft_id) = draft_id {
+                let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
+            }
+            return false;
+        };
+        let mut outbound = candidate.to_owned();
+        if let Some(hooks) = context.hooks.as_ref() {
+            match hooks
+                .run_on_message_sending(
+                    message.channel.clone(),
+                    message.reply_target.clone(),
+                    outbound.clone(),
+                )
+                .await
+            {
+                zeroclaw_runtime::hooks::HookResult::Cancel(_) => {
+                    if let Some(draft_id) = draft_id {
+                        let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
+                    }
+                    return false;
+                }
+                zeroclaw_runtime::hooks::HookResult::Continue((_, _, mut content)) => {
+                    if content.chars().count() > super::CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                        content = super::truncate_with_ellipsis(
+                            &content,
+                            super::CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                        );
+                    }
+                    outbound = content;
+                }
+            }
+        }
+        let sanitized = sanitize_channel_response_for_format_with_leak_detection(
+            &outbound,
+            context.tools_registry.as_ref(),
+            &context.prompt_config.security.leak_detection,
+            outbound_content_format_for_channel(&message.channel),
+        );
+        let delivered = if sanitized.is_empty() && !outbound.trim().is_empty() {
+            super::channel_runtime_cli_string("channel-runtime-malformed-tool-output")
+        } else {
+            sanitized
+        };
+        let delivered = super::ensure_nonempty_channel_reply(
+            delivered,
+            &outbound,
+            &message.channel,
+            &message.reply_target,
+        );
+        let (delivery_channel, delivery_recipient, suppress_voice, force_voice, is_redirect) =
+            if let Some(route) = turn_route {
+                let delivery_channel = match route.channel.as_deref() {
+                    None | Some("") => Some(Arc::clone(channel)),
+                    Some(name) => context.channels_by_name.get(name).map(Arc::clone),
+                };
+                let recipient = route
+                    .recipient
+                    .unwrap_or_else(|| message.reply_target.clone());
+                let suppress_voice = match route.modality {
+                    zeroclaw_config::multi_agent::OutputModality::Text => Some(true),
+                    zeroclaw_config::multi_agent::OutputModality::Voice => Some(false),
+                    zeroclaw_config::multi_agent::OutputModality::Mirror => None,
+                };
+                let force_voice = matches!(
+                    route.modality,
+                    zeroclaw_config::multi_agent::OutputModality::Voice
+                );
+                (
+                    delivery_channel,
+                    recipient,
+                    suppress_voice,
+                    force_voice,
+                    route.channel.is_some(),
+                )
+            } else {
+                let (suppress_voice, force_voice) = super::voice_override_from_sender_verdict(
+                    super::sender_prefers_voice(context, message),
+                );
+                (
+                    Some(Arc::clone(channel)),
+                    message.reply_target.clone(),
+                    suppress_voice,
+                    force_voice,
+                    false,
+                )
+            };
+        let Some(delivery_channel) = delivery_channel else {
+            if let Some(draft_id) = draft_id {
+                let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
+            }
+            return false;
+        };
+        let thread_ts = tools_used
+            .then(|| super::followup_thread_id(message))
+            .flatten();
+
+        let delivered_to_channel = deliver_goal_parent_response(
+            channel.as_ref(),
+            delivery_channel.as_ref(),
+            message,
+            draft_id,
+            &delivered,
+            &delivery_recipient,
+            suppress_voice,
+            force_voice,
+            thread_ts.clone(),
+            is_redirect,
+        )
+        .await;
+        if delivered_to_channel {
+            if let Some(hooks) = context.hooks.as_ref() {
+                hooks
+                    .fire_message_sent(&message.channel, &message.reply_target, &delivered)
+                    .await;
+            }
+            if context.show_receipts_in_response {
+                let receipts_block = {
+                    let receipts = receipts.lock().unwrap_or_else(|error| error.into_inner());
+                    zeroclaw_runtime::agent::tool_receipts::render_receipts_block(&receipts)
+                };
+                if let Some(block) = receipts_block {
+                    let _ = channel
+                        .send(
+                            &zeroclaw_api::channel::SendMessage::new(&block, &delivery_recipient)
+                                .in_thread(thread_ts)
+                                .suppress_voice(),
+                        )
+                        .await;
+                }
+            }
+        }
+        delivered_to_channel
+    }
+}
+
+/// Reuse the ordinary response delivery modes after a Goal parent turn.
+///
+/// The caller has already applied the normal response sanitizer. This helper
+/// deliberately owns no Goal state: it is only the channel presentation step.
+async fn deliver_goal_parent_response(
+    origin_channel: &dyn Channel,
+    delivery_channel: &dyn Channel,
+    message: &ChannelMessage,
+    draft_id: Option<&str>,
+    delivered: &str,
+    delivery_recipient: &str,
+    suppress_voice: Option<bool>,
+    force_voice: bool,
+    thread_ts: Option<String>,
+    is_redirect: bool,
+) -> bool {
+    if is_redirect {
+        if let Some(draft_id) = draft_id {
+            let _ = origin_channel
+                .cancel_draft(&message.reply_target, draft_id)
+                .await;
+        }
+        let suppress_voice = suppress_voice.unwrap_or(false);
+        let mut reply = zeroclaw_api::channel::SendMessage::new(delivered, delivery_recipient)
+            .in_thread(thread_ts);
+        if suppress_voice {
+            reply = reply.suppress_voice();
+        } else if force_voice {
+            reply = reply.force_voice();
+        }
+        return delivery_channel.send_final(&reply).await.is_ok();
+    }
+    match draft_id {
+        Some(draft_id) if force_voice => {
+            let _ = origin_channel
+                .cancel_draft(delivery_recipient, draft_id)
+                .await;
+            delivery_channel
+                .send_final(
+                    &zeroclaw_api::channel::SendMessage::new(delivered, delivery_recipient)
+                        .force_voice()
+                        .in_thread(thread_ts),
+                )
+                .await
+                .is_ok()
+        }
+        Some(draft_id) => {
+            let suppress_voice = suppress_voice.unwrap_or(false);
+            match delivery_channel
+                .finalize_draft(delivery_recipient, draft_id, delivered, suppress_voice)
+                .await
+            {
+                Ok(()) => true,
+                Err(_) => {
+                    let mut fallback =
+                        zeroclaw_api::channel::SendMessage::reply_to(message, delivered)
+                            .in_thread(thread_ts);
+                    if suppress_voice {
+                        fallback = fallback.suppress_voice();
+                    }
+                    delivery_channel.send_final(&fallback).await.is_ok()
+                }
+            }
+        }
+        None => {
+            let mut reply = zeroclaw_api::channel::SendMessage::reply_to(message, delivered)
+                .in_thread(thread_ts);
+            if suppress_voice.unwrap_or(false) {
+                reply = reply.suppress_voice();
+            } else if force_voice {
+                reply = reply.force_voice();
+            }
+            delivery_channel.send_final(&reply).await.is_ok()
         }
     }
 }
@@ -701,8 +971,9 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             loop_knobs.draft_reasoning =
                 super::matrix_stream_reasoning(self.context.as_ref(), &self.message);
         }
+        self.parent_candidate_presented = false;
         let presentation =
-            GoalParentPresentation::start(self.context.as_ref(), &self.message).await;
+            GoalParentPresentation::start(Arc::clone(&self.context), &self.message).await;
         if let Some(on_delta) = presentation.on_delta.as_ref() {
             // Match the normal channel turn's initial presentation events.
             // Matrix single-message renders its own configured progress chrome;
@@ -719,6 +990,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 .await;
         }
         let thread_message_id = self.message.id.clone();
+        // `send_via` is ordinary parent-turn behavior. Give this operation its
+        // own routing handle so its requested destination and modality cannot
+        // leak to a concurrent Goal or ordinary channel turn.
+        let turn_routing: zeroclaw_runtime::tools::TurnRoutingHandle =
+            Arc::new(Mutex::new(Vec::new()));
         let tool_loop = run_tool_call_loop(ToolLoop {
             exec: resolved_channel_execution(
                 self.context.as_ref(),
@@ -736,7 +1012,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             on_delta: presentation.on_delta.clone(),
             shared_budget: None,
             channel: None,
-            collected_receipts: None,
+            collected_receipts: self
+                .context
+                .receipt_generator
+                .as_ref()
+                .map(|_| presentation.receipts.as_ref()),
             event_tx: None,
             steering: None,
             new_messages_out: None,
@@ -748,13 +1028,37 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             turn_id: &turn_id,
             sop_reassembly: None,
         });
+        let receipt_scope = self.context.receipt_generator.as_ref().map(|generator| {
+            zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
+                generator: generator.clone(),
+                collector: Arc::clone(&presentation.receipts),
+            }
+        });
+        let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+            .scope(receipt_scope, tool_loop);
+        let tool_loop =
+            zeroclaw_runtime::tools::TURN_ROUTING.scope(Some(Arc::clone(&turn_routing)), tool_loop);
         let candidate = scope_goal_parent_turn(scope_session_key(
             Some(self.session_key.durable_id()),
             async { scope_thread_id(Some(thread_message_id), tool_loop).await },
         ))
         .await;
-        presentation.finish().await;
-        let candidate = candidate?;
+        let candidate = match candidate {
+            Ok(candidate) => {
+                let turn_route = turn_routing
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .last()
+                    .cloned();
+                self.parent_candidate_presented =
+                    presentation.finish(Some(&candidate), turn_route).await;
+                candidate
+            }
+            Err(error) => {
+                presentation.finish(None, None).await;
+                return Err(error);
+            }
+        };
         let _ = operation;
         Ok(GoalParentTurnResult {
             candidate,
@@ -817,15 +1121,18 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &self.context.prompt_config.security.leak_detection,
             outbound_content_format_for_channel(&self.message.channel),
         );
-        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
-            .context("Matrix Goal channel is no longer available")?;
-        channel
-            .send(&zeroclaw_api::channel::SendMessage::reply_to(
-                &self.message,
-                &delivered,
-            ))
-            .await
-            .context("deliver verified Matrix Goal candidate")?;
+        if !self.parent_candidate_presented {
+            let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
+                .context("Matrix Goal channel is no longer available")?;
+            channel
+                .send_final(&zeroclaw_api::channel::SendMessage::reply_to(
+                    &self.message,
+                    &delivered,
+                ))
+                .await
+                .context("deliver verified Matrix Goal candidate")?;
+        }
+        self.parent_candidate_presented = false;
         append_sender_turn(
             self.context.as_ref(),
             &self.session_key.durable_id(),
@@ -893,6 +1200,72 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct GoalPresentationChannel {
+        events: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalPresentationChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-presentation"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for GoalPresentationChannel {
+        fn name(&self) -> &str {
+            "goal-presentation"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("send:{}", message.content));
+            Ok(())
+        }
+
+        async fn send_final(&self, message: &zeroclaw_api::channel::SendMessage) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("final:{}", message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            draft_id: &str,
+            text: &str,
+            _suppress_voice: bool,
+        ) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("draft:{recipient}:{draft_id}:{text}"));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, draft_id: &str) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("cancel:{recipient}:{draft_id}"));
+            Ok(())
+        }
+    }
 
     #[test]
     fn blocked_notice_includes_the_verifier_blocker() {
@@ -1010,7 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_parent_relay_preserves_normal_events_but_withholds_candidate_text() {
+    async fn goal_parent_relay_preserves_every_parent_event() {
         use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
 
         let (source_tx, source_rx) = tokio::sync::mpsc::channel(8);
@@ -1020,17 +1393,14 @@ mod tests {
             StreamDelta::Lifecycle(ProgressEvent::Planning),
             StreamDelta::Status("🤔 Thinking...".to_owned()),
             StreamDelta::Reasoning("configured reasoning".to_owned()),
+            StreamDelta::Text("unverified candidate".to_owned()),
         ];
-        for event in expected {
+        for event in &expected {
             source_tx
-                .send(event)
+                .send(event.clone())
                 .await
                 .expect("Goal relay should remain open");
         }
-        source_tx
-            .send(StreamDelta::Text("unverified candidate".to_owned()))
-            .await
-            .expect("Goal relay should remain open");
         drop(source_tx);
         relay.await.expect("Goal relay should join");
 
@@ -1042,6 +1412,121 @@ mod tests {
             StreamDelta::Lifecycle(ProgressEvent::Planning),
             StreamDelta::Status(status),
             StreamDelta::Reasoning(reason),
-        ] if status == "🤔 Thinking..." && reason == "configured reasoning"));
+            StreamDelta::Text(text),
+        ] if status == "🤔 Thinking..."
+            && reason == "configured reasoning"
+            && text == "unverified candidate"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_uses_the_normal_draft_finalization_surface() {
+        let channel = GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        assert!(
+            deliver_goal_parent_response(
+                &channel,
+                &channel,
+                &message,
+                Some("draft-id"),
+                "parent report",
+                "!room:test",
+                Some(true),
+                false,
+                None,
+                false,
+            )
+            .await
+        );
+        assert_eq!(
+            channel.events.lock().await.as_slice(),
+            ["draft:!room:test:draft-id:parent report"]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_without_a_draft_uses_the_normal_final_surface() {
+        let channel = GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        assert!(
+            deliver_goal_parent_response(
+                &channel,
+                &channel,
+                &message,
+                None,
+                "parent report",
+                "!room:test",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await
+        );
+        assert_eq!(
+            channel.events.lock().await.as_slice(),
+            ["final:parent report"]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_honors_send_via_delivery() {
+        let origin = GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let destination = GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        assert!(
+            deliver_goal_parent_response(
+                &origin,
+                &destination,
+                &message,
+                Some("draft-id"),
+                "parent report",
+                "destination",
+                Some(true),
+                false,
+                None,
+                true,
+            )
+            .await
+        );
+        assert_eq!(
+            origin.events.lock().await.as_slice(),
+            ["cancel:!room:test:draft-id"]
+        );
+        assert_eq!(
+            destination.events.lock().await.as_slice(),
+            ["final:parent report"]
+        );
     }
 }

@@ -16,6 +16,10 @@ pub struct GoalStatusProjection {
     pub accounting_state: String,
     pub pause_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocker_messages: Vec<String>,
@@ -66,6 +70,8 @@ mod goal_wire_tests {
 
         assert_eq!(projection.pause_description, None);
         assert!(projection.blocker_messages.is_empty());
+        assert_eq!(projection.terminal_reason, None);
+        assert_eq!(projection.terminal_provider, None);
     }
 
     #[test]
@@ -78,6 +84,8 @@ mod goal_wire_tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -87,6 +95,8 @@ mod goal_wire_tests {
 
         assert!(raw.get("pause_description").is_none());
         assert!(raw.get("blocker_messages").is_none());
+        assert!(raw.get("terminal_reason").is_none());
+        assert!(raw.get("terminal_provider").is_none());
     }
 }
 

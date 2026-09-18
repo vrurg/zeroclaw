@@ -297,7 +297,9 @@ pub trait GoalSessionDriver: Send + Sync {
     /// audit data only; live policy stays with the driver and is revalidated
     /// there. `canonical_history` is read-only, parent and verifier calls
     /// mutate only process-local working state, and `append_verified_candidate`
-    /// appends and delivers exactly one already-verified final candidate.
+    /// appends one already-verified final candidate. A driver may have already
+    /// presented that parent response through its ordinary transient channel
+    /// surface; completion must not duplicate it.
     /// The object is the sole transport bridge used by the later Goal executor.
     async fn acquire_execution(
         &self,
@@ -534,7 +536,7 @@ impl fmt::Debug for GoalVerifierTurn {
 pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Do not emit any other keys or blocker kinds.",
+            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Choose blocked only when the candidate explicitly reports a concrete, user-actionable blocker. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done; choose continue instead. For blocked, restate only the candidate's reported blocker. Do not emit any other keys or blocker kinds.",
         ),
         ChatMessage::user(format!(
             "Objective:\n{}\n\nCandidate:\n{}",
@@ -1084,6 +1086,74 @@ pub enum GoalResponse {
     Stale,
 }
 
+/// A safe, controller-derived explanation for why a terminal Goal stopped.
+///
+/// The durable task error is an internal diagnostic and can include provider
+/// or runtime details. This enum is the deliberately small public projection
+/// used by channel and RPC renderers instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalTerminalReason {
+    VerifiedCompletion,
+    AccountingOutcomeUnknown,
+    AccountingMissingOrInvalid,
+    PricingUnavailable,
+    CandidateEmpty,
+    ParentOperationFailed,
+    VerifierOperationFailed,
+    VerifierProtocolInvalid,
+    ExecutorFailed,
+    ExecutorStartFailed,
+    GoalToolPairingIncomplete,
+    PolicyRevoked,
+    SessionDisposed,
+    Unspecified,
+}
+
+impl GoalTerminalReason {
+    fn from_durable_reason(reason: &str) -> (Self, Option<String>) {
+        let (reason, provider) = reason
+            .split_once('@')
+            .map_or((reason, None), |(reason, provider)| {
+                (reason, safe_terminal_provider(provider))
+            });
+        let reason = match reason {
+            "verified completion" => Self::VerifiedCompletion,
+            "accounting_outcome_unknown" => Self::AccountingOutcomeUnknown,
+            "accounting_missing_or_invalid" => Self::AccountingMissingOrInvalid,
+            "pricing_unavailable" => Self::PricingUnavailable,
+            "candidate_empty" => Self::CandidateEmpty,
+            "parent_operation_failed" => Self::ParentOperationFailed,
+            "verifier_operation_failed" => Self::VerifierOperationFailed,
+            "verifier_protocol_invalid" => Self::VerifierProtocolInvalid,
+            "executor_failed" => Self::ExecutorFailed,
+            "executor_start_failed" => Self::ExecutorStartFailed,
+            "goal_tool_pairing_incomplete" => Self::GoalToolPairingIncomplete,
+            "policy_revoked" => Self::PolicyRevoked,
+            "session_disposed" => Self::SessionDisposed,
+            _ => Self::Unspecified,
+        };
+        // A provider label is useful only when it is paired with a known,
+        // controller-owned failure category. Do not turn an unknown durable
+        // diagnostic containing `@something` into a user-facing assertion
+        // about which provider failed.
+        let provider = (reason != Self::Unspecified).then_some(provider).flatten();
+        (reason, provider)
+    }
+}
+
+/// Provider profile names are safe to surface only in the narrow established
+/// identifier grammar. Terminal diagnostics and endpoint text stay private.
+fn safe_terminal_provider(provider: &str) -> Option<String> {
+    let provider = provider.trim();
+    (provider.len() <= 128
+        && !provider.is_empty()
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then(|| provider.to_owned())
+}
+
 /// Controller-derived status visible to Matrix and ZeroCode renderers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1095,6 +1165,15 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
+    /// Safe, controller-derived explanation for a terminal Goal. Raw task
+    /// errors remain internal and never cross this transport-neutral boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<GoalTerminalReason>,
+    /// The known terminal provider profile for a failed model operation. This
+    /// is omitted when a failure did not identify one or the value is unsafe
+    /// for a user-visible surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_provider: Option<String>,
     /// Controller-authored explanation for a paused Goal. This is display data
     /// derived from the canonical Goal extension, not a second lifecycle fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1117,6 +1196,8 @@ impl GoalStatusProjection {
             cost_limit_usd: goal.effective_cost_limit_usd,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: goal.pause_description,
             blocker_messages: goal
                 .blockers
@@ -1125,6 +1206,16 @@ impl GoalStatusProjection {
                 .collect(),
             resumable,
         }
+    }
+
+    pub(super) fn with_durable_terminal_reason(mut self, reason: Option<&str>) -> Self {
+        if let Some(reason) = reason {
+            let (terminal_reason, terminal_provider) =
+                GoalTerminalReason::from_durable_reason(reason);
+            self.terminal_reason = Some(terminal_reason);
+            self.terminal_provider = terminal_provider;
+        }
+        self
     }
 }
 
@@ -1531,7 +1622,19 @@ impl GoalController {
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, goal))),
+            Some(goal) => {
+                let terminal_reason = if task.status.is_terminal() {
+                    self.registry
+                        .terminal_reason_for_session_goal(&task.id, session_id)
+                        .await?
+                } else {
+                    None
+                };
+                Ok(Some(
+                    GoalStatusProjection::from_parts(task, goal)
+                        .with_durable_terminal_reason(terminal_reason.as_deref()),
+                ))
+            }
             None => {
                 // A terminal predecessor can be atomically replaced between
                 // the current-task read and extension read. Recheck only on
@@ -1698,6 +1801,67 @@ mod tests {
 
         assert!(raw.get("pause_description").is_none());
         assert!(raw.get("blocker_messages").is_none());
+        assert!(raw.get("terminal_reason").is_none());
+        assert!(raw.get("terminal_provider").is_none());
+    }
+
+    #[test]
+    fn terminal_reason_projection_is_safe_and_actionable() {
+        let known = GoalStatusProjection::from_parts(
+            &TaskRecord {
+                id: "goal-terminal".to_owned(),
+                kind: TaskKind::Goal,
+                agent: "main".to_owned(),
+                status: TaskStatus::Failed,
+                owner_pid: 1,
+                owner_boot_id: "boot".to_owned(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some("matrix.room".to_owned()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some("@user:example.test".to_owned()),
+                session_id: Some("matrix_session".to_owned()),
+                execution_epoch: 2,
+                started_at: "2026-09-11T00:00:00Z".to_owned(),
+                finished_at: Some("2026-09-11T00:01:00Z".to_owned()),
+            },
+            GoalTaskRecord::default(),
+        )
+        .with_durable_terminal_reason(Some("accounting_outcome_unknown"));
+
+        assert_eq!(
+            known.terminal_reason,
+            Some(GoalTerminalReason::AccountingOutcomeUnknown)
+        );
+        assert_eq!(known.terminal_provider, None);
+
+        let provider = known
+            .clone()
+            .with_durable_terminal_reason(Some("parent_operation_failed@openai.default"));
+        assert_eq!(
+            provider.terminal_provider.as_deref(),
+            Some("openai.default")
+        );
+
+        let unknown_with_suffix = known
+            .clone()
+            .with_durable_terminal_reason(Some("unknown_failure@openai.default"));
+        assert_eq!(
+            unknown_with_suffix.terminal_reason,
+            Some(GoalTerminalReason::Unspecified)
+        );
+        assert_eq!(unknown_with_suffix.terminal_provider, None);
+
+        let unknown = known.with_durable_terminal_reason(Some(
+            "provider route secret-model returned an internal diagnostic",
+        ));
+        assert_eq!(
+            unknown.terminal_reason,
+            Some(GoalTerminalReason::Unspecified)
+        );
+        assert_eq!(unknown.terminal_provider, None);
     }
 
     #[test]
@@ -1822,6 +1986,11 @@ mod tests {
             messages[0]
                 .content
                 .contains("{\"decision\":\"complete|continue|blocked\"")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("only when the candidate explicitly reports")
         );
         assert!(!messages[0].content.contains("\\\""));
         assert_eq!(messages[1].role, "user");

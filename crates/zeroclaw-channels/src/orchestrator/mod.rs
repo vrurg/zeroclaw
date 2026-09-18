@@ -702,6 +702,7 @@ fn render_goal_projection(
     projection: &zeroclaw_runtime::goal_mode::GoalStatusProjection,
 ) -> String {
     use zeroclaw_runtime::control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus};
+    use zeroclaw_runtime::goal_mode::GoalTerminalReason;
 
     let token_limit = projection
         .token_limit
@@ -721,10 +722,14 @@ fn render_goal_projection(
         TaskStatus::TimedOut => "timed_out",
     };
     let accounting = match projection.accounting_state {
-        GoalAccountingState::Complete => "complete",
-        GoalAccountingState::Missing => "missing",
-        GoalAccountingState::Invalid => "invalid",
-        GoalAccountingState::OutcomeUnknown => "outcome_unknown",
+        GoalAccountingState::Complete => {
+            channel_runtime_cli_string("goal-mode-accounting-complete")
+        }
+        GoalAccountingState::Missing => channel_runtime_cli_string("goal-mode-accounting-missing"),
+        GoalAccountingState::Invalid => channel_runtime_cli_string("goal-mode-accounting-invalid"),
+        GoalAccountingState::OutcomeUnknown => {
+            channel_runtime_cli_string("goal-mode-accounting-outcome-unknown")
+        }
     };
     let resumable = channel_runtime_cli_string(if projection.resumable {
         "goal-mode-yes"
@@ -733,6 +738,61 @@ fn render_goal_projection(
     });
     let mut message =
         channel_runtime_cli_string_with_args("goal-mode-summary-status", &[("status", status)]);
+    if let Some(reason) = projection.terminal_reason {
+        let reason = match reason {
+            GoalTerminalReason::VerifiedCompletion => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-verified-completion")
+            }
+            GoalTerminalReason::AccountingOutcomeUnknown => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-accounting-outcome-unknown")
+            }
+            GoalTerminalReason::AccountingMissingOrInvalid => channel_runtime_cli_string(
+                "goal-mode-terminal-reason-accounting-missing-or-invalid",
+            ),
+            GoalTerminalReason::PricingUnavailable => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-pricing-unavailable")
+            }
+            GoalTerminalReason::CandidateEmpty => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-candidate-empty")
+            }
+            GoalTerminalReason::ParentOperationFailed => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-parent-operation-failed")
+            }
+            GoalTerminalReason::VerifierOperationFailed => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-verifier-operation-failed")
+            }
+            GoalTerminalReason::VerifierProtocolInvalid => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-verifier-protocol-invalid")
+            }
+            GoalTerminalReason::ExecutorFailed | GoalTerminalReason::ExecutorStartFailed => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-executor-failed")
+            }
+            GoalTerminalReason::GoalToolPairingIncomplete => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-tool-pairing-incomplete")
+            }
+            GoalTerminalReason::PolicyRevoked => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-policy-revoked")
+            }
+            GoalTerminalReason::SessionDisposed => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-session-disposed")
+            }
+            GoalTerminalReason::Unspecified => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-unspecified")
+            }
+        };
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-reason",
+            &[("reason", &reason)],
+        ));
+    }
+    if let Some(provider) = projection.terminal_provider.as_deref() {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-provider",
+            &[("provider", provider)],
+        ));
+    }
     message.push('\n');
     message.push_str(&channel_runtime_cli_string_with_args(
         "goal-mode-summary-budget",
@@ -741,7 +801,7 @@ fn render_goal_projection(
     message.push('\n');
     message.push_str(&channel_runtime_cli_string_with_args(
         "goal-mode-summary-accounting",
-        &[("accounting", accounting)],
+        &[("accounting", &accounting)],
     ));
     message.push('\n');
     message.push_str(&channel_runtime_cli_string_with_args(
@@ -784,6 +844,38 @@ fn render_goal_projection(
         ));
     }
     message
+}
+
+#[cfg(test)]
+mod goal_response_render_tests {
+    use super::render_goal_response;
+    use zeroclaw_runtime::{
+        control_plane::{GoalAccountingState, TaskStatus},
+        goal_mode::{GoalResponse, GoalStatusProjection, GoalTerminalReason},
+    };
+
+    #[test]
+    fn terminal_goal_status_explains_an_unsettled_operation() {
+        let rendered = render_goal_response(&GoalResponse::Terminal(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Failed,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::OutcomeUnknown,
+            pause_reason: None,
+            terminal_reason: Some(GoalTerminalReason::AccountingOutcomeUnknown),
+            terminal_provider: Some("openai.default".to_owned()),
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: false,
+        }));
+
+        assert!(rendered.contains("**Reason:** The last model operation did not settle cleanly."));
+        assert!(rendered.contains("**Accounting:** usage may be incomplete"));
+        assert!(rendered.contains("**Provider:** openai.default"));
+        assert!(!rendered.contains("outcome_unknown"));
+    }
 }
 
 #[cfg(feature = "channel-telegram")]

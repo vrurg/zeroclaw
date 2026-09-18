@@ -804,7 +804,16 @@ impl GoalExecutionSupervisor {
         if !classified {
             return Ok(None);
         }
-        let projection = super::GoalStatusProjection::from_parts(&current, goal);
+        let terminal_reason = if current.status.is_terminal() {
+            self.engine
+                .registry
+                .terminal_reason_for_session_goal(&current.id, scope.session_id())
+                .await?
+        } else {
+            None
+        };
+        let projection = super::GoalStatusProjection::from_parts(&current, goal)
+            .with_durable_terminal_reason(terminal_reason.as_deref());
         Ok(Some(match current.status {
             TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
             _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
@@ -1082,7 +1091,8 @@ impl GoalExecutionEngine {
                     }
                 }
                 Err(error) => {
-                    self.fail(scope, "parent_operation_failed").await?;
+                    self.fail_operation(scope, "parent_operation_failed", &error)
+                        .await?;
                     return Err(error).context("Goal parent operation failed");
                 }
             };
@@ -1109,7 +1119,8 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
-                    self.fail(scope, "verifier_operation_failed").await?;
+                    self.fail_operation(scope, "verifier_operation_failed", &error)
+                        .await?;
                     return Err(error).context("Goal verifier operation failed");
                 }
             };
@@ -1261,6 +1272,12 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
+        self.fail_with_reason(scope, reason).await
+    }
+
+    /// Preserve tool-pairing cleanup for both stable lifecycle failures and
+    /// failures augmented with a safe provider identifier.
+    async fn fail_with_reason(&self, scope: &GoalExecutionScope, reason: &str) -> Result<()> {
         let goal = self.registry.get_goal_task(scope.task_id()).await?;
         if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
             goal.pending_tool_batch_id
@@ -1315,6 +1332,37 @@ impl GoalExecutionEngine {
                 }
             }
         }
+        self.finish_failure(scope, reason).await
+    }
+
+    async fn fail_operation(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let provider = error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+                .and_then(|failure| failure.provider())
+        });
+        let reason = provider
+            .filter(|provider| {
+                !provider.is_empty()
+                    && provider.len() <= 128
+                    && provider.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            })
+            .map_or_else(
+                || reason.to_owned(),
+                |provider| format!("{reason}@{provider}"),
+            );
+
+        self.fail_with_reason(scope, &reason).await
+    }
+
+    async fn finish_failure(&self, scope: &GoalExecutionScope, reason: &str) -> Result<()> {
         match self
             .registry
             .finish_session_goal(

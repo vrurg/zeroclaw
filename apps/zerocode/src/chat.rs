@@ -112,6 +112,49 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     });
     let mut message =
         crate::i18n::t_args("zc-goal-summary-status", &[("status", &projection.status)]);
+    if let Some(reason) = projection.terminal_reason.as_deref() {
+        let reason = match reason {
+            "verified_completion" => crate::i18n::t("zc-goal-terminal-reason-verified-completion"),
+            "accounting_outcome_unknown" => {
+                crate::i18n::t("zc-goal-terminal-reason-accounting-outcome-unknown")
+            }
+            "accounting_missing_or_invalid" => {
+                crate::i18n::t("zc-goal-terminal-reason-accounting-missing-or-invalid")
+            }
+            "pricing_unavailable" => crate::i18n::t("zc-goal-terminal-reason-pricing-unavailable"),
+            "candidate_empty" => crate::i18n::t("zc-goal-terminal-reason-candidate-empty"),
+            "parent_operation_failed" => {
+                crate::i18n::t("zc-goal-terminal-reason-parent-operation-failed")
+            }
+            "verifier_operation_failed" => {
+                crate::i18n::t("zc-goal-terminal-reason-verifier-operation-failed")
+            }
+            "verifier_protocol_invalid" => {
+                crate::i18n::t("zc-goal-terminal-reason-verifier-protocol-invalid")
+            }
+            "executor_failed" | "executor_start_failed" => {
+                crate::i18n::t("zc-goal-terminal-reason-executor-failed")
+            }
+            "goal_tool_pairing_incomplete" => {
+                crate::i18n::t("zc-goal-terminal-reason-tool-pairing-incomplete")
+            }
+            "policy_revoked" => crate::i18n::t("zc-goal-terminal-reason-policy-revoked"),
+            "session_disposed" => crate::i18n::t("zc-goal-terminal-reason-session-disposed"),
+            _ => crate::i18n::t("zc-goal-terminal-reason-unspecified"),
+        };
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-reason",
+            &[("reason", &reason)],
+        ));
+    }
+    if let Some(provider) = projection.terminal_provider.as_deref() {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-provider",
+            &[("provider", provider)],
+        ));
+    }
     message.push('\n');
     message.push_str(&crate::i18n::t_args(
         "zc-goal-summary-budget",
@@ -10589,6 +10632,8 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: Some("needs_user_input".to_owned()),
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: Some("Select a target.".to_owned()),
             blocker_messages: vec!["Which target should receive the change?".to_owned()],
             resumable: true,
@@ -10614,6 +10659,8 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -10639,6 +10686,8 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -10666,12 +10715,36 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
         });
 
         assert!(!goal_response_message(&response).contains("Pause:"));
+    }
+
+    #[test]
+    fn terminal_goal_response_explains_an_unsettled_operation() {
+        let response = crate::wire::GoalResponse::Terminal(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "failed".to_owned(),
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "outcome_unknown".to_owned(),
+            pause_reason: None,
+            terminal_reason: Some("accounting_outcome_unknown".to_owned()),
+            terminal_provider: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: false,
+        });
+
+        let rendered = goal_response_message(&response);
+
+        assert!(rendered.contains("Reason: The last model operation did not settle cleanly."));
     }
 
     fn draw_todo_close(chat: &mut Chat) -> Rect {
