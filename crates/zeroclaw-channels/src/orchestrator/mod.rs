@@ -4420,7 +4420,16 @@ async fn handle_runtime_command_for_delivery(
                     "Session prompts are enabled but the persisted session backend is unavailable"
                 );
             }
-            if delete_error.is_some() || missing_required_store {
+            // Preserve the established best-effort reset behavior when prompt
+            // attachments are disabled. Alternative reset policies are possible,
+            // but making every channel reset fail-close would be a separate
+            // compatibility and lifecycle decision. Enabled prompt attachments
+            // are different: their durable cleanup is part of this feature's
+            // atomic reset contract and cannot be skipped.
+            let durable_prompt_cleanup_required =
+                ctx.prompt_config.channels.session_prompts_enabled;
+            if (durable_prompt_cleanup_required && delete_error.is_some()) || missing_required_store
+            {
                 channel_runtime_cli_string("channel-runtime-new-session-failed")
             } else {
                 clear_sender_history(ctx, &sender_key);
@@ -23167,19 +23176,24 @@ BTC is currently around $65,000 based on latest tool output."#
                 .await
             );
 
-            let expected = channel_runtime_cli_string("channel-runtime-new-session-failed");
+            let expected = if session_prompts_enabled {
+                channel_runtime_cli_string("channel-runtime-new-session-failed")
+            } else {
+                channel_runtime_cli_string("channel-runtime-new-session")
+            };
             assert_eq!(
                 channel_impl.sent_messages.lock().await.as_slice(),
                 [format!("r1:{expected}")],
                 "session_prompts_enabled={session_prompts_enabled}"
             );
-            assert!(
+            assert_eq!(
                 ctx.conversation_histories
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .peek(&history_key)
                     .is_some(),
-                "a rejected reset must leave the in-memory session intact; \
+                session_prompts_enabled,
+                "an enabled-prompt reset must leave the in-memory session intact; \
                  session_prompts_enabled={session_prompts_enabled}"
             );
             assert_eq!(

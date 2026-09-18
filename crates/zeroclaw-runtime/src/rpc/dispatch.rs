@@ -515,9 +515,16 @@ pub struct RpcDispatcher {
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
     connection_cancel: CancellationToken,
-    /// Whether this dispatcher owns the transport connection.
+    /// Whether this dispatcher owns the transport connection. Only the owner
+    /// may end the generation: prompt handles from [`Self::spawn_handle`] read
+    /// the same token to observe teardown, and a completing prompt dropping
+    /// its handle must not close the connection that is still serving requests.
     owns_connection: bool,
-    /// Liveness token shared with work started by this connection.
+    /// Liveness token for the accepted connection, shared with every task this
+    /// connection starts. Cloned into each spawned prompt and into the nested
+    /// turn task, so the listener's client count falls to zero only once that
+    /// work has actually finished unwinding. `None` when no listener supplied
+    /// one (direct dispatcher construction outside an accepted connection).
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
@@ -555,6 +562,9 @@ impl RpcDispatcher {
         }
     }
 
+    /// Attach the accepted connection's liveness token. Additive builder so the
+    /// listeners can share their client-count token with the tasks this
+    /// dispatcher spawns while other construction sites need no change.
     #[must_use]
     pub(crate) fn with_connection_activity(
         mut self,
@@ -603,6 +613,10 @@ impl RpcDispatcher {
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
+    ///
+    /// The handle observes the connection generation token but does not own it:
+    /// a prompt finishing normally drops its handle, and that drop must leave
+    /// the connection open for the requests that follow.
     fn spawn_handle(&self) -> Self {
         Self {
             ctx: Arc::clone(&self.ctx),
@@ -617,14 +631,24 @@ impl RpcDispatcher {
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
+            // Shared, not re-created: this handle is moved into the spawned
+            // prompt task, so the clone it carries keeps the connection counted
+            // until that task's future is dropped.
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
 
+    /// Cancel and join every prompt accepted by this connection generation.
+    /// The queue guard held by an in-flight turn is released only after its
+    /// provider/tool future has observed cancellation and returned, so a
+    /// replacement connection cannot race invisible old-generation work.
     pub(crate) async fn shutdown(&mut self) {
         self.connection_cancel.cancel();
+        // Join each handle where it is stored, and remove it only once its
+        // join has returned. Moving handles out first would detach whichever
+        // prompt is being awaited if this future is itself dropped.
         while !self.prompt_tasks.is_empty() {
             if let Some(task) = self.prompt_tasks.last_mut() {
                 let _ = task.await;
@@ -754,7 +778,7 @@ impl RpcDispatcher {
     }
 
     /// Own a transport until EOF or generation cancellation, then drain all
-    /// accepted prompt work before returning.
+    /// work accepted by that exact connection before returning.
     pub(crate) async fn run_connection(&mut self, transport: &mut (dyn RpcTransport + Send)) {
         let connection_cancel = self.connection_cancel.clone();
         tokio::select! {
