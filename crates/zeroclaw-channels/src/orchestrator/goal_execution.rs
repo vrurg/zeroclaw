@@ -3,7 +3,10 @@
 //! This module owns only live Matrix session mechanics. Durable lifecycle,
 //! accounting, and execution fencing remain in `zeroclaw-runtime`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
@@ -457,6 +460,195 @@ fn goal_continue_history(
     Ok(history)
 }
 
+/// Forward parent-loop events through the ordinary channel presentation path.
+///
+/// The parent response is a verifier-gated candidate, so it is the sole event
+/// that cannot enter the channel's regular stream before verification. Every
+/// other event, including configuration-selected reasoning, remains intact so
+/// the normal channel presentation policy decides what is visible.
+async fn relay_goal_parent_events(
+    mut source: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
+    destination: tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>,
+) {
+    while let Some(event) = source.recv().await {
+        if matches!(event, zeroclaw_runtime::agent::loop_::StreamDelta::Text(_)) {
+            continue;
+        }
+        if destination.send(event).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The normal channel presentation plumbing for one Goal parent operation.
+///
+/// Goal execution uses the same draft and tool-notification paths as an
+/// ordinary channel turn. Keeping the configuration and rendering decision in
+/// the existing helpers is deliberate: Goal Mode only protects unverified
+/// candidate text; it must not become a second presentation policy.
+struct GoalParentPresentation {
+    on_delta: Option<tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>>,
+    observer: Arc<super::ChannelNotifyObserver>,
+    relay: Option<tokio::task::JoinHandle<()>>,
+    draft_updater: Option<tokio::task::JoinHandle<()>>,
+    notify_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl GoalParentPresentation {
+    async fn start(context: &ChannelRuntimeContext, message: &ChannelMessage) -> Self {
+        let channel = find_channel_for_message(&context.channels_by_name, message).cloned();
+        let use_draft_streaming = channel
+            .as_ref()
+            .is_some_and(|channel| channel.supports_draft_updates());
+        let matrix_single_message_streaming =
+            super::matrix_single_message_streaming_enabled(context, message);
+
+        let (on_delta, relay, draft_updater) = if use_draft_streaming {
+            let (source_tx, source_rx) = tokio::sync::mpsc::channel(64);
+            let (visible_tx, visible_rx) = tokio::sync::mpsc::channel(64);
+            let relay = Some(zeroclaw_spawn::spawn!(relay_goal_parent_events(
+                source_rx, visible_tx,
+            )));
+            let draft_id = if let Some(channel) = channel.as_ref() {
+                match channel
+                    .send_draft(&zeroclaw_api::channel::SendMessage::reply_to(
+                        message,
+                        zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+                    ))
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Goal draft creation failed"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let draft_updater = match (channel.as_ref(), draft_id) {
+                (Some(channel), Some(draft_id)) if matrix_single_message_streaming => {
+                    let channel = Arc::clone(channel);
+                    let reply_target = message.reply_target.clone();
+                    let matrix_config = Arc::clone(&context.prompt_config);
+                    let matrix_alias = message.channel_alias.clone().unwrap_or_default();
+                    let interval_ms = super::matrix_draft_update_interval_ms(context, message);
+                    let stream_draft_lines = super::matrix_stream_draft_lines(context, message);
+                    Some(zeroclaw_spawn::spawn!(async move {
+                        super::run_matrix_single_message_draft_updater(
+                            visible_rx,
+                            channel,
+                            reply_target,
+                            draft_id,
+                            interval_ms,
+                            stream_draft_lines,
+                            matrix_config,
+                            matrix_alias,
+                        )
+                        .await;
+                    }))
+                }
+                (Some(channel), Some(draft_id)) => {
+                    let channel = Arc::clone(channel);
+                    let reply_target = message.reply_target.clone();
+                    let known_tool_names: HashSet<String> = context
+                        .tools_registry
+                        .iter()
+                        .map(|tool| tool.name().to_ascii_lowercase())
+                        .collect();
+                    Some(zeroclaw_spawn::spawn!(async move {
+                        super::run_draft_updater(
+                            channel,
+                            reply_target,
+                            draft_id,
+                            known_tool_names,
+                            visible_rx,
+                        )
+                        .await;
+                    }))
+                }
+                _ => None,
+            };
+            (Some(source_tx), relay, draft_updater)
+        } else {
+            (None, None, None)
+        };
+
+        let is_partial_draft = channel.as_ref().is_some_and(|channel| {
+            channel.supports_draft_updates() && !channel.supports_multi_message_streaming()
+        }) || matrix_single_message_streaming;
+        let (notify_tx, notify_task) = if matrix_single_message_streaming {
+            (None, None)
+        } else {
+            let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+            let notify_channel = channel.clone();
+            let reply_target = message.reply_target.clone();
+            let thread_ts = super::followup_thread_id(message);
+            let notify_task = if !context.show_tool_calls || is_partial_draft {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    while notify_rx.recv().await.is_some() {}
+                }))
+            } else {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    while let Some(text) = notify_rx.recv().await {
+                        if let Some(channel) = notify_channel.as_ref() {
+                            let _ = channel
+                                .send(
+                                    &zeroclaw_api::channel::SendMessage::new(&text, &reply_target)
+                                        .in_thread(thread_ts.clone())
+                                        .suppress_voice(),
+                                )
+                                .await;
+                        }
+                    }
+                }))
+            };
+            (Some(notify_tx), notify_task)
+        };
+
+        Self {
+            on_delta,
+            observer: Arc::new(super::ChannelNotifyObserver {
+                inner: Arc::clone(&context.observer),
+                tx: notify_tx,
+                tools_used: std::sync::atomic::AtomicBool::new(false),
+            }),
+            relay,
+            draft_updater,
+            notify_task,
+        }
+    }
+
+    async fn finish(self) {
+        let Self {
+            on_delta,
+            observer,
+            relay,
+            draft_updater,
+            notify_task,
+        } = self;
+        drop(on_delta);
+        if let Some(relay) = relay {
+            let _ = relay.await;
+        }
+        if let Some(draft_updater) = draft_updater {
+            let _ = draft_updater.await;
+        }
+        drop(observer);
+        if let Some(notify_task) = notify_task {
+            let _ = notify_task.await;
+        }
+    }
+}
+
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     fn session_key(&self) -> &GoalSessionKey {
@@ -504,13 +696,35 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             )?,
         };
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let loop_knobs = LoopKnobs::default();
+        let mut loop_knobs = LoopKnobs::default();
+        if super::matrix_single_message_streaming_enabled(self.context.as_ref(), &self.message) {
+            loop_knobs.draft_reasoning =
+                super::matrix_stream_reasoning(self.context.as_ref(), &self.message);
+        }
+        let presentation =
+            GoalParentPresentation::start(self.context.as_ref(), &self.message).await;
+        if let Some(on_delta) = presentation.on_delta.as_ref() {
+            // Match the normal channel turn's initial presentation events.
+            // Matrix single-message renders its own configured progress chrome;
+            // other draft-capable channels consume these typed lifecycle events.
+            let _ = on_delta
+                .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                    zeroclaw_runtime::agent::loop_::ProgressEvent::Received,
+                ))
+                .await;
+            let _ = on_delta
+                .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                    zeroclaw_runtime::agent::loop_::ProgressEvent::Planning,
+                ))
+                .await;
+        }
+        let thread_message_id = self.message.id.clone();
         let tool_loop = run_tool_call_loop(ToolLoop {
             exec: resolved_channel_execution(
                 self.context.as_ref(),
                 provider.as_ref(),
                 &route,
-                self.context.observer.as_ref(),
+                presentation.observer.as_ref(),
                 &loop_knobs,
                 self.context.non_cli_excluded_tools.as_ref(),
                 defaults.defaults.temperature,
@@ -519,7 +733,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             channel_name: "matrix",
             channel_reply_target: Some(self.message.reply_target.as_str()),
             cancellation_token: None,
-            on_delta: None,
+            on_delta: presentation.on_delta.clone(),
             shared_budget: None,
             channel: None,
             collected_receipts: None,
@@ -536,9 +750,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         });
         let candidate = scope_goal_parent_turn(scope_session_key(
             Some(self.session_key.durable_id()),
-            async { scope_thread_id(Some(self.message.id.clone()), tool_loop).await },
+            async { scope_thread_id(Some(thread_message_id), tool_loop).await },
         ))
-        .await?;
+        .await;
+        presentation.finish().await;
+        let candidate = candidate?;
         let _ = operation;
         Ok(GoalParentTurnResult {
             candidate,
@@ -791,5 +1007,41 @@ mod tests {
         .expect_err("continuation must retain the system prompt at history index zero");
 
         assert!(error.to_string().contains("lost its system prompt"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_relay_preserves_normal_events_but_withholds_candidate_text() {
+        use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
+
+        let (source_tx, source_rx) = tokio::sync::mpsc::channel(8);
+        let (visible_tx, mut visible_rx) = tokio::sync::mpsc::channel(8);
+        let relay = zeroclaw_spawn::spawn!(relay_goal_parent_events(source_rx, visible_tx));
+        let expected = vec![
+            StreamDelta::Lifecycle(ProgressEvent::Planning),
+            StreamDelta::Status("🤔 Thinking...".to_owned()),
+            StreamDelta::Reasoning("configured reasoning".to_owned()),
+        ];
+        for event in expected {
+            source_tx
+                .send(event)
+                .await
+                .expect("Goal relay should remain open");
+        }
+        source_tx
+            .send(StreamDelta::Text("unverified candidate".to_owned()))
+            .await
+            .expect("Goal relay should remain open");
+        drop(source_tx);
+        relay.await.expect("Goal relay should join");
+
+        let mut actual = Vec::new();
+        while let Some(event) = visible_rx.recv().await {
+            actual.push(event);
+        }
+        assert!(matches!(actual.as_slice(), [
+            StreamDelta::Lifecycle(ProgressEvent::Planning),
+            StreamDelta::Status(status),
+            StreamDelta::Reasoning(reason),
+        ] if status == "🤔 Thinking..." && reason == "configured reasoning"));
     }
 }
