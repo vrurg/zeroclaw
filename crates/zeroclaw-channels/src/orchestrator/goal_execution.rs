@@ -965,6 +965,13 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 self.context.agent_cfg.resolved.max_system_prompt_chars,
             )?,
         };
+        if let Some(response) = turn.resume_response {
+            // A response to a Goal blocker is ordinary untrusted user input,
+            // not lifecycle authority. Keep it solely in this fresh working
+            // transcript: verified completion remains the only path that
+            // appends a candidate to canonical session history.
+            history.push(ChatMessage::user(response));
+        }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut loop_knobs = LoopKnobs::default();
         if super::matrix_single_message_streaming_enabled(self.context.as_ref(), &self.message) {
@@ -1276,10 +1283,9 @@ mod tests {
         assert!(rendered.starts_with("⏸️ Goal paused."));
         assert!(rendered.contains("\n**Blocker:**\n• Provide the task packet reference."));
         assert!(!rendered.contains("verifier requires resolution"));
-        assert!(
-            rendered
-                .contains("\n**Next:** Resolve the blocker, then run `/goal resume` to continue.")
-        );
+        assert!(rendered.contains(
+            "\n**Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue."
+        ));
     }
 
     #[test]

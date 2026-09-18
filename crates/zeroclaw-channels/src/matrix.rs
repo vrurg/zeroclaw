@@ -8156,6 +8156,23 @@ mod tests {
         }
 
         #[test]
+        fn addressed_resume_preserves_a_multiline_response() {
+            let bot = user_id!("@zc-architect:example.org");
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "zc-architect: /goal resume\nThe task packet is docs/task.md.\n\nPlease continue.",
+                ),
+                Some(
+                    "/goal resume\nThe task packet is docs/task.md.\n\nPlease continue."
+                        .to_string(),
+                ),
+            );
+        }
+
+        #[test]
         fn explicit_mention_in_user_ids_passes() {
             let bot = user_id!("@bot:example.org");
             assert!(is_mentioned(

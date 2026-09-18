@@ -1304,7 +1304,7 @@ goal-mode-help =
     • /goal budget set --cost-usd D [--tokens N]
     • /goal budget set --unlimited
     • /goal pause
-    • /goal resume
+    • /goal resume [RESPONSE]
     • /goal cancel
     • /goal help
 goal-mode-disabled = 🚫 Goal Mode is disabled.
@@ -1319,7 +1319,7 @@ goal-mode-paused-blocked = ⏸️ Goal paused.
 goal-mode-paused-blocker-heading = **Blocker:**
 goal-mode-paused-notice-blocker = • { $blocker }
 goal-mode-paused-notice-action = • { $action }
-goal-mode-paused-blocked-next = **Next:** Resolve the blocker, then run `/goal resume` to continue.
+goal-mode-paused-blocked-next = **Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue.
 goal-mode-paused-blocked-cancel = Or run `/goal cancel` to dismiss this Goal.
 goal-mode-paused-blocked-status = Run `/goal status` to review the current Goal.
 goal-mode-already-paused = ⏸️ Goal is already paused.

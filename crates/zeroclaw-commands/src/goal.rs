@@ -51,7 +51,12 @@ pub enum GoalCommand {
     Budget,
     SetBudget(GoalBudgetSelection),
     Pause,
-    Resume,
+    Resume {
+        /// Optional user response to a verifier-reported blocker. This stays
+        /// transport-neutral; the Goal executor places it in the fresh,
+        /// process-local resumed parent turn.
+        response: Option<String>,
+    },
     Cancel,
     Help,
 }
@@ -91,13 +96,24 @@ pub fn parse_goal_command(content: &str) -> Result<GoalCommand, GoalCommandParse
         "status" => argument_free(arguments, "status", GoalCommand::Status),
         "budget" => parse_budget(arguments),
         "pause" => argument_free(arguments, "pause", GoalCommand::Pause),
-        "resume" => argument_free(arguments, "resume", GoalCommand::Resume),
+        "resume" => parse_resume(arguments),
         "cancel" => argument_free(arguments, "cancel", GoalCommand::Cancel),
         "help" => argument_free(arguments, "help", GoalCommand::Help),
         _ => Err(GoalCommandParseError::UnknownSubcommand(
             normalized_subcommand,
         )),
     }
+}
+
+fn parse_resume(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
+    let response = arguments.trim();
+    if response.is_empty() {
+        return Ok(GoalCommand::Resume { response: None });
+    }
+    validate_goal_objective(response)?;
+    Ok(GoalCommand::Resume {
+        response: Some(response.to_owned()),
+    })
 }
 
 fn split_token(input: &str) -> (&str, &str) {
@@ -328,6 +344,20 @@ mod tests {
     }
 
     #[test]
+    fn resume_accepts_a_multiline_user_response() {
+        assert_eq!(
+            parse_goal_command("/goal resume\nThe target is `main`.\n\nPlease continue."),
+            Ok(GoalCommand::Resume {
+                response: Some("The target is `main`.\n\nPlease continue.".into()),
+            })
+        );
+        assert_eq!(
+            parse_goal_command("/goal resume"),
+            Ok(GoalCommand::Resume { response: None })
+        );
+    }
+
+    #[test]
     fn start_accepts_an_objective_without_a_delimiter() {
         assert_eq!(
             parse_goal_command("/goal start finish the task"),
@@ -366,7 +396,6 @@ mod tests {
         for command in [
             "/goal start -- objective",
             "/goal objective amend",
-            "/goal resume note",
             "/goal start --tokens=1 objective",
             "/goal start --tokens 0 objective",
             "/goal start --cost-usd 0 objective",

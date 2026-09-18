@@ -397,6 +397,10 @@ pub struct GoalParentTurn {
     /// durable Goal record. It is untrusted prompt data, never policy or
     /// authority.
     pub objective: String,
+    /// Optional user reply supplied with `/goal resume`. It is transient prompt
+    /// data for this fresh epoch only: the controller never persists it as
+    /// Goal state or canonical session history.
+    pub resume_response: Option<String>,
     pub working_history: Vec<ChatMessage>,
 }
 
@@ -681,7 +685,7 @@ fn goal_command_kind(command: &GoalCommand) -> &'static str {
         GoalCommand::Budget => "budget",
         GoalCommand::SetBudget(_) => "budget_set",
         GoalCommand::Pause => "pause",
-        GoalCommand::Resume => "resume",
+        GoalCommand::Resume { .. } => "resume",
         GoalCommand::Cancel => "cancel",
         GoalCommand::Help => "help",
     }
@@ -744,6 +748,12 @@ impl GoalExecutionHost {
         }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
+        }
+        if let GoalCommand::Resume {
+            response: Some(response),
+        } = &command
+        {
+            validate_goal_objective(response).map_err(|error| Error::msg(format!("{error:?}")))?;
         }
 
         let lease = driver.bind(&ingress).await?;
@@ -836,6 +846,7 @@ pub struct GoalExecutionRequest {
     submission: GoalSubmission,
     scope: GoalExecutionScope,
     initial_turn_kind: GoalParentTurnKind,
+    resume_response: Option<String>,
 }
 
 impl GoalExecutionRequest {
@@ -854,6 +865,13 @@ impl GoalExecutionRequest {
     /// The controller-derived lifecycle phase for this new executor.
     pub const fn initial_turn_kind(&self) -> GoalParentTurnKind {
         self.initial_turn_kind
+    }
+
+    /// The optional, transient reply supplied by the user when resuming a
+    /// verifier-blocked Goal. The executor consumes it on its first parent
+    /// turn and never persists it as lifecycle state or session history.
+    pub fn resume_response(&self) -> Option<&str> {
+        self.resume_response.as_deref()
     }
 }
 
@@ -905,11 +923,16 @@ impl GoalRuntime {
                     submission.ingress().session_key().durable_id(),
                     projection.execution_epoch,
                 )?;
+                let resume_response = match submission.command() {
+                    GoalCommand::Resume { response } => response.clone(),
+                    _ => None,
+                };
                 (
                     Some(GoalExecutionRequest {
                         scope,
                         submission,
                         initial_turn_kind,
+                        resume_response,
                     }),
                     None,
                 )
@@ -1275,7 +1298,7 @@ impl GoalController {
                 self.set_budget(submission.ingress(), *selection).await
             }
             GoalCommand::Pause => self.pause(submission.ingress()).await,
-            GoalCommand::Resume => self.resume(settings, submission.ingress()).await,
+            GoalCommand::Resume { .. } => self.resume(settings, submission.ingress()).await,
             GoalCommand::Cancel => self.cancel(submission.ingress()).await,
         }
     }
@@ -1874,6 +1897,7 @@ mod tests {
             let directive = goal_parent_directive(&GoalParentTurn {
                 kind,
                 objective: "ship goal mode".to_owned(),
+                resume_response: None,
                 working_history: Vec::new(),
             });
 
@@ -1933,6 +1957,7 @@ mod tests {
         let directive = goal_parent_directive(&GoalParentTurn {
             kind: GoalParentTurnKind::Start,
             objective: objective.to_owned(),
+            resume_response: None,
             working_history: Vec::new(),
         });
 
@@ -1960,6 +1985,7 @@ mod tests {
         let directive = goal_parent_directive(&GoalParentTurn {
             kind: GoalParentTurnKind::Start,
             objective: "ship goal mode".to_owned(),
+            resume_response: None,
             working_history: Vec::new(),
         });
 

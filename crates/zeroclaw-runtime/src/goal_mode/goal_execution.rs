@@ -216,7 +216,10 @@ impl GoalExecutionRestartGate {
     }
 
     async fn admit(&self, command: &GoalCommand) -> Result<Option<GoalExecutionAdmission>> {
-        if !matches!(command, GoalCommand::Start { .. } | GoalCommand::Resume) {
+        if !matches!(
+            command,
+            GoalCommand::Start { .. } | GoalCommand::Resume { .. }
+        ) {
             return Ok(None);
         }
         if self.closed.load(Ordering::Acquire) {
@@ -971,6 +974,7 @@ impl GoalExecutionEngine {
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let initial_turn_kind = request.initial_turn_kind();
+        let resume_response = request.resume_response().map(str::to_owned);
         let objective = self.current_objective(&scope).await?;
         let accountant: Arc<dyn GoalOperationAccounting> = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.registry),
@@ -984,8 +988,14 @@ impl GoalExecutionEngine {
         let result = GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
                 scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
-                    self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
-                        .await
+                    self.run_scoped(
+                        &scope,
+                        &objective,
+                        initial_turn_kind,
+                        resume_response,
+                        lease.as_mut(),
+                    )
+                    .await
                 })
                 .await
             })
@@ -1056,6 +1066,7 @@ impl GoalExecutionEngine {
         scope: &GoalExecutionScope,
         objective: &str,
         mut parent_turn_kind: super::GoalParentTurnKind,
+        mut resume_response: Option<String>,
         lease: &mut dyn GoalSessionExecutionLease,
     ) -> Result<GoalExecutionOutcome> {
         let mut working_history = lease.take_canonical_history()?;
@@ -1072,6 +1083,9 @@ impl GoalExecutionEngine {
                     GoalParentTurn {
                         kind: parent_turn_kind,
                         objective: objective.to_owned(),
+                        resume_response: (parent_turn_kind == super::GoalParentTurnKind::Resume)
+                            .then(|| resume_response.take())
+                            .flatten(),
                         working_history: std::mem::take(&mut working_history),
                     },
                 )

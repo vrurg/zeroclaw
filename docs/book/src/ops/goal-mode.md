@@ -72,7 +72,7 @@ session. Goal Mode is unavailable for zerocode ACP sessions:
 /goal budget set --cost-usd D [--tokens N]
 /goal budget set --unlimited
 /goal pause
-/goal resume
+/goal resume [RESPONSE]
 /goal cancel
 /goal help
 ```
@@ -111,16 +111,18 @@ blockers. Provider, protocol, attribution, malformed-output, and verifier
 failures fail the Goal rather than becoming a semantic blocker.
 
 A verifier-blocked Goal names its blocker in the pause notification and releases
-the session's foreground slot. If it needs more information, send that
-information as an ordinary message in the same session, wait for its normal
-reply, then run `/goal resume`. The fresh Goal executor reads the resulting
-canonical session history. Do not immediately resume an unchanged session: it
-is likely to repeat the same blocked assessment. For an external dependency or
-any other blocker, resolve it first and then resume.
+the session's foreground slot. Reply with `/goal resume RESPONSE` to give the
+fresh Goal executor the information it requested; `RESPONSE` may span multiple
+lines. The reply is transient prompt data for that resumed epoch: it is not
+persisted in the Goal record or canonical session history. A bare `/goal resume`
+remains valid when the external blocker has been resolved without a reply. Do
+not immediately resume an unchanged session: it is likely to repeat the same
+blocked assessment. Responses use the same 4096-character safety limit as the
+success criterion.
 
 `/goal pause` first durably fences the Goal as paused, then waits for an
-already-admitted operation to settle before returning. `/goal resume` starts a
-fresh executor after the persisted checks pass. `/goal cancel` retains the
+already-admitted operation to settle before returning. `/goal resume [RESPONSE]`
+starts a fresh executor after the persisted checks pass. `/goal cancel` retains the
 terminal audit record while the session still exists. Closing, deleting,
 killing, or truly replacing a session fences and disposes its Goal control
 state; the canonical usage ledger remains intact.

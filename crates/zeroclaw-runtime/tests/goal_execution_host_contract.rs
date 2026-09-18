@@ -94,6 +94,7 @@ struct TranscriptExecutionLease {
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
+    parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -116,6 +117,10 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             .unwrap()
             .push(turn.working_history.clone());
         self.parent_turn_kinds.lock().unwrap().push(turn.kind);
+        self.parent_resume_responses
+            .lock()
+            .unwrap()
+            .push(turn.resume_response.clone());
         Ok(GoalParentTurnResult {
             candidate: format!("parent:{}", turn.objective),
             working_history: turn.working_history,
@@ -162,6 +167,7 @@ struct TranscriptExecutionDriver {
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
+    parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -187,6 +193,7 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             notices: Arc::clone(&self.notices),
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
+            parent_resume_responses: Arc::clone(&self.parent_resume_responses),
         }))
     }
 }
@@ -991,6 +998,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                 GoalParentTurn {
                     kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
+                    resume_response: None,
                     working_history: Vec::new(),
                 }
             )
@@ -1136,6 +1144,7 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
         GoalParentTurn {
             kind: GoalParentTurnKind::Start,
             objective: "private stop condition".into(),
+            resume_response: None,
             working_history: Vec::new(),
         }
     );
@@ -1395,7 +1404,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Resume,
+            GoalCommand::Resume { response: None },
         )
         .await
         .unwrap();
@@ -1550,7 +1559,7 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Resume,
+            GoalCommand::Resume { response: None },
         )
         .await
         .unwrap();
@@ -1575,7 +1584,12 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
     );
 
     let resume = host
-        .submit(&host_settings(true), ingress, driver, GoalCommand::Resume)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver,
+            GoalCommand::Resume { response: None },
+        )
         .await
         .unwrap();
     let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
@@ -2272,6 +2286,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
+    let parent_resume_responses = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::clone(&delivered),
@@ -2279,6 +2294,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         notices,
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
+        parent_resume_responses: Arc::clone(&parent_resume_responses),
     });
     let request = runtime
         .submit(
@@ -2357,6 +2373,7 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
         notices: Arc::clone(&notices),
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
+        parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
     });
     let request = runtime
         .submit(
@@ -2397,6 +2414,97 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
         &[GoalExecutionNotice::PausedForBlocker {
             blocker_messages: vec!["Provide the task packet reference.".to_owned()],
         }]
+    );
+}
+
+#[tokio::test]
+async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    let blocked_driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        blocked: true,
+        notices: Arc::new(Mutex::new(Vec::new())),
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
+        parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+    });
+    let blocked_request = runtime
+        .submit(
+            &settings,
+            ingress.clone(),
+            blocked_driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    assert_eq!(
+        engine.run(&settings, blocked_request).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::VerifierBlocked
+    );
+
+    let response = "The task packet is at docs/task.md.\n\nPlease continue.".to_owned();
+    let parent_resume_responses = Arc::new(Mutex::new(Vec::new()));
+    let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
+    let resumed_driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        blocked: false,
+        notices: Arc::new(Mutex::new(Vec::new())),
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::clone(&parent_turn_kinds),
+        parent_resume_responses: Arc::clone(&parent_resume_responses),
+    });
+    let resumed_request = runtime
+        .submit(
+            &settings,
+            ingress,
+            resumed_driver,
+            GoalCommand::Resume {
+                response: Some(response.clone()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("resume must yield an execution request");
+
+    assert_eq!(
+        engine.run(&settings, resumed_request).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(
+        parent_turn_kinds.lock().unwrap().as_slice(),
+        &[GoalParentTurnKind::Resume, GoalParentTurnKind::Continue]
+    );
+    assert_eq!(
+        parent_resume_responses.lock().unwrap().as_slice(),
+        &[Some(response), None]
     );
 }
 

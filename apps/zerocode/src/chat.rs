@@ -16319,6 +16319,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiline_goal_resume_routes_the_exact_response_to_session_goal() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        let command = "/goal resume\nThe task packet is docs/task.md.\n\nPlease continue.";
+        active.input_bar.insert_text(command);
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+
+        let request =
+            next_rpc_request(&mut rx, "multiline Goal resume must use session/goal").await;
+        assert_eq!(request["method"], method::SESSION_GOAL);
+        assert_eq!(request["params"]["session_id"], "sess-1");
+        assert_eq!(request["params"]["command"], command);
+        respond_ok(
+            &outbound,
+            &request,
+            serde_json::json!({ "response": { "kind": "help" } }),
+        );
+    }
+
+    #[tokio::test]
     async fn rtg_9739_approval_enter_approves_without_submitting_composer() {
         use crossterm::event::KeyCode;
 
@@ -21839,7 +21874,9 @@ mod tests {
         assert!(
             text.contains("\nBlocker:\n• Provide the task packet reference.\n• State its scope.")
         );
-        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+        assert!(text.contains(
+            "\nNext: Resolve the blocker, then run /goal resume [RESPONSE] to continue."
+        ));
     }
 
     #[tokio::test]
@@ -21865,7 +21902,9 @@ mod tests {
             panic!("expected blocked Goal system message");
         };
         assert!(!text.contains("\nBlocker:"));
-        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+        assert!(text.contains(
+            "\nNext: Resolve the blocker, then run /goal resume [RESPONSE] to continue."
+        ));
     }
 
     #[test]
