@@ -4,9 +4,12 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod foreground;
+pub(crate) mod goal_execution;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod turn_execution;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -112,6 +115,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::goal::{GoalCommandParseError, parse_goal_command};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -138,6 +142,11 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
+
+use self::foreground::{
+    ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
+};
+use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
@@ -623,7 +632,7 @@ struct ChannelRuntimeContext {
     /// Per-conversation-history-key locks that serialize persistence mutations
     /// (append / remove_last / delete_session) for the same sender without
     /// serializing the full message-processing loop.
-    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -632,10 +641,149 @@ struct ChannelRuntimeContext {
 /// append/remove_last/delete_session operations for the same sender are
 /// serialized without blocking the full message-processing loop
 fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync::Mutex<()>> {
-    let mut map = ctx.persist_locks.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(key.to_string())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-        .clone()
+    persist_lock(&ctx.persist_locks, key)
+}
+
+/// Retain only the Matrix facts a Goal worker needs after command admission.
+/// Goal commands have no media payload, so copying attachments would only keep
+/// unnecessary inbound data alive while the worker runs.
+fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
+    ChannelMessage {
+        id: message.id.clone(),
+        sender: message.sender.clone(),
+        reply_target: message.reply_target.clone(),
+        content: message.content.clone(),
+        channel: message.channel.clone(),
+        channel_alias: message.channel_alias.clone(),
+        platform_sender_id: message.platform_sender_id.clone(),
+        timestamp: message.timestamp,
+        thread_ts: message.thread_ts.clone(),
+        interruption_scope_id: message.interruption_scope_id.clone(),
+        attachments: Vec::new(),
+        subject: message.subject.clone(),
+        internal_sop_event: message.internal_sop_event.clone(),
+        passive_context: message.passive_context,
+        explicitly_addressed: message.explicitly_addressed,
+        conversation_scope: message.conversation_scope,
+        references: message.references.clone(),
+    }
+}
+
+fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
+    use zeroclaw_runtime::goal_mode::GoalResponse;
+    let (key, projection) = match response {
+        GoalResponse::Help => ("goal-mode-help", None),
+        GoalResponse::Disabled => ("goal-mode-disabled", None),
+        GoalResponse::Started(projection) => ("goal-mode-started", Some(projection)),
+        GoalResponse::Status(projection) => ("goal-mode-status", Some(projection)),
+        GoalResponse::Budget(projection) => ("goal-mode-budget", Some(projection)),
+        GoalResponse::BudgetUpdated(projection) => ("goal-mode-budget-updated", Some(projection)),
+        GoalResponse::Paused(projection) => ("goal-mode-paused", Some(projection)),
+        GoalResponse::AlreadyPaused(projection) => ("goal-mode-already-paused", Some(projection)),
+        GoalResponse::Resumed(projection) => ("goal-mode-resumed", Some(projection)),
+        GoalResponse::Cancelled(projection) => ("goal-mode-cancelled", Some(projection)),
+        GoalResponse::AlreadyCancelled(projection) => {
+            ("goal-mode-already-cancelled", Some(projection))
+        }
+        GoalResponse::NoCurrentGoal => ("goal-mode-no-current", None),
+        GoalResponse::AlreadyActive => ("goal-mode-already-active", None),
+        GoalResponse::Terminal(projection) => ("goal-mode-terminal", Some(projection)),
+        GoalResponse::Stale => ("goal-mode-stale", None),
+    };
+    let mut message = channel_runtime_cli_string(key);
+    if let Some(projection) = projection {
+        message.push('\n');
+        message.push_str(&render_goal_projection(projection));
+    }
+    message
+}
+
+fn render_goal_projection(
+    projection: &zeroclaw_runtime::goal_mode::GoalStatusProjection,
+) -> String {
+    use zeroclaw_runtime::control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus};
+
+    let token_limit = projection
+        .token_limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
+    let cost_limit = projection
+        .cost_limit_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
+    let status = match projection.status {
+        TaskStatus::Running => "running",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Lost => "lost",
+        TaskStatus::TimedOut => "timed_out",
+    };
+    let accounting = match projection.accounting_state {
+        GoalAccountingState::Complete => "complete",
+        GoalAccountingState::Missing => "missing",
+        GoalAccountingState::Invalid => "invalid",
+        GoalAccountingState::OutcomeUnknown => "outcome_unknown",
+    };
+    let resumable = channel_runtime_cli_string(if projection.resumable {
+        "goal-mode-yes"
+    } else {
+        "goal-mode-no"
+    });
+    let mut message =
+        channel_runtime_cli_string_with_args("goal-mode-summary-status", &[("status", status)]);
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-budget",
+        &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
+    ));
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-accounting",
+        &[("accounting", accounting)],
+    ));
+    message.push('\n');
+    message.push_str(&channel_runtime_cli_string_with_args(
+        "goal-mode-summary-execution",
+        &[
+            ("epoch", &projection.execution_epoch.to_string()),
+            ("resumable", &resumable),
+        ],
+    ));
+    if let Some(reason) = projection.pause_reason {
+        let reason = match reason {
+            GoalPauseReason::OperatorPaused => "operator_paused",
+            GoalPauseReason::NeedsUserInput => "needs_user_input",
+            GoalPauseReason::HumanEscalation => "human_escalation",
+            GoalPauseReason::ExternalDependency => "external_dependency",
+            GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+            GoalPauseReason::VerifierBlocked => "verifier_blocked",
+            GoalPauseReason::BudgetExhausted => "budget_exhausted",
+            GoalPauseReason::BudgetUnavailable => "budget_unavailable",
+            GoalPauseReason::DaemonRestart => "daemon_restarted",
+        };
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-pause",
+            &[("pause_reason", reason)],
+        ));
+    }
+    if let Some(description) = projection.pause_description.as_deref() {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-pause-description",
+            &[("description", description)],
+        ));
+    }
+    for blocker in &projection.blocker_messages {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-blocker",
+            &[("blocker", blocker)],
+        ));
+    }
+    message
 }
 
 #[cfg(feature = "channel-telegram")]
@@ -2102,6 +2250,34 @@ fn append_session_prompts_to_channel_system_prompt(
         attachments,
         max_system_prompt_chars,
     )
+}
+
+/// Load the durable session-prompt attachment tail for a channel execution.
+///
+/// Both ordinary channel turns and Goal-owned parent turns are executions of
+/// the same session. Keeping the lookup here prevents the Goal path from
+/// silently losing the task context that an ordinary Matrix turn receives.
+/// Callers append the returned text only after their complete host-owned
+/// system prompt has been assembled.
+fn load_required_session_prompt_attachments(
+    context: &ChannelRuntimeContext,
+    session_key: &str,
+) -> anyhow::Result<String> {
+    if !context.prompt_config.channels.session_prompts_enabled {
+        return Ok(String::new());
+    }
+
+    let backend = context.session_store.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "persistent session prompts are enabled but the session backend is unavailable"
+        )
+    })?;
+    let prompts = backend
+        .list_session_prompts(session_key)
+        .context("load persistent session prompts")?;
+    Ok(zeroclaw_infra::session_prompts::render_session_prompts(
+        &prompts,
+    ))
 }
 
 fn current_date_section() -> String {
@@ -7379,6 +7555,30 @@ async fn reconcile_early_ack(
 /// nothing authorization-bearing reads this column; representing the full
 /// participant set needs a session-store schema change and is deliberately
 /// out of scope here.
+fn persist_session_routing_context(
+    store: &dyn SessionBackend,
+    msg: &ChannelMessage,
+    history_key: &str,
+) -> std::io::Result<()> {
+    let channel_id = msg
+        .channel_alias
+        .as_deref()
+        .map(|alias| format!("{}.{alias}", msg.channel));
+    let room_id = msg
+        .thread_ts
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!msg.reply_target.trim().is_empty()).then_some(msg.reply_target.as_str()));
+    store.set_session_context(
+        history_key,
+        zeroclaw_infra::session_backend::SessionContext {
+            channel_id: channel_id.as_deref(),
+            room_id,
+            sender_id: Some(msg.sender.as_str()).filter(|value| !value.is_empty()),
+        },
+    )
+}
+
 fn stamp_session_routing_context(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
@@ -7388,28 +7588,7 @@ fn stamp_session_routing_context(
         return;
     };
 
-    let channel_id = msg
-        .channel_alias
-        .as_deref()
-        .map(|alias| format!("{}.{alias}", msg.channel));
-    let room_id = msg
-        .thread_ts
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let target = msg.reply_target.trim();
-            if target.is_empty() {
-                None
-            } else {
-                Some(target)
-            }
-        });
-    let context = zeroclaw_infra::session_backend::SessionContext {
-        channel_id: channel_id.as_deref(),
-        room_id,
-        sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
-    };
-    if let Err(e) = store.set_session_context(history_key, context) {
+    if let Err(e) = persist_session_routing_context(store.as_ref(), msg, history_key) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7491,6 +7670,61 @@ async fn process_channel_message_body(
         }
     }
 
+    // Goal commands are a controller surface, not ordinary user prompts.
+    // Handle their shared grammar before SOP, enrichment, autosave, thinking,
+    // or model routing can reinterpret command text as agent work.
+    if is_matrix_channel_name(&msg.channel) {
+        match parse_goal_command(&msg.content) {
+            Ok(command) => {
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                let original = matrix_goal_message_snapshot(&msg);
+                let response = match submit_matrix_goal(
+                    Arc::clone(&ctx),
+                    history_key,
+                    original.clone(),
+                    command,
+                )
+                .await
+                {
+                    Ok(response) => render_goal_response(&response),
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                            })),
+                            "Goal command submission failed"
+                        );
+                        channel_runtime_cli_string("goal-mode-command-failed")
+                    }
+                };
+                if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original) {
+                    let _ = channel
+                        .send(&SendMessage::reply_to(&original, response))
+                        .await;
+                }
+                return;
+            }
+            Err(GoalCommandParseError::NotGoalCommand) => {}
+            Err(_) => {
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(&SendMessage::reply_to(
+                            &msg,
+                            channel_runtime_cli_string("goal-mode-command-invalid"),
+                        ))
+                        .await;
+                }
+                return;
+            }
+        }
+    }
+
     if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
         let topic = match &msg.channel_alias {
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
@@ -7526,6 +7760,62 @@ async fn process_channel_message_body(
     if crate::model_picker_delivery::take_revoked(&delivery_message_id) {
         return;
     }
+
+    // `/new` is a true Matrix session replacement. Retire its Goal control
+    // state before clearing ordinary history, so a detached Goal worker cannot
+    // later append a candidate into the replacement session.
+    if is_matrix_channel_name(&msg.channel)
+        && matches!(
+            parse_runtime_command(&msg.channel, &msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+    {
+        if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                    })),
+                "Matrix Goal disposal failed"
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(&SendMessage::reply_to(
+                        &msg,
+                        channel_runtime_cli_string("goal-mode-command-failed"),
+                    ))
+                    .await;
+            }
+            return;
+        }
+        let _ = handle_runtime_command_for_delivery(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            &delivery_message_id,
+        )
+        .await;
+        return;
+    }
+
+    // Matrix ordinary turns and Goal parent execution share this foreground
+    // lease. A queued ordinary turn must not reach prompt construction or a
+    // provider call while the session's Goal worker owns the epoch.
+    let _matrix_foreground_lease = if is_matrix_channel_name(&msg.channel) {
+        match wait_for_foreground_lease(
+            foreground_lock(&ctx.persist_locks, &history_key),
+            cancellation_token.clone(),
+        )
+        .await
+        {
+            Some(lease) => Some(lease),
+            None => return,
+        }
+    } else {
+        None
+    };
 
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
@@ -7866,42 +8156,35 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
-    let session_prompt_attachments = if ctx.prompt_config.channels.session_prompts_enabled {
-        let prompt_result = match ctx.session_store.as_ref() {
-            Some(backend) => backend.list_session_prompts(&history_key),
-            None => Err(std::io::Error::other(
-                "persistent session prompts are enabled but the session backend is unavailable",
-            )),
-        };
-        match prompt_result {
-            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                    "Persistent session prompts could not be loaded; refusing to dispatch without them"
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    let message =
-                        channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
-                    let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
-                }
-                rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
-                reconcile_early_ack(
-                    ctx.as_ref(),
-                    &msg,
-                    target_channel.as_ref(),
-                    early_ack_task,
-                    Some("\u{26A0}\u{FE0F}"),
-                )
-                .await;
-                return;
+    let session_prompt_attachments = match load_required_session_prompt_attachments(
+        ctx.as_ref(),
+        &history_key,
+    ) {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Persistent session prompts could not be loaded; refusing to dispatch without them"
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let message =
+                    channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
+                let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
             }
+            rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
+            return;
         }
-    } else {
-        String::new()
     };
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)

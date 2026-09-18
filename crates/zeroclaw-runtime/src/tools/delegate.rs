@@ -1828,8 +1828,19 @@ impl Tool for DelegateTool {
             DelegateAction::Delegate => {}
         }
 
+        let goal_scoped = crate::agent::goal_child_fence::is_goal_scoped();
+
         // --- Parallel mode ---
         if let Some(parallel_agents) = args.get("parallel").and_then(|v| v.as_array()) {
+            if goal_scoped {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "Goal mode V1 does not admit parallel foreground delegation".into(),
+                    ),
+                });
+            }
             return self.execute_parallel(parallel_agents, &args).await;
         }
 
@@ -1888,11 +1899,31 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
+            if goal_scoped {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Goal mode V1 does not admit background delegation".into()),
+                });
+            }
             return self.execute_background(agent_name, prompt, &args).await;
         }
 
         // --- Synchronous delegation (original path) ---
-        self.execute_sync(agent_name, prompt, &args).await
+        let _goal_child_guard = match crate::agent::goal_child_fence::admit_goal_child().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        crate::agent::goal_child_fence::scope_goal_child(Box::pin(
+            self.execute_sync(agent_name, prompt, &args),
+        ))
+        .await
     }
 }
 
@@ -2324,6 +2355,8 @@ impl DelegateTool {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: started_at.clone(),
                 finished_at: None,
             })
@@ -4013,16 +4046,15 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-21T00:00:00Z".into(),
             finished_at: None,
         }
     }
 
     fn task_control_plane(store: Arc<dyn TaskRegistry>) -> ControlPlaneHandle {
-        ControlPlaneHandle {
-            store,
-            boot_id: "test-boot".into(),
-        }
+        ControlPlaneHandle::task_only(store, "test-boot")
     }
 
     #[tokio::test]
@@ -6506,6 +6538,38 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn goal_scope_rejects_background_and_parallel_before_child_creation() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+
+        crate::agent::goal_child_fence::scope_goal_parent(async {
+            let background = tool
+                .execute(json!({"agent": "missing", "prompt": "test", "background": true}))
+                .await
+                .unwrap();
+            assert!(!background.success);
+            assert!(
+                background
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("background delegation"))
+            );
+
+            let parallel = tool
+                .execute(json!({"parallel": [{"agent": "missing", "prompt": "test"}]}))
+                .await
+                .unwrap();
+            assert!(!parallel.success);
+            assert!(
+                parallel
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("parallel foreground delegation"))
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

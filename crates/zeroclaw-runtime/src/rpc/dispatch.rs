@@ -14837,6 +14837,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -14881,6 +14882,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -14984,6 +14986,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());

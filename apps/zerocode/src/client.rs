@@ -117,6 +117,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_GOAL: &str = "session/goal";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
@@ -2713,6 +2714,18 @@ impl RpcClient {
         self.call(
             method::SESSION_STATE,
             serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_goal(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<crate::wire::SessionGoalResult> {
+        self.call(
+            method::SESSION_GOAL,
+            serde_json::json!({ "session_id": session_id, "command": command }),
         )
         .await
     }

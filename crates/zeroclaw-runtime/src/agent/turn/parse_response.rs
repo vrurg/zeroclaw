@@ -369,9 +369,13 @@ pub(crate) async fn record_accepted_chat_response(
         turn_id: Some(ctx.turn_id.to_string()),
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
-    let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    let cost_usd = (!crate::agent::cost::goal_operation_accounting_is_scoped())
+        .then(|| {
+            usage
+                .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+                .map(|(_total_tokens, cost_usd)| cost_usd)
+        })
+        .flatten();
     if let Some(tx) = ctx.event_tx
         && let Some(usage) = usage
     {

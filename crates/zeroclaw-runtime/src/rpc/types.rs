@@ -277,6 +277,38 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// A transport-neutral Goal control command bound to an existing live
+    /// ZeroCode session. The daemon derives agent, route, and current TUI
+    /// identity from the session; clients cannot submit those authority facts.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Typed Goal lifecycle result for both local IPC and WSS clients.
+    pub struct SessionGoalResult {
+        pub response: crate::goal_mode::GoalResponse,
+    }
+}
+
+rpc_type! {
+    /// Asynchronous Goal execution update. Goal work never emits ordinary
+    /// prompt chunks: only verified candidate and terminal lifecycle updates.
+    pub enum SessionGoalUpdate {
+        VerifiedCandidate { session_id: String, candidate: String },
+        Completed { session_id: String },
+        PausedForBlocker {
+            session_id: String,
+            #[serde(default)]
+            blocker_messages: Vec<String>,
+        },
+        Failed { session_id: String },
+    }
+}
+
+rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
         #[serde(default)]

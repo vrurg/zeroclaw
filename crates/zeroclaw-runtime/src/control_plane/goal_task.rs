@@ -9,8 +9,9 @@ use super::task_registry::{TaskRecord, TaskStatus};
 pub struct GoalTaskRecord {
     /// Foreign key to the canonical [`TaskRecord`].
     pub task_id: String,
-    /// Operator/model-supplied objective text. Treated as prompt input, not as
-    /// trusted policy data.
+    /// Immutable, user-declared success criterion. It is supplied as
+    /// untrusted prompt data to the parent and verifier, never as policy or
+    /// authority data.
     pub objective: String,
     #[serde(default)]
     pub effective_token_limit: Option<u64>,
@@ -30,6 +31,73 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
+    /// Durable fence for one admitted logical provider operation.
+    #[serde(default)]
+    pub pending_call_id: Option<String>,
+    /// Epoch that admitted `pending_call_id`; always paired with the identifier.
+    #[serde(default)]
+    pub pending_call_epoch: Option<i64>,
+    /// Durable fence for an executable tool batch whose assistant tool-use
+    /// record has not yet been paired with every result in session history.
+    #[serde(default)]
+    pub pending_tool_batch_id: Option<String>,
+    /// Epoch that admitted `pending_tool_batch_id`; always paired with it.
+    #[serde(default)]
+    pub pending_tool_epoch: Option<i64>,
+    /// Whether all Goal-attributed usage is known enough to admit another operation.
+    #[serde(default)]
+    pub accounting_state: GoalAccountingState,
+}
+
+impl Default for GoalTaskRecord {
+    fn default() -> Self {
+        Self {
+            task_id: String::new(),
+            objective: String::new(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+            pending_call_id: None,
+            pending_call_epoch: None,
+            pending_tool_batch_id: None,
+            pending_tool_epoch: None,
+            accounting_state: GoalAccountingState::Complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAccountingState {
+    #[default]
+    Complete,
+    Missing,
+    Invalid,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTransitionResult {
+    /// The guarded mutation committed for the exact task, session, and epoch.
+    Applied,
+    /// The task row exists, but at least one lifecycle, epoch, kind, or
+    /// session-binding predicate no longer matches. Callers must reload
+    /// canonical state before making another control decision.
+    Stale,
+    /// No canonical task row exists for the requested task id.
+    Missing,
+}
+
+/// Exact durable identity captured while preparing a prospective-policy
+/// cutover.  It prevents a policy decision made for one Goal epoch from
+/// cancelling a later replacement or resumed executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPolicyTarget {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +150,8 @@ impl TaskGoal {
         self.status().is_terminal()
     }
 
-    /// Untrusted objective text from the goal extension.
+    /// Immutable, user-declared success criterion from the goal extension.
+    /// It remains untrusted prompt data, not policy or authority data.
     pub fn objective(&self) -> &str {
         &self.goal.objective
     }
@@ -110,6 +179,8 @@ impl TaskGoal {
 /// Typed policy input for why a goal is paused.
 /// A pause reason is goal-specific explanation layered on top of
 /// [`TaskStatus::Paused`]. It must not be used as a second lifecycle enum.
+/// Values remain deserializable as durable Goal audit data even where the V1
+/// controller no longer creates that particular pause path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPauseReason {
@@ -222,15 +293,11 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
-    async fn create_goal(
-        &self,
-        task: TaskRecord,
-        goal: GoalTaskRecord,
-        continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()>;
-
-    /// Resolve the latest non-terminal goal task for `agent` directly from the
-    /// canonical task table. This is a read-only resolver, not cached state.
+    /// Resolve an observational latest non-terminal goal for `agent`.
+    ///
+    /// This is not a V1 control or attribution authority: multiple sessions
+    /// may have Goals with the same agent, route, and principal. Goal-owned
+    /// work must carry its exact task id and session binding instead.
     async fn latest_active_goal_for_agent(&self, agent: &str)
     -> anyhow::Result<Option<TaskRecord>>;
 
@@ -241,9 +308,10 @@ pub trait GoalTaskRegistry: Send + Sync {
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<TaskRecord>>;
 
-    /// Resolve only the id of the latest non-terminal goal for the trusted
-    /// runtime context. This is a read-only projection from `tasks.id`, used
-    /// by hot attribution paths that do not need the full task record.
+    /// Resolve an observational latest non-terminal Goal id for a context.
+    ///
+    /// It is not canonical for V1 attribution or lifecycle: use the exact
+    /// task id carried by the Goal execution scope instead.
     async fn latest_active_goal_id_for_context(
         &self,
         agent: &str,
@@ -252,8 +320,6 @@ pub trait GoalTaskRegistry: Send + Sync {
     ) -> anyhow::Result<Option<String>>;
 
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
-
-    async fn update_goal_objective(&self, task_id: &str, objective: &str) -> anyhow::Result<()>;
 
     /// Replace the persisted effective budget limits for a goal.
     /// These are creation/update-time policy limits only. Consumed and
@@ -271,16 +337,6 @@ pub trait GoalTaskRegistry: Send + Sync {
         pause: Option<GoalPauseState>,
     ) -> anyhow::Result<()>;
 
-    async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
-
-    async fn resume_goal_task(
-        &self,
-        task_id: &str,
-        owner_pid: u32,
-        owner_boot_id: &str,
-        continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()>;
-
     async fn set_continuation_context(
         &self,
         task_id: &str,
@@ -291,6 +347,178 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<TaskContinuationContext>>;
+
+    /// Return the single current Goal for a canonical session. Terminal rows
+    /// remain visible until a replacement or session disposal removes them.
+    async fn current_goal_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// Enumerate all nonterminal session-bound Goals for prospective-policy
+    /// classification. The returned records are observations only; a caller
+    /// must pass their exact identities to [`Self::cancel_policy_targets`] to
+    /// commit a revocation.
+    async fn list_nonterminal_session_goals(&self) -> anyhow::Result<Vec<TaskRecord>> {
+        anyhow::bail!("goal registry does not support policy classification")
+    }
+
+    /// Atomically cancel an exact set of nonterminal Goals because the
+    /// successor runtime policy revokes their eligibility.
+    ///
+    /// Any stale or missing target rolls back the whole set. The durable
+    /// cancellation fence is committed before the corresponding process-local
+    /// workers may be interrupted or drained.
+    async fn cancel_policy_targets(
+        &self,
+        targets: &[GoalPolicyTarget],
+    ) -> anyhow::Result<GoalTransitionResult> {
+        let _ = targets;
+        anyhow::bail!("goal registry does not support policy revocation")
+    }
+
+    /// Read the raw terminal reason for one exact session-bound Goal. Callers
+    /// must sanitize it before presenting it outside the control plane.
+    async fn terminal_reason_for_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Option<String>>;
+
+    /// Atomically create a session-bound Goal or replace its fully settled
+    /// terminal predecessor. New Goals always begin at execution epoch one.
+    async fn create_or_replace_session_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Fence a running Goal and persist its pause state. An operation already
+    /// admitted for the fenced epoch is allowed to settle; resume remains
+    /// unavailable until that settlement clears the pending-operation slot.
+    async fn pause_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Start a fresh executor epoch after a durable pause.
+    async fn resume_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Complete a lifecycle transition only for the exact running or paused
+    /// Goal epoch. Terminal state remains owned by the task record.
+    async fn finish_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Reserve the one durable pending-operation slot for the exact running
+    /// Goal epoch. This is an execution fence, not a usage reservation.
+    /// Callers must settle the exact slot on every local completion path; an
+    /// unsettled slot remains fenced until recovery classifies it.
+    async fn admit_pending_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Settle the matching pending-operation slot after accounting has reached
+    /// a durable classification.
+    async fn settle_pending_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+        accounting_state: GoalAccountingState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Fence one executable tool batch for the exact running Goal epoch.
+    /// This is independent of the provider-operation fence: a tool batch has
+    /// no spend reservation, but it must be durably paired before resumption.
+    async fn admit_pending_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Clear the matching tool-batch fence after complete history pairing.
+    /// Settlement remains legal after a pause has fenced the Goal to a later
+    /// epoch, because it cannot admit a successor operation.
+    async fn settle_pending_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Atomically terminalize a running or paused Goal whose exact admitted
+    /// tool batch could not be paired. Clearing the marker separately would
+    /// create a resumable gap, so storage owns both mutations in one guard.
+    async fn fail_unpaired_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Remove a matching marker from a terminal Goal. Terminal Goals cannot
+    /// resume, so this preserves replacement/disposal progress without
+    /// claiming that an interrupted batch paired cleanly.
+    async fn clear_terminal_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Atomically replace both effective limits for a running or paused Goal.
+    async fn update_session_goal_limits(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Hard-delete Goal control state after it has been fenced, quiesced, and
+    /// settled. Usage ledger rows are deliberately outside this operation.
+    async fn delete_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
 }
 
 #[cfg(test)]
@@ -298,26 +526,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_restart_pause_reason_uses_rfc_name_with_legacy_alias() {
-        // Restart recovery is an RFC-visible persisted reason; old local rows
-        // that used the draft spelling must continue to deserialize.
-        let serialized = serde_json::to_string(&GoalPauseReason::DaemonRestart).unwrap();
-        assert_eq!(serialized, "\"daemon_restarted\"");
-
+    fn daemon_restart_pause_reason_accepts_legacy_alias() {
+        // Restart recovery's current spelling is covered with every other
+        // pause reason below. Old local rows used this draft spelling.
         let legacy: GoalPauseReason = serde_json::from_str("\"daemon_restart\"").unwrap();
         assert_eq!(legacy, GoalPauseReason::DaemonRestart);
     }
 
     #[test]
-    fn operator_pause_reason_roundtrips_with_control_plane_name() {
-        // `/goal pause` is a controller request, not a human escalation. Its
-        // persisted reason must stay distinguishable for status and resume
-        // policy.
-        let serialized = serde_json::to_string(&GoalPauseReason::OperatorPaused).unwrap();
-        assert_eq!(serialized, "\"operator_paused\"");
-
-        let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed, GoalPauseReason::OperatorPaused);
+    fn every_goal_pause_reason_remains_readable_from_persisted_control_state() {
+        let reasons = [
+            GoalPauseReason::OperatorPaused,
+            GoalPauseReason::NeedsUserInput,
+            GoalPauseReason::HumanEscalation,
+            GoalPauseReason::ExternalDependency,
+            GoalPauseReason::ProviderUnavailable,
+            GoalPauseReason::VerifierBlocked,
+            GoalPauseReason::BudgetExhausted,
+            GoalPauseReason::BudgetUnavailable,
+            GoalPauseReason::DaemonRestart,
+        ];
+        for reason in reasons {
+            let wire_name = match reason {
+                GoalPauseReason::OperatorPaused => "operator_paused",
+                GoalPauseReason::NeedsUserInput => "needs_user_input",
+                GoalPauseReason::HumanEscalation => "human_escalation",
+                GoalPauseReason::ExternalDependency => "external_dependency",
+                GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+                GoalPauseReason::VerifierBlocked => "verifier_blocked",
+                GoalPauseReason::BudgetExhausted => "budget_exhausted",
+                GoalPauseReason::BudgetUnavailable => "budget_unavailable",
+                GoalPauseReason::DaemonRestart => "daemon_restarted",
+            };
+            let serialized = serde_json::to_string(&reason).unwrap();
+            assert_eq!(serialized, format!("\"{wire_name}\""));
+            let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed, reason);
+        }
     }
 
     #[test]

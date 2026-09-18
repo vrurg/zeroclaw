@@ -990,7 +990,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None);
+                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1045,7 +1045,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None);
+            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1102,13 +1102,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // Earlier physical leaves are rejected routing/retry work. The final
-        // accepted response remains settled by `record_accepted_chat_response`
-        // so only it updates context-window telemetry.
-        crate::agent::cost::settle_provider_attempts(
-            &attempts[..attempts.len().saturating_sub(1)],
-            None,
-        );
+        // A Goal operation settles the complete immutable report before
+        // response handling. Ordinary sessions retain their established split
+        // path, where the accepted leaf updates context-window telemetry.
+        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts,
+                Some(attempts.len().saturating_sub(1)),
+            )
+            .await?;
+        } else {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts[..attempts.len().saturating_sub(1)],
+                None,
+            )
+            .await?;
+        }
         record_accepted_chat_response(
             &ctx,
             served_provider,
@@ -1234,6 +1243,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+
+        // Persist the Goal-only pairing marker after preparation has proved
+        // there is real work to dispatch, but before any tool can begin an
+        // external effect. Ordinary tool batches receive `None` and retain
+        // their current parallel execution behavior.
+        let pending_goal_tool_batch =
+            crate::agent::goal_tool_pairing::admit_goal_tool_batch(executable_calls.len()).await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
@@ -1429,6 +1445,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &tool_results,
             use_native_tools,
         );
+
+        if let Some(batch) = pending_goal_tool_batch {
+            batch.settle()?;
+        }
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());

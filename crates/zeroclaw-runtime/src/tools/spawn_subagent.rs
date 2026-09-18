@@ -211,31 +211,35 @@ impl Tool for SpawnSubagentTool {
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
+                    session_id: None,
+                    execution_epoch: 0,
                     started_at: chrono::Utc::now().to_rfc3339(),
                     finished_at: None,
                 })
                 .await;
         }
 
-        let subagent_turn = Box::pin(scope!(
-            agent_alias: parent_alias,
-            session_key: run_id,
-            =>
-            crate::agent::run(
-                (*self.config).clone(),
-                &self.parent_alias,
-                Some(prompt),
-                None,
-                None,
-                temperature,
-                vec![],
-                false,
-                Some(session_path),
-                None,
-                zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                run_overrides,
-            )
-        ));
+        let subagent_turn = Box::pin(crate::agent::goal_child_fence::scope_goal_child(Box::pin(
+            scope!(
+                agent_alias: parent_alias,
+                session_key: run_id,
+                =>
+                crate::agent::run(
+                    (*self.config).clone(),
+                    &self.parent_alias,
+                    Some(prompt),
+                    None,
+                    None,
+                    temperature,
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                    run_overrides,
+                )
+            ),
+        )));
         let run_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
             .scope(false, subagent_turn)
             .await;

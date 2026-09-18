@@ -65,6 +65,145 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
     message
 }
 
+fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
+    use crate::wire::GoalResponse;
+
+    let (key, projection) = match response {
+        GoalResponse::Help => ("zc-goal-help", None),
+        GoalResponse::Disabled => ("zc-goal-disabled", None),
+        GoalResponse::Started(projection) => ("zc-goal-started", Some(projection)),
+        GoalResponse::Status(projection) => ("zc-goal-status", Some(projection)),
+        GoalResponse::Budget(projection) => ("zc-goal-budget", Some(projection)),
+        GoalResponse::BudgetUpdated(projection) => ("zc-goal-budget-updated", Some(projection)),
+        GoalResponse::Paused(projection) => ("zc-goal-paused", Some(projection)),
+        GoalResponse::AlreadyPaused(projection) => ("zc-goal-already-paused", Some(projection)),
+        GoalResponse::Resumed(projection) => ("zc-goal-resumed", Some(projection)),
+        GoalResponse::Cancelled(projection) => ("zc-goal-cancelled", Some(projection)),
+        GoalResponse::AlreadyCancelled(projection) => {
+            ("zc-goal-already-cancelled", Some(projection))
+        }
+        GoalResponse::NoCurrentGoal => ("zc-goal-no-current", None),
+        GoalResponse::AlreadyActive => ("zc-goal-already-active", None),
+        GoalResponse::Terminal(projection) => ("zc-goal-terminal", Some(projection)),
+        GoalResponse::Stale => ("zc-goal-stale", None),
+    };
+    let mut message = crate::i18n::t(key);
+    if let Some(projection) = projection {
+        message.push('\n');
+        message.push_str(&goal_projection_message(projection));
+    }
+    message
+}
+
+fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
+    let token_limit = projection
+        .token_limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let cost_limit = projection
+        .cost_limit_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let pause_reason = projection.pause_reason.as_deref();
+    let resumable = crate::i18n::t(if projection.resumable {
+        "zc-goal-yes"
+    } else {
+        "zc-goal-no"
+    });
+    let mut message =
+        crate::i18n::t_args("zc-goal-summary-status", &[("status", &projection.status)]);
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-budget",
+        &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
+    ));
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-accounting",
+        &[("accounting", &projection.accounting_state)],
+    ));
+    message.push('\n');
+    message.push_str(&crate::i18n::t_args(
+        "zc-goal-summary-execution",
+        &[
+            ("epoch", &projection.execution_epoch.to_string()),
+            ("resumable", &resumable),
+        ],
+    ));
+    if let Some(pause_reason) = pause_reason {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-pause",
+            &[("pause_reason", pause_reason)],
+        ));
+    }
+    if let Some(description) = projection.pause_description.as_deref() {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-pause-description",
+            &[("description", description)],
+        ));
+    }
+    for blocker in &projection.blocker_messages {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-blocker",
+            &[("blocker", blocker)],
+        ));
+    }
+    message
+}
+
+/// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
+/// Reject ambiguous or malformed notifications instead of treating an
+/// arbitrary object member as an update chosen by the daemon.
+enum GoalUpdate<'a> {
+    VerifiedCandidate {
+        session_id: &'a str,
+        candidate: &'a str,
+    },
+    Completed {
+        session_id: &'a str,
+    },
+    PausedForBlocker {
+        session_id: &'a str,
+        blocker_messages: Vec<&'a str>,
+    },
+    Failed {
+        session_id: &'a str,
+    },
+}
+
+fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
+    let object = params.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let (kind, payload) = object.iter().next()?;
+    let payload = payload.as_object()?;
+    let session_id = payload.get("session_id")?.as_str()?;
+    match kind.as_str() {
+        "verified_candidate" => Some(GoalUpdate::VerifiedCandidate {
+            session_id,
+            candidate: payload.get("candidate")?.as_str()?,
+        }),
+        "completed" => Some(GoalUpdate::Completed { session_id }),
+        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
+            session_id,
+            blocker_messages: match payload.get("blocker_messages") {
+                Some(value) => value
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?,
+                None => Vec::new(),
+            },
+        }),
+        "failed" => Some(GoalUpdate::Failed { session_id }),
+        _ => None,
+    }
+}
+
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
 enum ChatPhase {
@@ -279,6 +418,10 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Typed completions for Goal control commands. Unlike prompt completions,
+    /// these never alter turn or queue state.
+    goal_completion_tx: mpsc::Sender<GoalCompletion>,
+    goal_completion_rx: mpsc::Receiver<GoalCompletion>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Live but unfocused sessions of this pane. Each keeps its full
@@ -512,6 +655,11 @@ struct PromptCompletion {
     transport_closed: bool,
 }
 
+struct GoalCompletion {
+    session_id: String,
+    result: Result<crate::wire::GoalResponse, String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -525,6 +673,7 @@ impl Chat {
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (goal_completion_tx, goal_completion_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -542,6 +691,8 @@ impl Chat {
             session_resync_in_flight: HashSet::new(),
             prompt_completion_tx,
             prompt_completion_rx,
+            goal_completion_tx,
+            goal_completion_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -2124,6 +2275,77 @@ impl Chat {
                         }
                     }
                 }
+                Ok(notif) if notif.method == "session/goal_update" => {
+                    let Some(update) = parse_goal_update(&notif.params) else {
+                        continue;
+                    };
+                    let session_id = match &update {
+                        GoalUpdate::VerifiedCandidate { session_id, .. }
+                        | GoalUpdate::Completed { session_id }
+                        | GoalUpdate::PausedForBlocker { session_id, .. }
+                        | GoalUpdate::Failed { session_id } => session_id,
+                    };
+                    let Some(state) = self.state_for_session_mut(session_id) else {
+                        continue;
+                    };
+                    match update {
+                        GoalUpdate::VerifiedCandidate { candidate, .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::Completed { .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                    "zc-goal-completed",
+                                ))));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::PausedForBlocker {
+                            blocker_messages, ..
+                        } => {
+                            let mut message = crate::i18n::t("zc-goal-paused-blocked");
+                            if !blocker_messages.is_empty() {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
+                                for blocker in blocker_messages {
+                                    message.push('\n');
+                                    message.push_str(&crate::i18n::t_args(
+                                        "zc-goal-paused-notice-blocker",
+                                        &[("blocker", blocker)],
+                                    ));
+                                }
+                            }
+                            message.push('\n');
+                            message.push_str(&crate::i18n::t("zc-goal-paused-blocked-next"));
+                            for action_key in [
+                                "zc-goal-paused-blocked-cancel",
+                                "zc-goal-paused-blocked-status",
+                            ] {
+                                message.push('\n');
+                                let action = crate::i18n::t(action_key);
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-paused-notice-action",
+                                    &[("action", &action)],
+                                ));
+                            }
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::Failed { .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                    "zc-goal-failed",
+                                ))));
+                            state.mark_dirty_append();
+                        }
+                    }
+                }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
                     continue;
@@ -2183,6 +2405,22 @@ impl Chat {
         }
         if settled {
             self.pump_all_queues();
+        }
+    }
+
+    fn drain_goal_completions(&mut self) {
+        while let Ok(completion) = self.goal_completion_rx.try_recv() {
+            let Some(state) = self.state_for_session_mut(&completion.session_id) else {
+                continue;
+            };
+            let message = match completion.result {
+                Ok(response) => goal_response_message(&response),
+                Err(_) => crate::i18n::t("zc-goal-command-failed"),
+            };
+            state
+                .entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+            state.mark_dirty_append();
         }
     }
 
@@ -2836,6 +3074,7 @@ impl Chat {
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
+        self.drain_goal_completions();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -3341,6 +3580,20 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
+                    if attachments.is_empty() && prompt.trim_start().starts_with("/goal") {
+                        let session_id = state.session_id.clone();
+                        let rpc = Arc::clone(&self.rpc);
+                        let tx = self.goal_completion_tx.clone();
+                        tokio::spawn(async move {
+                            let result = rpc
+                                .session_goal(&session_id, &prompt)
+                                .await
+                                .map(|result| result.response)
+                                .map_err(|error| error.to_string());
+                            let _ = tx.send(GoalCompletion { session_id, result }).await;
+                        });
+                        return false;
+                    }
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
@@ -10326,6 +10579,101 @@ mod tests {
         chat
     }
 
+    #[test]
+    fn paused_goal_response_renders_controller_projection() {
+        let response = crate::wire::GoalResponse::Paused(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 4,
+            token_limit: Some(12_000),
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: Some("needs_user_input".to_owned()),
+            pause_description: Some("Select a target.".to_owned()),
+            blocker_messages: vec!["Which target should receive the change?".to_owned()],
+            resumable: true,
+        });
+
+        let rendered = goal_response_message(&response);
+
+        assert!(rendered.contains("⏸️ Goal paused."));
+        assert!(rendered.contains("Status: paused"));
+        assert!(rendered.contains("Budget: 12000 tokens · USD unlimited"));
+        assert!(rendered.contains("Pause: needs_user_input"));
+        assert!(rendered.contains("Details: Select a target."));
+        assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
+
+    #[test]
+    fn read_only_goal_responses_do_not_claim_a_mutation() {
+        let projection = crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "running".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::Status(projection.clone()))
+                .starts_with("ℹ️ Goal status is available.")
+        );
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::Budget(projection))
+                .starts_with("ℹ️ Goal budget is available.")
+        );
+    }
+
+    #[test]
+    fn idempotent_goal_controls_do_not_claim_a_mutation() {
+        let projection = crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::AlreadyPaused(
+                projection.clone(),
+            ))
+            .starts_with("⏸️ Goal is already paused.")
+        );
+        assert!(
+            goal_response_message(&crate::wire::GoalResponse::AlreadyCancelled(projection,))
+                .starts_with("🛑 Goal is already cancelled.")
+        );
+    }
+
+    #[test]
+    fn goal_projection_omits_pause_for_an_absent_pause_reason() {
+        let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "running".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        });
+
+        assert!(!goal_response_message(&response).contains("Pause:"));
+    }
+
     fn draw_todo_close(chat: &mut Chat) -> Rect {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
@@ -15856,6 +16204,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_command_routes_to_session_goal_not_prompt_submission() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let outbound = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active.input_bar.insert_text("/goal help");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await;
+
+            let request = next_rpc_request(&mut rx, "goal command must use session/goal").await;
+            assert_eq!(request["method"], method::SESSION_GOAL);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            assert_eq!(request["params"]["command"], "/goal help");
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({
+                    "response": { "kind": "help" }
+                }),
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                rx.try_recv().is_err(),
+                "goal commands must not fall through to session/prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rtg_9739_approval_enter_approves_without_submitting_composer() {
         use crossterm::event::KeyCode;
 
@@ -21289,6 +21679,132 @@ mod tests {
         assert!(
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        for params in [
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                },
+                "completed": { "session_id": "sess-1" }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "other-session",
+                    "candidate": "must not be displayed"
+                }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                }
+            }),
+            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+            serde_json::json!({ "failed": { "session_id": "sess-1" } }),
+        ] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".to_string(),
+                    params,
+                })
+                .unwrap();
+        }
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
+        );
+        assert!(
+            matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+        assert!(
+            matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_update_displays_the_verifier_blocker() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": {
+                        "session_id": "sess-1",
+                        "blocker_messages": [
+                            "Provide the task packet reference.",
+                            "State its scope."
+                        ]
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        let ChatEntry::SystemMessage(text) = &entries[0] else {
+            panic!("expected blocked Goal system message");
+        };
+        assert!(
+            text.contains("\nBlocker:\n• Provide the task packet reference.\n• State its scope.")
+        );
+        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_update_without_blockers_stays_compatible_and_compact() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": { "session_id": "sess-1" }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        let ChatEntry::SystemMessage(text) = &entries[0] else {
+            panic!("expected blocked Goal system message");
+        };
+        assert!(!text.contains("\nBlocker:"));
+        assert!(text.contains("\nNext: Resolve the blocker, then run /goal resume to continue."));
+    }
+
+    #[test]
+    fn malformed_blocker_messages_goal_update_is_rejected() {
+        assert!(
+            parse_goal_update(&serde_json::json!({
+                "paused_for_blocker": {
+                    "session_id": "sess-1",
+                    "blocker_messages": "not an array"
+                }
+            }))
+            .is_none()
         );
     }
 

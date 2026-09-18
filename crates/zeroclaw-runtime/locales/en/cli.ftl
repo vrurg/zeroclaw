@@ -1292,3 +1292,53 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# Goal Mode V1 channel control responses.
+goal-mode-help =
+    🎯 Goal commands:
+    • /goal start [--tokens N] [--cost-usd D] OBJECTIVE
+    • /goal start --unlimited OBJECTIVE
+    • /goal status
+    • /goal budget
+    • /goal budget set --tokens N [--cost-usd D]
+    • /goal budget set --cost-usd D [--tokens N]
+    • /goal budget set --unlimited
+    • /goal pause
+    • /goal resume
+    • /goal cancel
+    • /goal help
+goal-mode-disabled = 🚫 Goal Mode is disabled.
+goal-mode-started = 🟢 Goal started.
+goal-mode-completed = ✅ Goal completed.
+goal-mode-failed = ❌ Goal failed. Use `/goal status` for its terminal reason.
+goal-mode-status = ℹ️ Goal status is available.
+goal-mode-budget = ℹ️ Goal budget is available.
+goal-mode-budget-updated = 📝 Goal budget updated.
+goal-mode-paused = ⏸️ Goal paused.
+goal-mode-paused-blocked = ⏸️ Goal paused.
+goal-mode-paused-blocker-heading = **Blocker:**
+goal-mode-paused-notice-blocker = • { $blocker }
+goal-mode-paused-notice-action = • { $action }
+goal-mode-paused-blocked-next = **Next:** Resolve the blocker, then run `/goal resume` to continue.
+goal-mode-paused-blocked-cancel = Or run `/goal cancel` to dismiss this Goal.
+goal-mode-paused-blocked-status = Run `/goal status` to review the current Goal.
+goal-mode-already-paused = ⏸️ Goal is already paused.
+goal-mode-resumed = ▶️ Goal resumed.
+goal-mode-cancelled = 🛑 Goal cancelled.
+goal-mode-already-cancelled = 🛑 Goal is already cancelled.
+goal-mode-no-current = ⚠️ There is no current Goal for this session.
+goal-mode-already-active = ⚠️ A Goal is already active for this session.
+goal-mode-terminal = ⚠️ This Goal is terminal.
+goal-mode-unlimited = unlimited
+goal-mode-yes = yes
+goal-mode-no = no
+goal-mode-summary-status = **Status:** { $status }
+goal-mode-summary-budget = **Budget:** { $token_limit } tokens · USD { $cost_limit }
+goal-mode-summary-accounting = **Accounting:** { $accounting }
+goal-mode-summary-execution = **Execution:** epoch { $epoch } · resumable { $resumable }
+goal-mode-summary-pause = **Pause:** { $pause_reason }
+goal-mode-pause-description = **Details:** { $description }
+goal-mode-blocker = **Blocker:** { $blocker }
+goal-mode-stale = ⚠️ Goal state changed; try the command again.
+goal-mode-command-invalid = ⚠️ That is not a valid Goal command. Use `/goal help` to see the supported commands.
+goal-mode-command-failed = ⚠️ Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.

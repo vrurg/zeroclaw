@@ -10,7 +10,7 @@ use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
@@ -465,6 +465,25 @@ pub struct StreamedTurnError {
     pub error: anyhow::Error,
     pub committed_response: String,
     pub new_messages: Vec<ConversationMessage>,
+}
+
+/// The source of a Goal-owned, process-local provider transcript.
+///
+/// Canonical session history is projected once at Goal-epoch admission and is
+/// never mutated by isolated turns. Continuations retain only the working
+/// transcript returned by the previous isolated turn.
+#[derive(Debug)]
+pub enum IsolatedTranscriptSource {
+    Canonical { prefix: Vec<ChatMessage> },
+    Continuation(Vec<ChatMessage>),
+}
+
+/// The model response and process-local transcript produced by an isolated
+/// Agent turn.
+#[derive(Debug)]
+pub struct IsolatedTurnOutcome {
+    pub response: String,
+    pub working_history: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1180,6 +1199,229 @@ impl Agent {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
+    /// Projects canonical history for a Goal epoch without changing it.
+    ///
+    /// The active dispatcher is resolved from the live provider path so native
+    /// tool-call envelopes and text-tool transcripts retain their own wire
+    /// shape. System messages remain Agent-owned and are rebuilt when an
+    /// isolated turn starts.
+    pub fn isolated_canonical_prefix(&self) -> Result<Vec<ChatMessage>> {
+        let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let (vision_provider_box, _) = crate::agent::turn::resolve_vision_provider(
+            self.full_config(),
+            self.model_provider.as_ref(),
+            &base_provider_messages,
+            &self.multimodal_config,
+            &self.model_provider_name,
+            &self.model_name,
+        )?;
+        let (active_provider, active_model): (&dyn ModelProvider, &str) =
+            vision_provider_box.as_ref().map_or(
+                (self.model_provider.as_ref(), self.model_name.as_str()),
+                |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+            );
+        let dispatcher = tool_dispatcher_for_provider(&self.config, active_provider, active_model);
+
+        Ok(dispatcher
+            .to_provider_messages(&self.history)
+            .into_iter()
+            .filter(|message| message.role != "system")
+            .collect())
+    }
+
+    /// Runs one Goal-owned model turn against a process-local transcript.
+    ///
+    /// This intentionally bypasses the ordinary user-turn conveniences:
+    /// user-message insertion, memory persistence/injection, request hooks,
+    /// response caching, turn events, and canonical-history replay. The only
+    /// canonical mutation permitted here is refreshing the Agent-owned system
+    /// prompt for the active tool dispatcher.
+    pub async fn run_isolated_turn(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        directive: ChatMessage,
+    ) -> Result<IsolatedTurnOutcome> {
+        ensure!(
+            directive.role == "system",
+            "isolated Goal directive must be a system message"
+        );
+
+        if self.history.is_empty() {
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(
+                    self.build_system_prompt()?,
+                )));
+        }
+
+        let base_dispatcher = tool_dispatcher_for_provider(
+            &self.config,
+            self.model_provider.as_ref(),
+            &self.model_name,
+        );
+        self.rebuild_system_prompt_for_dispatcher(base_dispatcher.as_ref())?;
+        let session_prompt_attachments = self.session_prompt_attachments.clone();
+        let max_system_prompt_chars = self.config.resolved.max_system_prompt_chars;
+        let base_system_prompt =
+            self.build_system_prompt_without_session_prompt_attachments(base_dispatcher.as_ref())?;
+
+        let mut working_history = match source {
+            IsolatedTranscriptSource::Canonical { prefix } => {
+                ensure!(
+                    prefix.iter().all(|message| message.role != "system"),
+                    "isolated Goal canonical prefix must not contain system messages"
+                );
+                let mut history = Vec::with_capacity(prefix.len() + 2);
+                history.push(
+                    crate::goal_mode::goal_parent_system_message_with_session_prompts(
+                        &base_system_prompt,
+                        &directive.content,
+                        &session_prompt_attachments,
+                        max_system_prompt_chars,
+                    )?,
+                );
+                history.extend(prefix);
+                history.push(crate::goal_mode::goal_parent_execution_request());
+                history
+            }
+            IsolatedTranscriptSource::Continuation(mut history) => {
+                ensure!(
+                    history
+                        .first()
+                        .is_some_and(|message| message.role == "system"),
+                    "isolated Goal continuation must retain its system prompt"
+                );
+                history[0] = crate::goal_mode::goal_parent_system_message_with_session_prompts(
+                    &base_system_prompt,
+                    &directive.content,
+                    &session_prompt_attachments,
+                    max_system_prompt_chars,
+                )?;
+                history.push(crate::goal_mode::goal_parent_execution_request());
+                history
+            }
+        };
+        let (vision_provider_box, _) = crate::agent::turn::resolve_vision_provider(
+            self.full_config(),
+            self.model_provider.as_ref(),
+            &working_history,
+            &self.multimodal_config,
+            &self.model_provider_name,
+            &self.model_name,
+        )?;
+        let (active_provider, active_provider_name, active_model) =
+            vision_provider_box.as_ref().map_or(
+                (
+                    self.model_provider.as_ref(),
+                    self.model_provider_name.as_str(),
+                    self.model_name.as_str(),
+                ),
+                |resolved| {
+                    (
+                        resolved.provider.as_ref(),
+                        resolved.provider_name.as_str(),
+                        resolved.model.as_str(),
+                    )
+                },
+            );
+        let active_dispatcher =
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model);
+        working_history[0] = crate::goal_mode::goal_parent_system_message_with_session_prompts(
+            self.build_system_prompt_without_session_prompt_attachments(
+                active_dispatcher.as_ref(),
+            )?,
+            directive.content,
+            &session_prompt_attachments,
+            max_system_prompt_chars,
+        )?;
+        let tool_protocol_prompts = self.tool_protocol_prompts()?;
+        let turn_id = Self::new_turn_id();
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
+            detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+        };
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
+            self.channel_handles.ask_user.as_ref().map(|handles| {
+                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                    Arc::clone(handles),
+                    self.approval_route.clone(),
+                )) as Box<dyn zeroclaw_api::channel::Channel>
+            });
+        let agent_alias = self.observer_agent_alias();
+        let isolated_loop =
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: active_provider,
+                        provider_name: active_provider_name,
+                        model: active_model,
+                        temperature: self.temperature,
+                    },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &self.tools,
+                        observer: self.observer.as_ref(),
+                        silent: true,
+                        approval: self.approval_manager.as_deref(),
+                        multimodal_config: &self.multimodal_config,
+                        config: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|config| config.config.as_deref()),
+                        hooks: self.hook_runner.as_deref(),
+                        activated_tools: self.activated_tools.as_ref(),
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: self.config.resolved.max_tool_iterations,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                        pacing: &pacing,
+                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                        parallel_tools: self.config.resolved.parallel_tools,
+                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                        context_token_budget: self.config.resolved.effective_context_budget(),
+                        knobs: &knobs,
+                    },
+                ),
+                history: &mut working_history,
+                channel_name: &self.channel_name,
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: approval_bridge.as_deref(),
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: Some(&mut self.image_cache),
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                memory: None,
+                agent_alias: agent_alias.as_deref(),
+                parent_agent_alias: None,
+                turn_id: &turn_id,
+                sop_reassembly: None,
+            });
+        let response = crate::goal_mode::scope_goal_parent_turn(
+            crate::agent::turn::scope_tool_protocol_prompts(
+                Arc::clone(&tool_protocol_prompts),
+                isolated_loop,
+            ),
+        )
+        .await?;
+
+        Ok(IsolatedTurnOutcome {
+            response,
+            working_history,
+        })
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -3816,6 +4058,54 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "MockModelProvider"
+        }
+    }
+
+    struct GoalTranscriptCaptureProvider {
+        captured_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalTranscriptCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.captured_messages
+                .lock()
+                .push(request.messages.to_vec());
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalTranscriptCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GoalTranscriptCaptureProvider"
         }
     }
 
@@ -7886,6 +8176,181 @@ mod tests {
                 .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn isolated_canonical_prefix_excludes_the_agent_owned_system_prompt() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.seed_history(&[
+            ChatMessage::user("canonical user message"),
+            ChatMessage::assistant("canonical assistant message"),
+        ]);
+
+        let prefix = agent
+            .isolated_canonical_prefix()
+            .expect("Goal prefix should project canonical history");
+
+        assert!(prefix.iter().all(|message| message.role != "system"));
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "canonical user message"),
+                ("assistant", "canonical assistant message"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_keeps_intermediate_work_out_of_canonical_history() {
+        let captured_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(GoalTranscriptCaptureProvider {
+            captured_messages: Arc::clone(&captured_messages),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent.seed_history(&[ChatMessage::user("canonical user message")]);
+        let canonical_before = format!("{:?}", agent.history());
+        let prefix = agent
+            .isolated_canonical_prefix()
+            .expect("Goal prefix should project canonical history");
+
+        let outcome = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix },
+                ChatMessage::system("goal turn directive"),
+            )
+            .await
+            .expect("isolated Goal turn should succeed");
+
+        assert_eq!(outcome.response, "done");
+        assert_eq!(
+            outcome
+                .working_history
+                .first()
+                .map(|message| message.role.as_str()),
+            Some("system")
+        );
+        assert!(
+            outcome
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("goal turn directive"))
+        );
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .any(|message| message.role == "assistant" && message.content == "done")
+        );
+        assert_eq!(format!("{:?}", agent.history()), canonical_before);
+
+        let continuation = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Continuation(outcome.working_history),
+                ChatMessage::system("continue turn directive"),
+            )
+            .await
+            .expect("continued isolated Goal turn should succeed");
+
+        assert_eq!(
+            continuation
+                .working_history
+                .first()
+                .map(|message| message.role.as_str()),
+            Some("system")
+        );
+        assert!(
+            continuation
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("continue turn directive"))
+        );
+        assert!(
+            !continuation
+                .working_history
+                .first()
+                .is_some_and(|message| message.content.contains("goal turn directive"))
+        );
+        assert_eq!(format!("{:?}", agent.history()), canonical_before);
+
+        let captured_messages = captured_messages.lock();
+        assert_eq!(captured_messages.len(), 2);
+        for request in captured_messages.iter() {
+            assert_eq!(
+                request.first().map(|message| message.role.as_str()),
+                Some("system")
+            );
+            assert_eq!(
+                request
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                request.last().map(|message| message.role.as_str()),
+                Some("user")
+            );
+        }
+        assert!(
+            captured_messages[0][0]
+                .content
+                .contains("goal turn directive")
+        );
+        assert!(
+            captured_messages[1][0]
+                .content
+                .contains("continue turn directive")
+        );
+        assert!(
+            !captured_messages[1][0]
+                .content
+                .contains("goal turn directive")
         );
     }
 

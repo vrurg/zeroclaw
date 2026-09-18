@@ -6,6 +6,90 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoalStatusProjection {
+    pub task_id: String,
+    pub status: String,
+    pub execution_epoch: i64,
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+    pub accounting_state: String,
+    pub pause_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker_messages: Vec<String>,
+    pub resumable: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "status", rename_all = "snake_case")]
+pub enum GoalResponse {
+    Help,
+    Disabled,
+    Started(GoalStatusProjection),
+    Status(GoalStatusProjection),
+    Budget(GoalStatusProjection),
+    BudgetUpdated(GoalStatusProjection),
+    Paused(GoalStatusProjection),
+    AlreadyPaused(GoalStatusProjection),
+    Resumed(GoalStatusProjection),
+    Cancelled(GoalStatusProjection),
+    AlreadyCancelled(GoalStatusProjection),
+    NoCurrentGoal,
+    AlreadyActive,
+    Terminal(GoalStatusProjection),
+    Stale,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionGoalResult {
+    pub response: GoalResponse,
+}
+
+#[cfg(test)]
+mod goal_wire_tests {
+    use super::*;
+
+    #[test]
+    fn goal_status_projection_accepts_older_daemon_responses() {
+        let raw = serde_json::json!({
+            "task_id": "goal-1",
+            "status": "paused",
+            "execution_epoch": 4,
+            "token_limit": 12_000,
+            "cost_limit_usd": null,
+            "accounting_state": "complete",
+            "pause_reason": "needs_user_input",
+            "resumable": true
+        });
+
+        let projection: GoalStatusProjection = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(projection.pause_description, None);
+        assert!(projection.blocker_messages.is_empty());
+    }
+
+    #[test]
+    fn goal_status_projection_omits_empty_detail_fields() {
+        let projection = GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 4,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        };
+
+        let raw = serde_json::to_value(projection).expect("serialize Goal status projection");
+
+        assert!(raw.get("pause_description").is_none());
+        assert!(raw.get("blocker_messages").is_none());
+    }
+}
+
 // ── Initialize shapes ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

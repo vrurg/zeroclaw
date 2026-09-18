@@ -61,6 +61,10 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    /// Serializes Goal lifecycle commands for this exact live session. It is
+    /// session-owned so removal and same-ID replacement cannot leave a
+    /// daemon-lifetime lock entry behind.
+    goal_command: Arc<Mutex<()>>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -88,6 +92,19 @@ pub struct ResumedRpcSession {
     pub message_count: usize,
 }
 
+/// The authoritative live-session facts required to admit a Goal command.
+///
+/// Goal admission reads these under one lock so a same-ID replacement cannot
+/// combine one incarnation's owner with another incarnation's Agent.
+pub(crate) struct GoalSessionSnapshot {
+    pub(crate) agent: Arc<Mutex<Agent>>,
+    pub(crate) agent_alias: String,
+    pub(crate) chat_mode: crate::rpc::types::ChatMode,
+    pub(crate) owner_tui_id: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) goal_command: Arc<Mutex<()>>,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -97,6 +114,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             agent: Arc::new(Mutex::new(agent)),
+            goal_command: Arc::new(Mutex::new(())),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
@@ -460,6 +478,22 @@ impl SessionStore {
     /// becomes a no-op.
     pub async fn get_generation(&self, id: &str) -> Option<u64> {
         self.sessions.lock().await.get(id).map(|s| s.generation)
+    }
+
+    /// Read the exact Goal-admission facts under one session-store lock.
+    pub(crate) async fn goal_session_snapshot(&self, id: &str) -> Option<GoalSessionSnapshot> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| GoalSessionSnapshot {
+                agent: Arc::clone(&session.agent),
+                agent_alias: session.agent_alias.clone(),
+                chat_mode: session.chat_mode.clone(),
+                owner_tui_id: session.owner_tui_id.clone(),
+                generation: session.generation,
+                goal_command: Arc::clone(&session.goal_command),
+            })
     }
 
     /// Await the test-only pause gate before validating generation in
