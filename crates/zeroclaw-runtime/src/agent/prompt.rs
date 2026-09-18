@@ -2205,6 +2205,19 @@ mod tests {
             "a truncated sensitive name after opaque arguments must retain redaction"
         );
 
+        let arguments_before_mid_name_truncation = format!(
+            r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"session_prompt_se"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&arguments_before_mid_name_truncation),
+            "truncation within a sensitive name after opaque arguments must retain redaction"
+        );
+        assert!(
+            !redact_session_prompt_text_protocol_for_export(&arguments_before_mid_name_truncation)
+                .contains(marker),
+            "mid-name truncation must not expose opaque session-prompt content"
+        );
+
         let unterminated_name_with_closers = format!(
             r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"session_prompt_set}}]}}"#
         );
@@ -2239,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn export_copy_preserves_user_input_after_malformed_ordinary_tool_envelope() {
+    fn export_copy_preserves_malformed_ordinary_tool_diagnostics_and_user_input() {
         let malformed = r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"pwd"}}]"#;
         let messages = vec![
             ChatMessage::assistant(malformed),
@@ -2249,8 +2262,8 @@ mod tests {
         let export = redact_session_prompt_tool_exchanges_for_export(&messages);
 
         assert_eq!(
-            export[0].content, SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER,
-            "malformed tool envelopes remain withheld at export boundaries"
+            export[0].content, malformed,
+            "ordinary malformed tool diagnostics are not session-prompt content"
         );
         assert_eq!(
             export[1].content, "cancel that and summarize the log",

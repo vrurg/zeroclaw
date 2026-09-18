@@ -686,11 +686,15 @@ fn malformed_json_field_names(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Recognize an incomplete JSON tool invocation without relying on a tool
-/// name. At export-only privacy boundaries this must fail closed: truncation
-/// can remove or corrupt either a structural discriminator or the name after
-/// opaque arguments have already arrived. This does not affect parsing or
-/// provider-visible history.
+/// Recognize an incomplete JSON invocation of a known sensitive tool.
+///
+/// This is for export-only privacy boundaries, not parsing or provider-visible
+/// history. It requires both an arguments-like field and a recovered sensitive
+/// tool name. An unterminated name value may end partway through the name, so a
+/// non-empty prefix of a known sensitive name is sufficient only when that
+/// JSON string is itself unterminated. That preserves ordinary malformed-tool
+/// diagnostics while withholding opaque arguments from a truncated sensitive
+/// invocation.
 pub fn looks_like_malformed_json_tool_invocation(
     text: &str,
     known_sensitive_tool_names: &HashSet<String>,
@@ -718,16 +722,71 @@ pub fn looks_like_malformed_json_tool_invocation(
     let has_arguments = ["arguments", "parameters"]
         .iter()
         .any(|key| field_names.contains(*key));
-    let has_known_sensitive_name = string_fields.iter().any(|(key, value)| {
-        key == "name" && known_sensitive_tool_names.contains(&value.trim().to_ascii_lowercase())
-    }) || known_sensitive_tool_names.iter().any(|name| {
-        Regex::new(&format!(r#""name"\s*:\s*"{}"#, regex::escape(name)))
-            .is_ok_and(|pattern| pattern.is_match(&lower))
-    });
+    let has_known_sensitive_name =
+        string_fields.iter().any(|(key, value)| {
+            key == "name" && known_sensitive_tool_names.contains(&value.trim().to_ascii_lowercase())
+        }) || has_unterminated_sensitive_name_prefix(&lower, known_sensitive_tool_names);
     // This helper is used for sensitive-export redaction. A malformed generic
     // tool envelope must retain its diagnostic and provider history; only a
     // recovered sensitive name establishes that opaque prompt content is present.
     has_arguments && has_known_sensitive_name
+}
+
+fn has_unterminated_sensitive_name_prefix(
+    lower_text: &str,
+    known_sensitive_tool_names: &HashSet<String>,
+) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_name_key) = lower_text[search_start..].find("\"name\"") {
+        let name_key_start = search_start + relative_name_key;
+        let after_key = &lower_text[name_key_start + "\"name\"".len()..];
+        let after_colon = after_key.trim_start().strip_prefix(':');
+        let Some(after_open_quote) = after_colon
+            .map(str::trim_start)
+            .and_then(|value| value.strip_prefix('"'))
+        else {
+            search_start = name_key_start + "\"name\"".len();
+            continue;
+        };
+
+        let mut prefix_end = 0;
+        let mut escaped = false;
+        let mut terminated = false;
+        for (offset, character) in after_open_quote.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '"' => {
+                    terminated = true;
+                    break;
+                }
+                character
+                    if character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '.' | '-') =>
+                {
+                    prefix_end = offset + character.len_utf8();
+                }
+                _ => break,
+            }
+        }
+
+        if !terminated {
+            let prefix = &after_open_quote[..prefix_end];
+            if !prefix.is_empty()
+                && known_sensitive_tool_names
+                    .iter()
+                    .any(|known_name| known_name.starts_with(prefix))
+            {
+                return true;
+            }
+        }
+
+        search_start = name_key_start + "\"name\"".len();
+    }
+    false
 }
 
 fn has_malformed_tool_protocol_text_signal_for_known_tools(
@@ -3416,6 +3475,14 @@ mod tests {
         ));
         assert!(looks_like_malformed_json_tool_invocation(
             r#"{"tool_\u0063alls":[{"arguments":{"content":"secret"},"name":"session_prompt_set}]} Done"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"arguments":{"content":"secret"},"name":"session_prompt_se"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"arguments":{"content":"secret"},"name":"session_prompt_setter"}]"#,
             &known,
         ));
         assert!(!looks_like_malformed_json_tool_invocation(
