@@ -694,7 +694,10 @@ fn malformed_json_field_names(text: &str) -> HashSet<String> {
 /// non-empty prefix of a known sensitive name is sufficient only when that
 /// JSON string is itself unterminated. That preserves ordinary malformed-tool
 /// diagnostics while withholding opaque arguments from a truncated sensitive
-/// invocation.
+/// invocation. If truncation occurs before a sensitive name can be recovered,
+/// the envelope remains classified as a generic malformed diagnostic and is
+/// not parsed or executed; failing closed there would also redact
+/// indistinguishable malformed calls to ordinary tools.
 pub fn looks_like_malformed_json_tool_invocation(
     text: &str,
     known_sensitive_tool_names: &HashSet<String>,
