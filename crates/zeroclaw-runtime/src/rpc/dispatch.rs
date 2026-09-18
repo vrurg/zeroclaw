@@ -2198,7 +2198,7 @@ impl RpcDispatcher {
         // lifecycle policies are possible, but need a separate architectural
         // decision because they change the durable-versus-interrupt ordering
         // contract.
-        let _lifecycle_cancellation = self
+        let lifecycle_cancellation = self
             .ctx
             .sessions
             .signal_session_kill_at_generation(sid, expected_generation)
@@ -2236,11 +2236,16 @@ impl RpcDispatcher {
         let _guard = span.enter();
 
         if matches!(chat_mode, ChatMode::Acp) {
-            let store = self
-                .ctx
-                .acp_session_store
-                .clone()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let Some(store) = self.ctx.acp_session_store.clone() else {
+                // Keep the queue permit until the failed kill has removed its
+                // generation-scoped cancellation state. Otherwise a queued
+                // prompt could inherit the rejected administrative kill.
+                drop(lifecycle_cancellation);
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "ACP session store is not available",
+                ));
+            };
             let sid_owned = sid.to_string();
             let marked =
                 tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
@@ -2256,12 +2261,14 @@ impl RpcDispatcher {
                     );
                 }
                 Ok(Err(e)) => {
+                    drop(lifecycle_cancellation);
                     return Err(rpc_err(
                         INTERNAL_ERROR,
                         format!("Failed to mark ACP session killed: {e}"),
                     ));
                 }
                 Err(e) => {
+                    drop(lifecycle_cancellation);
                     return Err(rpc_err(
                         INTERNAL_ERROR,
                         format!("Failed to mark ACP session killed: {e}"),
@@ -12012,6 +12019,10 @@ mod tests {
             !sessions.has_pending_lifecycle_cancellation(sid),
             "a failed ACP kill must not cancel a later prompt after its active turn finishes"
         );
+        assert!(
+            !sessions.has_admin_kill_fence(sid),
+            "a failed ACP kill must clear its queued-turn admission fence"
+        );
     }
 
     #[tokio::test]
@@ -12161,6 +12172,104 @@ mod tests {
         let kill_result = tokio::time::timeout(std::time::Duration::from_secs(2), kill)
             .await
             .expect("kill must finish after the cancelled turn releases its queue permit")
+            .expect("kill task must not panic")
+            .expect("Chat kill should remove the live session");
+        assert_eq!(kill_result["killed"], true);
+        assert!(sessions.get_agent(sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_kill_prevents_a_queued_prompt_from_starting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "queued-chat-kill";
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let active_handle = dispatcher.spawn_handle();
+        let active = zeroclaw_spawn::spawn!(async move {
+            active_handle
+                .handle_session_prompt(&json!({ "session_id": sid, "prompt": "block" }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("the first provider call must be active before queuing another prompt")
+            .expect("gated provider must report its start");
+
+        let queued_handle = dispatcher.spawn_handle();
+        let queued = zeroclaw_spawn::spawn!(async move {
+            queued_handle
+                .handle_session_prompt(&json!({ "session_id": sid, "prompt": "must not start" }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second prompt must wait behind the active turn");
+
+        let kill_handle = dispatcher.spawn_handle();
+        let kill = zeroclaw_spawn::spawn!(async move {
+            kill_handle
+                .handle_session_kill(&json!({ "session_id": sid }))
+                .await
+        });
+
+        let active_result = tokio::time::timeout(std::time::Duration::from_secs(2), active)
+            .await
+            .expect("kill must interrupt the active provider turn")
+            .expect("active prompt task must not panic")
+            .expect("active prompt should settle as cancelled");
+        assert_eq!(active_result["stop_reason"], "cancelled");
+
+        let queued_result = tokio::time::timeout(std::time::Duration::from_secs(2), queued)
+            .await
+            .expect("queued prompt must settle before kill finalizes")
+            .expect("queued prompt task must not panic")
+            .expect("queued prompt should settle as cancelled");
+        assert_eq!(queued_result["stop_reason"], "cancelled");
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the queued prompt must not reach the provider after session/kill begins"
+        );
+
+        let kill_result = tokio::time::timeout(std::time::Duration::from_secs(2), kill)
+            .await
+            .expect("kill must finalize after cancelling queued work")
             .expect("kill task must not panic")
             .expect("Chat kill should remove the live session");
         assert_eq!(kill_result["killed"], true);
@@ -16791,9 +16900,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Hold admission so both operations queue deterministically. The
-            // prompt registers first; the removal must remain behind it until
-            // that session incarnation has finalized all durable work.
+            // Hold admission so both operations queue deterministically. Close
+            // and delete let the earlier prompt run before finalization; the
+            // terminal administrative Kill instead fences that queued prompt.
             let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
             let prompt_handle = dispatcher.spawn_handle();
             let sid_for_prompt = sid.clone();
@@ -16848,20 +16957,39 @@ mod tests {
             assert_eq!(sessions.chat_mode(&sid).await, Some(chat_mode));
 
             drop(admission_guard);
-            started_rx
-                .recv()
-                .await
-                .expect("the queued prompt must run before removal");
+            let prompt_result = match removal {
+                Removal::Kill => {
+                    let prompt_result = prompt_task.await.expect("prompt task must not panic");
+                    let prompt_result = prompt_result
+                        .expect("queued prompt should settle as cancelled before Kill finalizes");
+                    assert_eq!(prompt_result["stop_reason"], "cancelled");
+                    assert!(
+                        started_rx.try_recv().is_err(),
+                        "Kill must prevent the queued prompt from entering the provider"
+                    );
+                    prompt_result
+                }
+                Removal::Close | Removal::Delete => {
+                    started_rx
+                        .recv()
+                        .await
+                        .expect("the queued prompt must run before removal");
+                    assert!(
+                        !removal_task.is_finished(),
+                        "{removal:?} must wait while the provider is blocked"
+                    );
+                    release_tx.send(()).unwrap();
+                    let prompt_result = prompt_task.await.expect("prompt task must not panic");
+                    assert!(
+                        prompt_result.is_ok(),
+                        "prompt should finalize before {removal:?}: {prompt_result:?}"
+                    );
+                    prompt_result.expect("the queued prompt should complete normally")
+                }
+            };
             assert!(
-                !removal_task.is_finished(),
-                "{removal:?} must wait while the provider is blocked"
-            );
-            release_tx.send(()).unwrap();
-
-            let prompt_result = prompt_task.await.expect("prompt task must not panic");
-            assert!(
-                prompt_result.is_ok(),
-                "prompt should finalize before {removal:?}: {prompt_result:?}"
+                prompt_result.is_object(),
+                "prompt must return a structured RPC result before {removal:?} finalizes"
             );
             let removal_result = removal_task.await.expect("removal task must not panic");
             assert!(

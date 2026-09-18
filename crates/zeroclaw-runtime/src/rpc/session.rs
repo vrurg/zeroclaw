@@ -149,10 +149,17 @@ pub struct SessionStore {
     /// registration, so a same-ID successor cannot inherit cancellation.
     pending_cancellations: std::sync::Mutex<HashMap<String, (u64, u64, CancelCause)>>,
     pending_cancellation_generation: std::sync::atomic::AtomicU64,
+    /// An administrative kill is terminal for the observed session
+    /// incarnation. Unlike a pre-registration cancellation latch, this fence
+    /// also covers prompts still waiting for the actor permit, so they cannot
+    /// start provider work between interrupting the active turn and durable
+    /// kill finalization.
+    admin_kill_fences: std::sync::Mutex<HashMap<String, u64>>,
     /// A prompt that has acquired the per-session queue and passed its
     /// incarnation check, but has not registered a cancellation token yet.
-    /// This is the only state that may receive a pending lifecycle signal;
-    /// queued prompts have not been admitted and must remain unaffected.
+    /// This is the only state that may receive a generic pending lifecycle
+    /// signal; administrative kill additionally fences queued prompts because
+    /// it is terminal for the observed incarnation.
     pre_registration_admissions: std::sync::Mutex<HashMap<String, u64>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -192,6 +199,7 @@ pub(crate) struct LifecycleCancellation<'a> {
     session_id: String,
     session_generation: u64,
     pending_cancellation_generation: Option<u64>,
+    admin_kill_fence: bool,
 }
 
 /// Marks the narrow admitted-before-token window for one prompt. Dropping the
@@ -233,6 +241,16 @@ impl Drop for LifecycleCancellation<'_> {
         {
             pending.remove(&self.session_id);
         }
+        if self.admin_kill_fence {
+            let mut fences = self
+                .store
+                .admin_kill_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if fences.get(&self.session_id) == Some(&self.session_generation) {
+                fences.remove(&self.session_id);
+            }
+        }
     }
 }
 
@@ -267,6 +285,7 @@ impl SessionStore {
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             pending_cancellations: std::sync::Mutex::new(HashMap::new()),
             pending_cancellation_generation: std::sync::atomic::AtomicU64::new(0),
+            admin_kill_fences: std::sync::Mutex::new(HashMap::new()),
             pre_registration_admissions: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
@@ -924,9 +943,18 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+        let admin_kill_fenced = self
+            .admin_kill_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            == Some(&session_generation);
         drop(tokens);
 
-        if let Some((pending_generation, _, cause)) = pending
+        if admin_kill_fenced {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
+            token_for_cancel.cancel();
+        } else if let Some((pending_generation, _, cause)) = pending
             && pending_generation == session_generation
         {
             self.record_cancel_cause(id, cause);
@@ -1098,6 +1126,13 @@ impl SessionStore {
             return None;
         }
         drop(sessions);
+        let admin_kill_fence = matches!(cause, CancelCause::AdminKill);
+        if admin_kill_fence {
+            self.admin_kill_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), expected_generation);
+        }
         let pending_cancellation_generation =
             self.signal_cancellation_at_session_generation(id, expected_generation, cause);
         Some(LifecycleCancellation {
@@ -1105,6 +1140,7 @@ impl SessionStore {
             session_id: id.to_string(),
             session_generation: expected_generation,
             pending_cancellation_generation,
+            admin_kill_fence,
         })
     }
 
@@ -1119,6 +1155,14 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn has_pending_lifecycle_cancellation(&self, id: &str) -> bool {
         self.pending_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_admin_kill_fence(&self, id: &str) -> bool {
+        self.admin_kill_fences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)
