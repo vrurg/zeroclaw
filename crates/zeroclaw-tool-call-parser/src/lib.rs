@@ -715,19 +715,19 @@ pub fn looks_like_malformed_json_tool_invocation(
 
     let field_names = malformed_json_field_names(trimmed);
     let string_fields = malformed_json_string_fields(trimmed);
-    let has_protocol_container = ["tool_calls", "toolcalls", "function_call"]
-        .iter()
-        .any(|key| field_names.contains(*key))
-        || string_fields
-            .iter()
-            .any(|(key, value)| key == "type" && value == "function_call");
     let has_arguments = ["arguments", "parameters"]
         .iter()
         .any(|key| field_names.contains(*key));
     let has_known_sensitive_name = string_fields.iter().any(|(key, value)| {
         key == "name" && known_sensitive_tool_names.contains(&value.trim().to_ascii_lowercase())
+    }) || known_sensitive_tool_names.iter().any(|name| {
+        Regex::new(&format!(r#""name"\s*:\s*"{}"#, regex::escape(name)))
+            .is_ok_and(|pattern| pattern.is_match(&lower))
     });
-    has_arguments && (has_protocol_container || has_known_sensitive_name)
+    // This helper is used for sensitive-export redaction. A malformed generic
+    // tool envelope must retain its diagnostic and provider history; only a
+    // recovered sensitive name establishes that opaque prompt content is present.
+    has_arguments && has_known_sensitive_name
 }
 
 fn has_malformed_tool_protocol_text_signal_for_known_tools(
@@ -3407,7 +3407,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_tool_invocation_detection_is_name_independent() {
+    fn malformed_json_tool_invocation_detection_requires_sensitive_name() {
         let known = HashSet::from(["session_prompt_set".to_owned()]);
 
         assert!(looks_like_malformed_json_tool_invocation(
@@ -3418,7 +3418,7 @@ mod tests {
             r#"{"tool_\u0063alls":[{"arguments":{"content":"secret"},"name":"session_prompt_set}]} Done"#,
             &known,
         ));
-        assert!(looks_like_malformed_json_tool_invocation(
+        assert!(!looks_like_malformed_json_tool_invocation(
             r#"{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]"#,
             &known,
         ));

@@ -11,9 +11,8 @@ use std::{borrow::Cow, collections::HashSet, sync::LazyLock};
 use zeroclaw_config::schema::IdentityConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::{
-    looks_like_malformed_json_tool_invocation, looks_like_malformed_tool_protocol_envelope,
-    parse_tool_calls, parsed_tool_protocol_mentions_known_tool,
-    tool_protocol_envelope_mentions_known_tool,
+    looks_like_malformed_json_tool_invocation, parse_tool_calls,
+    parsed_tool_protocol_mentions_known_tool, tool_protocol_envelope_mentions_known_tool,
 };
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
@@ -205,11 +204,8 @@ pub(crate) fn redact_session_prompt_text_protocol_for_export(content: &str) -> C
 ///
 /// Mentioning a tool name in normal user, assistant, or system prose is not a
 /// sensitive exchange. The runtime parser is the source of truth for accepted
-/// call formats. A malformed tool invocation is withheld at export boundaries
-/// without tool-name recovery: a truncated name cannot safely prove whether
-/// opaque arguments came from a session-prompt call. This intentionally hides
-/// malformed ordinary tool diagnostics, but never changes parsing or provider
-/// history.
+/// call formats. Export redaction requires a recovered session-prompt identity
+/// so unrelated malformed tool diagnostics and retained history stay intact.
 pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool {
     let malformed_xml_session_prompt_envelope = {
         let lower = content.to_ascii_lowercase();
@@ -231,10 +227,10 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
                 || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
         })
         || malformed_xml_session_prompt_envelope
-        || looks_like_malformed_tool_protocol_envelope(content)
         || looks_like_malformed_json_tool_invocation(content, session_prompt_tool_names())
         || transport_escaped_json_candidate(content).is_some_and(|decoded| {
-            looks_like_malformed_tool_protocol_envelope(&decoded)
+            parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
+                || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
                 || looks_like_malformed_json_tool_invocation(&decoded, session_prompt_tool_names())
         })
 }
@@ -2162,12 +2158,12 @@ mod tests {
 
         let ordinary_malformed = r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"pwd"}}]"#;
         assert!(
-            session_prompt_tool_call_envelope_mentioned(ordinary_malformed),
-            "malformed tool invocations are redacted at export boundaries even when their name is not sensitive"
+            !session_prompt_tool_call_envelope_mentioned(ordinary_malformed),
+            "ordinary malformed tool invocations must retain their diagnostics"
         );
         assert!(
-            !redact_session_prompt_text_protocol_for_export(ordinary_malformed).contains("pwd"),
-            "the fail-closed malformed-tool boundary must redact ordinary tool arguments too"
+            redact_session_prompt_text_protocol_for_export(ordinary_malformed).contains("pwd"),
+            "ordinary malformed tool arguments must not be labelled as session-prompt content"
         );
 
         let escaped_name = format!(
@@ -2181,8 +2177,8 @@ mod tests {
         let shell_argument_mention =
             r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"echo session_prompt_set"}}]"#;
         assert!(
-            session_prompt_tool_call_envelope_mentioned(shell_argument_mention),
-            "the malformed-tool export boundary is name-independent"
+            !session_prompt_tool_call_envelope_mentioned(shell_argument_mention),
+            "a prompt-tool name in ordinary tool arguments is not a prompt-tool invocation"
         );
 
         let responses_whitespace = format!(
