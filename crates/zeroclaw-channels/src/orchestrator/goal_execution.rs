@@ -474,7 +474,10 @@ fn goal_start_history(
 /// A retained transcript owns the continuation case, but a Goal can also be
 /// resumed after the resident worker was retired. In that case the canonical
 /// session history is the only durable prefix and an optional user response
-/// must still be the final user turn seen by the new worker.
+/// must still be the final user turn seen by the new worker. Keep the ordinary
+/// execution request as well: unlike a retained transcript, a canonical prefix
+/// has no guaranteed terminal role, and provider conversion coalesces the
+/// adjacent user messages when a response follows it.
 fn goal_canonical_history_for_parent_turn(
     turn: GoalParentTurn,
     system_prompt: String,

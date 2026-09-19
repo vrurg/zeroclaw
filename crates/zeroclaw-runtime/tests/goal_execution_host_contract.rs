@@ -2853,6 +2853,62 @@ async fn supervisor_delivers_the_initial_notice_before_starting_the_parent_turn(
 }
 
 #[tokio::test]
+async fn initial_notice_failure_is_durable_and_never_starts_the_parent_turn() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    ));
+
+    let error = supervisor
+        .submit_with_before_launch(
+            host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+            |_| async { anyhow::bail!("initial notice unavailable") },
+        )
+        .await
+        .expect_err("an undeliverable initial notice must stop the Goal before launch");
+
+    assert!(error.to_string().contains("initial notice delivery failed"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    let session_id = ingress.session_key().durable_id();
+    let current = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .expect("the failed Goal remains status-visible");
+    assert_eq!(current.status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(&current.id, &session_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("initial_goal_notice_failed")
+    );
+}
+
+#[tokio::test]
 async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
