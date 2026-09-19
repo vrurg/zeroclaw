@@ -474,8 +474,18 @@ pub struct StreamedTurnError {
 /// transcript returned by the previous isolated turn.
 #[derive(Debug)]
 pub enum IsolatedTranscriptSource {
-    Canonical { prefix: Vec<ChatMessage> },
-    Continuation(Vec<ChatMessage>),
+    Canonical {
+        prefix: Vec<ChatMessage>,
+        /// A user reply supplied with a recovery resume. It must follow the
+        /// rebuilt execution request so every provider sees a user-role tail.
+        trailing_user: Option<ChatMessage>,
+    },
+    Continuation {
+        history: Vec<ChatMessage>,
+        /// A verifier-blocked resume with an explicit reply already ends in
+        /// that reply. A bare resume needs the normal execution request.
+        append_execution_request: bool,
+    },
 }
 
 /// The model response and process-local transcript produced by an isolated
@@ -1235,13 +1245,14 @@ impl Agent {
     ///
     /// This intentionally bypasses the ordinary user-turn conveniences:
     /// user-message insertion, memory persistence/injection, request hooks,
-    /// response caching, turn events, and canonical-history replay. The only
+    /// response caching and canonical-history replay. The only
     /// canonical mutation permitted here is refreshing the Agent-owned system
     /// prompt for the active tool dispatcher.
     pub async fn run_isolated_turn(
         &mut self,
         source: IsolatedTranscriptSource,
         directive: ChatMessage,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<IsolatedTurnOutcome> {
         ensure!(
             directive.role == "system",
@@ -1267,7 +1278,10 @@ impl Agent {
             self.build_system_prompt_without_session_prompt_attachments(base_dispatcher.as_ref())?;
 
         let mut working_history = match source {
-            IsolatedTranscriptSource::Canonical { prefix } => {
+            IsolatedTranscriptSource::Canonical {
+                prefix,
+                trailing_user,
+            } => {
                 ensure!(
                     prefix.iter().all(|message| message.role != "system"),
                     "isolated Goal canonical prefix must not contain system messages"
@@ -1283,9 +1297,15 @@ impl Agent {
                 );
                 history.extend(prefix);
                 history.push(crate::goal_mode::goal_parent_execution_request());
+                if let Some(user) = trailing_user {
+                    history.push(user);
+                }
                 history
             }
-            IsolatedTranscriptSource::Continuation(mut history) => {
+            IsolatedTranscriptSource::Continuation {
+                mut history,
+                append_execution_request,
+            } => {
                 ensure!(
                     history
                         .first()
@@ -1298,7 +1318,9 @@ impl Agent {
                     &session_prompt_attachments,
                     max_system_prompt_chars,
                 )?;
-                history.push(crate::goal_mode::goal_parent_execution_request());
+                if append_execution_request {
+                    history.push(crate::goal_mode::goal_parent_execution_request());
+                }
                 history
             }
         };
@@ -1367,6 +1389,10 @@ impl Agent {
                     crate::agent::loop_::ResolvedIo {
                         tools_registry: &self.tools,
                         observer: self.observer.as_ref(),
+                        // Event delivery and terminal narration are separate
+                        // paths. Keep the latter suppressed exactly as the
+                        // ordinary streamed channel path does; an event sink
+                        // alone drives representation-surface visibility.
                         silent: true,
                         approval: self.approval_manager.as_deref(),
                         multimodal_config: &self.multimodal_config,
@@ -1399,7 +1425,7 @@ impl Agent {
                 shared_budget: None,
                 channel: approval_bridge.as_deref(),
                 collected_receipts: None,
-                event_tx: None,
+                event_tx: event_tx.clone(),
                 steering: None,
                 new_messages_out: None,
                 image_cache: Some(&mut self.image_cache),
@@ -1410,13 +1436,59 @@ impl Agent {
                 turn_id: &turn_id,
                 sop_reassembly: None,
             });
-        let response = crate::goal_mode::scope_goal_parent_turn(
-            crate::agent::turn::scope_tool_protocol_prompts(
-                Arc::clone(&tool_protocol_prompts),
-                isolated_loop,
-            ),
-        )
-        .await?;
+        // An isolated Goal parent turn still uses the ordinary Reliable and
+        // safeguard provider path. Scope its transient recovery facts around
+        // the complete loop, then relay their normal display notices through
+        // the same event sink as every other parent event. The verifier must
+        // receive the unadorned candidate, so these notices never alter the
+        // returned response or retained working transcript.
+        let isolated_loop = Box::pin(isolated_loop);
+        let (result, provider_fallback, safeguard_fallback) =
+            zeroclaw_providers::scope_safeguard_fallback(async {
+                let (result, provider_fallback) =
+                    zeroclaw_providers::reliable::scope_provider_fallback(async {
+                        let result = crate::goal_mode::scope_goal_parent_turn(
+                            crate::agent::turn::scope_tool_protocol_prompts(
+                                Arc::clone(&tool_protocol_prompts),
+                                isolated_loop,
+                            ),
+                        )
+                        .await;
+                        (
+                            result,
+                            zeroclaw_providers::reliable::take_last_provider_fallback(),
+                        )
+                    })
+                    .await;
+                (
+                    result,
+                    provider_fallback,
+                    zeroclaw_providers::take_last_safeguard_fallback(),
+                )
+            })
+            .await;
+        let response = result?;
+
+        if let Some(event_tx) = event_tx.as_ref() {
+            let presented = Self::append_model_fallback_notice(
+                response.clone(),
+                provider_fallback.as_ref(),
+                safeguard_fallback.as_ref(),
+                event_tx,
+            )
+            .await;
+            let with_safeguard = crate::agent::append_safeguard_fallback_notice(
+                presented.clone(),
+                safeguard_fallback.as_ref(),
+            );
+            if let Some(delta) = with_safeguard.strip_prefix(&presented) {
+                let _ = event_tx
+                    .send(TurnEvent::Chunk {
+                        delta: delta.to_string(),
+                    })
+                    .await;
+            }
+        }
 
         Ok(IsolatedTurnOutcome {
             response,
@@ -8258,16 +8330,25 @@ mod tests {
         let prefix = agent
             .isolated_canonical_prefix()
             .expect("Goal prefix should project canonical history");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
 
         let outcome = agent
             .run_isolated_turn(
-                IsolatedTranscriptSource::Canonical { prefix },
+                IsolatedTranscriptSource::Canonical {
+                    prefix,
+                    trailing_user: None,
+                },
                 ChatMessage::system("goal turn directive"),
+                Some(event_tx),
             )
             .await
             .expect("isolated Goal turn should succeed");
 
         assert_eq!(outcome.response, "done");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent::Chunk { delta }) if delta == "done"
+        ));
         assert_eq!(
             outcome
                 .working_history
@@ -8289,10 +8370,17 @@ mod tests {
         );
         assert_eq!(format!("{:?}", agent.history()), canonical_before);
 
+        let mut blocked_history = outcome.working_history;
+        blocked_history.push(ChatMessage::assistant("Which module should I change?"));
+        blocked_history.push(ChatMessage::user("Use the authentication module."));
         let continuation = agent
             .run_isolated_turn(
-                IsolatedTranscriptSource::Continuation(outcome.working_history),
+                IsolatedTranscriptSource::Continuation {
+                    history: blocked_history,
+                    append_execution_request: false,
+                },
                 ChatMessage::system("continue turn directive"),
+                None,
             )
             .await
             .expect("continued isolated Goal turn should succeed");
@@ -8318,8 +8406,23 @@ mod tests {
         );
         assert_eq!(format!("{:?}", agent.history()), canonical_before);
 
+        let recovery = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical {
+                    prefix: vec![ChatMessage::user("canonical recovery task")],
+                    trailing_user: Some(ChatMessage::user("the blocker is resolved")),
+                },
+                ChatMessage::system("recovery Goal directive"),
+                None,
+            )
+            .await
+            .expect("recovery Goal turn should succeed");
+
+        assert_eq!(recovery.response, "done");
+        assert_eq!(format!("{:?}", agent.history()), canonical_before);
+
         let captured_messages = captured_messages.lock();
-        assert_eq!(captured_messages.len(), 2);
+        assert_eq!(captured_messages.len(), 3);
         for request in captured_messages.iter() {
             assert_eq!(
                 request.first().map(|message| message.role.as_str()),
@@ -8351,6 +8454,139 @@ mod tests {
             !captured_messages[1][0]
                 .content
                 .contains("goal turn directive")
+        );
+        assert_eq!(
+            captured_messages[1]
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("Use the authentication module.")
+        );
+        assert!(
+            captured_messages[1].iter().any(|message| {
+                message.role == "assistant" && message.content == "Which module should I change?"
+            }),
+            "a resident Goal resume must retain the agent question that the user is answering"
+        );
+        assert!(
+            captured_messages[2][0]
+                .content
+                .contains("recovery Goal directive")
+        );
+        assert_eq!(
+            captured_messages[2]
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("the blocker is resolved")
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_goal_turn_relays_reliable_fallback_without_decorating_candidate() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "provider-requested".to_string(),
+                    Box::new(FailingModelProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "provider-served".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(Vec::new()),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.seed_history(&[ChatMessage::user("finish the Goal task")]);
+        let prefix = agent
+            .isolated_canonical_prefix()
+            .expect("Goal prefix should project canonical history");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical {
+                    prefix,
+                    trailing_user: None,
+                },
+                ChatMessage::system("Goal turn directive"),
+                Some(event_tx),
+            )
+            .await
+            .expect("Goal turn should recover through the fallback provider");
+
+        assert_eq!(
+            outcome.response, "done",
+            "the verifier and retained Goal transcript receive the exact candidate"
+        );
+
+        let mut presented = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                presented.push_str(&delta);
+            }
+        }
+        assert!(
+            presented.contains("provider-requested") && presented.contains("provider-served"),
+            "Goal presentation must retain the ordinary Reliable fallback notice: {presented}"
+        );
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|message| !message.content.contains("provider-requested")),
+            "presentation-only recovery information must not become Goal working context"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_goal_turn_relays_safeguard_notice_without_decorating_candidate() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        agent.seed_history(&[ChatMessage::user("finish the Goal task")]);
+        let prefix = agent
+            .isolated_canonical_prefix()
+            .expect("Goal prefix should project canonical history");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical {
+                    prefix,
+                    trailing_user: None,
+                },
+                ChatMessage::system("Goal turn directive"),
+                Some(event_tx),
+            )
+            .await
+            .expect("Goal turn should preserve safeguard attribution");
+
+        assert_eq!(
+            outcome.response, "accepted response",
+            "the verifier and retained Goal transcript receive the exact candidate"
+        );
+
+        let mut presented = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                presented.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            presented.matches("Safety safeguards").count(),
+            1,
+            "Goal presentation must relay the same one safeguard notice as an ordinary turn"
+        );
+        assert!(presented.contains("requested-model") && presented.contains("served-model"));
+        assert!(!presented.contains("private-category"));
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|message| !message.content.contains("Safety safeguards")),
+            "presentation-only safeguard information must not become Goal working context"
         );
     }
 

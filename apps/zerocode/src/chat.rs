@@ -84,6 +84,7 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         }
         GoalResponse::NoCurrentGoal => ("zc-goal-no-current", None),
         GoalResponse::AlreadyActive => ("zc-goal-already-active", None),
+        GoalResponse::ResponseRequiresPause => ("zc-goal-response-requires-pause", None),
         GoalResponse::Terminal(projection) => ("zc-goal-terminal", Some(projection)),
         GoalResponse::Stale => ("zc-goal-stale", None),
     };
@@ -93,6 +94,18 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         message.push_str(&goal_projection_message(projection));
     }
     message
+}
+
+/// Keep operator-actionable Goal command failures aligned with the Matrix
+/// surface without exposing arbitrary daemon diagnostics to the chat.
+fn goal_command_error_message(error: &str) -> String {
+    if error.contains("required cost tracker storage path differs from the resident tracker") {
+        crate::i18n::t("zc-goal-command-accounting-storage")
+    } else if error.contains("Goal control plane is unavailable") {
+        crate::i18n::t("zc-goal-command-control-plane-unavailable")
+    } else {
+        crate::i18n::t("zc-goal-command-failed")
+    }
 }
 
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
@@ -137,6 +150,9 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             }
             "goal_tool_pairing_incomplete" => {
                 crate::i18n::t("zc-goal-terminal-reason-tool-pairing-incomplete")
+            }
+            "goal_tool_loop_safety_limit" => {
+                crate::i18n::t("zc-goal-terminal-reason-tool-loop-safety-limit")
             }
             "policy_revoked" => crate::i18n::t("zc-goal-terminal-reason-policy-revoked"),
             "session_disposed" => crate::i18n::t("zc-goal-terminal-reason-session-disposed"),
@@ -201,9 +217,12 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
 /// Reject ambiguous or malformed notifications instead of treating an
 /// arbitrary object member as an update chosen by the daemon.
 enum GoalUpdate<'a> {
-    VerifiedCandidate {
+    Acknowledged {
         session_id: &'a str,
-        candidate: &'a str,
+        response: Box<crate::wire::GoalResponse>,
+    },
+    ParentTurnFinished {
+        session_id: &'a str,
     },
     Completed {
         session_id: &'a str,
@@ -214,6 +233,8 @@ enum GoalUpdate<'a> {
     },
     Failed {
         session_id: &'a str,
+        terminal_reason: Option<&'a str>,
+        terminal_provider: Option<&'a str>,
     },
 }
 
@@ -226,10 +247,11 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
     let payload = payload.as_object()?;
     let session_id = payload.get("session_id")?.as_str()?;
     match kind.as_str() {
-        "verified_candidate" => Some(GoalUpdate::VerifiedCandidate {
+        "acknowledged" => Some(GoalUpdate::Acknowledged {
             session_id,
-            candidate: payload.get("candidate")?.as_str()?,
+            response: Box::new(serde_json::from_value(payload.get("response")?.clone()).ok()?),
         }),
+        "parent_turn_finished" => Some(GoalUpdate::ParentTurnFinished { session_id }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
             session_id,
@@ -242,7 +264,15 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
                 None => Vec::new(),
             },
         }),
-        "failed" => Some(GoalUpdate::Failed { session_id }),
+        "failed" => Some(GoalUpdate::Failed {
+            session_id,
+            terminal_reason: payload
+                .get("terminal_reason")
+                .and_then(serde_json::Value::as_str),
+            terminal_provider: payload
+                .get("terminal_provider")
+                .and_then(serde_json::Value::as_str),
+        }),
         _ => None,
     }
 }
@@ -2323,22 +2353,34 @@ impl Chat {
                         continue;
                     };
                     let session_id = match &update {
-                        GoalUpdate::VerifiedCandidate { session_id, .. }
+                        GoalUpdate::Acknowledged { session_id, .. }
+                        | GoalUpdate::ParentTurnFinished { session_id }
                         | GoalUpdate::Completed { session_id }
                         | GoalUpdate::PausedForBlocker { session_id, .. }
-                        | GoalUpdate::Failed { session_id } => session_id,
+                        | GoalUpdate::Failed { session_id, .. } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
                     };
                     match update {
-                        GoalUpdate::VerifiedCandidate { candidate, .. } => {
+                        GoalUpdate::Acknowledged { response, .. } => {
+                            // A resident Goal may still be relaying ordinary
+                            // agent events while a read-only command is
+                            // handled. Never let its control reply overtake
+                            // text that was already emitted by the agent.
+                            state.finish_goal_agent_presentation();
                             state
                                 .entries
-                                .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    goal_response_message(&response),
+                                )));
                             state.mark_dirty_append();
                         }
+                        GoalUpdate::ParentTurnFinished { .. } => {
+                            state.finish_goal_agent_presentation();
+                        }
                         GoalUpdate::Completed { .. } => {
+                            state.finish_goal_agent_presentation();
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -2349,6 +2391,9 @@ impl Chat {
                         GoalUpdate::PausedForBlocker {
                             blocker_messages, ..
                         } => {
+                            // Preserve the ordinary agent question or report
+                            // before the Goal lifecycle notice that reacts to it.
+                            state.finish_goal_agent_presentation();
                             let mut message = crate::i18n::t("zc-goal-paused-blocked");
                             if !blocker_messages.is_empty() {
                                 message.push('\n');
@@ -2379,12 +2424,72 @@ impl Chat {
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
                             state.mark_dirty_append();
                         }
-                        GoalUpdate::Failed { .. } => {
+                        GoalUpdate::Failed {
+                            terminal_reason,
+                            terminal_provider,
+                            ..
+                        } => {
+                            state.finish_goal_agent_presentation();
+                            let mut message = crate::i18n::t("zc-goal-failed");
+                            let reason = terminal_reason.map(|reason| match reason {
+                                "verified_completion" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-verified-completion")
+                                }
+                                "accounting_outcome_unknown" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-accounting-outcome-unknown",
+                                ),
+                                "accounting_missing_or_invalid" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-accounting-missing-or-invalid",
+                                ),
+                                "pricing_unavailable" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-pricing-unavailable")
+                                }
+                                "candidate_empty" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-candidate-empty")
+                                }
+                                "parent_operation_failed" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-parent-operation-failed",
+                                ),
+                                "verifier_operation_failed" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-verifier-operation-failed",
+                                ),
+                                "verifier_protocol_invalid" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-verifier-protocol-invalid",
+                                ),
+                                "executor_failed" | "executor_start_failed" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-executor-failed")
+                                }
+                                "goal_tool_pairing_incomplete" => crate::i18n::t(
+                                    "zc-goal-terminal-reason-tool-pairing-incomplete",
+                                ),
+                                "goal_tool_loop_safety_limit" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-tool-loop-safety-limit")
+                                }
+                                "policy_revoked" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-policy-revoked")
+                                }
+                                "session_disposed" => {
+                                    crate::i18n::t("zc-goal-terminal-reason-session-disposed")
+                                }
+                                _ => crate::i18n::t("zc-goal-terminal-reason-unspecified"),
+                            });
+                            if let Some(reason) = reason {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-summary-reason",
+                                    &[("reason", &reason)],
+                                ));
+                            }
+                            if let Some(provider) = terminal_provider {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-summary-provider",
+                                    &[("provider", provider)],
+                                ));
+                            }
                             state
                                 .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-failed",
-                                ))));
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
                             state.mark_dirty_append();
                         }
                     }
@@ -2457,9 +2562,20 @@ impl Chat {
                 continue;
             };
             let message = match completion.result {
+                // A resident Start/Resume is rendered by the daemon's
+                // pre-launch acknowledgement. The RPC response follows that
+                // notification on the same transport, so showing it again
+                // would duplicate and can visually overtake agent events.
+                Ok(
+                    crate::wire::GoalResponse::Started(_) | crate::wire::GoalResponse::Resumed(_),
+                ) => continue,
                 Ok(response) => goal_response_message(&response),
-                Err(_) => crate::i18n::t("zc-goal-command-failed"),
+                Err(error) => goal_command_error_message(&error),
             };
+            // Read-only Goal commands can complete while a resident parent
+            // turn is still streaming. Preserve the ordinary event order
+            // before adding the command's control response.
+            state.finish_goal_agent_presentation();
             state
                 .entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
@@ -9428,6 +9544,19 @@ impl ChatState {
         }
     }
 
+    /// Goal execution uses the ordinary event stream without setting the
+    /// interactive prompt's `turn_in_flight` marker.  Its lifecycle notices
+    /// still need the exact same flush boundary as a normal terminal event so
+    /// they cannot overtake a streamed question or final report.
+    fn finish_goal_agent_presentation(&mut self) {
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
+        self.flush_streaming_thought();
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
+    }
+
     pub fn apply_update(&mut self, update: SessionUpdate) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
@@ -10702,6 +10831,24 @@ mod tests {
         assert!(
             goal_response_message(&crate::wire::GoalResponse::AlreadyCancelled(projection,))
                 .starts_with("🛑 Goal is already cancelled.")
+        );
+    }
+
+    #[test]
+    fn running_goal_response_rejection_is_explicit() {
+        assert_eq!(
+            goal_response_message(&crate::wire::GoalResponse::ResponseRequiresPause),
+            "⚠️ The Goal is still running, so your response was not applied. Wait until it pauses for user input, then run /goal resume RESPONSE."
+        );
+    }
+
+    #[test]
+    fn goal_command_error_classifies_a_conflicting_resident_ledger() {
+        assert_eq!(
+            goal_command_error_message(
+                "required cost tracker storage path differs from the resident tracker"
+            ),
+            "Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again."
         );
     }
 
@@ -21794,31 +21941,46 @@ mod tests {
     async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
-        let (notif_tx, notif_rx) = broadcast::channel(4);
+        let (notif_tx, notif_rx) = broadcast::channel(8);
         chat.notif_rx = notif_rx;
+
+        assert!(
+            parse_goal_update(&serde_json::json!({
+                "acknowledged": {
+                    "session_id": "sess-1",
+                    "response": { "kind": "help" }
+                }
+            }))
+            .is_some()
+        );
 
         for params in [
             serde_json::json!({
-                "verified_candidate": {
+                "acknowledged": {
                     "session_id": "sess-1",
-                    "candidate": "accepted result"
+                    "response": { "kind": "help" }
                 },
                 "completed": { "session_id": "sess-1" }
             }),
             serde_json::json!({
-                "verified_candidate": {
+                "acknowledged": {
                     "session_id": "other-session",
-                    "candidate": "must not be displayed"
+                    "response": { "kind": "help" }
                 }
             }),
             serde_json::json!({
-                "verified_candidate": {
+                "acknowledged": {
                     "session_id": "sess-1",
-                    "candidate": "accepted result"
+                    "response": { "kind": "help" }
                 }
             }),
             serde_json::json!({ "completed": { "session_id": "sess-1" } }),
-            serde_json::json!({ "failed": { "session_id": "sess-1" } }),
+            serde_json::json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "terminal_reason": "goal_tool_pairing_incomplete"
+                }
+            }),
         ] {
             notif_tx
                 .send(RpcNotification {
@@ -21833,14 +21995,199 @@ mod tests {
         let entries = active_state(&mut chat).entries();
         assert_eq!(entries.len(), 3);
         assert!(
-            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
+            matches!(&entries[0], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-help"))
         );
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
         );
+        assert!(matches!(&entries[2], ChatEntry::SystemMessage(text)
+                if text.as_ref() == "❌ Goal failed.\nReason: A tool operation did not settle cleanly, so the Goal stopped to avoid an unsafe retry."));
+    }
+
+    #[tokio::test]
+    async fn failed_goal_update_includes_the_safe_provider_profile() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "failed": {
+                        "session_id": "sess-1",
+                        "terminal_reason": "parent_operation_failed",
+                        "terminal_provider": "openai.default"
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        assert!(matches!(
+            &active_state(&mut chat).entries()[0],
+            ChatEntry::SystemMessage(text)
+                if text.as_ref()
+                    == "❌ Goal failed.\nReason: The agent's model operation failed before it produced a verified result.\nProvider: openai.default"
+        ));
+    }
+
+    #[tokio::test]
+    async fn goal_pause_flushes_the_ordinary_agent_question_first() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "Which target should I use?"
+                }),
+            })
+            .unwrap();
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": {
+                        "session_id": "sess-1",
+                        "blocker_messages": ["Choose the target."]
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
         assert!(
-            matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-failed"))
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "Which target should I use?")
         );
+        assert!(matches!(&entries[1], ChatEntry::SystemMessage(text) if text.starts_with("⏸")));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_turn_boundary_keeps_verifier_continued_responses_separate() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(8);
+        chat.notif_rx = notif_rx;
+
+        for params in [
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-1",
+                "text": "Need more work."
+            }),
+            serde_json::json!({
+                "parent_turn_finished": { "session_id": "sess-1" }
+            }),
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-1",
+                "text": "Done."
+            }),
+            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+        ] {
+            let method = if params.get("type").is_some() {
+                "session/update"
+            } else {
+                "session/goal_update"
+            };
+            notif_tx
+                .send(RpcNotification {
+                    method: method.to_owned(),
+                    params,
+                })
+                .unwrap();
+        }
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert!(
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "Need more work.")
+        );
+        assert!(matches!(&entries[1], ChatEntry::AgentMessage(text) if text.as_ref() == "Done."));
+        assert!(
+            matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_goal_rpc_reply_does_not_duplicate_its_acknowledgement() {
+        let mut chat = active_chat();
+        chat.goal_completion_tx
+            .try_send(GoalCompletion {
+                session_id: "sess-1".to_owned(),
+                result: Ok(crate::wire::GoalResponse::Started(
+                    crate::wire::GoalStatusProjection {
+                        task_id: "goal-1".to_owned(),
+                        status: "running".to_owned(),
+                        execution_epoch: 1,
+                        token_limit: None,
+                        cost_limit_usd: None,
+                        accounting_state: "complete".to_owned(),
+                        pause_reason: None,
+                        terminal_reason: None,
+                        terminal_provider: None,
+                        pause_description: None,
+                        blocker_messages: Vec::new(),
+                        resumable: false,
+                    },
+                )),
+            })
+            .unwrap();
+
+        chat.drain_goal_completions();
+
+        assert!(
+            active_state(&mut chat).entries().is_empty(),
+            "the pre-launch acknowledgement is the sole Started presentation"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_control_reply_never_overtakes_streamed_agent_text() {
+        let mut chat = active_chat();
+        active_state(&mut chat).streaming_text = "The agent's earlier report.".to_owned();
+        chat.goal_completion_tx
+            .try_send(GoalCompletion {
+                session_id: "sess-1".to_owned(),
+                result: Ok(crate::wire::GoalResponse::Status(
+                    crate::wire::GoalStatusProjection {
+                        task_id: "goal-1".to_owned(),
+                        status: "running".to_owned(),
+                        execution_epoch: 1,
+                        token_limit: None,
+                        cost_limit_usd: None,
+                        accounting_state: "complete".to_owned(),
+                        pause_reason: None,
+                        terminal_reason: None,
+                        terminal_provider: None,
+                        pause_description: None,
+                        blocker_messages: Vec::new(),
+                        resumable: false,
+                    },
+                )),
+            })
+            .unwrap();
+
+        chat.drain_goal_completions();
+
+        let entries = active_state(&mut chat).entries();
+        assert!(matches!(
+            &entries[0],
+            ChatEntry::AgentMessage(text) if text.as_ref() == "The agent's earlier report."
+        ));
+        assert!(matches!(
+            &entries[1],
+            ChatEntry::SystemMessage(text) if text.starts_with("ℹ️ Goal status is available.")
+        ));
     }
 
     #[tokio::test]

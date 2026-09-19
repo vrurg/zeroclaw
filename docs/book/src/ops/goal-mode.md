@@ -111,14 +111,38 @@ blockers. Provider, protocol, attribution, malformed-output, and verifier
 failures fail the Goal rather than becoming a semantic blocker.
 
 A verifier-blocked Goal names its blocker in the pause notification and releases
-the session's foreground slot. Reply with `/goal resume RESPONSE` to give the
-fresh Goal executor the information it requested; `RESPONSE` may span multiple
-lines. The reply is transient prompt data for that resumed epoch: it is not
-persisted in the Goal record or canonical session history. A bare `/goal resume`
-remains valid when the external blocker has been resolved without a reply. Do
-not immediately resume an unchanged session: it is likely to repeat the same
-blocked assessment. Responses use the same 4096-character safety limit as the
-success criterion.
+the session's foreground slot. To prevent an ordinary progress report from
+being mistaken for a request for human intervention, the verifier can accept a
+block only when the candidate visibly ends with this exact certificate:
+
+```text
+## Goal blocker
+Kind: needs_user_input|human_escalation|external_dependency
+Action: one concrete action or answer needed
+```
+
+While the resident Goal supervisor remains available, it retains the in-process
+working transcript, including that final question or blocker report. Reply with
+`/goal resume RESPONSE` to add the requested information as the next user
+message; `RESPONSE` may span multiple lines. A bare `/goal resume` keeps that
+transcript after an externally resolved blocker. When a Goal is already
+running, `/goal resume` does not fence, drain, or restart its current agentic
+loop. A submitted response is explicitly rejected rather than silently applied
+to the in-flight turn; wait for a user-input pause before resubmitting it. This
+transient continuity is
+neither persisted in the Goal record nor canonical session history, so restart,
+disposal, or loss of the resident supervisor begins a fresh executor. Responses
+use the same 4096-character safety limit as the success criterion.
+
+Goal Mode does not replace the session's normal agent presentation path. Every
+parent-turn event that the owning surface would normally present remains on that
+same surface with Goal Mode active: configured streaming, drafts, reasoning,
+tool progress, and the final agent response. The Goal controller adds separate
+lifecycle notices, but it neither hides nor rewrites ordinary agent events. On
+Matrix, a `Goal started` or `Goal resumed` notice is delivered before the
+corresponding parent turn begins. A pause notice necessarily follows the
+candidate that caused the verifier to block: on streaming channels that
+candidate may already be visible while the verifier evaluates it.
 
 `/goal pause` first durably fences the Goal as paused, then waits for an
 already-admitted operation to settle before returning. `/goal resume [RESPONSE]`

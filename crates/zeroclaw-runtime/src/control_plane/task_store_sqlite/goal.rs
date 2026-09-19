@@ -7,7 +7,8 @@ use std::collections::HashSet;
 use crate::control_plane::authority::is_authoritative;
 use crate::control_plane::goal_task::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalPolicyTarget,
-    GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
+    GoalTaskRecord, GoalTaskRegistry, GoalToolBatchFailureReason, GoalTransitionResult,
+    TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -1465,6 +1466,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         expected_epoch: i64,
         admitted_epoch: i64,
         batch_id: &str,
+        failure_reason: GoalToolBatchFailureReason,
     ) -> Result<GoalTransitionResult> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -1494,8 +1496,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         }
         let failed = tx.execute(
             "UPDATE tasks
-                SET status = 'failed', error = 'goal_tool_pairing_incomplete',
-                    finished_at = COALESCE(finished_at, ?4),
+                SET status = 'failed', error = ?4,
+                    finished_at = COALESCE(finished_at, ?5),
                     execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
@@ -1505,6 +1507,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 task_id,
                 session_id,
                 expected_epoch,
+                failure_reason.durable_reason(),
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;

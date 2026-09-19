@@ -16,8 +16,8 @@ pub use global::control_plane;
 pub(crate) use global::{init_control_plane, spawn_control_plane_reaper};
 pub use goal_task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalPolicyTarget, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
-    TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
+    GoalPolicyTarget, GoalTaskRecord, GoalTaskRegistry, GoalToolBatchFailureReason,
+    GoalTransitionResult, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
 };
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;

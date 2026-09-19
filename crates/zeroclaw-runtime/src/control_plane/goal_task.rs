@@ -68,6 +68,25 @@ impl Default for GoalTaskRecord {
     }
 }
 
+/// Safe, durable classification for why an admitted tool batch could not be
+/// paired with its session-history results. This stays deliberately smaller
+/// than arbitrary runtime errors: task storage must not persist or surface a
+/// provider/tool payload while it closes the non-resumable fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalToolBatchFailureReason {
+    PairingIncomplete,
+    LoopSafetyLimit,
+}
+
+impl GoalToolBatchFailureReason {
+    pub const fn durable_reason(self) -> &'static str {
+        match self {
+            Self::PairingIncomplete => "goal_tool_pairing_incomplete",
+            Self::LoopSafetyLimit => "goal_tool_loop_safety_limit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalAccountingState {
@@ -484,6 +503,7 @@ pub trait GoalTaskRegistry: Send + Sync {
         _expected_epoch: i64,
         _admitted_epoch: i64,
         _batch_id: &str,
+        _failure_reason: GoalToolBatchFailureReason,
     ) -> anyhow::Result<GoalTransitionResult> {
         anyhow::bail!("goal registry does not support durable tool pairing")
     }

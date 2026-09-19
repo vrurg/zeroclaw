@@ -28,6 +28,7 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
+use zeroclaw_commands::goal::parse_goal_command;
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
@@ -91,6 +92,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionGoal,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -215,6 +217,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionGoal, "session/goal"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -918,6 +921,7 @@ impl RpcDispatcher {
                 self.prompt_tasks.push(task);
                 return;
             }
+            Method::SessionGoal => self.handle_session_goal(&req.params).await,
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
@@ -3114,6 +3118,37 @@ impl RpcDispatcher {
                 let _ = self.rpc.send_raw(s).await;
             }
         }
+    }
+
+    /// Run a typed Goal control command against an existing owned Chat session.
+    /// The command parser deliberately sees only user text; the driver derives
+    /// all authority facts from the live server-side session snapshot.
+    async fn handle_session_goal(&self, params: &Value) -> RpcResult {
+        let req: SessionGoalParams = parse_params(params)?;
+        let command = parse_goal_command(&req.command)
+            .map_err(|_| rpc_err(INVALID_PARAMS, "Invalid Goal command"))?;
+        let tui_id = self
+            .tui_id
+            .clone()
+            .ok_or_else(|| rpc_err(AUTH_REQUIRED, "Goal commands require an initialized client"))?;
+        let driver = Arc::new(
+            crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
+                Arc::clone(&self.ctx),
+                Arc::clone(&self.rpc),
+                self.connection_activity.clone(),
+                req.session_id,
+                tui_id,
+            )
+            .await
+            .map_err(|error| rpc_err(SESSION_NOT_FOUND, error.to_string()))?,
+        );
+        let response = self
+            .ctx
+            .goal_runtime
+            .submit(Arc::clone(&self.ctx), driver, command)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        to_result(SessionGoalResult { response })
     }
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
@@ -6285,7 +6320,10 @@ fn truncate_memory_previews(
 /// model-window helper here is wrong: that path ignores the runtime profile
 /// and falls back to 32_000 when `providers.models.*.context_window` is unset,
 /// so the meter freezes at the default even when the profile is set higher.
-fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
+pub(crate) fn context_usage_max_tokens(
+    cfg: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> u64 {
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
@@ -6366,7 +6404,11 @@ fn plan_replay_notification(
     notification_for_turn_event(session_id, &event, None)
 }
 
-fn notification_for_turn_event(
+/// Render the ordinary ZeroCode presentation for one agent event.
+///
+/// Goal-owned turns use this same mapping so enabling Goal Mode does not
+/// create a second representation protocol.
+pub(crate) fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
     max_context_tokens: Option<u64>,
@@ -8801,6 +8843,35 @@ mod tests {
     #[test]
     fn method_from_wire_unknown() {
         assert_eq!(Method::from_wire("nonexistent/method"), None);
+    }
+
+    #[tokio::test]
+    async fn session_goal_is_dispatched_instead_of_rejected_as_an_unknown_method() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            1,
+            Arc::new(SessionActorQueue::new(1, 1, 1)),
+        ));
+        let context = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut dispatcher = RpcDispatcher::new(context, tx, "test-goal-dispatch".to_owned());
+        dispatcher.authenticated = true;
+
+        dispatcher
+            .process_line_for_test(
+                r#"{"jsonrpc":"2.0","id":1,"method":"session/goal","params":{}}"#,
+            )
+            .await;
+
+        let reply: serde_json::Value = serde_json::from_str(
+            &rx.recv()
+                .await
+                .expect("Goal dispatch should return an RPC error response"),
+        )
+        .expect("Goal dispatch reply should be JSON");
+        assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+        assert_ne!(reply["error"]["code"], METHOD_NOT_FOUND);
     }
 
     #[test]

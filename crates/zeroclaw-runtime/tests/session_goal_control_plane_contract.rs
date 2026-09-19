@@ -7,7 +7,8 @@ use rusqlite::{Connection, ErrorCode, params};
 use zeroclaw_runtime::control_plane::task_registry::TerminalSettlementIntent;
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    GoalToolBatchFailureReason, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord,
+    TaskRegistry, TaskStatus,
 };
 
 fn insert_current_goal(
@@ -515,6 +516,7 @@ async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
                 2,
                 1,
                 "unpaired-batch",
+                GoalToolBatchFailureReason::PairingIncomplete,
             )
             .await
             .expect("fail atomically instead of reopening the Goal"),

@@ -8,11 +8,15 @@ use std::{
     sync::{Arc, Mutex, atomic::Ordering},
 };
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Error, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
     channel::{Channel, ChannelMessage},
     model_provider::{ChatMessage, ChatRequest},
+};
+use zeroclaw_providers::{
+    reliable::{scope_provider_fallback, take_last_provider_fallback},
+    scope_safeguard_fallback, take_last_safeguard_fallback,
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
@@ -122,15 +126,15 @@ pub(super) async fn submit_matrix_goal(
     history_key: String,
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
-) -> Result<zeroclaw_runtime::goal_mode::GoalResponse> {
+) -> Result<(zeroclaw_runtime::goal_mode::GoalResponse, bool)> {
     // Help is local grammar. It must not require Matrix driver validation,
     // runtime configuration, or a live control plane.
     if matches!(command, zeroclaw_commands::goal::GoalCommand::Help) {
-        return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Help);
+        return Ok((zeroclaw_runtime::goal_mode::GoalResponse::Help, false));
     }
     let defaults = runtime_defaults_snapshot(context.as_ref());
     if !defaults.config.goal.enabled {
-        return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Disabled);
+        return Ok((zeroclaw_runtime::goal_mode::GoalResponse::Disabled, false));
     }
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
@@ -148,7 +152,7 @@ pub(super) async fn submit_matrix_goal(
         history_key.clone(),
         original.sender.clone(),
         route.clone(),
-        original,
+        original.clone(),
         command_lease,
     )?);
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
@@ -211,23 +215,63 @@ pub(super) async fn submit_matrix_goal(
             raw_mxid: driver.raw_mxid.clone(),
         },
     )?;
+    let initial_notice = original;
+    let initial_context = Arc::clone(&context);
     let submission = supervisor
-        .submit(settings, ingress, driver, command)
+        .submit_with_before_launch(settings, ingress, driver, command, move |response| {
+            let message = initial_notice.clone();
+            let context = Arc::clone(&initial_context);
+            let rendered = super::render_goal_response(response);
+            async move {
+                let channel = find_channel_for_message(&context.channels_by_name, &message)
+                    .context("Matrix Goal channel is no longer available")?;
+                channel
+                    .send(&zeroclaw_api::channel::SendMessage::reply_to(
+                        &message, rendered,
+                    ))
+                    .await
+                    .context("deliver Matrix Goal initial notice")
+            }
+        })
         .await?;
-    if matches!(
-        submission.response(),
-        zeroclaw_runtime::goal_mode::GoalResponse::Paused(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::AlreadyPaused(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::Cancelled(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::AlreadyCancelled(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::Terminal(_)
-    ) {
+    if submission.response().retires_resident_supervisor() {
         // Pause and cancellation drain the old worker before the supervisor
         // returns. Rebuilding on an explicit resume picks up live policy and
         // pricing instead of keeping a stale configuration snapshot.
         clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
     }
-    Ok(submission.into_response())
+    let response = submission.into_response();
+    let initial_notice_delivered = matches!(
+        response,
+        zeroclaw_runtime::goal_mode::GoalResponse::Started(_)
+            | zeroclaw_runtime::goal_mode::GoalResponse::Resumed(_)
+    );
+    Ok((response, initial_notice_delivered))
+}
+
+/// Render only stable, actionable command failures. The original error stays
+/// in structured logs; this surface must not turn arbitrary configuration or
+/// provider diagnostics into user-visible text.
+pub(super) fn render_matrix_goal_command_error(error: &Error) -> String {
+    if error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("required cost tracker storage path differs")
+    }) {
+        return zeroclaw_runtime::i18n::get_required_cli_string(
+            "goal-mode-command-accounting-storage",
+        );
+    }
+    if error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("Goal control plane is unavailable")
+    }) {
+        return zeroclaw_runtime::i18n::get_required_cli_string(
+            "goal-mode-command-control-plane-unavailable",
+        );
+    }
+    zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-command-failed")
 }
 
 /// Dispose a Matrix session's Goal before the channel resets its history.
@@ -462,6 +506,71 @@ fn goal_continue_history(
         max_system_prompt_chars,
     )?;
     history.push(goal_parent_execution_request());
+    Ok(history)
+}
+
+/// Refresh a retained verifier-blocked transcript for an explicit resume.
+/// Unlike an ordinary verifier `Continue`, a reply to the blocked candidate
+/// must follow it directly. A bare resume still needs the normal user-role
+/// execution request so every provider can accept the transcript.
+fn goal_resume_history(
+    system_prompt: String,
+    directive: ChatMessage,
+    mut history: Vec<ChatMessage>,
+    session_prompt_attachments: &str,
+    max_system_prompt_chars: usize,
+    append_execution_request: bool,
+) -> Result<Vec<ChatMessage>> {
+    let first = history
+        .first_mut()
+        .context("Goal resume lost its system prompt")?;
+    ensure!(first.role == "system", "Goal resume lost its system prompt");
+    *first = goal_parent_system_message_with_session_prompts(
+        system_prompt,
+        directive.content,
+        session_prompt_attachments,
+        max_system_prompt_chars,
+    )?;
+    if append_execution_request {
+        history.push(goal_parent_execution_request());
+    }
+    Ok(history)
+}
+
+/// Rebuild a resident Goal transcript for one Matrix parent turn.
+///
+/// The branch lives here rather than at the call site so the exact resume
+/// semantics (explicit reply versus bare resume) have a direct regression
+/// test. An explicit reply must remain the final user turn; a bare resume
+/// receives the normal user-role execution request.
+fn goal_continuation_history_for_parent_turn(
+    turn: GoalParentTurn,
+    system_prompt: String,
+    directive: ChatMessage,
+    session_prompt_attachments: &str,
+    max_system_prompt_chars: usize,
+) -> Result<Vec<ChatMessage>> {
+    let mut history = if turn.kind == GoalParentTurnKind::Resume {
+        goal_resume_history(
+            system_prompt,
+            directive,
+            turn.working_history,
+            session_prompt_attachments,
+            max_system_prompt_chars,
+            turn.resume_response.is_none(),
+        )?
+    } else {
+        goal_continue_history(
+            system_prompt,
+            directive,
+            turn.working_history,
+            session_prompt_attachments,
+            max_system_prompt_chars,
+        )?
+    };
+    if let Some(response) = turn.resume_response {
+        history.push(ChatMessage::user(response));
+    }
     Ok(history)
 }
 
@@ -949,29 +1058,24 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         )
         .await?;
         let directive = goal_parent_directive(&turn);
-        let mut history = match turn.kind {
-            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => self
+        let mut history = match turn.history_source {
+            zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical => self
                 .initial_working_history(
                     provider.as_ref(),
                     &route,
                     directive,
                     turn.working_history,
                 )?,
-            GoalParentTurnKind::Continue => goal_continue_history(
-                self.goal_system_prompt(provider.as_ref(), &route),
-                directive,
-                turn.working_history,
-                &self.session_prompt_attachments()?,
-                self.context.agent_cfg.resolved.max_system_prompt_chars,
-            )?,
+            zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation => {
+                goal_continuation_history_for_parent_turn(
+                    turn,
+                    self.goal_system_prompt(provider.as_ref(), &route),
+                    directive,
+                    &self.session_prompt_attachments()?,
+                    self.context.agent_cfg.resolved.max_system_prompt_chars,
+                )?
+            }
         };
-        if let Some(response) = turn.resume_response {
-            // A response to a Goal blocker is ordinary untrusted user input,
-            // not lifecycle authority. Keep it solely in this fresh working
-            // transcript: verified completion remains the only path that
-            // appends a candidate to canonical session history.
-            history.push(ChatMessage::user(response));
-        }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut loop_knobs = LoopKnobs::default();
         if super::matrix_single_message_streaming_enabled(self.context.as_ref(), &self.message) {
@@ -1045,10 +1149,22 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .scope(receipt_scope, tool_loop);
         let tool_loop =
             zeroclaw_runtime::tools::TURN_ROUTING.scope(Some(Arc::clone(&turn_routing)), tool_loop);
-        let candidate = scope_goal_parent_turn(scope_session_key(
-            Some(self.session_key.durable_id()),
-            async { scope_thread_id(Some(thread_message_id), tool_loop).await },
-        ))
+        // Mirror the normal Matrix turn's recovery scopes. The candidate stays
+        // exact for verifier input and canonical history; only the surface
+        // presentation receives the ordinary recovery footer.
+        let tool_loop = Box::pin(tool_loop);
+        let (candidate, provider_fallback, safeguard_fallback) = scope_safeguard_fallback(async {
+            let (candidate, provider_fallback) = scope_provider_fallback(async {
+                let candidate = scope_goal_parent_turn(scope_session_key(
+                    Some(self.session_key.durable_id()),
+                    async { scope_thread_id(Some(thread_message_id), tool_loop).await },
+                ))
+                .await;
+                (candidate, take_last_provider_fallback())
+            })
+            .await;
+            (candidate, provider_fallback, take_last_safeguard_fallback())
+        })
         .await;
         let candidate = match candidate {
             Ok(candidate) => {
@@ -1057,8 +1173,13 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                     .unwrap_or_else(|error| error.into_inner())
                     .last()
                     .cloned();
+                let presented = super::append_provider_fallback_footer(
+                    candidate.clone(),
+                    provider_fallback.as_ref(),
+                    safeguard_fallback.as_ref(),
+                );
                 self.parent_candidate_presented =
-                    presentation.finish(Some(&candidate), turn_route).await;
+                    presentation.finish(Some(&presented), turn_route).await;
                 candidate
             }
             Err(error) => {
@@ -1199,8 +1320,70 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
             }
             message
         }
-        GoalExecutionNotice::Failed => {
-            zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failed")
+        GoalExecutionNotice::Failed {
+            terminal_reason,
+            terminal_provider,
+        } => {
+            let mut message = zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failed");
+            let reason = match terminal_reason {
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::VerifiedCompletion => {
+                    "goal-mode-terminal-reason-verified-completion"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::AccountingOutcomeUnknown => {
+                    "goal-mode-terminal-reason-accounting-outcome-unknown"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::AccountingMissingOrInvalid => {
+                    "goal-mode-terminal-reason-accounting-missing-or-invalid"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::PricingUnavailable => {
+                    "goal-mode-terminal-reason-pricing-unavailable"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::CandidateEmpty => {
+                    "goal-mode-terminal-reason-candidate-empty"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentOperationFailed => {
+                    "goal-mode-terminal-reason-parent-operation-failed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::VerifierOperationFailed => {
+                    "goal-mode-terminal-reason-verifier-operation-failed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::VerifierProtocolInvalid => {
+                    "goal-mode-terminal-reason-verifier-protocol-invalid"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::ExecutorFailed
+                | zeroclaw_runtime::goal_mode::GoalTerminalReason::ExecutorStartFailed => {
+                    "goal-mode-terminal-reason-executor-failed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::GoalToolPairingIncomplete => {
+                    "goal-mode-terminal-reason-tool-pairing-incomplete"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::GoalToolLoopSafetyLimit => {
+                    "goal-mode-terminal-reason-tool-loop-safety-limit"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::PolicyRevoked => {
+                    "goal-mode-terminal-reason-policy-revoked"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::SessionDisposed => {
+                    "goal-mode-terminal-reason-session-disposed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::Unspecified => {
+                    "goal-mode-terminal-reason-unspecified"
+                }
+            };
+            let reason = zeroclaw_runtime::i18n::get_required_cli_string(reason);
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "goal-mode-summary-reason",
+                &[("reason", reason.as_str())],
+            ));
+            if let Some(provider) = terminal_provider.as_deref() {
+                message.push('\n');
+                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "goal-mode-summary-provider",
+                    &[("provider", provider)],
+                ));
+            }
+            message
         }
     }
 }
@@ -1316,6 +1499,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_notice_includes_the_safe_terminal_reason() {
+        let rendered = goal_notice_message(GoalExecutionNotice::Failed {
+            terminal_reason:
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::GoalToolPairingIncomplete,
+            terminal_provider: None,
+        });
+
+        assert_eq!(
+            rendered,
+            "❌ Goal failed.\n**Reason:** A tool operation did not settle cleanly, so the Goal stopped to avoid an unsafe retry."
+        );
+    }
+
+    #[test]
+    fn failed_notice_includes_the_safe_provider_profile() {
+        let rendered = goal_notice_message(GoalExecutionNotice::Failed {
+            terminal_reason: zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentOperationFailed,
+            terminal_provider: Some("openai.default".to_owned()),
+        });
+
+        assert_eq!(
+            rendered,
+            "❌ Goal failed.\n**Reason:** The agent's model operation failed before it produced a verified result.\n**Provider:** openai.default"
+        );
+    }
+
+    #[test]
+    fn command_error_classifies_a_conflicting_resident_ledger() {
+        let rendered = render_matrix_goal_command_error(&anyhow::anyhow!(
+            "required cost tracker storage path differs from the resident tracker"
+        ));
+
+        assert_eq!(
+            rendered,
+            "⚠️ Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again."
+        );
+    }
+
+    #[test]
     fn start_history_combines_goal_directive_into_the_system_prompt() {
         let history = goal_start_history(
             "system prompt".to_owned(),
@@ -1375,6 +1597,135 @@ mod tests {
     }
 
     #[test]
+    fn blocked_resume_replaces_the_system_head_without_inserting_a_new_request() {
+        let mut history = goal_resume_history(
+            "rebuilt system prompt".to_owned(),
+            ChatMessage::system("resume Goal directive"),
+            vec![
+                ChatMessage::system("old system prompt\n\nstart Goal directive"),
+                ChatMessage::user("original task"),
+                ChatMessage::assistant("What exact target should I change?"),
+            ],
+            "## Session Prompts\n- id: \"task\"; content: \"current task\"\n",
+            0,
+            false,
+        )
+        .expect("blocked resume with a live transcript should build");
+        history.push(ChatMessage::user("Change the authentication module."));
+
+        assert_eq!(history[0].role, "system");
+        assert!(history[0].content.contains("resume Goal directive"));
+        assert!(!history[0].content.contains("start Goal directive"));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history[history.len() - 2].content,
+            "What exact target should I change?"
+        );
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("Change the authentication module.")
+        );
+        assert!(history.iter().all(|message| {
+            !message
+                .content
+                .contains("Proceed with the Goal work under the trusted runtime directive.")
+        }));
+    }
+
+    #[test]
+    fn bare_blocked_resume_ends_in_the_execution_request() {
+        let history = goal_resume_history(
+            "rebuilt system prompt".to_owned(),
+            ChatMessage::system("resume Goal directive"),
+            vec![
+                ChatMessage::system("old system prompt"),
+                ChatMessage::user("original task"),
+                ChatMessage::assistant("What exact target should I change?"),
+            ],
+            "",
+            0,
+            true,
+        )
+        .expect("bare blocked resume should build");
+
+        assert_eq!(
+            history.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("Proceed with the Goal work under the trusted runtime directive.")
+        );
+    }
+
+    #[test]
+    fn matrix_continuation_dispatch_preserves_each_resume_tail() {
+        let retained = || {
+            vec![
+                ChatMessage::system("old Goal system prompt"),
+                ChatMessage::user("original task"),
+                ChatMessage::assistant("Which module should I change?"),
+            ]
+        };
+        let rebuild = |turn| {
+            goal_continuation_history_for_parent_turn(
+                turn,
+                "rebuilt system prompt".to_owned(),
+                ChatMessage::system("resume Goal directive"),
+                "",
+                0,
+            )
+            .expect("Matrix continuation dispatch should build")
+        };
+
+        let with_reply = rebuild(GoalParentTurn {
+            kind: GoalParentTurnKind::Resume,
+            objective: "finish the task".to_owned(),
+            resume_response: Some("Use the authentication module.".to_owned()),
+            history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
+            working_history: retained(),
+        });
+        assert_eq!(
+            with_reply.last().map(|message| message.content.as_str()),
+            Some("Use the authentication module.")
+        );
+
+        let bare = rebuild(GoalParentTurn {
+            kind: GoalParentTurnKind::Resume,
+            objective: "finish the task".to_owned(),
+            resume_response: None,
+            history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
+            working_history: retained(),
+        });
+        assert_eq!(
+            bare.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            bare.last().map(|message| message.content.as_str()),
+            Some("Proceed with the Goal work under the trusted runtime directive.")
+        );
+
+        let continued = rebuild(GoalParentTurn {
+            kind: GoalParentTurnKind::Continue,
+            objective: "finish the task".to_owned(),
+            resume_response: None,
+            history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
+            working_history: retained(),
+        });
+        assert_eq!(
+            continued.last().map(|message| message.content.as_str()),
+            Some("Proceed with the Goal work under the trusted runtime directive.")
+        );
+    }
+
+    #[test]
     fn continuation_rejects_a_transcript_without_a_system_prompt() {
         let error = goal_continue_history(
             "rebuilt system prompt".to_owned(),
@@ -1422,6 +1773,65 @@ mod tests {
         ] if status == "🤔 Thinking..."
             && reason == "configured reasoning"
             && text == "unverified candidate"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_relay_preserves_representative_typed_stream_events() {
+        use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
+
+        let (source_tx, source_rx) = tokio::sync::mpsc::channel(8);
+        let (visible_tx, mut visible_rx) = tokio::sync::mpsc::channel(8);
+        let relay = zeroclaw_spawn::spawn!(relay_goal_parent_events(source_rx, visible_tx));
+        source_tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
+            .await
+            .unwrap();
+        source_tx
+            .send(StreamDelta::ToolStart {
+                tool: "file_read".to_owned(),
+                arguments: Arc::new(serde_json::json!({"path": "README.md"})),
+                tool_provenance: None,
+            })
+            .await
+            .unwrap();
+        source_tx
+            .send(StreamDelta::ToolComplete {
+                tool: "file_read".to_owned(),
+                arguments: Arc::new(serde_json::json!({"path": "README.md"})),
+                tool_provenance: None,
+                secs: 2,
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        drop(source_tx);
+        relay.await.unwrap();
+
+        assert!(matches!(
+            visible_rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::Received))
+        ));
+        assert!(matches!(
+            visible_rx.recv().await,
+            Some(StreamDelta::ToolStart {
+                tool,
+                arguments,
+                tool_provenance: None,
+            }) if tool == "file_read" && arguments["path"] == "README.md"
+        ));
+        assert!(matches!(
+            visible_rx.recv().await,
+            Some(StreamDelta::ToolComplete {
+                tool,
+                arguments,
+                tool_provenance: None,
+                secs: 2,
+                success: true,
+                error: None,
+            }) if tool == "file_read" && arguments["path"] == "README.md"
+        ));
+        assert!(visible_rx.recv().await.is_none());
     }
 
     #[tokio::test]

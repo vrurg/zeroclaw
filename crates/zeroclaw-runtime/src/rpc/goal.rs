@@ -9,21 +9,21 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use zeroclaw_api::{
     jsonrpc::RpcOutbound,
     model_provider::{ChatMessage, ChatRequest},
 };
 
 use crate::{
-    agent::agent::{Agent, IsolatedTranscriptSource, build_session_model_provider},
+    agent::agent::{Agent, IsolatedTranscriptSource, TurnEvent, build_session_model_provider},
     agent::cost::build_type_level_model_provider_pricing,
     control_plane::control_plane,
     cost::CostTracker,
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-        GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
-        GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+        GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnResult,
+        GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
         GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
         dispose_unowned_session_goal,
     },
@@ -200,6 +200,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             outbound: Arc::clone(&self.outbound),
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
+            agent_alias: self.agent_alias.clone(),
         }))
     }
 }
@@ -211,6 +212,7 @@ struct ZeroCodeGoalExecutionLease {
     outbound: Arc<RpcOutbound>,
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
+    agent_alias: String,
 }
 
 impl ZeroCodeGoalExecutionLease {
@@ -263,22 +265,35 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     ) -> Result<GoalParentTurnResult> {
         self.refresh_session_prompt_attachments().await?;
         let directive = crate::goal_mode::goal_parent_directive(&turn);
-        let source = match turn.kind {
-            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
-                IsolatedTranscriptSource::Canonical {
-                    prefix: turn.working_history,
-                }
-            }
-            GoalParentTurnKind::Continue => {
-                IsolatedTranscriptSource::Continuation(turn.working_history)
-            }
+        let source = isolated_source_for_goal_turn(turn);
+        let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
+        let event_outbound = Arc::clone(&self.outbound);
+        let event_session_id = self.raw_session_id()?.to_owned();
+        let event_max_context_tokens = {
+            let config = self.context.config.read();
+            crate::rpc::dispatch::context_usage_max_tokens(&config, &self.agent_alias)
         };
+        let event_relay = zeroclaw_spawn::spawn!(async move {
+            while let Some(event) = event_rx.recv().await {
+                forward_zerocode_goal_event(
+                    &event_outbound,
+                    &event_session_id,
+                    event_max_context_tokens,
+                    event,
+                )
+                .await;
+            }
+        });
         let outcome = self
             .agent
             .lock()
             .await
-            .run_isolated_turn(source, directive)
-            .await?;
+            .run_isolated_turn(source, directive, Some(event_tx))
+            .await;
+        event_relay
+            .await
+            .map_err(|error| anyhow::anyhow!("ZeroCode Goal event relay panicked: {error}"))?;
+        let outcome = outcome?;
         Ok(GoalParentTurnResult {
             candidate: outcome.response,
             working_history: outcome.working_history,
@@ -314,20 +329,26 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         response.text.context("Goal verifier returned no text")
     }
 
+    async fn finish_parent_turn_presentation(&mut self) -> Result<()> {
+        self.outbound
+            .notify(
+                GOAL_UPDATE_METHOD,
+                serde_json::to_value(crate::rpc::types::SessionGoalUpdate::ParentTurnFinished {
+                    session_id: self.raw_session_id()?.to_owned(),
+                })?,
+            )
+            .await;
+        Ok(())
+    }
+
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
         self.agent
             .lock()
             .await
             .seed_history(&[ChatMessage::assistant(&candidate)]);
-        self.outbound
-            .notify(
-                GOAL_UPDATE_METHOD,
-                serde_json::to_value(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
-                    session_id: self.raw_session_id()?.to_owned(),
-                    candidate,
-                })?,
-            )
-            .await;
+        // `run_parent_turn` has already forwarded the exact agent response via
+        // ordinary `session/update` events. Sending the candidate again through
+        // a Goal-specific notification would duplicate it for every RPC client.
         Ok(())
     }
 
@@ -342,14 +363,61 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     blocker_messages,
                 }
             }
-            GoalExecutionNotice::Failed => crate::rpc::types::SessionGoalUpdate::Failed {
+            GoalExecutionNotice::Failed {
+                terminal_reason,
+                terminal_provider,
+            } => crate::rpc::types::SessionGoalUpdate::Failed {
                 session_id: self.raw_session_id()?.to_owned(),
+                terminal_reason: Some(terminal_reason),
+                terminal_provider,
             },
         };
         self.outbound
             .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
             .await;
         Ok(())
+    }
+}
+
+/// Forward one Goal-owned agent event through ZeroCode's ordinary session
+/// presentation protocol. Lifecycle updates remain separate Goal metadata.
+async fn forward_zerocode_goal_event(
+    outbound: &RpcOutbound,
+    session_id: &str,
+    max_context_tokens: u64,
+    event: TurnEvent,
+) {
+    if let Some(notification) = crate::rpc::dispatch::notification_for_turn_event(
+        session_id,
+        &event,
+        Some(max_context_tokens),
+    ) {
+        let _ = outbound.send_raw(notification).await;
+    }
+}
+
+fn isolated_source_for_goal_turn(turn: GoalParentTurn) -> IsolatedTranscriptSource {
+    let mut working_history = turn.working_history;
+    match turn.history_source {
+        crate::goal_mode::GoalParentHistorySource::Canonical => {
+            IsolatedTranscriptSource::Canonical {
+                prefix: working_history,
+                trailing_user: turn.resume_response.map(ChatMessage::user),
+            }
+        }
+        crate::goal_mode::GoalParentHistorySource::Continuation => {
+            let append_execution_request = turn.resume_response.is_none();
+            if let Some(response) = turn.resume_response {
+                // The response is ordinary untrusted session input. Keeping it
+                // in the transient isolated transcript makes a resident resume
+                // continuous without adding it to canonical history.
+                working_history.push(ChatMessage::user(response));
+            }
+            IsolatedTranscriptSource::Continuation {
+                history: working_history,
+                append_execution_request,
+            }
+        }
     }
 }
 
@@ -451,17 +519,32 @@ impl RpcGoalRuntime {
                 tui_id: driver.tui_id.clone(),
             },
         )?;
+        let acknowledgement_outbound = Arc::clone(&driver.outbound);
+        let acknowledgement_session_id = session_id.clone();
         let submission = supervisor
-            .submit(settings, ingress, driver, command)
+            .submit_with_before_launch(settings, ingress, driver, command, move |response| {
+                let outbound = Arc::clone(&acknowledgement_outbound);
+                let session_id = acknowledgement_session_id.clone();
+                let response = response.clone();
+                async move {
+                    let update = crate::rpc::types::SessionGoalUpdate::Acknowledged {
+                        session_id,
+                        response,
+                    };
+                    let payload = serde_json::to_value(update)?;
+                    let notification = zeroclaw_api::jsonrpc::JsonRpcNotification::new(
+                        GOAL_UPDATE_METHOD,
+                        payload,
+                    );
+                    let encoded = serde_json::to_string(&notification)?;
+                    if !outbound.send_raw(encoded).await {
+                        bail!("ZeroCode Goal acknowledgement could not be delivered");
+                    }
+                    Ok(())
+                }
+            })
             .await?;
-        if matches!(
-            submission.response(),
-            GoalResponse::Paused(_)
-                | GoalResponse::AlreadyPaused(_)
-                | GoalResponse::Cancelled(_)
-                | GoalResponse::AlreadyCancelled(_)
-                | GoalResponse::Terminal(_)
-        ) {
+        if submission.response().retires_resident_supervisor() {
             self.remove_supervisor_if_current(&session_id, &supervisor)
                 .await;
         }
@@ -516,7 +599,92 @@ mod tests {
     use zeroclaw_infra::session_queue::SessionActorQueue;
 
     use super::*;
+    use crate::goal_mode::GoalParentTurnKind;
     use crate::rpc::session::SessionStore;
+
+    #[test]
+    fn retained_goal_resume_uses_the_isolated_continuation_source() {
+        let source = isolated_source_for_goal_turn(GoalParentTurn {
+            kind: GoalParentTurnKind::Resume,
+            objective: "finish the task".to_owned(),
+            resume_response: Some("use the authentication module".to_owned()),
+            history_source: crate::goal_mode::GoalParentHistorySource::Continuation,
+            working_history: vec![
+                ChatMessage::system("previous Goal system prompt"),
+                ChatMessage::assistant("Which module should I change?"),
+            ],
+        });
+
+        match source {
+            IsolatedTranscriptSource::Continuation {
+                history,
+                append_execution_request,
+            } => {
+                assert_eq!(history[0].role, "system");
+                assert_eq!(history[1].content, "Which module should I change?");
+                assert_eq!(history[2].role, "user");
+                assert_eq!(history[2].content, "use the authentication module");
+                assert!(!append_execution_request);
+            }
+            IsolatedTranscriptSource::Canonical { .. } => {
+                panic!("a retained Goal transcript must not be treated as canonical history")
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_goal_resume_places_the_response_after_the_execution_request() {
+        let source = isolated_source_for_goal_turn(GoalParentTurn {
+            kind: GoalParentTurnKind::Resume,
+            objective: "finish the task".to_owned(),
+            resume_response: Some("the blocker is resolved".to_owned()),
+            history_source: crate::goal_mode::GoalParentHistorySource::Canonical,
+            working_history: vec![ChatMessage::user("original task")],
+        });
+
+        match source {
+            IsolatedTranscriptSource::Canonical {
+                prefix,
+                trailing_user: Some(response),
+            } => {
+                assert_eq!(
+                    prefix.last().map(|message| message.content.as_str()),
+                    Some("original task")
+                );
+                assert_eq!(response.role, "user");
+                assert_eq!(response.content, "the blocker is resolved");
+            }
+            other => panic!("expected canonical recovery source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_event_uses_the_ordinary_zerocode_session_update_protocol() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(outbound_tx);
+
+        forward_zerocode_goal_event(
+            &outbound,
+            "goal-session",
+            128_000,
+            TurnEvent::Chunk {
+                delta: "agent-visible progress".to_owned(),
+            },
+        )
+        .await;
+
+        let notification: serde_json::Value = serde_json::from_str(
+            &outbound_rx
+                .recv()
+                .await
+                .expect("Goal event should reach the ordinary session surface"),
+        )
+        .expect("ordinary session notification should be JSON");
+        assert_eq!(notification["method"], "session/update");
+        assert_eq!(notification["params"]["type"], "agent_message_chunk");
+        assert_eq!(notification["params"]["session_id"], "goal-session");
+        assert_eq!(notification["params"]["text"], "agent-visible progress");
+    }
 
     #[tokio::test]
     async fn help_is_available_while_goal_mode_is_disabled() {

@@ -146,7 +146,9 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
-use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
+use self::goal_execution::{
+    dispose_matrix_goal, render_matrix_goal_command_error, submit_matrix_goal,
+};
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
@@ -687,6 +689,7 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
         }
         GoalResponse::NoCurrentGoal => ("goal-mode-no-current", None),
         GoalResponse::AlreadyActive => ("goal-mode-already-active", None),
+        GoalResponse::ResponseRequiresPause => ("goal-mode-response-requires-pause", None),
         GoalResponse::Terminal(projection) => ("goal-mode-terminal", Some(projection)),
         GoalResponse::Stale => ("goal-mode-stale", None),
     };
@@ -769,6 +772,9 @@ fn render_goal_projection(
             }
             GoalTerminalReason::GoalToolPairingIncomplete => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-tool-pairing-incomplete")
+            }
+            GoalTerminalReason::GoalToolLoopSafetyLimit => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-tool-loop-safety-limit")
             }
             GoalTerminalReason::PolicyRevoked => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-policy-revoked")
@@ -875,6 +881,14 @@ mod goal_response_render_tests {
         assert!(rendered.contains("**Accounting:** usage may be incomplete"));
         assert!(rendered.contains("**Provider:** openai.default"));
         assert!(!rendered.contains("outcome_unknown"));
+    }
+
+    #[test]
+    fn running_goal_rejects_a_response_without_claiming_it_was_delivered() {
+        assert_eq!(
+            render_goal_response(&GoalResponse::ResponseRequiresPause),
+            "⚠️ The Goal is still running, so your response was not applied. Wait until it pauses for user input, then run `/goal resume RESPONSE`."
+        );
     }
 }
 
@@ -7770,7 +7784,7 @@ async fn process_channel_message_body(
             Ok(command) => {
                 let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
                 let original = matrix_goal_message_snapshot(&msg);
-                let response = match submit_matrix_goal(
+                let (response, already_delivered) = match submit_matrix_goal(
                     Arc::clone(&ctx),
                     history_key,
                     original.clone(),
@@ -7778,7 +7792,9 @@ async fn process_channel_message_body(
                 )
                 .await
                 {
-                    Ok(response) => render_goal_response(&response),
+                    Ok((response, already_delivered)) => {
+                        (render_goal_response(&response), already_delivered)
+                    }
                     Err(error) => {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -7792,10 +7808,13 @@ async fn process_channel_message_body(
                             })),
                             "Goal command submission failed"
                         );
-                        channel_runtime_cli_string("goal-mode-command-failed")
+                        (render_matrix_goal_command_error(&error), false)
                     }
                 };
-                if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original) {
+                if !already_delivered
+                    && let Some(channel) =
+                        find_channel_for_message(&ctx.channels_by_name, &original)
+                {
                     let _ = channel
                         .send(&SendMessage::reply_to(&original, response))
                         .await;

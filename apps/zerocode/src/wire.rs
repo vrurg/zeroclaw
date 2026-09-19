@@ -41,6 +41,7 @@ pub enum GoalResponse {
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
     AlreadyActive,
+    ResponseRequiresPause,
     Terminal(GoalStatusProjection),
     Stale,
 }

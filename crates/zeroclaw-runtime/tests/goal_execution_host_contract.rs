@@ -22,9 +22,10 @@ use zeroclaw_runtime::control_plane::{
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionNotice, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
-    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalVerifierTurn,
+    GoalOperationScope, GoalParentHistorySource, GoalParentTurn, GoalParentTurnKind,
+    GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalTerminalReason,
+    GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -95,6 +96,7 @@ struct TranscriptExecutionLease {
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
     parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
+    parent_presentation_finishes: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -121,10 +123,24 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             .lock()
             .unwrap()
             .push(turn.resume_response.clone());
+        let candidate = if self.blocked {
+            format!(
+                "parent:{}\n\n## Goal blocker\nKind: needs_user_input\nAction: Provide the task packet reference.",
+                turn.objective
+            )
+        } else {
+            format!("parent:{}", turn.objective)
+        };
         Ok(GoalParentTurnResult {
-            candidate: format!("parent:{}", turn.objective),
+            candidate,
             working_history: turn.working_history,
         })
+    }
+
+    async fn finish_parent_turn_presentation(&mut self) -> anyhow::Result<()> {
+        self.parent_presentation_finishes
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn run_verifier(
@@ -168,6 +184,7 @@ struct TranscriptExecutionDriver {
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
     parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
+    parent_presentation_finishes: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -194,6 +211,7 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
             parent_resume_responses: Arc::clone(&self.parent_resume_responses),
+            parent_presentation_finishes: Arc::clone(&self.parent_presentation_finishes),
         }))
     }
 }
@@ -203,6 +221,7 @@ struct PausingExecutionLease {
     parent_started: Arc<Notify>,
     release_parent: Arc<Notify>,
     verifier_calls: Arc<AtomicUsize>,
+    initial_notice_seen: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -220,6 +239,10 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         _operation: &GoalOperationScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
+        assert!(
+            self.initial_notice_seen.load(Ordering::SeqCst),
+            "the transport acknowledgement must be delivered before a Goal parent turn starts"
+        );
         self.parent_started.notify_one();
         self.release_parent.notified().await;
         Ok(GoalParentTurnResult {
@@ -254,6 +277,7 @@ struct PausingExecutionDriver {
     parent_started: Arc<Notify>,
     release_parent: Arc<Notify>,
     verifier_calls: Arc<AtomicUsize>,
+    initial_notice_seen: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -276,6 +300,7 @@ impl GoalSessionDriver for PausingExecutionDriver {
             parent_started: Arc::clone(&self.parent_started),
             release_parent: Arc::clone(&self.release_parent),
             verifier_calls: Arc::clone(&self.verifier_calls),
+            initial_notice_seen: Arc::clone(&self.initial_notice_seen),
         }))
     }
 }
@@ -999,6 +1024,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                     kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
                     resume_response: None,
+                    history_source: GoalParentHistorySource::Canonical,
                     working_history: Vec::new(),
                 }
             )
@@ -1145,6 +1171,7 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
             kind: GoalParentTurnKind::Start,
             objective: "private stop condition".into(),
             resume_response: None,
+            history_source: GoalParentHistorySource::Canonical,
             working_history: Vec::new(),
         }
     );
@@ -2287,6 +2314,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let parent_resume_responses = Arc::new(Mutex::new(Vec::new()));
+    let parent_presentation_finishes = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::clone(&delivered),
@@ -2295,6 +2323,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
         parent_resume_responses: Arc::clone(&parent_resume_responses),
+        parent_presentation_finishes: Arc::clone(&parent_presentation_finishes),
     });
     let request = runtime
         .submit(
@@ -2332,6 +2361,11 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
     );
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        parent_presentation_finishes.load(Ordering::SeqCst),
+        2,
+        "each parent operation must finish presentation before a verifier continuation can start another one"
+    );
     {
         let histories = parent_histories.lock().unwrap();
         assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
@@ -2374,6 +2408,7 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
         parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let request = runtime
         .submit(
@@ -2446,6 +2481,7 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
         parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let blocked_request = runtime
         .submit(
@@ -2478,6 +2514,7 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
         parent_resume_responses: Arc::clone(&parent_resume_responses),
+        parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let resumed_request = runtime
         .submit(
@@ -2506,6 +2543,118 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         parent_resume_responses.lock().unwrap().as_slice(),
         &[Some(response), None]
     );
+}
+
+#[tokio::test]
+async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+    let blocked_driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        blocked: true,
+        notices: Arc::new(Mutex::new(Vec::new())),
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
+        parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
+    });
+    supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            blocked_driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let session_id = ingress.session_key().durable_id();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_some_and(|task| task.status == TaskStatus::Paused)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked worker must pause before resume");
+
+    let histories = Arc::new(Mutex::new(Vec::new()));
+    let turn_kinds = Arc::new(Mutex::new(Vec::new()));
+    let resume_responses = Arc::new(Mutex::new(Vec::new()));
+    let resumed_driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        blocked: false,
+        notices: Arc::new(Mutex::new(Vec::new())),
+        parent_histories: Arc::clone(&histories),
+        parent_turn_kinds: Arc::clone(&turn_kinds),
+        parent_resume_responses: Arc::clone(&resume_responses),
+        parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
+    });
+    let response = "The task packet is at docs/task.md.\n\nPlease continue.".to_owned();
+    let resumed = supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            resumed_driver,
+            GoalCommand::Resume {
+                response: Some(response.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(resumed.response(), GoalResponse::Resumed(_)));
+    let current = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .expect("resumed Goal must remain current");
+    let scope = GoalExecutionScope::new(current.id, session_id, current.execution_epoch).unwrap();
+    assert_eq!(
+        supervisor.drain(&scope).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(
+        turn_kinds.lock().unwrap().as_slice(),
+        &[GoalParentTurnKind::Resume, GoalParentTurnKind::Continue]
+    );
+    assert_eq!(
+        resume_responses.lock().unwrap().as_slice(),
+        &[Some(response), None]
+    );
+    assert!(histories.lock().unwrap()[0].iter().any(|message| {
+        message.role == "assistant"
+            && message.content
+                == "parent:finish the task\n\n## Goal blocker\nKind: needs_user_input\nAction: Provide the task packet reference."
+    }));
 }
 
 #[tokio::test]
@@ -2555,7 +2704,10 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
     assert!(error.to_string().contains("Goal parent operation failed"));
     assert_eq!(
         notices.lock().unwrap().as_slice(),
-        &[GoalExecutionNotice::Failed]
+        &[GoalExecutionNotice::Failed {
+            terminal_reason: GoalTerminalReason::ParentOperationFailed,
+            terminal_provider: None,
+        }]
     );
     assert_eq!(
         store
@@ -2577,6 +2729,130 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
 }
 
 #[tokio::test]
+async fn supervisor_delivers_the_initial_notice_before_starting_the_parent_turn() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let initial_notice_seen = Arc::new(AtomicBool::new(false));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
+        initial_notice_seen: Arc::clone(&initial_notice_seen),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+    let notice = Arc::clone(&initial_notice_seen);
+    let started = supervisor
+        .submit_with_before_launch(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+            move |_| {
+                let notice = Arc::clone(&notice);
+                async move {
+                    notice.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    parent_started.notified().await;
+    assert!(initial_notice_seen.load(Ordering::SeqCst));
+
+    let active_resume = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Resume { response: None },
+        )
+        .await
+        .expect("a bare resume must not disturb the resident Goal worker");
+    assert!(matches!(
+        active_resume.response(),
+        GoalResponse::AlreadyActive
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), release_parent.notified())
+            .await
+            .is_err(),
+        "a bare resume must not release, fence, or otherwise abort the active parent turn"
+    );
+
+    let active_response = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Resume {
+                response: Some("Please use the approved task packet.".to_owned()),
+            },
+        )
+        .await
+        .expect("a response cannot interrupt a resident Goal worker");
+    assert!(matches!(
+        active_response.response(),
+        GoalResponse::ResponseRequiresPause
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), release_parent.notified())
+            .await
+            .is_err(),
+        "a response must be rejected visibly, not injected into or used to abort the active parent turn"
+    );
+
+    let pausing = Arc::clone(&supervisor);
+    let pause_settings = settings;
+    let pause_ingress = ingress;
+    let pause_driver = driver;
+    let mut pause = zeroclaw_spawn::spawn!(async move {
+        pausing
+            .submit(
+                pause_settings,
+                pause_ingress,
+                pause_driver,
+                GoalCommand::Pause,
+            )
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(20), &mut pause)
+            .await
+            .is_err()
+    );
+    release_parent.notify_one();
+    assert!(matches!(
+        pause.await.unwrap().unwrap().response(),
+        GoalResponse::Paused(_)
+    ));
+}
+
+#[tokio::test]
 async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
@@ -2590,6 +2866,7 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
+        initial_notice_seen: Arc::new(AtomicBool::new(true)),
     });
     let directory = TempDir::new().unwrap();
     let tracker = Arc::new(
@@ -2669,6 +2946,7 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
+        initial_notice_seen: Arc::new(AtomicBool::new(true)),
     });
     let directory = TempDir::new().unwrap();
     let tracker = Arc::new(
@@ -2743,6 +3021,7 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::new(AtomicUsize::new(0)),
+        initial_notice_seen: Arc::new(AtomicBool::new(true)),
     });
     let directory = TempDir::new().unwrap();
     let tracker = Arc::new(

@@ -294,17 +294,36 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// Asynchronous Goal execution update. Goal work never emits ordinary
-    /// prompt chunks: only verified candidate and terminal lifecycle updates.
+    /// Asynchronous Goal lifecycle update. Goal-owned parent turns keep using
+    /// the ordinary `session/update` event stream; these notices only bracket
+    /// the lifecycle around that unmodified agent presentation.
     pub enum SessionGoalUpdate {
-        VerifiedCandidate { session_id: String, candidate: String },
+        /// Sent before a resident Goal worker is launched so the presentation
+        /// surface can render its lifecycle acknowledgement ahead of the
+        /// parent turn's ordinary agent events.
+        Acknowledged {
+            session_id: String,
+            response: crate::goal_mode::GoalResponse,
+        },
+        /// Presentation-only boundary after one ordinary Goal parent turn.
+        /// This is not a lifecycle decision; buffered clients use it to retain
+        /// the same per-turn rendering boundaries they have outside Goal Mode.
+        ParentTurnFinished { session_id: String },
         Completed { session_id: String },
         PausedForBlocker {
             session_id: String,
             #[serde(default)]
             blocker_messages: Vec<String>,
         },
-        Failed { session_id: String },
+        Failed {
+            session_id: String,
+            /// Stable, controller-derived error class. It is intentionally
+            /// distinct from the raw durable task diagnostic.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            terminal_reason: Option<crate::goal_mode::GoalTerminalReason>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            terminal_provider: Option<String>,
+        },
     }
 }
 
