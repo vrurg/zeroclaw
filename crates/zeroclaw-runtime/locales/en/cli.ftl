@@ -1355,6 +1355,7 @@ goal-mode-terminal-reason-parent-operation-failed = The agent's model operation 
 goal-mode-terminal-reason-verifier-operation-failed = The verification operation failed before it could decide whether the Goal was complete.
 goal-mode-terminal-reason-verifier-protocol-invalid = The verifier returned an invalid completion decision.
 goal-mode-terminal-reason-executor-failed = The Goal worker could not continue.
+goal-mode-terminal-reason-initial-notice-failed = The Goal could not deliver its initial status notice.
 goal-mode-terminal-reason-tool-pairing-incomplete = A tool operation did not settle cleanly, so the Goal stopped to avoid an unsafe retry.
 goal-mode-terminal-reason-tool-loop-safety-limit = The agent reached its tool-loop safety limit before the tool results could be paired. The Goal stopped to avoid an unsafe retry.
 goal-mode-terminal-reason-policy-revoked = Current policy no longer permits this Goal to run.

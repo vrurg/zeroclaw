@@ -770,6 +770,9 @@ fn render_goal_projection(
             GoalTerminalReason::ExecutorFailed | GoalTerminalReason::ExecutorStartFailed => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-executor-failed")
             }
+            GoalTerminalReason::InitialNoticeFailed => {
+                channel_runtime_cli_string("goal-mode-terminal-reason-initial-notice-failed")
+            }
             GoalTerminalReason::GoalToolPairingIncomplete => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-tool-pairing-incomplete")
             }

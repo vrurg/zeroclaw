@@ -268,6 +268,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let source = isolated_source_for_goal_turn(turn);
         let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
         let event_outbound = Arc::clone(&self.outbound);
+        let event_context = Arc::clone(&self.context);
         let event_session_id = self.raw_session_id()?.to_owned();
         let event_max_context_tokens = {
             let config = self.context.config.read();
@@ -276,6 +277,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let event_relay = zeroclaw_spawn::spawn!(async move {
             while let Some(event) = event_rx.recv().await {
                 forward_zerocode_goal_event(
+                    event_context.as_ref(),
                     &event_outbound,
                     &event_session_id,
                     event_max_context_tokens,
@@ -382,11 +384,17 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
 /// Forward one Goal-owned agent event through ZeroCode's ordinary session
 /// presentation protocol. Lifecycle updates remain separate Goal metadata.
 async fn forward_zerocode_goal_event(
+    context: &RpcContext,
     outbound: &RpcOutbound,
     session_id: &str,
     max_context_tokens: u64,
     event: TurnEvent,
 ) {
+    // The Goal driver only admits `Chat` sessions. ACP durable plan storage
+    // belongs exclusively to ACP sessions, so a daemon-wide ACP store must
+    // not cause a Goal event to attempt a write for this chat session.
+    crate::rpc::dispatch::persist_plan_if_any(context.sessions.as_ref(), None, session_id, &event)
+        .await;
     if let Some(notification) = crate::rpc::dispatch::notification_for_turn_event(
         session_id,
         &event,
@@ -660,10 +668,20 @@ mod tests {
 
     #[tokio::test]
     async fn goal_event_uses_the_ordinary_zerocode_session_update_protocol() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
         let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
         let outbound = RpcOutbound::new(outbound_tx);
+        let context = RpcContext::minimal(
+            Config::default(),
+            Arc::new(SessionStore::new(
+                1,
+                Arc::new(SessionActorQueue::new(1, 1, 1)),
+            )),
+        );
 
         forward_zerocode_goal_event(
+            context.as_ref(),
             &outbound,
             "goal-session",
             128_000,

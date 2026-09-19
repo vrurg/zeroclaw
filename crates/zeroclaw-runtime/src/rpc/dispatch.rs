@@ -14,8 +14,8 @@ use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -530,6 +530,11 @@ pub struct RpcDispatcher {
     /// one (direct dispatcher construction outside an accepted connection).
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
+    /// Completion receivers for Goal commands accepted on this connection,
+    /// keyed by their trusted session ID. A successor awaits its predecessor
+    /// before touching the session, preserving wire arrival order without
+    /// stalling the transport read loop behind a graceful Goal fence.
+    goal_command_tails: HashMap<String, oneshot::Receiver<()>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -561,6 +566,7 @@ impl RpcDispatcher {
             owns_connection: true,
             connection_activity: None,
             prompt_tasks: Vec::new(),
+            goal_command_tails: HashMap::new(),
             peer_cert_fingerprint: None,
         }
     }
@@ -639,8 +645,49 @@ impl RpcDispatcher {
             // until that task's future is dropped.
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
+            goal_command_tails: HashMap::new(),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
+    }
+
+    /// Reserve this connection's next Goal-command position for one session.
+    ///
+    /// A receiver waits only for the preceding wire request for the same
+    /// session. The caller must keep the returned sender until its command has
+    /// produced a response (or dropped), so a later command cannot overtake it
+    /// while the connection stays responsive to other sessions and methods.
+    fn queue_session_goal_command(
+        &mut self,
+        params: &Value,
+    ) -> (Option<oneshot::Receiver<()>>, Option<oneshot::Sender<()>>) {
+        let Some(session_id) = params
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .map(str::to_owned)
+        else {
+            // Invalid requests still run through the normal typed handler so
+            // they preserve its JSON-RPC error behavior; they simply have no
+            // trustworthy session key on which to serialize.
+            return (None, None);
+        };
+        let predecessor = self.goal_command_tails.remove(&session_id);
+        let (completion, tail) = oneshot::channel();
+        self.goal_command_tails.insert(session_id, tail);
+        (predecessor, Some(completion))
+    }
+
+    /// Discard completed Goal command lanes retained only to serialize a
+    /// successor. A completed receiver has no ordering value left; consuming it
+    /// here keeps long-lived client connections from retaining one map entry
+    /// for every historical session.
+    fn prune_completed_goal_command_tails(&mut self) {
+        self.goal_command_tails.retain(|_, tail| {
+            matches!(
+                tail.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        });
     }
 
     /// Cancel and join every prompt accepted by this connection generation.
@@ -792,6 +839,7 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
+        self.prune_completed_goal_command_tails();
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(e) => {
@@ -921,7 +969,49 @@ impl RpcDispatcher {
                 self.prompt_tasks.push(task);
                 return;
             }
-            Method::SessionGoal => self.handle_session_goal(&req.params).await,
+            Method::SessionGoal => {
+                // Goal pause and cancellation may wait for a currently
+                // admitted operation to settle. Keep the transport read loop
+                // available while that happens so the same client can still
+                // send a later cancel, state, or prompt request.
+                //
+                // The spawned tasks must nevertheless execute Goal commands
+                // in the wire order for each session. Queue only a completion
+                // dependency here, before either task can await session
+                // lookup or lifecycle locks; do not hold the read loop behind
+                // the potentially long Goal command itself.
+                let (predecessor, completion) = self.queue_session_goal_command(&req.params);
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    if let Some(predecessor) = predecessor {
+                        // A cancelled or panicked predecessor drops its
+                        // sender. That still releases this successor, which
+                        // then reports its own typed result instead of leaving
+                        // this session's command lane permanently wedged.
+                        let _ = predecessor.await;
+                    }
+                    let result = handle.handle_session_goal(&params_clone).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
+                            Err(error) => {
+                                handle
+                                    .send_error(id_clone, error.code, &error.message)
+                                    .await;
+                            }
+                        }
+                    }
+                    if let Some(completion) = completion {
+                        let _ = completion.send(());
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
@@ -6359,7 +6449,7 @@ async fn persist_acp_turn(
 /// `spawn_blocking`, since SQLite is synchronous). No-op for every
 /// other event. Durable-write failures are logged-and-swallowed: the
 /// in-memory cache is still authoritative for the live session.
-async fn persist_plan_if_any(
+pub(crate) async fn persist_plan_if_any(
     sessions: &crate::rpc::session::SessionStore,
     acp_store: Option<&std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
     session_id: &str,
@@ -9749,7 +9839,8 @@ mod tests {
             serde_json::json!([
                 {"id": "help", "name": "help"},
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
-                {"id": "model", "name": "model"}
+                {"id": "model", "name": "model"},
+                {"id": "goal", "name": "goal"}
             ])
         );
     }
@@ -15084,6 +15175,45 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
         dispatcher.authenticated = true;
         (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn session_goal_commands_preserve_wire_order_per_session() {
+        let (mut dispatcher, _rx) = make_bidi_test_dispatcher();
+        let params = serde_json::json!({ "session_id": "goal-session" });
+
+        let (first_predecessor, first_completion) = dispatcher.queue_session_goal_command(&params);
+        assert!(first_predecessor.is_none());
+
+        let (second_predecessor, second_completion) =
+            dispatcher.queue_session_goal_command(&params);
+        let mut second_predecessor = second_predecessor.expect("second command waits for first");
+        assert!(matches!(
+            second_predecessor.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        first_completion
+            .expect("first command completion sender")
+            .send(())
+            .expect("second command still waits");
+        assert_eq!(second_predecessor.await, Ok(()));
+
+        second_completion
+            .expect("second command completion sender")
+            .send(())
+            .expect("dispatcher retains the second lane until it prunes it");
+
+        dispatcher.prune_completed_goal_command_tails();
+        assert!(
+            dispatcher.goal_command_tails.is_empty(),
+            "a completed lane must not remain resident until the connection closes"
+        );
+
+        let (other_predecessor, other_completion) =
+            dispatcher.queue_session_goal_command(&serde_json::json!({ "session_id": "other" }));
+        assert!(other_predecessor.is_none());
+        drop(other_completion);
     }
 
     #[test]

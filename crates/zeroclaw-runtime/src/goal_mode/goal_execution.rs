@@ -1220,10 +1220,10 @@ impl GoalExecutionEngine {
                     return Err(error).context("Goal parent operation failed");
                 }
             };
-            lease
-                .finish_parent_turn_presentation()
-                .await
-                .context("finish Goal parent-turn presentation")?;
+            if let Err(error) = lease.finish_parent_turn_presentation().await {
+                self.fail(scope, "executor_failed").await?;
+                return Err(error).context("finish Goal parent-turn presentation");
+            }
             let candidate = parent.candidate;
             working_history = parent.working_history;
 
@@ -1974,20 +1974,20 @@ fn parse_verifier_response(raw: &str, candidate: &str) -> Result<VerifierDecisio
             );
             let blocker = &response.blockers[0];
             let blocker_kind: GoalBlockerKind = blocker.kind.into();
-            if blocker_kind != certificate.kind || blocker.message.trim() != certificate.message {
+            if blocker_kind != certificate.kind {
                 return Ok(VerifierDecision::Continue { reason });
             }
             Ok(VerifierDecision::Blocked {
                 reason,
-                blockers: response
-                    .blockers
-                    .into_iter()
-                    .map(|blocker| GoalBlocker {
-                        kind: blocker.kind.into(),
-                        message: blocker.message,
-                        payload: blocker.payload,
-                    })
-                    .collect(),
+                // The certificate is the parent-visible, controller-validated
+                // request for help. Do not make a pause depend on an exact
+                // textual echo from the verifier, which has only model output
+                // and may add harmless punctuation or wording changes.
+                blockers: vec![GoalBlocker {
+                    kind: certificate.kind,
+                    message: certificate.message,
+                    payload: blocker.payload.clone(),
+                }],
             })
         }
     }
@@ -2240,6 +2240,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_blocker_uses_the_parent_certificate_not_a_textual_echo() {
+        let parsed = parse_verifier_response(
+            r#"{"decision":"blocked","reason":"needs an answer","blockers":[{"kind":"needs_user_input","message":"Please provide the target."}]}"#,
+            "I need the target before I can continue.\n## Goal blocker\nKind: needs_user_input\nAction: Please provide the target",
+        )
+        .expect("matching blocker kind with a harmless verifier rewording should pause");
+
+        assert!(matches!(
+            parsed,
+            VerifierDecision::Blocked { blockers, .. }
+                if blockers.len() == 1
+                    && blockers[0].message == "Please provide the target"
+        ));
     }
 
     #[test]

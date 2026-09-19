@@ -108,6 +108,44 @@ fn goal_command_error_message(error: &str) -> String {
     }
 }
 
+/// Render the durable terminal-reason key consistently for command projections
+/// and asynchronous Goal lifecycle notifications.
+fn goal_terminal_reason_message(reason: &str) -> String {
+    match reason {
+        "verified_completion" => crate::i18n::t("zc-goal-terminal-reason-verified-completion"),
+        "accounting_outcome_unknown" => {
+            crate::i18n::t("zc-goal-terminal-reason-accounting-outcome-unknown")
+        }
+        "accounting_missing_or_invalid" => {
+            crate::i18n::t("zc-goal-terminal-reason-accounting-missing-or-invalid")
+        }
+        "pricing_unavailable" => crate::i18n::t("zc-goal-terminal-reason-pricing-unavailable"),
+        "candidate_empty" => crate::i18n::t("zc-goal-terminal-reason-candidate-empty"),
+        "parent_operation_failed" => {
+            crate::i18n::t("zc-goal-terminal-reason-parent-operation-failed")
+        }
+        "verifier_operation_failed" => {
+            crate::i18n::t("zc-goal-terminal-reason-verifier-operation-failed")
+        }
+        "verifier_protocol_invalid" => {
+            crate::i18n::t("zc-goal-terminal-reason-verifier-protocol-invalid")
+        }
+        "executor_failed" | "executor_start_failed" => {
+            crate::i18n::t("zc-goal-terminal-reason-executor-failed")
+        }
+        "initial_notice_failed" => crate::i18n::t("zc-goal-terminal-reason-initial-notice-failed"),
+        "goal_tool_pairing_incomplete" => {
+            crate::i18n::t("zc-goal-terminal-reason-tool-pairing-incomplete")
+        }
+        "goal_tool_loop_safety_limit" => {
+            crate::i18n::t("zc-goal-terminal-reason-tool-loop-safety-limit")
+        }
+        "policy_revoked" => crate::i18n::t("zc-goal-terminal-reason-policy-revoked"),
+        "session_disposed" => crate::i18n::t("zc-goal-terminal-reason-session-disposed"),
+        _ => crate::i18n::t("zc-goal-terminal-reason-unspecified"),
+    }
+}
+
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
     let token_limit = projection
         .token_limit
@@ -126,38 +164,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     let mut message =
         crate::i18n::t_args("zc-goal-summary-status", &[("status", &projection.status)]);
     if let Some(reason) = projection.terminal_reason.as_deref() {
-        let reason = match reason {
-            "verified_completion" => crate::i18n::t("zc-goal-terminal-reason-verified-completion"),
-            "accounting_outcome_unknown" => {
-                crate::i18n::t("zc-goal-terminal-reason-accounting-outcome-unknown")
-            }
-            "accounting_missing_or_invalid" => {
-                crate::i18n::t("zc-goal-terminal-reason-accounting-missing-or-invalid")
-            }
-            "pricing_unavailable" => crate::i18n::t("zc-goal-terminal-reason-pricing-unavailable"),
-            "candidate_empty" => crate::i18n::t("zc-goal-terminal-reason-candidate-empty"),
-            "parent_operation_failed" => {
-                crate::i18n::t("zc-goal-terminal-reason-parent-operation-failed")
-            }
-            "verifier_operation_failed" => {
-                crate::i18n::t("zc-goal-terminal-reason-verifier-operation-failed")
-            }
-            "verifier_protocol_invalid" => {
-                crate::i18n::t("zc-goal-terminal-reason-verifier-protocol-invalid")
-            }
-            "executor_failed" | "executor_start_failed" => {
-                crate::i18n::t("zc-goal-terminal-reason-executor-failed")
-            }
-            "goal_tool_pairing_incomplete" => {
-                crate::i18n::t("zc-goal-terminal-reason-tool-pairing-incomplete")
-            }
-            "goal_tool_loop_safety_limit" => {
-                crate::i18n::t("zc-goal-terminal-reason-tool-loop-safety-limit")
-            }
-            "policy_revoked" => crate::i18n::t("zc-goal-terminal-reason-policy-revoked"),
-            "session_disposed" => crate::i18n::t("zc-goal-terminal-reason-session-disposed"),
-            _ => crate::i18n::t("zc-goal-terminal-reason-unspecified"),
-        };
+        let reason = goal_terminal_reason_message(reason);
         message.push('\n');
         message.push_str(&crate::i18n::t_args(
             "zc-goal-summary-reason",
@@ -2431,48 +2438,8 @@ impl Chat {
                         } => {
                             state.finish_goal_agent_presentation();
                             let mut message = crate::i18n::t("zc-goal-failed");
-                            let reason = terminal_reason.map(|reason| match reason {
-                                "verified_completion" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-verified-completion")
-                                }
-                                "accounting_outcome_unknown" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-accounting-outcome-unknown",
-                                ),
-                                "accounting_missing_or_invalid" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-accounting-missing-or-invalid",
-                                ),
-                                "pricing_unavailable" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-pricing-unavailable")
-                                }
-                                "candidate_empty" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-candidate-empty")
-                                }
-                                "parent_operation_failed" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-parent-operation-failed",
-                                ),
-                                "verifier_operation_failed" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-verifier-operation-failed",
-                                ),
-                                "verifier_protocol_invalid" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-verifier-protocol-invalid",
-                                ),
-                                "executor_failed" | "executor_start_failed" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-executor-failed")
-                                }
-                                "goal_tool_pairing_incomplete" => crate::i18n::t(
-                                    "zc-goal-terminal-reason-tool-pairing-incomplete",
-                                ),
-                                "goal_tool_loop_safety_limit" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-tool-loop-safety-limit")
-                                }
-                                "policy_revoked" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-policy-revoked")
-                                }
-                                "session_disposed" => {
-                                    crate::i18n::t("zc-goal-terminal-reason-session-disposed")
-                                }
-                                _ => crate::i18n::t("zc-goal-terminal-reason-unspecified"),
-                            });
+                            let reason =
+                                terminal_reason.as_deref().map(goal_terminal_reason_message);
                             if let Some(reason) = reason {
                                 message.push('\n');
                                 message.push_str(&crate::i18n::t_args(
@@ -9544,17 +9511,17 @@ impl ChatState {
         }
     }
 
-    /// Goal execution uses the ordinary event stream without setting the
-    /// interactive prompt's `turn_in_flight` marker.  Its lifecycle notices
-    /// still need the exact same flush boundary as a normal terminal event so
-    /// they cannot overtake a streamed question or final report.
+    /// Goal lifecycle notices use the ordinary event stream without owning the
+    /// interactive prompt's turn markers. They still need the same flush
+    /// boundary as a normal terminal event so they cannot overtake a streamed
+    /// question or final report. Do not reset turn flags here: a Goal command
+    /// may interleave with an ordinary streamed turn, whose final completion
+    /// still owns those flags.
     fn finish_goal_agent_presentation(&mut self) {
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
-        self.turn_had_streaming_text = false;
-        self.turn_had_tool_calls = false;
     }
 
     pub fn apply_update(&mut self, update: SessionUpdate) {
@@ -10892,6 +10859,50 @@ mod tests {
         let rendered = goal_response_message(&response);
 
         assert!(rendered.contains("Reason: The last model operation did not settle cleanly."));
+    }
+
+    #[test]
+    fn terminal_reason_rendering_is_shared_by_status_and_lifecycle_updates() {
+        assert_eq!(
+            goal_terminal_reason_message("initial_notice_failed"),
+            "The Goal could not deliver its initial status notice."
+        );
+    }
+
+    #[test]
+    fn every_goal_terminal_reason_on_the_wire_has_a_specific_rendering() {
+        // Keep this list synchronized with the `snake_case` serialization of
+        // runtime `GoalTerminalReason`. ZeroCode is deliberately RPC-only and
+        // does not link the daemon crate, so this is its explicit wire contract.
+        let unspecified = crate::i18n::t("zc-goal-terminal-reason-unspecified");
+        for reason in [
+            "verified_completion",
+            "accounting_outcome_unknown",
+            "accounting_missing_or_invalid",
+            "pricing_unavailable",
+            "candidate_empty",
+            "parent_operation_failed",
+            "verifier_operation_failed",
+            "verifier_protocol_invalid",
+            "executor_failed",
+            "executor_start_failed",
+            "initial_notice_failed",
+            "goal_tool_pairing_incomplete",
+            "goal_tool_loop_safety_limit",
+            "policy_revoked",
+            "session_disposed",
+        ] {
+            assert_ne!(
+                goal_terminal_reason_message(reason),
+                unspecified,
+                "known Goal terminal reason {reason:?} must not silently render as unspecified"
+            );
+        }
+        assert_eq!(
+            goal_terminal_reason_message("unspecified"),
+            unspecified,
+            "the explicit unspecified terminal reason remains a valid fallback"
+        );
     }
 
     fn draw_todo_close(chat: &mut Chat) -> Rect {
@@ -19633,6 +19644,28 @@ mod tests {
             matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Before tool.")
         );
         assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
+    }
+
+    #[test]
+    fn goal_presentation_does_not_reset_an_ordinary_streamed_turn() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "The streamed report.".to_string(),
+        });
+
+        // A Goal lifecycle notice can arrive while an unrelated ordinary turn
+        // is streaming. Flushing it for presentation must not make the later
+        // ordinary completion forget that the text was already shown.
+        s.finish_goal_agent_presentation();
+        s.commit_turn("The streamed report.".to_string(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(matches!(
+            &s.entries()[0],
+            ChatEntry::AgentMessage(text) if text.as_ref() == "The streamed report."
+        ));
     }
 
     /// When no streaming text was accumulated, commit_turn must use the

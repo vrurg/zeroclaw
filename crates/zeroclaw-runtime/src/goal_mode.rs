@@ -1214,6 +1214,7 @@ pub enum GoalTerminalReason {
     VerifierProtocolInvalid,
     ExecutorFailed,
     ExecutorStartFailed,
+    InitialNoticeFailed,
     GoalToolPairingIncomplete,
     GoalToolLoopSafetyLimit,
     PolicyRevoked,
@@ -1239,6 +1240,7 @@ impl GoalTerminalReason {
             "verifier_protocol_invalid" => Self::VerifierProtocolInvalid,
             "executor_failed" => Self::ExecutorFailed,
             "executor_start_failed" => Self::ExecutorStartFailed,
+            "initial_goal_notice_failed" => Self::InitialNoticeFailed,
             "goal_tool_pairing_incomplete" => Self::GoalToolPairingIncomplete,
             "goal_tool_loop_safety_limit" => Self::GoalToolLoopSafetyLimit,
             "policy_revoked" => Self::PolicyRevoked,
@@ -1871,6 +1873,82 @@ mod tests {
         assert!(!GoalResponse::AlreadyCancelled(projection).retires_resident_supervisor());
     }
 
+    #[tokio::test]
+    async fn bare_resume_while_running_leaves_the_goal_epoch_untouched() {
+        let store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone());
+        let session_id = "matrix_goal-running-resume";
+        let task = TaskRecord {
+            id: "goal-running-resume".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix:room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some(session_id.to_owned()),
+            execution_epoch: 7,
+            started_at: "2026-09-19T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "finish the task".to_owned(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task.clone(), goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let before = store
+            .current_goal_for_session(session_id)
+            .await
+            .unwrap()
+            .expect("created Goal should be current");
+        let ingress = GoalIngressContext::trusted(
+            GoalSessionKey::matrix(session_id).unwrap(),
+            "main",
+            "matrix:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "@user:example.test".to_owned(),
+            },
+        )
+        .unwrap();
+        let settings = GoalHostSettings {
+            enabled: true,
+            default_limits: GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: None,
+            },
+            owner_pid: 2,
+            owner_boot_id: "new-boot".to_owned(),
+        };
+
+        assert!(matches!(
+            controller.resume(&settings, &ingress, false).await.unwrap(),
+            GoalResponse::AlreadyActive
+        ));
+
+        let current = store
+            .current_goal_for_session(session_id)
+            .await
+            .unwrap()
+            .expect("running Goal should remain current");
+        assert_eq!(current.status, TaskStatus::Running);
+        assert_eq!(current.execution_epoch, before.execution_epoch);
+        assert_eq!(current.owner_pid, before.owner_pid);
+        assert_eq!(current.owner_boot_id, before.owner_boot_id);
+    }
+
     #[test]
     fn goal_status_projection_keeps_actionable_pause_details() {
         let task = TaskRecord {
@@ -1993,6 +2071,15 @@ mod tests {
             Some(GoalTerminalReason::GoalToolLoopSafetyLimit)
         );
         assert_eq!(loop_safety.terminal_provider, None);
+
+        let initial_notice = known
+            .clone()
+            .with_durable_terminal_reason(Some("initial_goal_notice_failed"));
+        assert_eq!(
+            initial_notice.terminal_reason,
+            Some(GoalTerminalReason::InitialNoticeFailed)
+        );
+        assert_eq!(initial_notice.terminal_provider, None);
 
         let provider = known
             .clone()

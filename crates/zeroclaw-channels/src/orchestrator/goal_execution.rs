@@ -440,22 +440,6 @@ impl MatrixGoalExecutionLease {
         )
     }
 
-    fn initial_working_history(
-        &self,
-        provider: &dyn zeroclaw_providers::ModelProvider,
-        route: &ChannelRouteSelection,
-        directive: ChatMessage,
-        canonical_history: Vec<ChatMessage>,
-    ) -> Result<Vec<ChatMessage>> {
-        goal_start_history(
-            self.goal_system_prompt(provider, route),
-            directive,
-            canonical_history,
-            &self.session_prompt_attachments()?,
-            self.context.agent_cfg.resolved.max_system_prompt_chars,
-        )
-    }
-
     /// Resolve durable task context for each parent operation so a resumed
     /// Goal sees the same current session prompt as an ordinary Matrix turn.
     fn session_prompt_attachments(&self) -> Result<String> {
@@ -482,6 +466,32 @@ fn goal_start_history(
     )?);
     history.extend(canonical_history);
     history.push(goal_parent_execution_request());
+    Ok(history)
+}
+
+/// Rebuild a canonical Goal transcript for one parent turn.
+///
+/// A retained transcript owns the continuation case, but a Goal can also be
+/// resumed after the resident worker was retired. In that case the canonical
+/// session history is the only durable prefix and an optional user response
+/// must still be the final user turn seen by the new worker.
+fn goal_canonical_history_for_parent_turn(
+    turn: GoalParentTurn,
+    system_prompt: String,
+    directive: ChatMessage,
+    session_prompt_attachments: &str,
+    max_system_prompt_chars: usize,
+) -> Result<Vec<ChatMessage>> {
+    let mut history = goal_start_history(
+        system_prompt,
+        directive,
+        turn.working_history,
+        session_prompt_attachments,
+        max_system_prompt_chars,
+    )?;
+    if let Some(response) = turn.resume_response {
+        history.push(ChatMessage::user(response));
+    }
     Ok(history)
 }
 
@@ -1059,13 +1069,15 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         .await?;
         let directive = goal_parent_directive(&turn);
         let mut history = match turn.history_source {
-            zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical => self
-                .initial_working_history(
-                    provider.as_ref(),
-                    &route,
+            zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical => {
+                goal_canonical_history_for_parent_turn(
+                    turn,
+                    self.goal_system_prompt(provider.as_ref(), &route),
                     directive,
-                    turn.working_history,
-                )?,
+                    &self.session_prompt_attachments()?,
+                    self.context.agent_cfg.resolved.max_system_prompt_chars,
+                )?
+            }
             zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation => {
                 goal_continuation_history_for_parent_turn(
                     turn,
@@ -1353,6 +1365,9 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::ExecutorFailed
                 | zeroclaw_runtime::goal_mode::GoalTerminalReason::ExecutorStartFailed => {
                     "goal-mode-terminal-reason-executor-failed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::InitialNoticeFailed => {
+                    "goal-mode-terminal-reason-initial-notice-failed"
                 }
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::GoalToolPairingIncomplete => {
                     "goal-mode-terminal-reason-tool-pairing-incomplete"
@@ -1723,6 +1738,37 @@ mod tests {
             continued.last().map(|message| message.content.as_str()),
             Some("Proceed with the Goal work under the trusted runtime directive.")
         );
+    }
+
+    #[test]
+    fn matrix_canonical_resume_preserves_the_user_response() {
+        let history = goal_canonical_history_for_parent_turn(
+            GoalParentTurn {
+                kind: GoalParentTurnKind::Resume,
+                objective: "finish the task".to_owned(),
+                resume_response: Some("Use the migration documented in the task.".to_owned()),
+                history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical,
+                working_history: vec![
+                    ChatMessage::user("original task"),
+                    ChatMessage::assistant("Which migration should I use?"),
+                ],
+            },
+            "rebuilt system prompt".to_owned(),
+            ChatMessage::system("resume Goal directive"),
+            "",
+            0,
+        )
+        .expect("canonical resume should build");
+
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("Use the migration documented in the task.")
+        );
+        assert!(history.iter().any(|message| {
+            message.role == "user"
+                && message.content
+                    == "Proceed with the Goal work under the trusted runtime directive."
+        }));
     }
 
     #[test]
