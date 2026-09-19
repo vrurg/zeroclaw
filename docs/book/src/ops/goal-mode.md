@@ -108,13 +108,20 @@ A Goal is completed only after its configured verifier receives the exact
 success criterion and candidate response and returns `Complete`. A verifier
 `Continue` keeps work eligible; `Blocked` pauses the Goal with actionable
 blockers. Provider, protocol, attribution, malformed-output, and verifier
-failures fail the Goal rather than becoming a semantic blocker.
+failures fail the Goal rather than becoming a semantic blocker. One narrow
+exception applies to a context-window rejection from an admitted parent
+operation after its provider attempt has settled and accounting is complete:
+Goal Mode presents the ordinary core error, pauses the Goal, and resumes from
+canonical session history rather than replaying the oversized resident
+transcript. That gives the next parent operation a chance to reduce or split
+the work. An unsettled operation, or a context-window failure outside that
+admitted-and-settled path, still fails closed.
 
 An agent loop-safety interruption is different when every already-executed tool
 result was paired into the isolated transcript: Goal Mode presents the ordinary
 core error, pauses the Goal, and permits `/goal resume` to start a fresh parent
-operation. An interrupted or unpaired tool batch still fails closed and is
-never resumed.
+operation. It retains that paired transcript only for this loop-safety case.
+An interrupted or unpaired tool batch still fails closed and is never resumed.
 
 A verifier-blocked Goal names its blocker in the pause notification and releases
 the session's foreground slot. When a parent agent needs a user answer, it calls

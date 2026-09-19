@@ -236,7 +236,7 @@ enum GoalUpdate<'a> {
     },
     ParentError {
         session_id: &'a str,
-        message: &'a str,
+        error: &'a str,
     },
     Completed {
         session_id: &'a str,
@@ -272,7 +272,7 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         "parent_turn_finished" => Some(GoalUpdate::ParentTurnFinished { session_id }),
         "parent_error" => Some(GoalUpdate::ParentError {
             session_id,
-            message: payload.get("message")?.as_str()?,
+            error: payload.get("error")?.as_str()?,
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
@@ -2407,11 +2407,16 @@ impl Chat {
                         GoalUpdate::ParentTurnFinished { .. } => {
                             state.finish_goal_agent_presentation();
                         }
-                        GoalUpdate::ParentError { message, .. } => {
+                        GoalUpdate::ParentError { error, .. } => {
                             state.finish_goal_agent_presentation();
                             state
                                 .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    crate::i18n::t_args(
+                                        "zc-goal-parent-error",
+                                        &[("error", error)],
+                                    ),
+                                )));
                             state.mark_dirty_append();
                         }
                         GoalUpdate::Completed { .. } => {
@@ -22078,11 +22083,11 @@ mod tests {
     }
 
     #[test]
-    fn parent_error_goal_update_preserves_the_sanitized_error_message() {
+    fn parent_error_goal_update_preserves_the_sanitized_error_payload() {
         let payload = serde_json::json!({
             "parent_error": {
                 "session_id": "session-1",
-                "message": "⚠️ Error: tool loop stopped"
+                "error": "tool loop stopped"
             }
         });
         let update =
@@ -22092,7 +22097,7 @@ mod tests {
             update,
             GoalUpdate::ParentError {
                 session_id: "session-1",
-                message: "⚠️ Error: tool loop stopped",
+                error: "tool loop stopped",
             }
         ));
     }

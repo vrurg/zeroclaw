@@ -351,10 +351,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 GOAL_UPDATE_METHOD,
                 serde_json::to_value(crate::rpc::types::SessionGoalUpdate::ParentError {
                     session_id: self.raw_session_id()?.to_owned(),
-                    message: crate::i18n::get_required_cli_string_with_args(
-                        "goal-mode-parent-error",
-                        &[("error", safe_error.as_str())],
-                    ),
+                    error: safe_error,
                 })?,
             )
             .await;

@@ -829,7 +829,7 @@ fn render_goal_projection(
             GoalPauseReason::NeedsUserInput => "needs_user_input",
             GoalPauseReason::HumanEscalation => "human_escalation",
             GoalPauseReason::ExternalDependency => "external_dependency",
-            GoalPauseReason::CoreInterrupted => "agent safety interruption",
+            GoalPauseReason::CoreInterrupted => "core_interrupted",
             GoalPauseReason::ProviderUnavailable => "provider_unavailable",
             GoalPauseReason::VerifierBlocked => "verifier_blocked",
             GoalPauseReason::BudgetExhausted => "budget_exhausted",

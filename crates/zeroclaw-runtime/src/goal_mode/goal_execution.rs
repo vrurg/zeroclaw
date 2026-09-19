@@ -1257,7 +1257,11 @@ impl GoalExecutionEngine {
             working_history = parent_history;
 
             if let Some(interruption) = interruption {
-                let message = interruption.message().to_owned();
+                // This value originated at a provider or core boundary. It is
+                // presented twice, so sanitize it once before either surface
+                // receives it; the lifecycle notice must not become an
+                // unbounded second copy of a provider error.
+                let message = zeroclaw_providers::sanitize_api_error(interruption.message());
                 let description = match interruption {
                     super::GoalParentInterruption::ToolLoopSafety { .. } => {
                         "The agent tool-loop safety limit stopped further tool work after completed results were recorded."
@@ -1282,10 +1286,20 @@ impl GoalExecutionEngine {
                         "Goal interruption presentation failed"
                     );
                 }
-                *paused_transcript.lock().await = Some(GoalRetainedTranscript {
-                    working_history,
-                    canonical_history,
-                });
+                if matches!(
+                    interruption,
+                    super::GoalParentInterruption::ToolLoopSafety { .. }
+                ) {
+                    *paused_transcript.lock().await = Some(GoalRetainedTranscript {
+                        working_history,
+                        canonical_history,
+                    });
+                } else {
+                    // Reusing a context-window-rejected transcript would
+                    // deterministically repeat the same rejection. Resume
+                    // from canonical history so the parent can remediate.
+                    *paused_transcript.lock().await = None;
+                }
                 self.pause_for_blockers(
                     scope,
                     GoalPauseReason::CoreInterrupted,
@@ -2454,7 +2468,8 @@ mod tests {
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
             interruption: Some(super::super::GoalParentInterruption::ToolLoopSafety {
-                message: "Agent loop aborted by loop detector: repeated tool calls".to_owned(),
+                message: "Agent loop aborted by loop detector: Bearer gho_1234567890abcdef"
+                    .to_owned(),
             }),
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
@@ -2481,12 +2496,12 @@ mod tests {
         assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             lease.parent_errors.lock().unwrap().as_slice(),
-            ["Agent loop aborted by loop detector: repeated tool calls"]
+            ["Agent loop aborted by loop detector: Bearer [REDACTED]"]
         );
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
             &[GoalExecutionNotice::PausedForInterruption {
-                message: "Agent loop aborted by loop detector: repeated tool calls".to_owned(),
+                message: "Agent loop aborted by loop detector: Bearer [REDACTED]".to_owned(),
             }]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
@@ -2530,6 +2545,7 @@ mod tests {
             parent_errors: std::sync::Mutex::new(Vec::new()),
         };
 
+        let paused_transcript = Arc::new(Mutex::new(None));
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
             store.clone() as Arc<dyn GoalTaskRegistry>,
             scope.clone(),
@@ -2540,7 +2556,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(Mutex::new(None)),
+                Arc::clone(&paused_transcript),
                 &mut lease,
             ),
         ))
@@ -2561,6 +2577,7 @@ mod tests {
         assert!(goal.blockers.is_empty());
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_call_id.is_none());
+        assert!(paused_transcript.lock().await.is_none());
     }
 
     #[test]
