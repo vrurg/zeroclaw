@@ -124,6 +124,9 @@ fn goal_terminal_reason_message(reason: &str) -> String {
         "parent_operation_failed" => {
             crate::i18n::t("zc-goal-terminal-reason-parent-operation-failed")
         }
+        "parent_context_window_exceeded" => {
+            crate::i18n::t("zc-goal-terminal-reason-parent-context-window-exceeded")
+        }
         "verifier_operation_failed" => {
             crate::i18n::t("zc-goal-terminal-reason-verifier-operation-failed")
         }
@@ -231,12 +234,20 @@ enum GoalUpdate<'a> {
     ParentTurnFinished {
         session_id: &'a str,
     },
+    ParentError {
+        session_id: &'a str,
+        message: &'a str,
+    },
     Completed {
         session_id: &'a str,
     },
     PausedForBlocker {
         session_id: &'a str,
         blocker_messages: Vec<&'a str>,
+    },
+    PausedForInterruption {
+        session_id: &'a str,
+        message: &'a str,
     },
     Failed {
         session_id: &'a str,
@@ -259,6 +270,10 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
             response: Box::new(serde_json::from_value(payload.get("response")?.clone()).ok()?),
         }),
         "parent_turn_finished" => Some(GoalUpdate::ParentTurnFinished { session_id }),
+        "parent_error" => Some(GoalUpdate::ParentError {
+            session_id,
+            message: payload.get("message")?.as_str()?,
+        }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
             session_id,
@@ -270,6 +285,10 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
                     .collect::<Option<Vec<_>>>()?,
                 None => Vec::new(),
             },
+        }),
+        "paused_for_interruption" => Some(GoalUpdate::PausedForInterruption {
+            session_id,
+            message: payload.get("message")?.as_str()?,
         }),
         "failed" => Some(GoalUpdate::Failed {
             session_id,
@@ -2362,8 +2381,10 @@ impl Chat {
                     let session_id = match &update {
                         GoalUpdate::Acknowledged { session_id, .. }
                         | GoalUpdate::ParentTurnFinished { session_id }
+                        | GoalUpdate::ParentError { session_id, .. }
                         | GoalUpdate::Completed { session_id }
                         | GoalUpdate::PausedForBlocker { session_id, .. }
+                        | GoalUpdate::PausedForInterruption { session_id, .. }
                         | GoalUpdate::Failed { session_id, .. } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
@@ -2385,6 +2406,13 @@ impl Chat {
                         }
                         GoalUpdate::ParentTurnFinished { .. } => {
                             state.finish_goal_agent_presentation();
+                        }
+                        GoalUpdate::ParentError { message, .. } => {
+                            state.finish_goal_agent_presentation();
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                            state.mark_dirty_append();
                         }
                         GoalUpdate::Completed { .. } => {
                             state.finish_goal_agent_presentation();
@@ -2426,6 +2454,17 @@ impl Chat {
                                     &[("action", &action)],
                                 ));
                             }
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::PausedForInterruption { message, .. } => {
+                            state.finish_goal_agent_presentation();
+                            let message = crate::i18n::t_args(
+                                "zc-goal-paused-core-interruption",
+                                &[("reason", message)],
+                            );
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
@@ -10882,6 +10921,7 @@ mod tests {
             "pricing_unavailable",
             "candidate_empty",
             "parent_operation_failed",
+            "parent_context_window_exceeded",
             "verifier_operation_failed",
             "verifier_protocol_invalid",
             "executor_failed",
@@ -22035,6 +22075,46 @@ mod tests {
         );
         assert!(matches!(&entries[2], ChatEntry::SystemMessage(text)
                 if text.as_ref() == "❌ Goal failed.\nReason: A tool operation did not settle cleanly, so the Goal stopped to avoid an unsafe retry."));
+    }
+
+    #[test]
+    fn parent_error_goal_update_preserves_the_sanitized_error_message() {
+        let payload = serde_json::json!({
+            "parent_error": {
+                "session_id": "session-1",
+                "message": "⚠️ Error: tool loop stopped"
+            }
+        });
+        let update =
+            parse_goal_update(&payload).expect("a complete parent-error update must parse");
+
+        assert!(matches!(
+            update,
+            GoalUpdate::ParentError {
+                session_id: "session-1",
+                message: "⚠️ Error: tool loop stopped",
+            }
+        ));
+    }
+
+    #[test]
+    fn paired_safety_interruption_goal_update_preserves_its_reason() {
+        let payload = serde_json::json!({
+            "paused_for_interruption": {
+                "session_id": "session-1",
+                "message": "Agent loop aborted by loop detector: repeated tool calls"
+            }
+        });
+        let update =
+            parse_goal_update(&payload).expect("a complete paired-interruption update must parse");
+
+        assert!(matches!(
+            update,
+            GoalUpdate::PausedForInterruption {
+                session_id: "session-1",
+                message: "Agent loop aborted by loop detector: repeated tool calls",
+            }
+        ));
     }
 
     #[tokio::test]

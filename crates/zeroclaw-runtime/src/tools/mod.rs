@@ -12,6 +12,7 @@ pub mod cron_update;
 pub mod delegate;
 pub mod deliver_file;
 pub mod file_read;
+pub(crate) mod goal_ask_user;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
@@ -1824,8 +1825,14 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
-    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
-    tool_arcs.push(Arc::new(ask_user_tool));
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(AskUserTool::new(
+        security.clone(),
+        Arc::clone(&ask_user_tool_handle),
+    ));
+    tool_arcs.push(Arc::new(goal_ask_user::GoalAwareAskUser::new(
+        ask_user_tool,
+        security.clone(),
+    )));
 
     {
         let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {

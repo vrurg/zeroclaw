@@ -47,6 +47,7 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
+pub use outcome::{ToolLoopSafetyInterrupted, tool_loop_safety_interruption};
 pub use outcome::{
     append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
@@ -1137,10 +1138,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // malformed fallback completion cannot leak a stale recovery notice.
         zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
+        // An exact Goal blocker certificate ends a parent response even when
+        // the model also requested tools or appended narration. Stop before
+        // preparation, so an explicit request for help cannot be followed by
+        // new side effects. The Goal controller still sends this candidate to
+        // its mandatory verifier; ordinary turns and prose-only requests keep
+        // their normal tool-loop behavior.
+        let final_goal_blocker =
+            crate::agent::goal_user_input::final_goal_blocker_ends_parent_turn(&display_text);
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
+            if !tool_calls.is_empty() && !final_goal_blocker {
+                let llm_secs = llm_started_at.elapsed().as_secs();
                 let _ = tx
                     .send(StreamDelta::Status(format!(
                         "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
@@ -1150,7 +1160,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        if tool_calls.is_empty() {
+        if tool_calls.is_empty() || final_goal_blocker {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -1183,7 +1193,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .await?;
             }
 
-            let msg = ChatMessage::assistant(response_text.clone());
+            // A response carrying tool calls must not enter history as an
+            // assistant tool-use record after the Goal blocker has declined
+            // those calls.  Persist only the exact visible candidate which
+            // the verifier will assess.
+            let msg = ChatMessage::assistant(
+                final_goal_blocker
+                    .then_some(display_text.clone())
+                    .unwrap_or(response_text.clone()),
+            );
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
@@ -1412,6 +1430,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             individual_results,
             tool_results,
             detection_relevant_output,
+            loop_safety_interruption,
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
@@ -1425,7 +1444,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_id,
         )?;
 
-        if !cancelled_mid_batch {
+        let identical_output_abort = if !cancelled_mid_batch {
             check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -1435,8 +1454,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model,
                 iteration,
                 turn_id,
-            )?;
-        }
+            )
+            .err()
+        } else {
+            None
+        };
 
         turn_state.append_tool_round(
             assistant_history_content,
@@ -1448,6 +1470,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         if let Some(batch) = pending_goal_tool_batch {
             batch.settle()?;
+        }
+
+        if let Some(message) = loop_safety_interruption {
+            return Err(ToolLoopSafetyInterrupted::new(message).into());
+        }
+
+        if let Some(error) = identical_output_abort {
+            return Err(ToolLoopSafetyInterrupted::new(error.to_string()).into());
         }
 
         if cancelled_mid_batch {

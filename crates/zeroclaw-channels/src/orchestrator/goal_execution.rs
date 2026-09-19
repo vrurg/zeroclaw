@@ -25,11 +25,12 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
-        GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
-        GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_directive,
-        goal_parent_execution_request, goal_parent_system_message_with_session_prompts,
-        goal_verifier_messages, scope_goal_parent_turn,
+        GoalParentInterruption, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult,
+        GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+        GoalSessionLease, GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
+        goal_parent_directive, goal_parent_execution_request,
+        goal_parent_system_message_with_session_prompts, goal_verifier_messages,
+        scope_goal_parent_turn,
     },
 };
 
@@ -191,10 +192,22 @@ pub(super) async fn submit_matrix_goal(
             Arc::clone(supervisor)
         } else {
             let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::new(Arc::clone(&registry));
-            let tracker = CostTracker::get_or_init_global_required(
-                defaults.config.cost.clone(),
-                &defaults.config.data_dir,
-            )?;
+            // Reuse the exact tracker which ordinary Matrix turns already
+            // use. A config reload can leave this live channel context and a
+            // later global lookup on different data-directory snapshots; Goal
+            // accounting must follow the active channel ledger, not reject an
+            // otherwise valid session for that process-local transition.
+            let tracker = context
+                .cost_tracking
+                .as_ref()
+                .map(|tracking| Arc::clone(&tracking.tracker))
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    CostTracker::get_or_init_global_required(
+                        defaults.config.cost.clone(),
+                        &defaults.config.data_dir,
+                    )
+                })?;
             let engine = Arc::new(runtime.execution_engine(
                 tracker,
                 context.agent_alias.to_string(),
@@ -1199,14 +1212,45 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             }
             Err(error) => {
                 presentation.finish(None, None).await;
-                return Err(error);
+                let interruption =
+                    if zeroclaw_runtime::agent::tool_loop_safety_interruption(&error).is_some() {
+                        GoalParentInterruption::ToolLoopSafety {
+                            message: error.to_string(),
+                        }
+                    } else if zeroclaw_providers::reliable::is_context_window_exceeded(&error) {
+                        GoalParentInterruption::ContextWindowExceeded {
+                            message: error.to_string(),
+                        }
+                    } else {
+                        return Err(error);
+                    };
+                return Ok(GoalParentTurnResult {
+                    candidate: String::new(),
+                    working_history: history,
+                    interruption: Some(interruption),
+                });
             }
         };
         let _ = operation;
         Ok(GoalParentTurnResult {
             candidate,
             working_history: history,
+            interruption: None,
         })
+    }
+
+    async fn present_parent_error(&mut self, error: &Error) -> Result<()> {
+        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
+            .context("Matrix Goal channel is no longer available")?;
+        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+        let message = super::channel_user_error_message(error, &safe_error);
+        channel
+            .send(&zeroclaw_api::channel::SendMessage::reply_to(
+                &self.message,
+                message,
+            ))
+            .await
+            .context("deliver Matrix Goal parent error")
     }
 
     async fn run_verifier(
@@ -1335,6 +1379,23 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
             }
             message
         }
+        GoalExecutionNotice::PausedForInterruption {
+            message: interruption,
+        } => {
+            let mut message = zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-core-interruption",
+            );
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "goal-mode-paused-core-interruption-reason",
+                &[("reason", interruption.as_str())],
+            ));
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-paused-core-interruption-next",
+            ));
+            message
+        }
         GoalExecutionNotice::Failed {
             terminal_reason,
             terminal_provider,
@@ -1358,6 +1419,9 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
                 }
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentOperationFailed => {
                     "goal-mode-terminal-reason-parent-operation-failed"
+                }
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentContextWindowExceeded => {
+                    "goal-mode-terminal-reason-parent-context-window-exceeded"
                 }
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::VerifierOperationFailed => {
                     "goal-mode-terminal-reason-verifier-operation-failed"
@@ -1501,6 +1565,18 @@ mod tests {
     }
 
     #[test]
+    fn paired_safety_interruption_notice_is_not_mislabelled_as_a_blocker() {
+        let rendered = goal_notice_message(GoalExecutionNotice::PausedForInterruption {
+            message: "repeated tool calls".to_owned(),
+        });
+
+        assert!(rendered.starts_with("⏸️ Goal paused after a safety interruption."));
+        assert!(rendered.contains("**Reason:** repeated tool calls"));
+        assert!(rendered.contains("**Next:** Run `/goal resume`"));
+        assert!(!rendered.contains("**Blocker:**"));
+    }
+
+    #[test]
     fn blocked_notice_renders_each_blocker_as_a_uniform_localized_item() {
         let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
             blocker_messages: vec![
@@ -1540,6 +1616,20 @@ mod tests {
         assert_eq!(
             rendered,
             "❌ Goal failed.\n**Reason:** The agent's model operation failed before it produced a verified result.\n**Provider:** openai.default"
+        );
+    }
+
+    #[test]
+    fn failed_notice_explains_a_context_window_rejection() {
+        let rendered = goal_notice_message(GoalExecutionNotice::Failed {
+            terminal_reason:
+                zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentContextWindowExceeded,
+            terminal_provider: Some("openai.default".to_owned()),
+        });
+
+        assert_eq!(
+            rendered,
+            "❌ Goal failed.\n**Reason:** The selected model could not accept the current conversation because it exceeds that model's context window.\n**Provider:** openai.default"
         );
     }
 
@@ -1706,6 +1796,7 @@ mod tests {
             kind: GoalParentTurnKind::Resume,
             objective: "finish the task".to_owned(),
             resume_response: Some("Use the authentication module.".to_owned()),
+            paused_request: None,
             history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
             working_history: retained(),
         });
@@ -1718,6 +1809,7 @@ mod tests {
             kind: GoalParentTurnKind::Resume,
             objective: "finish the task".to_owned(),
             resume_response: None,
+            paused_request: None,
             history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
             working_history: retained(),
         });
@@ -1734,6 +1826,7 @@ mod tests {
             kind: GoalParentTurnKind::Continue,
             objective: "finish the task".to_owned(),
             resume_response: None,
+            paused_request: None,
             history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Continuation,
             working_history: retained(),
         });
@@ -1750,6 +1843,7 @@ mod tests {
                 kind: GoalParentTurnKind::Resume,
                 objective: "finish the task".to_owned(),
                 resume_response: Some("Use the migration documented in the task.".to_owned()),
+                paused_request: None,
                 history_source: zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical,
                 working_history: vec![
                     ChatMessage::user("original task"),

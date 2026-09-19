@@ -309,11 +309,19 @@ rpc_type! {
         /// This is not a lifecycle decision; buffered clients use it to retain
         /// the same per-turn rendering boundaries they have outside Goal Mode.
         ParentTurnFinished { session_id: String },
+        /// The ordinary parent loop failed. The message has already passed the
+        /// same sanitization boundary as an ordinary session error and is sent
+        /// before the later Goal lifecycle update.
+        ParentError { session_id: String, message: String },
         Completed { session_id: String },
         PausedForBlocker {
             session_id: String,
             #[serde(default)]
             blocker_messages: Vec<String>,
+        },
+        PausedForInterruption {
+            session_id: String,
+            message: String,
         },
         Failed {
             session_id: String,

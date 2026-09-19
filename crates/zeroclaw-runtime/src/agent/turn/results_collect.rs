@@ -26,12 +26,16 @@ pub(crate) struct CollectedResults {
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
+    /// A detector circuit break observed after a tool completed. The caller
+    /// appends the complete assistant/tool transcript and settles any Goal
+    /// pairing marker before returning the interruption.
+    pub(crate) loop_safety_interruption: Option<String>,
 }
 
 /// Collect this round's tool results (upstream loop body, results-collection
 /// section): feed the loop detector (Warning/Block append system messages;
-/// Break bails), canonicalize media markers, truncate, append receipts, and
-/// build the per-call and XML result forms.
+/// Break records an interruption), canonicalize media markers, truncate,
+/// append receipts, and build the per-call and XML result forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
     ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
@@ -48,6 +52,7 @@ pub(crate) fn collect_tool_results(
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
     let mut detection_relevant_output = String::new();
+    let mut loop_safety_interruption = None;
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -117,7 +122,11 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    // The completed tool result still needs to enter the
+                    // transcript before a Goal may safely pause and later
+                    // resume. Continue collection, then let the loop return
+                    // the typed interruption after pairing has settled.
+                    loop_safety_interruption.get_or_insert(msg);
                 }
             }
         }
@@ -170,6 +179,7 @@ pub(crate) fn collect_tool_results(
         individual_results,
         tool_results,
         detection_relevant_output,
+        loop_safety_interruption,
     })
 }
 
@@ -353,6 +363,47 @@ mod tests {
         // "no progress" exploration loop. Regression for the circuit breaker
         // firing on `file_read` "called N times ... identical results".
         assert!(run(8, RATE_LIMIT_ERR, false).is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_keeps_completed_results_available_for_pairing() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history = Vec::new();
+        let tool_calls = (0..5)
+            .map(|_| ParsedToolCall {
+                name: "file_read".to_owned(),
+                arguments: serde_json::json!({"path": "same.rs"}),
+                tool_call_id: None,
+            })
+            .collect::<Vec<_>>();
+        let ordered = (0..5)
+            .map(|_| {
+                Some((
+                    "file_read".to_owned(),
+                    None,
+                    outcome("completed output", true),
+                ))
+            })
+            .collect();
+
+        let collected = collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )
+        .expect("a circuit break must not discard completed tool results");
+
+        assert!(collected.loop_safety_interruption.is_some());
+        assert_eq!(collected.individual_results.len(), 5);
+        assert_eq!(collected.tool_results.matches("<tool_result").count(), 5);
     }
 
     #[test]

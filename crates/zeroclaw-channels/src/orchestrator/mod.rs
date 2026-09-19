@@ -761,6 +761,9 @@ fn render_goal_projection(
             GoalTerminalReason::ParentOperationFailed => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-parent-operation-failed")
             }
+            GoalTerminalReason::ParentContextWindowExceeded => channel_runtime_cli_string(
+                "goal-mode-terminal-reason-parent-context-window-exceeded",
+            ),
             GoalTerminalReason::VerifierOperationFailed => {
                 channel_runtime_cli_string("goal-mode-terminal-reason-verifier-operation-failed")
             }
@@ -826,6 +829,7 @@ fn render_goal_projection(
             GoalPauseReason::NeedsUserInput => "needs_user_input",
             GoalPauseReason::HumanEscalation => "human_escalation",
             GoalPauseReason::ExternalDependency => "external_dependency",
+            GoalPauseReason::CoreInterrupted => "agent safety interruption",
             GoalPauseReason::ProviderUnavailable => "provider_unavailable",
             GoalPauseReason::VerifierBlocked => "verifier_blocked",
             GoalPauseReason::BudgetExhausted => "budget_exhausted",

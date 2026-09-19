@@ -23,9 +23,9 @@ use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionNotice, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
     GoalOperationScope, GoalParentHistorySource, GoalParentTurn, GoalParentTurnKind,
-    GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalTerminalReason,
-    GoalVerifierTurn,
+    GoalParentTurnResult, GoalPausedRequest, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
+    GoalTerminalReason, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -57,6 +57,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         Ok(GoalParentTurnResult {
             candidate: format!("parent:{}", turn.objective),
             working_history: turn.working_history,
+            interruption: None,
         })
     }
 
@@ -96,6 +97,7 @@ struct TranscriptExecutionLease {
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
     parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
+    parent_paused_requests: Arc<Mutex<Vec<Option<GoalPausedRequest>>>>,
     parent_presentation_finishes: Arc<AtomicUsize>,
 }
 
@@ -123,6 +125,10 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             .lock()
             .unwrap()
             .push(turn.resume_response.clone());
+        self.parent_paused_requests
+            .lock()
+            .unwrap()
+            .push(turn.paused_request.clone());
         let candidate = if self.blocked {
             format!(
                 "parent:{}\n\n## Goal blocker\nKind: needs_user_input\nAction: Provide the task packet reference.",
@@ -134,6 +140,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         Ok(GoalParentTurnResult {
             candidate,
             working_history: turn.working_history,
+            interruption: None,
         })
     }
 
@@ -184,6 +191,7 @@ struct TranscriptExecutionDriver {
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
     parent_resume_responses: Arc<Mutex<Vec<Option<String>>>>,
+    parent_paused_requests: Arc<Mutex<Vec<Option<GoalPausedRequest>>>>,
     parent_presentation_finishes: Arc<AtomicUsize>,
 }
 
@@ -211,6 +219,7 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
             parent_resume_responses: Arc::clone(&self.parent_resume_responses),
+            parent_paused_requests: Arc::clone(&self.parent_paused_requests),
             parent_presentation_finishes: Arc::clone(&self.parent_presentation_finishes),
         }))
     }
@@ -248,6 +257,7 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         Ok(GoalParentTurnResult {
             candidate: "candidate that settled before pause".to_owned(),
             working_history: Vec::new(),
+            interruption: None,
         })
     }
 
@@ -308,6 +318,7 @@ impl GoalSessionDriver for PausingExecutionDriver {
 struct FailingExecutionLease {
     session_key: GoalSessionKey,
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
+    parent_errors: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -326,6 +337,11 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         _turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         anyhow::bail!("simulated parent failure")
+    }
+
+    async fn present_parent_error(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
+        self.parent_errors.lock().unwrap().push(error.to_string());
+        Ok(())
     }
 
     async fn run_verifier(
@@ -349,6 +365,7 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
 struct FailingExecutionDriver {
     binding: GoalSessionBinding,
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
+    parent_errors: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -369,6 +386,7 @@ impl GoalSessionDriver for FailingExecutionDriver {
         Ok(Box::new(FailingExecutionLease {
             session_key: self.binding.session_key().clone(),
             notices: Arc::clone(&self.notices),
+            parent_errors: Arc::clone(&self.parent_errors),
         }))
     }
 }
@@ -1024,6 +1042,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                     kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
                     resume_response: None,
+                    paused_request: None,
                     history_source: GoalParentHistorySource::Canonical,
                     working_history: Vec::new(),
                 }
@@ -1171,6 +1190,7 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
             kind: GoalParentTurnKind::Start,
             objective: "private stop condition".into(),
             resume_response: None,
+            paused_request: None,
             history_source: GoalParentHistorySource::Canonical,
             working_history: Vec::new(),
         }
@@ -1383,10 +1403,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         )
         .await
         .unwrap();
-    let (response, _start) = controller
-        .submit_for_execution(&settings, start)
-        .await
-        .unwrap();
+    let response = controller.submit(&settings, &start).await.unwrap();
     let GoalResponse::Started(started) = response else {
         panic!("expected a started Goal");
     };
@@ -2323,6 +2340,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
         parent_resume_responses: Arc::clone(&parent_resume_responses),
+        parent_paused_requests: Arc::new(Mutex::new(Vec::new())),
         parent_presentation_finishes: Arc::clone(&parent_presentation_finishes),
     });
     let request = runtime
@@ -2408,6 +2426,7 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
         parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_paused_requests: Arc::new(Mutex::new(Vec::new())),
         parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let request = runtime
@@ -2442,7 +2461,7 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
 
     assert_eq!(
         engine.run(&settings, request).await.unwrap(),
-        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::VerifierBlocked
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Paused
     );
     assert_eq!(
         notices.lock().unwrap().as_slice(),
@@ -2481,6 +2500,7 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
         parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_paused_requests: Arc::new(Mutex::new(Vec::new())),
         parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let blocked_request = runtime
@@ -2500,12 +2520,13 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         .expect("start must yield an execution request");
     assert_eq!(
         engine.run(&settings, blocked_request).await.unwrap(),
-        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::VerifierBlocked
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Paused
     );
 
     let response = "The task packet is at docs/task.md.\n\nPlease continue.".to_owned();
     let parent_resume_responses = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
+    let parent_paused_requests = Arc::new(Mutex::new(Vec::new()));
     let resumed_driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::new(AtomicUsize::new(0)),
@@ -2514,6 +2535,7 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
         parent_resume_responses: Arc::clone(&parent_resume_responses),
+        parent_paused_requests: Arc::clone(&parent_paused_requests),
         parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let resumed_request = runtime
@@ -2542,6 +2564,23 @@ async fn resumed_parent_turn_receives_the_optional_multiline_user_response_once(
     assert_eq!(
         parent_resume_responses.lock().unwrap().as_slice(),
         &[Some(response), None]
+    );
+    let paused_requests = parent_paused_requests.lock().unwrap();
+    assert_eq!(paused_requests.len(), 2);
+    let paused_request = paused_requests[0]
+        .as_ref()
+        .expect("a fresh resume must receive the durable request that paused the Goal");
+    assert_eq!(
+        paused_request.kind(),
+        zeroclaw_runtime::control_plane::GoalBlockerKind::NeedsUserInput
+    );
+    assert_eq!(
+        paused_request.request(),
+        "Provide the task packet reference."
+    );
+    assert!(
+        paused_requests[1].is_none(),
+        "a fresh resume must replay the durable request exactly once"
     );
 }
 
@@ -2575,6 +2614,7 @@ async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response()
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
         parent_resume_responses: Arc::new(Mutex::new(Vec::new())),
+        parent_paused_requests: Arc::new(Mutex::new(Vec::new())),
         parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     supervisor
@@ -2609,6 +2649,7 @@ async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response()
     let histories = Arc::new(Mutex::new(Vec::new()));
     let turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let resume_responses = Arc::new(Mutex::new(Vec::new()));
+    let paused_requests = Arc::new(Mutex::new(Vec::new()));
     let resumed_driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::new(AtomicUsize::new(0)),
@@ -2617,6 +2658,7 @@ async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response()
         parent_histories: Arc::clone(&histories),
         parent_turn_kinds: Arc::clone(&turn_kinds),
         parent_resume_responses: Arc::clone(&resume_responses),
+        parent_paused_requests: Arc::clone(&paused_requests),
         parent_presentation_finishes: Arc::new(AtomicUsize::new(0)),
     });
     let response = "The task packet is at docs/task.md.\n\nPlease continue.".to_owned();
@@ -2650,6 +2692,12 @@ async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response()
         resume_responses.lock().unwrap().as_slice(),
         &[Some(response), None]
     );
+    let paused_requests = paused_requests.lock().unwrap();
+    assert_eq!(paused_requests.len(), 2);
+    assert!(
+        paused_requests.iter().all(Option::is_none),
+        "the retained transcript already includes the paused request; do not replay it"
+    );
     assert!(histories.lock().unwrap()[0].iter().any(|message| {
         message.role == "assistant"
             && message.content
@@ -2664,9 +2712,11 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let notices = Arc::new(Mutex::new(Vec::new()));
+    let parent_errors = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(FailingExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         notices: Arc::clone(&notices),
+        parent_errors: Arc::clone(&parent_errors),
     });
     let request = runtime
         .submit(
@@ -2702,6 +2752,11 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
     let error = engine.run(&settings, request).await.unwrap_err();
 
     assert!(error.to_string().contains("Goal parent operation failed"));
+    assert_eq!(
+        parent_errors.lock().unwrap().as_slice(),
+        ["simulated parent failure"],
+        "the ordinary parent error must be presented before the Goal lifecycle notice"
+    );
     assert_eq!(
         notices.lock().unwrap().as_slice(),
         &[GoalExecutionNotice::Failed {

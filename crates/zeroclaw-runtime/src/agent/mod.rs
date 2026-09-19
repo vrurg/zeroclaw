@@ -8,6 +8,7 @@ pub mod dispatcher;
 pub mod eval;
 pub(crate) mod goal_child_fence;
 pub(crate) mod goal_tool_pairing;
+pub(crate) mod goal_user_input;
 pub mod history;
 pub mod history_pruner;
 pub mod history_trim;
@@ -34,6 +35,7 @@ pub use turn::{
     },
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
+    tool_loop_safety_interruption,
 };
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {

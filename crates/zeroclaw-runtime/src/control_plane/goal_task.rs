@@ -211,6 +211,9 @@ pub enum GoalPauseReason {
     HumanEscalation,
     /// A non-human dependency outside ZeroClaw is blocking progress.
     ExternalDependency,
+    /// A paired core safety interruption stopped further agent work. The Goal
+    /// may resume with a fresh parent operation.
+    CoreInterrupted,
     /// The selected provider or provider configuration is unavailable.
     ProviderUnavailable,
     /// The verifier could not produce a usable decision.
@@ -560,6 +563,7 @@ mod tests {
             GoalPauseReason::NeedsUserInput,
             GoalPauseReason::HumanEscalation,
             GoalPauseReason::ExternalDependency,
+            GoalPauseReason::CoreInterrupted,
             GoalPauseReason::ProviderUnavailable,
             GoalPauseReason::VerifierBlocked,
             GoalPauseReason::BudgetExhausted,
@@ -572,6 +576,7 @@ mod tests {
                 GoalPauseReason::NeedsUserInput => "needs_user_input",
                 GoalPauseReason::HumanEscalation => "human_escalation",
                 GoalPauseReason::ExternalDependency => "external_dependency",
+                GoalPauseReason::CoreInterrupted => "core_interrupted",
                 GoalPauseReason::ProviderUnavailable => "provider_unavailable",
                 GoalPauseReason::VerifierBlocked => "verifier_blocked",
                 GoalPauseReason::BudgetExhausted => "budget_exhausted",

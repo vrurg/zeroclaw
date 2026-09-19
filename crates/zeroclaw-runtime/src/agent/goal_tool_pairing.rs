@@ -139,6 +139,19 @@ pub(crate) struct GoalToolBatch {
     settled: bool,
 }
 
+/// The durable pairing state observed while an enclosing Goal parent turn is
+/// unwinding.
+///
+/// A completed tool batch must not obscure the parent error that followed it:
+/// the marker is only crash evidence until its paired history is known to be
+/// complete.  A broken batch, on the other hand, remains fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoalToolPairingDisposition {
+    None,
+    SettledClean,
+    Broken(&'static str),
+}
+
 impl GoalToolBatch {
     /// Mark one assistant/tool round as paired in the isolated transcript.
     ///
@@ -185,26 +198,41 @@ impl Drop for GoalToolBatch {
 /// Clear a durable marker only after the complete isolated parent turn has
 /// returned its paired working transcript to the Goal executor.
 pub(crate) async fn finalize_goal_tool_pairing() -> Result<()> {
+    match settle_goal_tool_pairing_if_clean().await? {
+        GoalToolPairingDisposition::None | GoalToolPairingDisposition::SettledClean => Ok(()),
+        GoalToolPairingDisposition::Broken(reason) => {
+            anyhow::bail!("Goal parent tool pairing is incomplete: {reason}")
+        }
+    }
+}
+
+/// Settle a clean pairing marker while preserving a broken marker for the
+/// terminal fail-closed path.  This is also used when a parent operation
+/// fails after its tool results have already been fully paired.
+pub(crate) async fn settle_goal_tool_pairing_if_clean() -> Result<GoalToolPairingDisposition> {
     let Some(pairing) = GOAL_TOOL_PAIRING.try_with(Clone::clone).ok() else {
-        return Ok(());
+        return Ok(GoalToolPairingDisposition::None);
     };
     let batch_id = {
         let mut active = pairing.active.lock();
         let Some(active_batch) = active.as_mut() else {
-            return Ok(());
+            return Ok(GoalToolPairingDisposition::None);
         };
-        ensure!(
-            active_batch.open_batches == 0,
-            "Goal parent turn returned with an unfinished tool batch"
-        );
-        ensure!(
-            !active_batch.nested_pairing_failed,
-            "Goal parent turn returned with an unpaired tool batch"
-        );
-        ensure!(
-            !active_batch.settling,
-            "Goal parent turn attempted duplicate tool-pairing settlement"
-        );
+        if active_batch.open_batches != 0 {
+            return Ok(GoalToolPairingDisposition::Broken(
+                "a tool batch is still running",
+            ));
+        }
+        if active_batch.nested_pairing_failed {
+            return Ok(GoalToolPairingDisposition::Broken(
+                "a tool batch ended without paired history",
+            ));
+        }
+        if active_batch.settling {
+            return Ok(GoalToolPairingDisposition::Broken(
+                "another settlement is already in progress",
+            ));
+        }
         active_batch.settling = true;
         active_batch.batch_id.clone()
     };
@@ -233,7 +261,7 @@ pub(crate) async fn finalize_goal_tool_pairing() -> Result<()> {
         "Goal tool batch changed while settlement completed"
     );
     *active = None;
-    Ok(())
+    Ok(GoalToolPairingDisposition::SettledClean)
 }
 
 #[cfg(test)]

@@ -28,15 +28,22 @@ use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 
 use super::{
     GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalHostSettings,
-    GoalIngressContext, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRetainedTranscript,
-    GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease,
-    GoalTerminalReason, GoalVerifierTurn,
+    GoalIngressContext, GoalOperationScope, GoalParentTurn, GoalPausedRequest, GoalResponse,
+    GoalRetainedTranscript, GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionLease, GoalTerminalReason, GoalVerifierTurn,
 };
 use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
     GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
-use crate::agent::goal_tool_pairing::{finalize_goal_tool_pairing, scope_goal_tool_pairing};
+use crate::agent::goal_tool_pairing::{
+    GoalToolPairingDisposition, finalize_goal_tool_pairing, scope_goal_tool_pairing,
+    settle_goal_tool_pairing_if_clean,
+};
+use crate::agent::goal_user_input::{
+    MAX_GOAL_BLOCKER_MESSAGE_CHARS, candidate_goal_blocker_certificate,
+    format_goal_user_input_request, scope_goal_user_input, take_goal_user_input,
+};
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
     GoalTaskRegistry, GoalToolBatchFailureReason, GoalTransitionResult, TaskStatus,
@@ -45,14 +52,12 @@ use zeroclaw_commands::goal::GoalCommand;
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
-const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
-const GOAL_BLOCKER_HEADING: &str = "## Goal blocker";
 
 /// Terminal or paused result of one owned Goal execution epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalExecutionOutcome {
     Completed,
-    VerifierBlocked,
+    Paused,
 }
 
 /// A Goal command result whose surface lease remains held until the transport
@@ -719,7 +724,7 @@ impl GoalExecutionSupervisor {
         // classifier for that condition.
         let paused_transcript = self.paused_transcript_for_scope(scope).await;
         match self.drain(scope).await {
-            Ok(GoalExecutionOutcome::VerifierBlocked) => Ok(match paused_transcript {
+            Ok(GoalExecutionOutcome::Paused) => Ok(match paused_transcript {
                 Some(transcript) => transcript.lock().await.take(),
                 None => None,
             }),
@@ -1050,6 +1055,7 @@ impl GoalExecutionEngine {
         let scope = request.scope().clone();
         let initial_turn_kind = request.initial_turn_kind();
         let resume_response = request.resume_response().map(str::to_owned);
+        let paused_request = request.paused_request().cloned();
         let initial_retained_transcript = request.retained_transcript().cloned();
         let objective = self.current_objective(&scope).await?;
         let accountant: Arc<dyn GoalOperationAccounting> = Arc::new(GoalOperationAccountant::new(
@@ -1064,15 +1070,16 @@ impl GoalExecutionEngine {
         let result = GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
                 scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
-                    self.run_scoped(
+                    scope_goal_user_input(self.run_scoped(
                         &scope,
                         &objective,
                         initial_turn_kind,
                         resume_response,
+                        paused_request,
                         initial_retained_transcript,
                         paused_transcript,
                         lease.as_mut(),
-                    )
+                    ))
                     .await
                 })
                 .await
@@ -1159,6 +1166,7 @@ impl GoalExecutionEngine {
         objective: &str,
         mut parent_turn_kind: super::GoalParentTurnKind,
         mut resume_response: Option<String>,
+        mut paused_request: Option<GoalPausedRequest>,
         initial_retained_transcript: Option<GoalRetainedTranscript>,
         paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
         lease: &mut dyn GoalSessionExecutionLease,
@@ -1192,6 +1200,10 @@ impl GoalExecutionEngine {
                         resume_response: (parent_turn_kind == super::GoalParentTurnKind::Resume)
                             .then(|| resume_response.take())
                             .flatten(),
+                        paused_request: (parent_turn_kind == super::GoalParentTurnKind::Resume
+                            && !retained_transcript)
+                            .then(|| paused_request.take())
+                            .flatten(),
                         history_source: (retained_transcript
                             || parent_turn_kind == super::GoalParentTurnKind::Continue)
                             .then_some(super::GoalParentHistorySource::Continuation)
@@ -1207,14 +1219,27 @@ impl GoalExecutionEngine {
                         return Err(error).context("Goal parent tool pairing failed");
                     }
                     self.require_complete_accounting(scope).await?;
-                    if !parent.candidate.trim().is_empty() {
-                        parent
-                    } else {
-                        self.fail(scope, "candidate_empty").await?;
-                        bail!("Goal parent returned an empty candidate");
-                    }
+                    parent
                 }
                 Err(error) => {
+                    if let Err(presentation_error) = lease.present_parent_error(&error).await {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": scope.task_id(),
+                                "session_id": scope.session_id(),
+                                "error": zeroclaw_providers::sanitize_api_error(
+                                    &format!("{presentation_error:#}")
+                                ),
+                            })),
+                            "Goal parent error presentation failed"
+                        );
+                    }
                     self.fail_operation(scope, "parent_operation_failed", &error)
                         .await?;
                     return Err(error).context("Goal parent operation failed");
@@ -1224,8 +1249,121 @@ impl GoalExecutionEngine {
                 self.fail(scope, "executor_failed").await?;
                 return Err(error).context("finish Goal parent-turn presentation");
             }
-            let candidate = parent.candidate;
-            working_history = parent.working_history;
+            let super::GoalParentTurnResult {
+                candidate,
+                working_history: parent_history,
+                interruption,
+            } = parent;
+            working_history = parent_history;
+
+            if let Some(interruption) = interruption {
+                let message = interruption.message().to_owned();
+                let description = match interruption {
+                    super::GoalParentInterruption::ToolLoopSafety { .. } => {
+                        "The agent tool-loop safety limit stopped further tool work after completed results were recorded."
+                    }
+                    super::GoalParentInterruption::ContextWindowExceeded { .. } => {
+                        "The selected model rejected the current context before it could produce a candidate."
+                    }
+                };
+                let error = anyhow::anyhow!(message.clone());
+                if let Err(presentation_error) = lease.present_parent_error(&error).await {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": scope.task_id(),
+                                "session_id": scope.session_id(),
+                                "error": zeroclaw_providers::sanitize_api_error(
+                                    &format!("{presentation_error:#}")
+                                ),
+                            })),
+                        "Goal interruption presentation failed"
+                    );
+                }
+                *paused_transcript.lock().await = Some(GoalRetainedTranscript {
+                    working_history,
+                    canonical_history,
+                });
+                self.pause_for_blockers(
+                    scope,
+                    GoalPauseReason::CoreInterrupted,
+                    description.to_owned(),
+                    Vec::new(),
+                )
+                .await?;
+                lease
+                    .publish_goal_notice(GoalExecutionNotice::PausedForInterruption { message })
+                    .await?;
+                return Ok(GoalExecutionOutcome::Paused);
+            }
+
+            if let Some(request) = take_goal_user_input().await {
+                let request_message =
+                    format_goal_user_input_request(&request.question, &request.choices);
+                append_candidate_if_missing(&mut working_history, &candidate);
+                *paused_transcript.lock().await = Some(GoalRetainedTranscript {
+                    working_history,
+                    canonical_history,
+                });
+                self.pause_for_blockers(
+                    scope,
+                    GoalPauseReason::NeedsUserInput,
+                    "The agent requested user input.".to_owned(),
+                    vec![GoalBlocker {
+                        kind: GoalBlockerKind::NeedsUserInput,
+                        message: request_message.clone(),
+                        payload: None,
+                    }],
+                )
+                .await?;
+                lease
+                    .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
+                        blocker_messages: vec![request_message],
+                    })
+                    .await?;
+                return Ok(GoalExecutionOutcome::Paused);
+            }
+
+            if let Some(certificate) =
+                crate::agent::goal_user_input::candidate_goal_blocker_certificate(&candidate)
+            {
+                let pause_reason = match certificate.kind {
+                    GoalBlockerKind::NeedsUserInput => GoalPauseReason::NeedsUserInput,
+                    GoalBlockerKind::HumanEscalation => GoalPauseReason::HumanEscalation,
+                    GoalBlockerKind::ExternalDependency => GoalPauseReason::ExternalDependency,
+                    _ => bail!("Goal blocker certificate has an unsupported pause kind"),
+                };
+                let message = certificate.message;
+                append_candidate_if_missing(&mut working_history, &candidate);
+                *paused_transcript.lock().await = Some(GoalRetainedTranscript {
+                    working_history,
+                    canonical_history,
+                });
+                self.pause_for_blockers(
+                    scope,
+                    pause_reason,
+                    "The agent reported a Goal blocker.".to_owned(),
+                    vec![GoalBlocker {
+                        kind: certificate.kind,
+                        message: message.clone(),
+                        payload: None,
+                    }],
+                )
+                .await?;
+                lease
+                    .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
+                        blocker_messages: vec![message],
+                    })
+                    .await?;
+                return Ok(GoalExecutionOutcome::Paused);
+            }
+
+            if candidate.trim().is_empty() {
+                self.fail(scope, "candidate_empty").await?;
+                bail!("Goal parent returned an empty candidate");
+            }
 
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
@@ -1275,13 +1413,19 @@ impl GoalExecutionEngine {
                         working_history,
                         canonical_history,
                     });
-                    self.pause_verifier_blocked(scope, reason, blockers).await?;
+                    self.pause_for_blockers(
+                        scope,
+                        GoalPauseReason::VerifierBlocked,
+                        reason,
+                        blockers,
+                    )
+                    .await?;
                     lease
                         .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
                             blocker_messages,
                         })
                         .await?;
-                    return Ok(GoalExecutionOutcome::VerifierBlocked);
+                    return Ok(GoalExecutionOutcome::Paused);
                 }
                 Err(error) => {
                     self.fail(scope, "verifier_protocol_invalid").await?;
@@ -1376,14 +1520,15 @@ impl GoalExecutionEngine {
             .await
     }
 
-    async fn pause_verifier_blocked(
+    async fn pause_for_blockers(
         &self,
         scope: &GoalExecutionScope,
+        pause_reason: GoalPauseReason,
         reason: String,
         blockers: Vec<GoalBlocker>,
     ) -> Result<()> {
         let pause = GoalPauseState {
-            reason: GoalPauseReason::VerifierBlocked,
+            reason: pause_reason,
             description: Some(reason),
             blockers,
         };
@@ -1399,7 +1544,7 @@ impl GoalExecutionEngine {
         {
             GoalTransitionResult::Applied => Ok(()),
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                bail!("Goal verifier pause lost its execution fence")
+                bail!("Goal execution pause lost its execution fence")
             }
         }
     }
@@ -1417,6 +1562,17 @@ impl GoalExecutionEngine {
         reason: &str,
         tool_batch_failure: GoalToolBatchFailureReason,
     ) -> Result<()> {
+        // A parent operation can fail after every dispatched tool result has
+        // already been paired into its isolated transcript.  In that case the
+        // pending marker is clean crash evidence, not the cause of failure;
+        // settle it before recording the real parent/provider error.  Only an
+        // unfinished or dropped batch remains the terminal fail-closed case.
+        if matches!(
+            settle_goal_tool_pairing_if_clean().await?,
+            GoalToolPairingDisposition::SettledClean
+        ) {
+            return self.finish_failure(scope, reason).await;
+        }
         let goal = self.registry.get_goal_task(scope.task_id()).await?;
         if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
             goal.pending_tool_batch_id
@@ -1481,6 +1637,13 @@ impl GoalExecutionEngine {
         reason: &'static str,
         error: &anyhow::Error,
     ) -> Result<()> {
+        let reason = if reason == "parent_operation_failed"
+            && zeroclaw_providers::reliable::is_context_window_exceeded(error)
+        {
+            "parent_context_window_exceeded"
+        } else {
+            reason
+        };
         let provider = error.chain().find_map(|cause| {
             cause
                 .downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
@@ -1881,45 +2044,6 @@ enum VerifierDecision {
     },
 }
 
-/// A controller-verifiable declaration from the visible parent candidate.
-///
-/// The verifier has no session history by design, so it must not infer that a
-/// broadly worded progress report needs a human. The parent supplies this
-/// deliberately small certificate only when it genuinely cannot continue.
-struct GoalBlockerCertificate {
-    kind: GoalBlockerKind,
-    message: String,
-}
-
-fn candidate_goal_blocker_certificate(candidate: &str) -> Option<GoalBlockerCertificate> {
-    let candidate = candidate.trim_end();
-    let marker = format!("{GOAL_BLOCKER_HEADING}\n");
-    let certificate = candidate.strip_prefix(&marker).or_else(|| {
-        candidate
-            .rsplit_once(&format!("\n{marker}"))
-            .map(|(_, certificate)| certificate)
-    })?;
-    let mut lines = certificate.lines();
-    let kind = lines.next()?.strip_prefix("Kind: ")?;
-    let message = lines.next()?.strip_prefix("Action: ")?.trim();
-    if lines.next().is_some()
-        || message.is_empty()
-        || message.chars().count() > MAX_VERIFIER_BLOCKER_MESSAGE_CHARS
-    {
-        return None;
-    }
-    let kind = match kind {
-        "needs_user_input" => GoalBlockerKind::NeedsUserInput,
-        "human_escalation" => GoalBlockerKind::HumanEscalation,
-        "external_dependency" => GoalBlockerKind::ExternalDependency,
-        _ => return None,
-    };
-    Some(GoalBlockerCertificate {
-        kind,
-        message: message.to_owned(),
-    })
-}
-
 fn parse_verifier_response(raw: &str, candidate: &str) -> Result<VerifierDecision> {
     let response: VerifierWireResponse =
         serde_json::from_str(raw).context("verifier response is not strict JSON")?;
@@ -1936,7 +2060,7 @@ fn parse_verifier_response(raw: &str, candidate: &str) -> Result<VerifierDecisio
     for blocker in &response.blockers {
         ensure!(
             !blocker.message.trim().is_empty()
-                && blocker.message.chars().count() <= MAX_VERIFIER_BLOCKER_MESSAGE_CHARS,
+                && blocker.message.chars().count() <= MAX_GOAL_BLOCKER_MESSAGE_CHARS,
             "verifier blocker message is invalid"
         );
     }
@@ -1958,31 +2082,20 @@ fn parse_verifier_response(raw: &str, candidate: &str) -> Result<VerifierDecisio
         }
         VerifierDecisionKind::Blocked => {
             ensure!(
-                !response.blockers.is_empty(),
-                "blocked verifier response has no actionable blockers"
+                response.blockers.len() == 1,
+                "blocked verifier response must contain exactly one actionable blocker"
             );
             let Some(certificate) = candidate_goal_blocker_certificate(candidate) else {
-                // A syntactically valid but unsupported semantic pause must
-                // not interrupt Goal execution. It is not a protocol error:
-                // the controller simply declines an inference the isolated
-                // verifier cannot substantiate from its allowed input.
                 return Ok(VerifierDecision::Continue { reason });
             };
-            ensure!(
-                response.blockers.len() == 1,
-                "blocked verifier response does not match the candidate blocker certificate"
-            );
             let blocker = &response.blockers[0];
             let blocker_kind: GoalBlockerKind = blocker.kind.into();
-            if blocker_kind != certificate.kind {
-                return Ok(VerifierDecision::Continue { reason });
-            }
+            ensure!(
+                blocker_kind == certificate.kind,
+                "blocked verifier response does not match the candidate blocker certificate"
+            );
             Ok(VerifierDecision::Blocked {
                 reason,
-                // The certificate is the parent-visible, controller-validated
-                // request for help. Do not make a pause depend on an exact
-                // textual echo from the verifier, which has only model output
-                // and may add harmless punctuation or wording changes.
                 blockers: vec![GoalBlocker {
                     kind: certificate.kind,
                     message: certificate.message,
@@ -1998,6 +2111,13 @@ fn parse_verifier_response(raw: &str, candidate: &str) -> Result<VerifierDecisio
 /// with the parent candidate; test and future drivers are allowed to return a
 /// history without it, so retain it only when needed for a later continuation.
 fn append_candidate_if_missing(history: &mut Vec<ChatMessage>, candidate: &str) {
+    // A tool-only parent turn may deliberately have no final assistant text
+    // while still recording a typed `ask_user` interruption. There is no
+    // assistant candidate to retain in that case; adding an empty assistant
+    // message would corrupt the later provider-facing transcript.
+    if candidate.trim().is_empty() {
+        return;
+    }
     if history
         .last()
         .is_none_or(|message| message.role != "assistant" || message.content != candidate)
@@ -2035,10 +2155,103 @@ fn append_canonical_delta(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use tempfile::TempDir;
 
+    use crate::agent::goal_user_input::{GoalUserInputRequest, record_goal_user_input};
     use crate::control_plane::{GoalTaskRecord, SqliteTaskStore, TaskKind, TaskRecord};
+
+    struct TypedInputLease {
+        session_key: super::super::GoalSessionKey,
+        presentation_finishes: AtomicUsize,
+        verifier_calls: AtomicUsize,
+        notices: std::sync::Mutex<Vec<GoalExecutionNotice>>,
+        interruption: Option<super::super::GoalParentInterruption>,
+        fallback_candidate: Option<String>,
+        parent_errors: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl GoalSessionExecutionLease for TypedInputLease {
+        fn session_key(&self) -> &super::super::GoalSessionKey {
+            &self.session_key
+        }
+
+        fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _operation: &GoalOperationScope,
+            turn: super::super::GoalParentTurn,
+        ) -> Result<super::super::GoalParentTurnResult> {
+            if let Some(interruption) = self.interruption.clone() {
+                let batch = crate::agent::goal_tool_pairing::admit_goal_tool_batch(1)
+                    .await?
+                    .context("test Goal tool batch must be admitted")?;
+                batch.settle()?;
+                return Ok(super::super::GoalParentTurnResult {
+                    candidate: String::new(),
+                    working_history: turn.working_history,
+                    interruption: Some(interruption),
+                });
+            }
+            if let Some(candidate) = self.fallback_candidate.clone() {
+                return Ok(super::super::GoalParentTurnResult {
+                    candidate,
+                    working_history: turn.working_history,
+                    interruption: None,
+                });
+            }
+            assert!(matches!(
+                record_goal_user_input(GoalUserInputRequest {
+                    question: "Which implementation should I use?".to_owned(),
+                    choices: vec!["A".to_owned(), "B".to_owned()],
+                })
+                .await,
+                Some(crate::agent::goal_user_input::RecordGoalUserInput::Recorded)
+            ));
+            Ok(super::super::GoalParentTurnResult {
+                // Tool-only provider turns may have no final assistant text.
+                // A recorded typed interruption still has sufficient durable
+                // evidence to pause rather than discarding the user's question.
+                candidate: String::new(),
+                working_history: turn.working_history,
+                interruption: None,
+            })
+        }
+
+        async fn finish_parent_turn_presentation(&mut self) -> Result<()> {
+            self.presentation_finishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn present_parent_error(&mut self, error: &anyhow::Error) -> Result<()> {
+            self.parent_errors.lock().unwrap().push(error.to_string());
+            Ok(())
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _operation: &GoalOperationScope,
+            _turn: super::super::GoalVerifierTurn,
+        ) -> Result<String> {
+            self.verifier_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(r#"{"decision":"complete","reason":"unexpected"}"#.to_owned())
+        }
+
+        async fn append_verified_candidate(&mut self, _candidate: String) -> Result<()> {
+            Ok(())
+        }
+
+        async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
+            self.notices.lock().unwrap().push(notice);
+            Ok(())
+        }
+    }
 
     #[test]
     fn candidate_retention_does_not_duplicate_the_completed_parent_turn() {
@@ -2054,6 +2267,16 @@ mod tests {
     }
 
     #[test]
+    fn candidate_retention_omits_an_empty_tool_only_turn() {
+        let mut history = vec![ChatMessage::user("question"), ChatMessage::tool("result")];
+
+        append_candidate_if_missing(&mut history, "");
+
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|message| message.role != "assistant"));
+    }
+
+    #[test]
     fn candidate_retention_supplies_a_missing_completed_parent_turn() {
         let mut history = vec![ChatMessage::user("question")];
 
@@ -2062,6 +2285,282 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history.last().unwrap().role, "assistant");
         assert_eq!(history.last().unwrap().content, "answer");
+    }
+
+    #[test]
+    fn user_input_pause_preserves_the_exact_question_and_choices() {
+        assert_eq!(
+            format_goal_user_input_request(
+                "Which policy should I use?",
+                &["Keep A".to_owned(), "Switch to B".to_owned()],
+            ),
+            "Which policy should I use? — 1. Keep A / 2. Switch to B"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_user_input_pauses_after_parent_presentation_without_a_verifier() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: None,
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                &mut lease,
+            ),
+        ))
+        .await;
+
+        assert_eq!(outcome.unwrap(), GoalExecutionOutcome::Paused);
+        assert_eq!(lease.presentation_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lease.notices.lock().unwrap().as_slice(),
+            &[GoalExecutionNotice::PausedForBlocker {
+                blocker_messages: vec![
+                    "Which implementation should I use? — 1. A / 2. B".to_owned()
+                ],
+            }]
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(goal.blockers.len(), 1);
+        assert_eq!(
+            goal.blockers[0].message,
+            "Which implementation should I use? — 1. A / 2. B"
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_spaced_goal_blocker_pauses_without_waiting_for_the_verifier() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: None,
+            fallback_candidate: Some(
+                "I need an exact decision.\n\n## Goal blocker\n\nKind: needs_user_input\n\nAction: Choose A or B"
+                    .to_owned(),
+            ),
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                &mut lease,
+            ),
+        ))
+        .await;
+
+        assert_eq!(outcome.unwrap(), GoalExecutionOutcome::Paused);
+        assert_eq!(lease.presentation_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lease.notices.lock().unwrap().as_slice(),
+            &[GoalExecutionNotice::PausedForBlocker {
+                blocker_messages: vec!["Choose A or B".to_owned()],
+            }]
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(goal.blockers.len(), 1);
+        assert_eq!(goal.blockers[0].message, "Choose A or B");
+    }
+
+    #[tokio::test]
+    async fn paired_tool_loop_safety_interruption_surfaces_then_pauses_without_a_verifier() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: Some(super::super::GoalParentInterruption::ToolLoopSafety {
+                message: "Agent loop aborted by loop detector: repeated tool calls".to_owned(),
+            }),
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                &mut lease,
+            ),
+        ))
+        .await;
+
+        assert_eq!(outcome.unwrap(), GoalExecutionOutcome::Paused);
+        assert_eq!(lease.presentation_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lease.parent_errors.lock().unwrap().as_slice(),
+            ["Agent loop aborted by loop detector: repeated tool calls"]
+        );
+        assert_eq!(
+            lease.notices.lock().unwrap().as_slice(),
+            &[GoalExecutionNotice::PausedForInterruption {
+                message: "Agent loop aborted by loop detector: repeated tool calls".to_owned(),
+            }]
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
+        assert!(goal.blockers.is_empty());
+        assert!(goal.pending_tool_batch_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn paired_context_window_interruption_surfaces_then_pauses_without_a_verifier() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let message = "request (8968 tokens) exceeds the available context size (8448 tokens)";
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: Some(
+                super::super::GoalParentInterruption::ContextWindowExceeded {
+                    message: message.to_owned(),
+                },
+            ),
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                &mut lease,
+            ),
+        ))
+        .await;
+
+        assert_eq!(outcome.unwrap(), GoalExecutionOutcome::Paused);
+        assert_eq!(lease.presentation_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.parent_errors.lock().unwrap().as_slice(), [message]);
+        assert_eq!(
+            lease.notices.lock().unwrap().as_slice(),
+            &[GoalExecutionNotice::PausedForInterruption {
+                message: message.to_owned(),
+            }]
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
+        assert!(goal.blockers.is_empty());
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_call_id.is_none());
     }
 
     #[test]
@@ -2233,12 +2732,54 @@ mod tests {
     }
 
     #[test]
+    fn verifier_protocol_rejects_removed_request_quote_field() {
+        assert!(parse_verifier_response(
+            r#"{"decision":"blocked","reason":"wait","blockers":[{"kind":"needs_user_input","message":"x","request_quote":"x"}]}"#,
+            "candidate",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn verifier_protocol_accepts_a_bounded_blocked_packet() {
         let parsed = parse_verifier_response(
             r#"{"decision":"blocked","reason":"dependency unavailable","blockers":[{"kind":"external_dependency","message":"wait for service"}]}"#,
             "Progress report.\n## Goal blocker\nKind: external_dependency\nAction: wait for service",
         )
         .unwrap();
+        assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_protocol_accepts_a_structured_blocker_before_trailing_narration() {
+        let parsed = parse_verifier_response(
+            r#"{"decision":"blocked","reason":"needs an answer","blockers":[{"kind":"needs_user_input","message":"Choose A or B"}]}"#,
+            "I need a decision.\n## Goal blocker\nKind: needs_user_input\nAction: Choose A or B\nI will wait for your response.",
+        )
+        .unwrap();
+
+        assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_protocol_accepts_a_crlf_certificate_with_whitespace_after_kind() {
+        let parsed = parse_verifier_response(
+            r#"{"decision":"blocked","reason":"dependency unavailable","blockers":[{"kind":"external_dependency","message":"wait for service"}]}"#,
+            "Progress report.\r\n## Goal blocker\r\nKind: external_dependency \r\nAction: wait for service",
+        )
+        .unwrap();
+
+        assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_protocol_uses_the_final_certificate_after_a_heading_prefix_in_prose() {
+        let parsed = parse_verifier_response(
+            r#"{"decision":"blocked","reason":"operator action required","blockers":[{"kind":"human_escalation","message":"Ask the operator for the deploy key"}]}"#,
+            "## Goal blocker checklist\nI cannot obtain the deploy key myself.\n## Goal blocker\nKind: human_escalation\nAction: Ask the operator for the deploy key",
+        )
+        .unwrap();
+
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
     }
 
@@ -2259,10 +2800,39 @@ mod tests {
     }
 
     #[test]
-    fn verifier_cannot_pause_an_ordinary_progress_report() {
+    fn verifier_rejects_multiple_blockers_even_with_a_valid_parent_certificate() {
+        let candidate = "Need a decision.\n## Goal blocker\nKind: needs_user_input\nAction: Please choose one target";
+
+        assert!(parse_verifier_response(
+            r#"{"decision":"blocked","reason":"needs a decision","blockers":[{"kind":"needs_user_input","message":"choose a target"},{"kind":"human_escalation","message":"ask an operator"}]}"#,
+            candidate,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_multiple_blockers_without_a_parent_certificate() {
+        assert!(parse_verifier_response(
+            r#"{"decision":"blocked","reason":"needs a decision","blockers":[{"kind":"needs_user_input","message":"choose a target"},{"kind":"human_escalation","message":"ask an operator"}]}"#,
+            "I ran the schema migration. Next steps: run the integration suite.",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_a_kind_mismatch_with_a_parent_certificate() {
+        assert!(parse_verifier_response(
+            r#"{"decision":"blocked","reason":"needs an operator","blockers":[{"kind":"external_dependency","message":"ask an operator"}]}"#,
+            "Need a decision.\n## Goal blocker\nKind: human_escalation\nAction: Ask an operator",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_cannot_pause_an_ordinary_progress_report_even_if_it_ends_with_a_colon() {
         let parsed = parse_verifier_response(
             r#"{"decision":"blocked","reason":"more context would help","blockers":[{"kind":"needs_user_input","message":"provide context"}]}"#,
-            "I inspected the repository and will continue with the next validation.",
+            "I ran the schema migration. Next steps: run the integration suite.",
         )
         .unwrap();
 
@@ -2636,6 +3206,101 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("goal_tool_loop_safety_limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanly_paired_tool_batch_does_not_mask_a_later_parent_failure() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        crate::agent::goal_tool_pairing::scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            async {
+                let batch = crate::agent::goal_tool_pairing::admit_goal_tool_batch(1)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                batch.settle().unwrap();
+                engine
+                    .fail_operation(
+                        &scope,
+                        "parent_operation_failed",
+                        &anyhow::anyhow!("provider rejected the oversized request"),
+                    )
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("parent_operation_failed")
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_tool_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_context_window_failure_keeps_a_safe_specific_terminal_reason() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        engine
+            .fail_operation(
+                &scope,
+                "parent_operation_failed",
+                &anyhow::anyhow!(
+                    "request (8968 tokens) exceeds the available context size (8448 tokens)"
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("parent_context_window_exceeded")
         );
     }
 

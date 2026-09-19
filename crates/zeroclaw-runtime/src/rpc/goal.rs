@@ -299,6 +299,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(GoalParentTurnResult {
             candidate: outcome.response,
             working_history: outcome.working_history,
+            interruption: outcome.interruption,
         })
     }
 
@@ -343,6 +344,23 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(())
     }
 
+    async fn present_parent_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+        self.outbound
+            .notify(
+                GOAL_UPDATE_METHOD,
+                serde_json::to_value(crate::rpc::types::SessionGoalUpdate::ParentError {
+                    session_id: self.raw_session_id()?.to_owned(),
+                    message: crate::i18n::get_required_cli_string_with_args(
+                        "goal-mode-parent-error",
+                        &[("error", safe_error.as_str())],
+                    ),
+                })?,
+            )
+            .await;
+        Ok(())
+    }
+
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
         self.agent
             .lock()
@@ -363,6 +381,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 crate::rpc::types::SessionGoalUpdate::PausedForBlocker {
                     session_id: self.raw_session_id()?.to_owned(),
                     blocker_messages,
+                }
+            }
+            GoalExecutionNotice::PausedForInterruption { message } => {
+                crate::rpc::types::SessionGoalUpdate::PausedForInterruption {
+                    session_id: self.raw_session_id()?.to_owned(),
+                    message,
                 }
             }
             GoalExecutionNotice::Failed {
@@ -505,10 +529,14 @@ impl RpcGoalRuntime {
             Some(supervisor) => supervisor,
             None => {
                 let runtime = GoalRuntime::new(Arc::clone(&registry));
-                let tracker = CostTracker::get_or_init_global_required(
-                    config.cost.clone(),
-                    &config.data_dir,
-                )?;
+                // Match the resident RPC turn path. Reload can replace the
+                // global singleton while this context still owns the tracker
+                // serving its active sessions; Goal Mode must use that same
+                // canonical ledger rather than fail admission on the stale
+                // configuration snapshot.
+                let tracker = context.cost_tracker.clone().map(Ok).unwrap_or_else(|| {
+                    CostTracker::get_or_init_global_required(config.cost.clone(), &config.data_dir)
+                })?;
                 let engine = Arc::new(runtime.execution_engine(
                     tracker,
                     driver.agent_alias().to_owned(),
@@ -616,6 +644,7 @@ mod tests {
             kind: GoalParentTurnKind::Resume,
             objective: "finish the task".to_owned(),
             resume_response: Some("use the authentication module".to_owned()),
+            paused_request: None,
             history_source: crate::goal_mode::GoalParentHistorySource::Continuation,
             working_history: vec![
                 ChatMessage::system("previous Goal system prompt"),
@@ -646,6 +675,7 @@ mod tests {
             kind: GoalParentTurnKind::Resume,
             objective: "finish the task".to_owned(),
             resume_response: Some("the blocker is resolved".to_owned()),
+            paused_request: None,
             history_source: crate::goal_mode::GoalParentHistorySource::Canonical,
             working_history: vec![ChatMessage::user("original task")],
         });

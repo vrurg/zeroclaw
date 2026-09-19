@@ -40,6 +40,47 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// A loop detector stopped further tool work after the current tool results
+/// were collected. Goal Mode may pause this error only after its durable tool
+/// pairing marker has settled; ordinary turns retain the same error outcome.
+#[derive(Debug, Clone)]
+pub struct ToolLoopSafetyInterrupted {
+    message: String,
+}
+
+impl ToolLoopSafetyInterrupted {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ToolLoopSafetyInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.starts_with("Agent loop aborted") {
+            formatter.write_str(&self.message)
+        } else {
+            write!(
+                formatter,
+                "Agent loop aborted by loop detector: {}",
+                self.message
+            )
+        }
+    }
+}
+
+impl std::error::Error for ToolLoopSafetyInterrupted {}
+
+pub fn tool_loop_safety_interruption(err: &anyhow::Error) -> Option<&ToolLoopSafetyInterrupted> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ToolLoopSafetyInterrupted>())
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,

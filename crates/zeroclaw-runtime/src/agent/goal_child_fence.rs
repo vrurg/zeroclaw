@@ -21,6 +21,15 @@ pub(crate) struct GoalChildFence {
     accepts_children: bool,
 }
 
+/// Which Goal-owned turn is currently executing.  This is deliberately
+/// process-local: it selects transient tool behavior and is never authority
+/// or durable Goal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoalTurnScope {
+    Parent,
+    Child,
+}
+
 impl GoalChildFence {
     pub(crate) fn open() -> Arc<Self> {
         Arc::new(Self {
@@ -66,6 +75,21 @@ pub(crate) fn is_goal_scoped() -> bool {
     GOAL_CHILD_FENCE
         .try_with(|fence| fence.is_some())
         .unwrap_or(false)
+}
+
+/// Return the exact Goal turn role, if this task is executing inside a Goal.
+pub(crate) fn goal_turn_scope() -> Option<GoalTurnScope> {
+    GOAL_CHILD_FENCE
+        .try_with(|fence| {
+            fence.as_ref().map(|fence| {
+                if fence.accepts_children {
+                    GoalTurnScope::Parent
+                } else {
+                    GoalTurnScope::Child
+                }
+            })
+        })
+        .unwrap_or(None)
 }
 
 /// Installs an open child-admission scope for one isolated Goal parent turn.

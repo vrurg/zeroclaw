@@ -6,9 +6,9 @@ use std::time::Duration;
 use rusqlite::{Connection, ErrorCode, params};
 use zeroclaw_runtime::control_plane::task_registry::TerminalSettlementIntent;
 use zeroclaw_runtime::control_plane::{
-    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalToolBatchFailureReason, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord,
-    TaskRegistry, TaskStatus,
+    GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
+    GoalTaskRecord, GoalTaskRegistry, GoalToolBatchFailureReason, GoalTransitionResult,
+    SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 
 fn insert_current_goal(
@@ -1650,6 +1650,72 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
             .expect("read missing-usage terminal reason")
             .as_deref(),
         Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn restart_preserves_a_verifier_blocker_for_the_explicit_resume_context() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize store");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("blocked", "blocked-session"),
+                session_goal_extension("blocked"),
+            )
+            .await
+            .expect("create Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .pause_session_goal(
+                "blocked",
+                "blocked-session",
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::VerifierBlocked,
+                    description: Some("A user decision is required.".to_owned()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::NeedsUserInput,
+                        message: "Please confirm whether to keep the retry policy.".to_owned(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .expect("pause Goal for user input"),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let reopened = SqliteTaskStore::new(directory.path()).expect("reopen store");
+    assert_eq!(
+        reopened
+            .reconcile_goal_boot_state("boot-new")
+            .expect("reconcile paused Goal"),
+        0,
+        "an already paused Goal requires no further lifecycle transition at restart"
+    );
+    let task = reopened
+        .current_goal_for_session("blocked-session")
+        .await
+        .expect("read blocked Goal")
+        .expect("blocked Goal remains current");
+    assert_eq!(task.status, TaskStatus::Paused);
+    let goal = reopened
+        .get_goal_task("blocked")
+        .await
+        .expect("read Goal extension")
+        .expect("Goal extension remains available");
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::VerifierBlocked));
+    assert_eq!(
+        goal.blockers,
+        vec![GoalBlocker {
+            kind: GoalBlockerKind::NeedsUserInput,
+            message: "Please confirm whether to keep the retry policy.".to_owned(),
+            payload: None,
+        }]
     );
 }
 

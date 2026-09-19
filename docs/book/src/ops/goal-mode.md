@@ -110,16 +110,33 @@ success criterion and candidate response and returns `Complete`. A verifier
 blockers. Provider, protocol, attribution, malformed-output, and verifier
 failures fail the Goal rather than becoming a semantic blocker.
 
+An agent loop-safety interruption is different when every already-executed tool
+result was paired into the isolated transcript: Goal Mode presents the ordinary
+core error, pauses the Goal, and permits `/goal resume` to start a fresh parent
+operation. An interrupted or unpaired tool batch still fails closed and is
+never resumed.
+
 A verifier-blocked Goal names its blocker in the pause notification and releases
-the session's foreground slot. To prevent an ordinary progress report from
-being mistaken for a request for human intervention, the verifier can accept a
-block only when the candidate visibly ends with this exact certificate:
+the session's foreground slot. When a parent agent needs a user answer, it calls
+`ask_user` with the exact question and optional choices. Goal Mode records that
+request, finishes presenting the current parent turn, and then pauses without
+running the verifier. This preserves a compact projection of the question and
+choices for a later
+`/goal resume RESPONSE`, including after a service restart. If `ask_user` is
+unavailable or rejected, the controller recognizes only the following explicit
+structured fallback after the parent turn is fully paired and accounted; it
+cannot invent a blocker from broad scope or ordinary progress:
 
 ```text
 ## Goal blocker
 Kind: needs_user_input|human_escalation|external_dependency
 Action: one concrete action or answer needed
 ```
+
+The parent should make the certificate its final section. If a provider still
+appends narration or tool calls, Goal Mode treats the final valid certificate
+as the control signal and pauses after presenting that response; it does not
+run the appended tools.
 
 While the resident Goal supervisor remains available, it retains the in-process
 working transcript, including that final question or blocker report. Reply with
@@ -128,11 +145,22 @@ message; `RESPONSE` may span multiple lines. A bare `/goal resume` keeps that
 transcript after an externally resolved blocker. When a Goal is already
 running, `/goal resume` does not fence, drain, or restart its current agentic
 loop. A submitted response is explicitly rejected rather than silently applied
-to the in-flight turn; wait for a user-input pause before resubmitting it. This
-transient continuity is
-neither persisted in the Goal record nor canonical session history, so restart,
-disposal, or loss of the resident supervisor begins a fresh executor. Responses
-use the same 4096-character safety limit as the success criterion.
+to the in-flight turn; wait for a user-input pause before resubmitting it.
+
+The parent Goal `ask_user` call remains subject to the ordinary tool policy and
+schema. Goal Mode uses the current session rather than selecting a channel or
+waiting for a timeout; its `channel` and `timeout_secs` hints therefore have no
+effect for that pause. Invalid or non-string choice entries are ignored just as
+they are by ordinary `ask_user`; the compact persisted request must fit the
+shared 2,000-character Goal-blocker limit.
+
+If the service restarts after a Goal pause, the transient working
+transcript is intentionally unavailable. The durable recorded request that
+caused the pause is supplied once to the fresh resumed turn alongside the
+user's response, so the agent can interpret that response. Goal Mode does not
+persist an intermediate candidate or reconstruct a full in-progress transcript;
+resuming can still repeat external side effects. Responses use the same
+4096-character safety limit as the success criterion.
 
 Goal Mode does not replace the session's normal agent presentation path. Every
 parent-turn event that the owning surface would normally present remains on that
@@ -141,8 +169,9 @@ tool progress, and the final agent response. The Goal controller adds separate
 lifecycle notices, but it neither hides nor rewrites ordinary agent events. On
 Matrix, a `Goal started` or `Goal resumed` notice is delivered before the
 corresponding parent turn begins. A pause notice necessarily follows the
-candidate that caused the verifier to block: on streaming channels that
-candidate may already be visible while the verifier evaluates it.
+candidate that caused a verifier or explicit parent blocker to pause: on
+streaming channels that candidate may already be visible while the verifier
+evaluates it.
 
 `/goal pause` first durably fences the Goal as paused, then waits for an
 already-admitted operation to settle before returning. `/goal resume [RESPONSE]`
@@ -200,8 +229,11 @@ identity, cancellation, deadline, and usage attribution. Their model calls
 share the Goal's serialized admission path.
 
 V1 rejects background, detached, parallel, and recursive Goal-owned children.
-It does not remove ordinary child tools: tool execution remains local to each
-agentic loop, while model-operation admission is serialized at the Goal.
+Goal Mode does not otherwise remove ordinary child tools: tool execution
+remains local to each agentic loop, while model-operation admission is
+serialized at the Goal. `ask_user` is unavailable to Goal-owned children,
+because only the parent may create a session-level user-input interruption; a
+child returns the needed question to its parent instead.
 
 For Matrix, the adapter uses the authenticated raw Matrix identity captured
 before hooks can alter message content. For zerocode, both local IPC and WSS

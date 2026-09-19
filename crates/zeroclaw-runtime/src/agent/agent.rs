@@ -494,6 +494,9 @@ pub enum IsolatedTranscriptSource {
 pub struct IsolatedTurnOutcome {
     pub response: String,
     pub working_history: Vec<ChatMessage>,
+    /// A core loop interruption emitted only after the isolated transcript has
+    /// recorded the completed tool round.
+    pub interruption: Option<crate::goal_mode::GoalParentInterruption>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1467,7 +1470,28 @@ impl Agent {
                 )
             })
             .await;
-        let response = result?;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                let interruption =
+                    if crate::agent::turn::tool_loop_safety_interruption(&error).is_some() {
+                        crate::goal_mode::GoalParentInterruption::ToolLoopSafety {
+                            message: error.to_string(),
+                        }
+                    } else if zeroclaw_providers::reliable::is_context_window_exceeded(&error) {
+                        crate::goal_mode::GoalParentInterruption::ContextWindowExceeded {
+                            message: error.to_string(),
+                        }
+                    } else {
+                        return Err(error);
+                    };
+                return Ok(IsolatedTurnOutcome {
+                    response: String::new(),
+                    working_history,
+                    interruption: Some(interruption),
+                });
+            }
+        };
 
         if let Some(event_tx) = event_tx.as_ref() {
             let presented = Self::append_model_fallback_notice(
@@ -1493,6 +1517,7 @@ impl Agent {
         Ok(IsolatedTurnOutcome {
             response,
             working_history,
+            interruption: None,
         })
     }
 
