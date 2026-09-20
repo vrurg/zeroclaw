@@ -400,6 +400,14 @@ mod tests {
     }
 
     #[test]
+    fn deferred_goal_command_acknowledgement_formats_from_fluent() {
+        assert_eq!(
+            get_english_cli_string_with_args("goal-mode-command-queued", &[("command", "resume")],),
+            "⏳ Goal resume queued. It will be processed after the current turn finishes."
+        );
+    }
+
+    #[test]
     fn executable_degraded_guidance_falls_back_past_stale_translated_catalog() {
         let stale_disk =
             "cli-config-section-degraded = advertencia: Ejecuta `zeroclaw config migrate`.\n";

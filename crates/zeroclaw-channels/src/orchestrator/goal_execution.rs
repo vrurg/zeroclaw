@@ -43,12 +43,12 @@ use super::{
     ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
     build_channel_system_prompt_for_message_with_signal,
     callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
-    get_route_selection, load_required_session_prompt_attachments, model_provider_entry_for_ref,
-    outbound_content_format_for_channel, persist_session_routing_context,
-    resolve_provider_ref_for_runtime_switch, runtime_defaults_from_config,
-    runtime_defaults_snapshot, sanitize_channel_response_for_format_with_leak_detection,
-    set_route_selection, system_prompt_for_channel_turn,
-    turn_execution::resolved_channel_execution,
+    get_route_selection, goal_ledger_config, load_required_session_prompt_attachments,
+    model_provider_entry_for_ref, outbound_content_format_for_channel,
+    persist_session_routing_context, resolve_provider_ref_for_runtime_switch,
+    runtime_defaults_from_config, runtime_defaults_snapshot,
+    sanitize_channel_response_for_format_with_leak_detection, set_route_selection,
+    system_prompt_for_channel_turn, turn_execution::resolved_channel_execution,
 };
 
 /// Immutable Matrix facts captured before mutable inbound hooks run.
@@ -198,19 +198,21 @@ pub(super) async fn submit_matrix_goal(
         } else {
             let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::new(Arc::clone(&registry));
             // Reuse the exact tracker which ordinary Matrix turns already
-            // use. A config reload can leave this live channel context and a
-            // later global lookup on different data-directory snapshots; Goal
-            // accounting must follow the active channel ledger, not reject an
-            // otherwise valid session for that process-local transition.
+            // use. If ordinary cost tracking is disabled, this context has no
+            // retained tracker; use its original channel configuration rather
+            // than a hot-reloaded defaults snapshot. A reload can change the
+            // latter's data directory while the process-global ledger remains
+            // bound to this channel context's active directory.
             let tracker = context
                 .cost_tracking
                 .as_ref()
                 .map(|tracking| Arc::clone(&tracking.tracker))
                 .map(Ok)
                 .unwrap_or_else(|| {
+                    let ledger_config = goal_ledger_config(&context);
                     CostTracker::get_or_init_global_required(
-                        defaults.config.cost.clone(),
-                        &defaults.config.data_dir,
+                        ledger_config.cost.clone(),
+                        &ledger_config.data_dir,
                     )
                 })?;
             let engine = Arc::new(runtime.execution_engine(

@@ -115,7 +115,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
-use zeroclaw_commands::goal::{GoalCommandParseError, parse_goal_command};
+use zeroclaw_commands::goal::{GoalCommand, GoalCommandParseError, parse_goal_command};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -1987,6 +1987,42 @@ fn is_matrix_goal_command_text(channel: &str, content: &str) -> bool {
     token.eq_ignore_ascii_case("/goal")
 }
 
+/// Return the user-facing label for a Goal command whose durable transition is
+/// deliberately deferred to the current conversation turn boundary.
+///
+/// Status and help are read-only, while `pause now` and `cancel` are the two
+/// explicit immediate controls. The remaining lifecycle-changing commands are
+/// accepted at ingress but must not claim their state change until their lane
+/// position executes.
+fn deferred_goal_command_label(command: &GoalCommand) -> Option<&'static str> {
+    match command {
+        GoalCommand::Start { .. } => Some("start"),
+        GoalCommand::SetBudget(_) => Some("budget update"),
+        GoalCommand::Pause => Some("pause"),
+        GoalCommand::Resume { .. } => Some("resume"),
+        GoalCommand::Status
+        | GoalCommand::Budget
+        | GoalCommand::PauseNow
+        | GoalCommand::Cancel
+        | GoalCommand::Help => None,
+    }
+}
+
+/// Whether a prior turn from this sender's interruption scope is still
+/// registered. Goal commands retain their ordered lane position, but this lets
+/// us immediately acknowledge a lifecycle command that cannot run yet.
+fn has_registered_turn_in_scope(
+    in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
+    msg: &ChannelMessage,
+) -> bool {
+    let scope_key = interruption_scope_key(msg);
+    in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_key)
+        .is_some_and(|states| !states.is_empty())
+}
+
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
     SendMessage::reply_to(msg, reply)
 }
@@ -3111,6 +3147,13 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         hot: false,
         generation: 0,
     }
+}
+
+/// Returns the configuration bound to this channel runtime's resident cost
+/// ledger. Runtime-default overrides may be hot-reloaded, but they do not
+/// replace the ledger that was initialized with the channel context.
+fn goal_ledger_config(ctx: &ChannelRuntimeContext) -> &Config {
+    ctx.prompt_config.as_ref()
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
@@ -10840,6 +10883,42 @@ async fn run_message_dispatch_loop(
         // agent-visible history and representation stream as a session
         // without Goal Mode.
         let matrix_goal_command = is_matrix_goal_command_text(&msg.channel, &msg.content);
+        let deferred_goal_command = matrix_goal_command
+            .then(|| parse_goal_command(&msg.content).ok())
+            .flatten()
+            .as_ref()
+            .and_then(deferred_goal_command_label);
+
+        // Lifecycle commands retain the normal conversation-lane ordering, so
+        // their durable transition cannot happen until earlier work completes.
+        // Acknowledge that accepted request immediately rather than leaving a
+        // user to infer whether it was received. This is intentionally not a
+        // Goal state transition: the normal controller response remains the
+        // sole authoritative confirmation when the queued command executes.
+        if let Some(command) = deferred_goal_command
+            && has_registered_turn_in_scope(&in_flight_by_sender, &msg)
+            && let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
+        {
+            let acknowledgement = channel_runtime_cli_string_with_args(
+                "goal-mode-command-queued",
+                &[("command", command)],
+            );
+            if let Err(error) = channel
+                .send(&SendMessage::reply_to(&msg, acknowledgement))
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                            "command": command,
+                        })),
+                    "deferred Goal command acknowledgement failed"
+                );
+            }
+        }
 
         // ── Aggregate admission: refuse before retaining message data ───────
         // Execution permits limit provider calls, while this distinct budget
@@ -18903,6 +18982,44 @@ temperature = 0.3
         assert_eq!(route_b.model_provider, "anthropic.default");
         assert_eq!(route_b.model, "startup-b");
         assert!(!runtime_defaults_snapshot(&agent_b).hot);
+    }
+
+    #[test]
+    fn goal_ledger_config_remains_bound_to_the_channel_context_after_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut context = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agent",
+            "openrouter.default",
+            "startup",
+        );
+        let mut ledger_config = zeroclaw_config::schema::Config::default();
+        ledger_config.data_dir = tmp.path().join("resident-ledger");
+        context.prompt_config = Arc::new(ledger_config);
+
+        let mut reloaded_config = zeroclaw_config::schema::Config::default();
+        reloaded_config.data_dir = tmp.path().join("hot-reload");
+        *context
+            .runtime_defaults_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(ChannelRuntimeOverride {
+            config: Arc::new(reloaded_config),
+            defaults: ChannelRuntimeDefaults {
+                default_model_provider: "openrouter.reloaded".to_owned(),
+                model: "hot-model".to_owned(),
+                temperature: None,
+                api_key: None,
+                api_url: None,
+                reliability: zeroclaw_config::schema::ReliabilityConfig::default(),
+            },
+            generation: 1,
+        }));
+
+        assert!(runtime_defaults_snapshot(&context).hot);
+        assert_eq!(
+            goal_ledger_config(&context).data_dir,
+            tmp.path().join("resident-ledger")
+        );
     }
 
     #[tokio::test]
@@ -42525,6 +42642,58 @@ This is an example JSON object for profile settings."#;
         assert!(is_matrix_goal_command_text("matrix", "  /GOAL nonsense"));
         assert!(!is_matrix_goal_command_text("matrix", "/goals status"));
         assert!(!is_matrix_goal_command_text("telegram", "/goal status"));
+    }
+
+    #[test]
+    fn deferred_goal_command_labels_cover_only_ordered_lifecycle_changes() {
+        let label = |command| {
+            parse_goal_command(command)
+                .ok()
+                .as_ref()
+                .and_then(deferred_goal_command_label)
+        };
+
+        assert_eq!(label("/goal start finish the work"), Some("start"));
+        assert_eq!(label("/goal budget set --unlimited"), Some("budget update"));
+        assert_eq!(label("/goal pause"), Some("pause"));
+        assert_eq!(label("/goal resume user response"), Some("resume"));
+        assert_eq!(label("/goal status"), None);
+        assert_eq!(label("/goal budget"), None);
+        assert_eq!(label("/goal pause now"), None);
+        assert_eq!(label("/goal cancel"), None);
+        assert_eq!(label("/goal help"), None);
+        assert_eq!(label("/goal nonsense"), None);
+    }
+
+    #[test]
+    fn deferred_goal_receipt_only_observes_earlier_turns_in_its_scope() {
+        let message = ChannelMessage {
+            channel: "matrix".to_string(),
+            sender: "user".to_string(),
+            reply_target: "!room:example.test".to_string(),
+            ..Default::default()
+        };
+        let in_flight = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!has_registered_turn_in_scope(&in_flight, &message));
+
+        let scope = interruption_scope_key(&message);
+        in_flight.lock().unwrap().insert(
+            scope,
+            vec![InFlightSenderTaskState {
+                task_id: 1,
+                cancellation: CancellationToken::new(),
+                completion: Arc::new(InFlightTaskCompletion::new()),
+                debounce_key: "matrix_room_user".to_string(),
+                superseded_completions: Vec::new(),
+            }],
+        );
+        assert!(has_registered_turn_in_scope(&in_flight, &message));
+
+        let other_sender = ChannelMessage {
+            sender: "other-user".to_string(),
+            ..message
+        };
+        assert!(!has_registered_turn_in_scope(&in_flight, &other_sender));
     }
 
     #[test]

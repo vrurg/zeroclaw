@@ -1369,6 +1369,7 @@ goal-mode-terminal-reason-session-disposed = The session was closed before the G
 goal-mode-terminal-reason-unspecified = The Goal stopped unexpectedly. Ask an operator to inspect the logs.
 goal-mode-stale = ⚠️ Goal state changed; try the command again.
 goal-mode-command-invalid = ⚠️ That is not a valid Goal command. Use `/goal help` to see the supported commands.
+goal-mode-command-queued = ⏳ Goal { $command } queued. It will be processed after the current turn finishes.
 goal-mode-command-failed = ⚠️ Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.
 goal-mode-command-accounting-storage = ⚠️ Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again.
 goal-mode-command-control-plane-unavailable = ⚠️ Goal control state is unavailable. Try again; if it persists, ask an operator to check the service logs.
