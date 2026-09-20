@@ -1749,8 +1749,9 @@ struct InFlightSenderTaskState {
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
     /// Immutable conversation-history identity.  Interruption remains
-    /// sender-scoped, but a deferred Goal control must acknowledge work ahead
-    /// of it in the shared conversation lane regardless of who sent that work.
+    /// sender- and thread-scoped, but a deferred Goal control must acknowledge
+    /// work ahead of it in its conversation lane. Matrix lanes are room-scoped
+    /// and thread-agnostic; ReplyTarget channels may also share them by sender.
     conversation_key: String,
     /// The debounce bucket this turn's payload is retained in for as long as
     /// its window is open. A turn killed before its window fires leaves that
@@ -2039,9 +2040,9 @@ fn deferred_goal_command_label(command: &GoalCommand) -> Option<&'static str> {
 
 /// Whether a prior turn in this conversation is still registered. Goal
 /// commands retain their ordered lane position, but this lets us immediately
-/// acknowledge a lifecycle command that cannot run yet.  This cannot use the
-/// sender interruption scope: Matrix rooms can intentionally share one history
-/// and lane across several senders.
+/// acknowledge a lifecycle command that cannot run yet. This cannot use the
+/// sender interruption scope: Matrix thread controls share a room lane, and
+/// ReplyTarget channels may deliberately share a lane across senders.
 fn has_registered_turn_in_conversation(
     in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
     conversation_key: &str,
