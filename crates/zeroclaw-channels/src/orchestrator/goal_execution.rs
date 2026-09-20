@@ -278,6 +278,33 @@ pub(super) async fn submit_matrix_goal(
     Ok((response, initial_notice_delivered))
 }
 
+/// Apply Matrix's `/stop` shortcut to a live Goal, if this exact conversation
+/// has one. The dispatcher still cancels ordinary sender turns itself; this
+/// helper owns only the Goal-specific cooperative pause and deliberately does
+/// not manufacture a controller response when no Goal is running.
+pub(super) async fn pause_active_matrix_goal_now(
+    context: Arc<ChannelRuntimeContext>,
+    history_key: String,
+    original: ChannelMessage,
+) -> Result<Option<zeroclaw_runtime::goal_mode::GoalResponse>> {
+    let control_plane = control_plane().context("Goal control plane is unavailable")?;
+    let registry = control_plane.goal_store()?;
+    let Some(current) = registry.current_goal_for_session(&history_key).await? else {
+        return Ok(None);
+    };
+    if current.status != zeroclaw_runtime::control_plane::TaskStatus::Running {
+        return Ok(None);
+    }
+    let (response, _already_delivered) = submit_matrix_goal(
+        context,
+        history_key,
+        original,
+        zeroclaw_commands::goal::GoalCommand::PauseNow,
+    )
+    .await?;
+    Ok(Some(response))
+}
+
 /// Render only stable, actionable command failures. The original error stays
 /// in structured logs; this surface must not turn arbitrary configuration or
 /// provider diagnostics into user-visible text.

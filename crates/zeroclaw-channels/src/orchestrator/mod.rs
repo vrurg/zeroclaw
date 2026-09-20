@@ -147,7 +147,8 @@ use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{
-    dispose_matrix_goal, render_matrix_goal_command_error, submit_matrix_goal,
+    dispose_matrix_goal, pause_active_matrix_goal_now, render_matrix_goal_command_error,
+    submit_matrix_goal,
 };
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -10694,6 +10695,37 @@ async fn run_message_dispatch_loop(
                 }
             }
 
+            // `/stop` remains the broad ordinary-turn cancellation command.
+            // For a Matrix conversation that also owns a running Goal, make
+            // it the documented shorthand for `/goal pause now`: that path
+            // cooperatively settles the active parent operation before the
+            // durable Goal pause. A failed Goal shortcut must not undo the
+            // established ordinary `/stop` behavior above.
+            let goal_pause_response = if is_matrix_channel_name(&msg.channel) {
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                let original = matrix_goal_message_snapshot(&msg);
+                match pause_active_matrix_goal_now(Arc::clone(&ctx), history_key, original).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
+                            })),
+                            "stop command could not pause active Matrix Goal"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // `/stop` is also a debounce boundary. Retiring the open bucket
             // wakes its reserved inbound slot, whose RAII registration then
             // disappears; a message inside the old window starts fresh. The
@@ -10751,7 +10783,16 @@ async fn run_message_dispatch_loop(
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(channel) = channel {
+            if let Some(response) = goal_pause_response {
+                if let Some(channel) = channel.as_ref() {
+                    let _ = channel
+                        .send(&SendMessage::reply_to(
+                            &msg,
+                            render_goal_response(&response),
+                        ))
+                        .await;
+                }
+            } else if let Some(channel) = channel {
                 // `/stop` bypasses every admission budget so cancellation
                 // stays reachable, but its acknowledgement must not: a
                 // sender flooding `/stop` against a slow channel would
