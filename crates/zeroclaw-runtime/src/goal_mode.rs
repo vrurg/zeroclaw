@@ -668,7 +668,7 @@ impl fmt::Debug for GoalVerifierTurn {
 pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains a standard ATX Markdown heading whose exact visible title is `Goal blocker`: one through six `#` markers, up to three leading spaces, a space or tab separator, and an optional closing `#` marker run; it must be followed by `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`. The blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
+            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains a standard ATX Markdown heading whose exact visible title is `Goal blocker`: one through six `#` markers, up to three leading spaces, one or more space or tab separators before the title, and an optional closing `#` marker run separated from the title by space or tab; it must be followed by `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`. The blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
         ),
         ChatMessage::user(format!(
             "Objective:\n{}\n\nCandidate:\n{}",
@@ -2495,6 +2495,14 @@ mod tests {
                 "standard ATX Markdown heading whose exact visible title is `Goal blocker`"
             )
         );
+        for grammar_detail in [
+            "one through six `#` markers",
+            "up to three leading spaces",
+            "one or more space or tab separators before the title",
+            "closing `#` marker run separated from the title by space or tab",
+        ] {
+            assert!(messages[0].content.contains(grammar_detail));
+        }
         assert!(!messages[0].content.contains("request_quote"));
         assert!(!messages[0].content.contains("\\\""));
         assert_eq!(messages[1].role, "user");

@@ -49,11 +49,12 @@ pub(crate) struct GoalBlockerCertificate {
 ///
 /// Markdown commonly places blank lines between a heading and its fields, so
 /// those separators are accepted. A Markdown ATX heading may use one through
-/// six `#` markers, up to three leading spaces, space or tab separators, and
-/// an optional closing marker run; agent renderers routinely vary those
-/// presentation details while preserving the same visible section. Any
-/// nonblank field line still has to match the exact `Kind:` and `Action:`
-/// fields, so ordinary prose remains non-authoritative.
+/// six `#` markers, up to three leading spaces, one or more space or tab
+/// separators, and an optional closing marker run separated from the title by
+/// space or tab; agent renderers routinely vary those presentation details
+/// while preserving the same visible section. Any nonblank field line still
+/// has to match the exact `Kind:` and `Action:` fields, so ordinary prose
+/// remains non-authoritative.
 pub(crate) fn candidate_goal_blocker_certificate(
     candidate: &str,
 ) -> Option<GoalBlockerCertificate> {
@@ -114,7 +115,9 @@ fn is_goal_blocker_heading(line: &str) -> bool {
     if !heading.starts_with([' ', '\t']) {
         return false;
     }
-    let heading = heading.trim_start_matches([' ', '\t']).trim_end();
+    let heading = heading
+        .trim_start_matches([' ', '\t'])
+        .trim_end_matches([' ', '\t']);
     let without_closing_markers = heading.trim_end_matches('#');
     let heading = if without_closing_markers.len() != heading.len()
         && without_closing_markers.ends_with([' ', '\t'])
@@ -297,12 +300,21 @@ mod tests {
             .await;
         }
 
-        assert!(
-            candidate_goal_blocker_certificate(
-                "## Goal blocker checklist\nKind: needs_user_input\nAction: Choose A or B"
-            )
-            .is_none()
-        );
+        for invalid_heading in [
+            "## Goal blocker checklist",
+            "##Goal blocker",
+            "## Goal blocker#",
+            "####### Goal blocker",
+            "## Goal blocker\u{00A0}",
+        ] {
+            assert!(
+                candidate_goal_blocker_certificate(&format!(
+                    "{invalid_heading}\nKind: needs_user_input\nAction: Choose A or B"
+                ))
+                .is_none(),
+                "{invalid_heading:?} must not be accepted as a Goal blocker heading"
+            );
+        }
         assert!(
             candidate_goal_blocker_certificate(
                 "    ## Goal blocker\nKind: needs_user_input\nAction: Choose A or B"
