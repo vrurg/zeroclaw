@@ -1257,6 +1257,19 @@ impl Agent {
         directive: ChatMessage,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<IsolatedTurnOutcome> {
+        self.run_isolated_turn_with_cancellation(source, directive, event_tx, None)
+            .await
+    }
+
+    /// As [`Self::run_isolated_turn`], with a transport-owned cooperative
+    /// cancellation token for a live Goal controller.
+    pub async fn run_isolated_turn_with_cancellation(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        directive: ChatMessage,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<IsolatedTurnOutcome> {
         ensure!(
             directive.role == "system",
             "isolated Goal directive must be a system message"
@@ -1423,7 +1436,7 @@ impl Agent {
                 history: &mut working_history,
                 channel_name: &self.channel_name,
                 channel_reply_target: None,
-                cancellation_token: None,
+                cancellation_token,
                 on_delta: None,
                 shared_budget: None,
                 channel: approval_bridge.as_deref(),

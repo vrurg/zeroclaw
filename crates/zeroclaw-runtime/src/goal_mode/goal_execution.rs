@@ -22,6 +22,7 @@ use tokio::{
     sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
@@ -263,6 +264,7 @@ struct GoalWorker {
     execution_epoch: i64,
     completion: watch::Receiver<Option<GoalWorkerCompletion>>,
     paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
+    cancellation: CancellationToken,
     // Retaining the join handle keeps the worker owned until a lifecycle
     // drainer has observed its completion. Drainers wait on `completion` so
     // multiple lifecycle paths can safely observe one terminal result.
@@ -321,9 +323,16 @@ impl GoalExecutionSupervisor {
         let (completion_tx, completion) = watch::channel(None);
         let paused_transcript = Arc::new(Mutex::new(None));
         let worker_transcript = Arc::clone(&paused_transcript);
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine
-                .run_with_paused_transcript(&settings, request, worker_transcript)
+                .run_with_paused_transcript(
+                    &settings,
+                    request,
+                    worker_transcript,
+                    worker_cancellation,
+                )
                 .await;
 
             // The engine normally records its own expected execution failures.
@@ -354,10 +363,42 @@ impl GoalExecutionSupervisor {
                 execution_epoch,
                 completion,
                 paused_transcript,
+                cancellation,
                 _handle: handle,
             })),
         );
         Ok(())
+    }
+
+    /// Cooperatively interrupt the active parent operation without changing
+    /// durable Goal state. The queued controller command owns the transition
+    /// after the parent loop has settled its tool pairing and accounting.
+    pub async fn interrupt_session(&self, session_id: &str) -> bool {
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(session_id).cloned()
+        };
+        let Some(worker) = worker else {
+            return false;
+        };
+        worker.lock().await.cancellation.cancel();
+        true
+    }
+
+    /// Interrupt and drain the resident parent turn before a controller
+    /// transition. This is used only by immediate controls; ordinary Goal
+    /// commands remain queued and cooperative. Draining first makes the
+    /// ordering explicit: the agent finishes its cancellation/accounting path
+    /// before `/goal pause now` or `/goal cancel` changes durable state.
+    pub async fn interrupt_and_drain_session(&self, session_id: &str) -> Result<bool> {
+        let Some(scope) = self.scope_for_session_id(session_id).await? else {
+            return Ok(false);
+        };
+        if !self.interrupt_session(session_id).await {
+            return Ok(false);
+        }
+        self.drain(&scope).await?;
+        Ok(true)
     }
 
     /// Submit one typed Goal command and retain any execution it starts.
@@ -1049,8 +1090,13 @@ impl GoalExecutionEngine {
         settings: &GoalHostSettings,
         request: GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
-        self.run_with_paused_transcript(settings, request, Arc::new(Mutex::new(None)))
-            .await
+        self.run_with_paused_transcript(
+            settings,
+            request,
+            Arc::new(Mutex::new(None)),
+            CancellationToken::new(),
+        )
+        .await
     }
 
     async fn run_with_paused_transcript(
@@ -1058,6 +1104,7 @@ impl GoalExecutionEngine {
         settings: &GoalHostSettings,
         request: GoalExecutionRequest,
         paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
+        cancellation: CancellationToken,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let initial_turn_kind = request.initial_turn_kind();
@@ -1073,6 +1120,7 @@ impl GoalExecutionEngine {
             scope.clone(),
         ));
         let mut lease = self.runtime.acquire_execution(settings, request).await?;
+        lease.set_execution_cancellation(cancellation);
 
         let result = GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
@@ -1249,6 +1297,13 @@ impl GoalExecutionEngine {
                         return Err(pairing_error).context("Goal parent tool pairing failed");
                     }
                     if self.publish_existing_budget_pause(scope, lease).await? {
+                        return Ok(GoalExecutionOutcome::Paused);
+                    }
+                    if lease.execution_cancelled() {
+                        // `/goal pause now` and `/goal cancel` deliberately
+                        // interrupt the ordinary parent loop, but the queued
+                        // command remains the sole owner of the durable
+                        // transition once this operation has settled.
                         return Ok(GoalExecutionOutcome::Paused);
                     }
                     if let Err(accounting_error) =

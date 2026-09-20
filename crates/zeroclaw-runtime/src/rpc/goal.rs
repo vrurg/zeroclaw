@@ -201,6 +201,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
             agent_alias: self.agent_alias.clone(),
+            cancellation: None,
         }))
     }
 }
@@ -213,6 +214,7 @@ struct ZeroCodeGoalExecutionLease {
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
     agent_alias: String,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ZeroCodeGoalExecutionLease {
@@ -258,6 +260,16 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(self.canonical_history.clone())
     }
 
+    fn set_execution_cancellation(&mut self, cancellation: tokio_util::sync::CancellationToken) {
+        self.cancellation = Some(cancellation);
+    }
+
+    fn execution_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
     async fn run_parent_turn(
         &mut self,
         _operation: &GoalOperationScope,
@@ -290,7 +302,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .agent
             .lock()
             .await
-            .run_isolated_turn(source, directive, Some(event_tx))
+            .run_isolated_turn_with_cancellation(
+                source,
+                directive,
+                Some(event_tx),
+                self.cancellation.clone(),
+            )
             .await;
         event_relay
             .await
@@ -556,6 +573,11 @@ impl RpcGoalRuntime {
                 tui_id: driver.tui_id.clone(),
             },
         )?;
+        if matches!(&command, GoalCommand::PauseNow | GoalCommand::Cancel) {
+            supervisor
+                .interrupt_and_drain_session(&driver.session_key().durable_id())
+                .await?;
+        }
         let acknowledgement_outbound = Arc::clone(&driver.outbound);
         let acknowledgement_session_id = session_id.clone();
         let submission = supervisor

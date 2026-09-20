@@ -12,6 +12,7 @@ use std::{fmt, future::Future, sync::Arc};
 use anyhow::{Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{
@@ -725,6 +726,16 @@ pub trait GoalSessionExecutionLease: Send {
         operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult>;
+    /// Install the supervisor-owned cancellation token for this execution.
+    /// Surface implementations forward it to their ordinary parent loop.
+    fn set_execution_cancellation(&mut self, _cancellation: CancellationToken) {}
+
+    /// True only for an explicit controller-requested interruption. This is
+    /// not a provider or tool failure and must not independently transition
+    /// the durable Goal state.
+    fn execution_cancelled(&self) -> bool {
+        false
+    }
     /// Finish the ordinary representation of one parent operation before the
     /// Goal executor starts a verifier or another parent operation.
     ///
@@ -858,6 +869,7 @@ fn goal_command_kind(command: &GoalCommand) -> &'static str {
         GoalCommand::Budget => "budget",
         GoalCommand::SetBudget(_) => "budget_set",
         GoalCommand::Pause => "pause",
+        GoalCommand::PauseNow => "pause_now",
         GoalCommand::Resume { .. } => "resume",
         GoalCommand::Cancel => "cancel",
         GoalCommand::Help => "help",
@@ -1588,7 +1600,9 @@ impl GoalController {
                 self.set_budget(submission.ingress(), *selection).await?,
                 None,
             )),
-            GoalCommand::Pause => Ok((self.pause(submission.ingress()).await?, None)),
+            GoalCommand::Pause | GoalCommand::PauseNow => {
+                Ok((self.pause(submission.ingress()).await?, None))
+            }
             GoalCommand::Resume { response } => {
                 self.resume_with_context(settings, submission.ingress(), response.is_some())
                     .await

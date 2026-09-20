@@ -1304,6 +1304,7 @@ goal-mode-help =
     • /goal budget set --cost-usd D [--tokens N]
     • /goal budget set --unlimited
     • /goal pause
+    • /goal pause now
     • /goal resume [RESPONSE]
     • /goal cancel
     • /goal help

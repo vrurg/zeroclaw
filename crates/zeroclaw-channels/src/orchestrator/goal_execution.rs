@@ -226,13 +226,24 @@ pub(super) async fn submit_matrix_goal(
         }
     };
     let ingress = GoalIngressContext::trusted(
-        GoalSessionKey::matrix(history_key)?,
+        GoalSessionKey::matrix(history_key.clone())?,
         context.agent_alias.to_string(),
         route,
         zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix {
             raw_mxid: driver.raw_mxid.clone(),
         },
     )?;
+    if matches!(
+        &command,
+        zeroclaw_commands::goal::GoalCommand::PauseNow
+            | zeroclaw_commands::goal::GoalCommand::Cancel
+    ) {
+        // These are the only immediate Goal controls. They request a
+        // cooperative stop of the resident parent loop; the subsequent
+        // runtime submission still owns the durable pause/cancel transition
+        // and drains the settled worker before acknowledging the command.
+        supervisor.interrupt_and_drain_session(&history_key).await?;
+    }
     let initial_notice = original;
     let initial_context = Arc::clone(&context);
     let submission = supervisor
@@ -390,6 +401,7 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             session_key: self.session_key.clone(),
             message: self.message.clone(),
             parent_candidate_history: None,
+            cancellation: None,
         }))
     }
 }
@@ -403,6 +415,7 @@ struct MatrixGoalExecutionLease {
     /// history would retain. It deliberately excludes recovery presentation
     /// footers, matching the non-Goal channel path.
     parent_candidate_history: Option<String>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl MatrixGoalExecutionLease {
@@ -1092,6 +1105,16 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         Ok(self.history())
     }
 
+    fn set_execution_cancellation(&mut self, cancellation: tokio_util::sync::CancellationToken) {
+        self.cancellation = Some(cancellation);
+    }
+
+    fn execution_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
     async fn run_parent_turn(
         &mut self,
         operation: &GoalOperationScope,
@@ -1214,7 +1237,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                                 history: &mut history,
                                 channel_name: "matrix",
                                 channel_reply_target: Some(self.message.reply_target.as_str()),
-                                cancellation_token: None,
+                                cancellation_token: self.cancellation.clone(),
                                 on_delta: presentation.on_delta.clone(),
                                 shared_budget: None,
                                 channel: None,

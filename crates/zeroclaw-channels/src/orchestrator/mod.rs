@@ -1971,6 +1971,21 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
+/// Return whether this is addressed to the Matrix Goal controller, including
+/// malformed Goal commands. The dispatcher needs this lightweight check before
+/// debounce and interruption policy: a malformed controller command still
+/// belongs to the controller and must never supersede an ordinary turn.
+fn is_matrix_goal_command_text(channel: &str, content: &str) -> bool {
+    if !is_matrix_channel_name(channel) {
+        return false;
+    }
+    let trimmed = content.trim_start();
+    let (token, _rest) = trimmed
+        .split_once(char::is_whitespace)
+        .map_or((trimmed, ""), |parts| parts);
+    token.eq_ignore_ascii_case("/goal")
+}
+
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
     SendMessage::reply_to(msg, reply)
 }
@@ -9845,14 +9860,16 @@ async fn register_inbound_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
     in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
     task_sequence: &Arc<AtomicU64>,
+    allow_new_message_interruption: bool,
 ) -> Option<TurnRegistration> {
     if msg.channel == "cli" || msg.passive_context {
         return None;
     }
 
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    let interrupt_enabled = allow_new_message_interruption
+        && ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
     let scope_key = interruption_scope_key(msg);
     // The payload this turn is waiting with lives in its debounce bucket until
     // the window fires. Recording the key here is what lets `/stop` reach that
@@ -10775,6 +10792,14 @@ async fn run_message_dispatch_loop(
             continue;
         }
 
+        // Goal control commands are queued behind the current conversation
+        // turn. They are not ordinary user messages, so they must neither
+        // debounce into user text nor invoke the transport's "new message
+        // interrupts the previous turn" policy. This preserves the same
+        // agent-visible history and representation stream as a session
+        // without Goal Mode.
+        let matrix_goal_command = is_matrix_goal_command_text(&msg.channel, &msg.content);
+
         // ── Aggregate admission: refuse before retaining message data ───────
         // Execution permits limit provider calls, while this distinct budget
         // bounds every memory-bearing turn behind the dispatcher across all
@@ -10802,6 +10827,7 @@ async fn run_message_dispatch_loop(
         // channel already confirmed it. Ordinary messages keep their
         // existing debounce semantics, including any already pending.
         let msg = if msg.channel != "cli"
+            && !matrix_goal_command
             && parse_runtime_command(&msg.channel, &msg.content).is_none()
         {
             let debounce_key =
@@ -10866,9 +10892,14 @@ async fn run_message_dispatch_loop(
                     debounce_buckets.retain(|_, open| !open.is_closed());
                     debounce_bucket_owners.retain(|key, _| debounce_buckets.contains_key(key));
                     debounce_buckets.insert(debounce_key.clone(), bucket);
-                    let registration =
-                        register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence)
-                            .await;
+                    let registration = register_inbound_turn(
+                        &ctx,
+                        &msg,
+                        &in_flight_by_sender,
+                        &task_sequence,
+                        !matrix_goal_command,
+                    )
+                    .await;
                     // This turn owns the bucket it just opened: the reserved
                     // slot, and the queued position behind it, are its own, so
                     // only its own cancellation may retire the bucket.
@@ -10927,8 +10958,14 @@ async fn run_message_dispatch_loop(
 
         // Hook execution and final routing are detached and globally bounded,
         // so the loop remains free to receive `/stop` and interruptions.
-        let registration =
-            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+        let registration = register_inbound_turn(
+            &ctx,
+            &msg,
+            &in_flight_by_sender,
+            &task_sequence,
+            !matrix_goal_command,
+        )
+        .await;
         // Registering with interruption enabled cancels the turn this one
         // supersedes. A message that bypasses debounce (a runtime command such
         // as `/new`, or a channel with no window) can supersede a turn that is
@@ -42439,6 +42476,14 @@ This is an example JSON object for profile settings."#;
     fn is_stop_command_rejects_stop_as_substring() {
         assert!(!is_stop_command("/stopwatch"));
         assert!(!is_stop_command("/stop-all"));
+    }
+
+    #[test]
+    fn matrix_goal_command_detection_preserves_controller_boundary() {
+        assert!(is_matrix_goal_command_text("matrix", "/goal status"));
+        assert!(is_matrix_goal_command_text("matrix", "  /GOAL nonsense"));
+        assert!(!is_matrix_goal_command_text("matrix", "/goals status"));
+        assert!(!is_matrix_goal_command_text("telegram", "/goal status"));
     }
 
     #[test]

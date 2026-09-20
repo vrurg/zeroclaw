@@ -51,6 +51,10 @@ pub enum GoalCommand {
     Budget,
     SetBudget(GoalBudgetSelection),
     Pause,
+    /// Pause immediately, interrupting the currently executing parent turn.
+    /// Plain `pause` is deliberately graceful and never interrupts the
+    /// currently executing parent turn.
+    PauseNow,
     Resume {
         /// Optional user response to a verifier-reported blocker. This stays
         /// transport-neutral; the Goal executor places it in the fresh,
@@ -95,13 +99,24 @@ pub fn parse_goal_command(content: &str) -> Result<GoalCommand, GoalCommandParse
         "start" => parse_start(arguments),
         "status" => argument_free(arguments, "status", GoalCommand::Status),
         "budget" => parse_budget(arguments),
-        "pause" => argument_free(arguments, "pause", GoalCommand::Pause),
+        "pause" => parse_pause(arguments),
         "resume" => parse_resume(arguments),
         "cancel" => argument_free(arguments, "cancel", GoalCommand::Cancel),
         "help" => argument_free(arguments, "help", GoalCommand::Help),
         _ => Err(GoalCommandParseError::UnknownSubcommand(
             normalized_subcommand,
         )),
+    }
+}
+
+fn parse_pause(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        Ok(GoalCommand::Pause)
+    } else if arguments.eq_ignore_ascii_case("now") {
+        Ok(GoalCommand::PauseNow)
+    } else {
+        Err(GoalCommandParseError::UnexpectedArguments("pause"))
     }
 }
 
@@ -354,6 +369,19 @@ mod tests {
         assert_eq!(
             parse_goal_command("/goal resume"),
             Ok(GoalCommand::Resume { response: None })
+        );
+    }
+
+    #[test]
+    fn pause_now_is_the_only_immediate_pause_form() {
+        assert_eq!(parse_goal_command("/goal pause"), Ok(GoalCommand::Pause));
+        assert_eq!(
+            parse_goal_command("/goal pause now"),
+            Ok(GoalCommand::PauseNow)
+        );
+        assert_eq!(
+            parse_goal_command("/goal pause later"),
+            Err(GoalCommandParseError::UnexpectedArguments("pause"))
         );
     }
 
