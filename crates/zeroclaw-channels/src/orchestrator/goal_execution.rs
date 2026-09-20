@@ -742,6 +742,9 @@ struct GoalParentPresentation {
     observer: Arc<super::ChannelNotifyObserver>,
     draft_updater: Option<tokio::task::JoinHandle<()>>,
     notify_task: Option<tokio::task::JoinHandle<()>>,
+    /// Mirrors ordinary Matrix `single_message` typing from the accepted
+    /// command through the parent turn's final draft delivery.
+    matrix_single_message_typing_scope: Option<super::MatrixSingleMessageTypingScope>,
 }
 
 impl GoalParentPresentation {
@@ -753,6 +756,16 @@ impl GoalParentPresentation {
             .is_some_and(|channel| channel.supports_draft_updates());
         let matrix_single_message_streaming =
             super::matrix_single_message_streaming_enabled(&context, message);
+        let matrix_single_message_typing_scope = matrix_single_message_streaming
+            .then(|| {
+                channel.as_ref().map(|channel| {
+                    super::start_matrix_single_message_typing_scope(
+                        Arc::clone(channel),
+                        message.reply_target.clone(),
+                    )
+                })
+            })
+            .flatten();
 
         let (on_delta, draft_updater, draft_id) = if use_draft_streaming {
             // Use the ordinary one-hop channel-to-renderer queue. A Goal
@@ -878,6 +891,7 @@ impl GoalParentPresentation {
             }),
             draft_updater,
             notify_task,
+            matrix_single_message_typing_scope,
         }
     }
 
@@ -905,6 +919,7 @@ impl GoalParentPresentation {
             observer,
             draft_updater,
             notify_task,
+            matrix_single_message_typing_scope,
         } = self;
         drop(on_delta);
         if let Some(draft_updater) = draft_updater {
@@ -914,6 +929,9 @@ impl GoalParentPresentation {
         drop(observer);
         if let Some(notify_task) = notify_task {
             let _ = notify_task.await;
+        }
+        if let Some(scope) = matrix_single_message_typing_scope {
+            super::stop_matrix_single_message_typing_scope(scope).await;
         }
         Self::present_parent_result(
             context.as_ref(),
@@ -1885,6 +1903,33 @@ mod tests {
             Ok(())
         }
 
+        async fn start_typing(&self, recipient: &str) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("typing:start:{recipient}"));
+            Ok(())
+        }
+
+        async fn stop_typing(&self, recipient: &str) -> Result<()> {
+            self.events
+                .lock()
+                .await
+                .push(format!("typing:stop:{recipient}"));
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(
+            &self,
+            _message: &zeroclaw_api::channel::SendMessage,
+        ) -> Result<Option<String>> {
+            Ok(Some("goal-draft".to_owned()))
+        }
+
         async fn listen(
             &self,
             _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
@@ -1927,6 +1972,51 @@ mod tests {
         assert!(rendered.contains(
             "\n**Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue."
         ));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_single_message_streaming_uses_the_ordinary_typing_scope() {
+        let channel = Arc::new(GoalPresentationChannel::new(false));
+        let channel_handle: Arc<dyn Channel> = channel.clone();
+        let mut context = super::super::tests::router_test_ctx_with_hooks(None);
+        let context_mut = Arc::get_mut(&mut context).expect("test context is unshared");
+        context_mut.channels_by_name = Arc::new(std::collections::HashMap::from([(
+            "matrix.single".to_owned(),
+            channel_handle,
+        )]));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_owned(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        context_mut.prompt_config = Arc::new(config);
+        let message = ChannelMessage {
+            id: "event".to_owned(),
+            sender: "@user:example.test".to_owned(),
+            reply_target: "!room:test".to_owned(),
+            channel: "matrix".to_owned(),
+            channel_alias: Some("single".to_owned()),
+            ..Default::default()
+        };
+
+        let presentation = GoalParentPresentation::start(context, &message).await;
+        assert!(presentation.matrix_single_message_typing_scope.is_some());
+        let _ = presentation.finish(None, None, None, None, None).await;
+
+        let events = channel.events.lock().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "typing:start:!room:test"),
+            "Goal single-message streaming must start the ordinary typing scope: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event == "typing:stop:!room:test"),
+            "Goal single-message streaming must stop the ordinary typing scope: {events:?}"
+        );
     }
 
     #[test]
