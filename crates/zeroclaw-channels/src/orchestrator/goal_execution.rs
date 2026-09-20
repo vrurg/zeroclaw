@@ -733,9 +733,9 @@ struct GoalParentPresentation {
     observer: Arc<super::ChannelNotifyObserver>,
     draft_updater: Option<tokio::task::JoinHandle<()>>,
     notify_task: Option<tokio::task::JoinHandle<()>>,
-    /// Fallback cleanup for ordinary Matrix `single_message` typing. The
-    /// normal path stops it immediately before the placeholder draft is
-    /// delivered; this remains for the no-draft and draft-error paths.
+    /// Typing is needed only when this turn cannot begin streaming through a
+    /// visible draft. Draft-capable Matrix single-message turns immediately
+    /// create that draft, just as the ordinary path does after its precheck.
     matrix_single_message_typing_scope: Option<super::MatrixSingleMessageTypingScope>,
 }
 
@@ -748,7 +748,8 @@ impl GoalParentPresentation {
             .is_some_and(|channel| channel.supports_draft_updates());
         let matrix_single_message_streaming =
             super::matrix_single_message_streaming_enabled(&context, message);
-        let mut matrix_single_message_typing_scope = matrix_single_message_streaming
+        let matrix_single_message_typing_scope = (matrix_single_message_streaming
+            && !use_draft_streaming)
             .then(|| {
                 channel.as_ref().map(|channel| {
                     super::start_matrix_single_message_typing_scope(
@@ -765,15 +766,6 @@ impl GoalParentPresentation {
             // stream backpressure or event ordering.
             let (on_delta, visible_rx) = tokio::sync::mpsc::channel(64);
             let draft_id = if let Some(channel) = channel.as_ref() {
-                // Match the ordinary Matrix single-message path: once the
-                // live draft becomes visible, it replaces the typing signal.
-                // Keep `finish`/`Drop` as a fallback if draft creation does
-                // not happen or fails.
-                if matrix_single_message_streaming {
-                    if let Some(scope) = matrix_single_message_typing_scope.take() {
-                        super::stop_matrix_single_message_typing_scope(scope).await;
-                    }
-                }
                 match channel
                     .send_draft(&zeroclaw_api::channel::SendMessage::reply_to(
                         message,
@@ -1982,7 +1974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_parent_single_message_streaming_uses_the_ordinary_typing_scope() {
+    async fn goal_parent_single_message_streaming_uses_the_ordinary_draft_surface() {
         let channel = Arc::new(GoalPresentationChannel::new(false));
         let channel_handle: Arc<dyn Channel> = channel.clone();
         let mut context = super::super::tests::router_test_ctx_with_hooks(None);
@@ -2012,32 +2004,18 @@ mod tests {
         let presentation = GoalParentPresentation::start(context, &message).await;
         assert!(
             presentation.matrix_single_message_typing_scope.is_none(),
-            "typing scope must finish before the visible single-message draft"
+            "draft-capable single-message Goal turns must use the ordinary draft surface"
         );
         let _ = presentation.finish(None, None, None, None, None).await;
 
         let events = channel.events.lock().await;
         assert!(
-            events
-                .iter()
-                .any(|event| event == "typing:start:!room:test"),
-            "Goal single-message streaming must start the ordinary typing scope: {events:?}"
+            events.iter().any(|event| event.starts_with("draft-send:")),
+            "Goal single-message streaming must create an ordinary draft: {events:?}"
         );
         assert!(
-            events.iter().any(|event| event == "typing:stop:!room:test"),
-            "Goal single-message streaming must stop the ordinary typing scope: {events:?}"
-        );
-        let typing_stop = events
-            .iter()
-            .position(|event| event == "typing:stop:!room:test")
-            .expect("typing stop was asserted above");
-        let draft = events
-            .iter()
-            .position(|event| event.starts_with("draft-send:"))
-            .expect("Goal single-message streaming must create a draft: {events:?}");
-        assert!(
-            typing_stop < draft,
-            "Goal typing cleanup must complete before draft delivery: {events:?}"
+            !events.iter().any(|event| event.starts_with("typing:")),
+            "an immediately visible draft must not leave a stray typing event: {events:?}"
         );
     }
 

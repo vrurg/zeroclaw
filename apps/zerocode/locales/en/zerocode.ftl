@@ -179,7 +179,6 @@ zc-goal-terminal-reason-session-disposed = The session was closed before the Goa
 zc-goal-terminal-reason-unspecified = The Goal stopped unexpectedly. Ask an operator to inspect the logs.
 zc-goal-stale = Goal state changed; try again.
 zc-goal-command-failed = Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.
-zc-goal-command-accounting-storage = Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again.
 zc-goal-command-control-plane-unavailable = Goal control state is unavailable. Try again; if it persists, ask an operator to check the service logs.
 zc-zerocode-agent-modal-pick = Pick agent, then choose a theme
 zc-zerocode-agent-theme-loading = Loading agents…

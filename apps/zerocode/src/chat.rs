@@ -96,12 +96,10 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     message
 }
 
-/// Keep operator-actionable Goal command failures aligned with the Matrix
-/// surface without exposing arbitrary daemon diagnostics to the chat.
+/// Keep Goal command failures aligned with the Matrix surface without exposing
+/// arbitrary daemon diagnostics to the chat.
 fn goal_command_error_message(error: &str) -> String {
-    if error.contains("required cost tracker storage path differs from the resident tracker") {
-        crate::i18n::t("zc-goal-command-accounting-storage")
-    } else if error.contains("Goal control plane is unavailable") {
+    if error.contains("Goal control plane is unavailable") {
         crate::i18n::t("zc-goal-command-control-plane-unavailable")
     } else {
         crate::i18n::t("zc-goal-command-failed")
@@ -10850,16 +10848,6 @@ mod tests {
         assert_eq!(
             goal_response_message(&crate::wire::GoalResponse::ResponseRequiresPause),
             "⚠️ The Goal is still running, so your response was not applied. Wait until it pauses for user input, then run /goal resume RESPONSE."
-        );
-    }
-
-    #[test]
-    fn goal_command_error_classifies_a_conflicting_resident_ledger() {
-        assert_eq!(
-            goal_command_error_message(
-                "required cost tracker storage path differs from the resident tracker"
-            ),
-            "Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again."
         );
     }
 
