@@ -631,8 +631,8 @@ pub enum GoalParentInterruption {
     ToolLoopSafety { message: String },
     /// The selected model rejected the current context before producing a
     /// candidate. The ordinary loop has already settled its provider attempt,
-    /// so the controller may preserve the transcript and let a later parent
-    /// turn reduce or otherwise remediate the request.
+    /// so the controller may pause safely and let a later parent turn reduce
+    /// or otherwise remediate the request from canonical session history.
     ContextWindowExceeded { message: String },
 }
 

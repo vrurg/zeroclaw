@@ -2475,6 +2475,7 @@ mod tests {
             parent_errors: std::sync::Mutex::new(Vec::new()),
         };
 
+        let paused_transcript = Arc::new(Mutex::new(None));
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
             store.clone() as Arc<dyn GoalTaskRegistry>,
             scope.clone(),
@@ -2485,7 +2486,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(Mutex::new(None)),
+                Arc::clone(&paused_transcript),
                 &mut lease,
             ),
         ))
@@ -2508,6 +2509,7 @@ mod tests {
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
         assert!(goal.blockers.is_empty());
         assert!(goal.pending_tool_batch_id.is_none());
+        assert!(paused_transcript.lock().await.is_some());
     }
 
     #[tokio::test]
