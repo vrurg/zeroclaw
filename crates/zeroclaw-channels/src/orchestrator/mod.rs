@@ -716,15 +716,15 @@ fn render_goal_projection(
         .cost_limit_usd
         .map(|value| format!("{value:.6}"))
         .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
-    let status = match projection.status {
-        TaskStatus::Running => "running",
-        TaskStatus::Paused => "paused",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::Lost => "lost",
-        TaskStatus::TimedOut => "timed_out",
-    };
+    let status = channel_runtime_cli_string(match projection.status {
+        TaskStatus::Running => "goal-mode-status-running",
+        TaskStatus::Paused => "goal-mode-status-paused",
+        TaskStatus::Completed => "goal-mode-status-completed",
+        TaskStatus::Failed => "goal-mode-status-failed",
+        TaskStatus::Cancelled => "goal-mode-status-cancelled",
+        TaskStatus::Lost => "goal-mode-status-lost",
+        TaskStatus::TimedOut => "goal-mode-status-timed-out",
+    });
     let accounting = match projection.accounting_state {
         GoalAccountingState::Complete => {
             channel_runtime_cli_string("goal-mode-accounting-complete")
@@ -740,8 +740,10 @@ fn render_goal_projection(
     } else {
         "goal-mode-no"
     });
-    let mut message =
-        channel_runtime_cli_string_with_args("goal-mode-summary-status", &[("status", status)]);
+    let mut message = channel_runtime_cli_string_with_args(
+        "goal-mode-summary-status",
+        &[("status", status.as_str())],
+    );
     if let Some(reason) = projection.terminal_reason {
         let reason = match reason {
             GoalTerminalReason::VerifiedCompletion => {
@@ -832,22 +834,22 @@ fn render_goal_projection(
         ],
     ));
     if let Some(reason) = projection.pause_reason {
-        let reason = match reason {
-            GoalPauseReason::OperatorPaused => "operator_paused",
-            GoalPauseReason::NeedsUserInput => "needs_user_input",
-            GoalPauseReason::HumanEscalation => "human_escalation",
-            GoalPauseReason::ExternalDependency => "external_dependency",
-            GoalPauseReason::CoreInterrupted => "core_interrupted",
-            GoalPauseReason::ProviderUnavailable => "provider_unavailable",
-            GoalPauseReason::VerifierBlocked => "verifier_blocked",
-            GoalPauseReason::BudgetExhausted => "budget_exhausted",
-            GoalPauseReason::BudgetUnavailable => "budget_unavailable",
-            GoalPauseReason::DaemonRestart => "daemon_restarted",
-        };
+        let reason = channel_runtime_cli_string(match reason {
+            GoalPauseReason::OperatorPaused => "goal-mode-pause-operator-paused",
+            GoalPauseReason::NeedsUserInput => "goal-mode-pause-needs-user-input",
+            GoalPauseReason::HumanEscalation => "goal-mode-pause-human-escalation",
+            GoalPauseReason::ExternalDependency => "goal-mode-pause-external-dependency",
+            GoalPauseReason::CoreInterrupted => "goal-mode-pause-core-interrupted",
+            GoalPauseReason::ProviderUnavailable => "goal-mode-pause-provider-unavailable",
+            GoalPauseReason::VerifierBlocked => "goal-mode-pause-verifier-blocked",
+            GoalPauseReason::BudgetExhausted => "goal-mode-pause-budget-exhausted",
+            GoalPauseReason::BudgetUnavailable => "goal-mode-pause-budget-unavailable",
+            GoalPauseReason::DaemonRestart => "goal-mode-pause-daemon-restarted",
+        });
         message.push('\n');
         message.push_str(&channel_runtime_cli_string_with_args(
             "goal-mode-summary-pause",
-            &[("pause_reason", reason)],
+            &[("pause_reason", reason.as_str())],
         ));
     }
     if let Some(description) = projection.pause_description.as_deref() {
@@ -871,7 +873,7 @@ fn render_goal_projection(
 mod goal_response_render_tests {
     use super::render_goal_response;
     use zeroclaw_runtime::{
-        control_plane::{GoalAccountingState, TaskStatus},
+        control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus},
         goal_mode::{GoalResponse, GoalStatusProjection, GoalTerminalReason},
     };
 
@@ -906,6 +908,29 @@ mod goal_response_render_tests {
             render_goal_response(&GoalResponse::ResponseRequiresPause),
             "⚠️ The Goal is still running, so your response was not applied. Wait until it pauses for user input, then run `/goal resume RESPONSE`."
         );
+    }
+
+    #[test]
+    fn paused_goal_status_uses_human_readable_state_labels() {
+        let rendered = render_goal_response(&GoalResponse::Status(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Paused,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            terminal_reason: None,
+            terminal_provider: None,
+            terminal_detail: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        }));
+
+        assert!(rendered.contains("**Status:** paused"));
+        assert!(rendered.contains("**Pause:** waiting for your input"));
+        assert!(!rendered.contains("needs_user_input"));
     }
 }
 
