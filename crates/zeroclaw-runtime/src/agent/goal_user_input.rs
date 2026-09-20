@@ -238,6 +238,10 @@ mod tests {
             crate::control_plane::GoalBlockerKind::NeedsUserInput
         );
         assert_eq!(parsed.message, "Choose A or B");
+        scope_goal_parent(async {
+            assert!(final_goal_blocker_ends_parent_turn(markdown_spaced));
+        })
+        .await;
 
         assert!(
             candidate_goal_blocker_certificate("I need a decision before I can continue.")
