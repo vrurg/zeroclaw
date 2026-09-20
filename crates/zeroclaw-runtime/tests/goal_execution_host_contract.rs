@@ -2939,6 +2939,89 @@ async fn terminal_goal_notice_keeps_the_causal_execution_diagnostic() {
 }
 
 #[tokio::test]
+async fn supervisor_keeps_a_settled_parent_failure_resumable() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let parent_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::Parent,
+        notices: Arc::clone(&notices),
+        parent_errors: Arc::clone(&parent_errors),
+        presentation_events: Arc::clone(&presentation_events),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    ));
+
+    let started = supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+
+    let session_id = ingress.session_key().durable_id();
+    let current = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .expect("started Goal must remain status-visible");
+    let scope = GoalExecutionScope::new(current.id, session_id, current.execution_epoch).unwrap();
+
+    assert_eq!(
+        supervisor.drain(&scope).await.unwrap(),
+        GoalExecutionOutcome::Paused
+    );
+    assert_eq!(
+        parent_errors.lock().unwrap().as_slice(),
+        ["simulated parent failure"]
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::PausedForInterruption]
+    );
+    assert_eq!(
+        presentation_events.lock().unwrap().as_slice(),
+        ["notice:paused", "error:simulated parent failure"],
+        "the supervisor must retain the Goal lifecycle notice and ordinary error ordering"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Paused
+    );
+}
+
+#[tokio::test]
 async fn verifier_execution_failure_pauses_and_preserves_the_ordinary_error_surface() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
