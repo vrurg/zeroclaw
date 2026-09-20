@@ -1370,8 +1370,9 @@ impl GoalExecutionEngine {
             }
 
             if candidate.trim().is_empty() {
-                self.fail(scope, "candidate_empty").await?;
-                bail!("Goal parent returned an empty candidate");
+                let error = anyhow::anyhow!("Goal parent returned an empty candidate");
+                self.pause_for_core_error(scope, lease, &error).await?;
+                return Ok(GoalExecutionOutcome::Paused);
             }
 
             // A lifecycle transition can race with the parent call above.
@@ -1448,8 +1449,9 @@ impl GoalExecutionEngine {
                     return Ok(GoalExecutionOutcome::Paused);
                 }
                 Err(error) => {
-                    self.fail(scope, "verifier_protocol_invalid").await?;
-                    return Err(error).context("Goal verifier response is invalid");
+                    let error = error.context("Goal verifier response is invalid");
+                    self.pause_for_core_error(scope, lease, &error).await?;
+                    return Ok(GoalExecutionOutcome::Paused);
                 }
             }
         }

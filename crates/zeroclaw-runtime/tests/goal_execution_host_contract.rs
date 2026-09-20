@@ -338,6 +338,8 @@ struct FailingExecutionLease {
 enum FailurePoint {
     Parent,
     Verifier,
+    EmptyParentCandidate,
+    InvalidVerifierProtocol,
 }
 
 #[async_trait]
@@ -359,7 +361,11 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
             anyhow::bail!("simulated parent failure")
         }
         Ok(GoalParentTurnResult {
-            candidate: "simulated parent candidate".to_owned(),
+            candidate: if matches!(self.failure_point, FailurePoint::EmptyParentCandidate) {
+                String::new()
+            } else {
+                "simulated parent candidate".to_owned()
+            },
             working_history: turn.working_history,
             interruption: None,
         })
@@ -382,6 +388,9 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         if matches!(self.failure_point, FailurePoint::Verifier) {
             anyhow::bail!("simulated verifier failure")
         }
+        if matches!(self.failure_point, FailurePoint::InvalidVerifierProtocol) {
+            return Ok("not strict JSON".to_owned());
+        }
         anyhow::bail!("parent failure must skip the verifier")
     }
 
@@ -389,7 +398,10 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         &mut self,
         _candidate: String,
     ) -> anyhow::Result<()> {
-        if matches!(self.failure_point, FailurePoint::Parent) {
+        if matches!(
+            self.failure_point,
+            FailurePoint::Parent | FailurePoint::EmptyParentCandidate
+        ) {
             anyhow::bail!("parent failure must not record a candidate")
         }
         Ok(())
@@ -2923,6 +2935,157 @@ async fn verifier_execution_failure_pauses_and_preserves_the_ordinary_error_surf
             .unwrap()
             .status,
         TaskStatus::Paused
+    );
+    assert_eq!(
+        store
+            .get_goal_task(scope.task_id())
+            .await
+            .unwrap()
+            .expect("Goal extension should remain resumable")
+            .pause_reason,
+        Some(GoalPauseReason::CoreInterrupted)
+    );
+}
+
+#[tokio::test]
+async fn empty_parent_candidate_pauses_and_preserves_the_ordinary_error_surface() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let core_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::EmptyParentCandidate,
+        notices: Arc::clone(&notices),
+        parent_errors: Arc::clone(&core_errors),
+        presentation_events: Arc::clone(&presentation_events),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let scope = request.scope().clone();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        GoalExecutionOutcome::Paused
+    );
+    assert_eq!(
+        core_errors.lock().unwrap().as_slice(),
+        ["Goal parent returned an empty candidate"]
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::PausedForInterruption]
+    );
+    assert_eq!(
+        presentation_events.lock().unwrap().as_slice(),
+        [
+            "notice:paused",
+            "error:Goal parent returned an empty candidate"
+        ]
+    );
+    assert_eq!(
+        store
+            .get_goal_task(scope.task_id())
+            .await
+            .unwrap()
+            .expect("Goal extension should remain resumable")
+            .pause_reason,
+        Some(GoalPauseReason::CoreInterrupted)
+    );
+}
+
+#[tokio::test]
+async fn invalid_verifier_protocol_pauses_and_preserves_the_ordinary_error_surface() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let core_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::InvalidVerifierProtocol,
+        notices: Arc::clone(&notices),
+        parent_errors: Arc::clone(&core_errors),
+        presentation_events: Arc::clone(&presentation_events),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let scope = request.scope().clone();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        GoalExecutionOutcome::Paused
+    );
+    assert_eq!(
+        core_errors.lock().unwrap().as_slice(),
+        ["Goal verifier response is invalid"]
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::PausedForInterruption]
+    );
+    assert_eq!(
+        presentation_events.lock().unwrap().as_slice(),
+        ["notice:paused", "error:Goal verifier response is invalid"]
     );
     assert_eq!(
         store
