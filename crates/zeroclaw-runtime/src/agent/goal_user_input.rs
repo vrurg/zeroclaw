@@ -59,25 +59,23 @@ pub(crate) fn candidate_goal_blocker_certificate(
     candidate: &str,
 ) -> Option<GoalBlockerCertificate> {
     let mut accepted = None;
-    let mut lines = candidate.lines();
-    while let Some(line) = lines.next() {
+    let lines = candidate.lines().collect::<Vec<_>>();
+    for (heading_index, line) in lines.iter().enumerate() {
         if !is_goal_blocker_heading(line) {
             continue;
         }
-        let Some(kind) = lines
-            .by_ref()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| line.trim_end_matches('\r'))
-            .and_then(|line| line.strip_prefix("Kind: "))
+        let Some((kind_index, kind_line)) =
+            next_nonblank_certificate_line(&lines, heading_index + 1)
         else {
             continue;
         };
-        let Some(message) = lines
-            .by_ref()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| line.trim_end_matches('\r'))
-            .and_then(|line| line.strip_prefix("Action: "))
-        else {
+        let Some(kind) = kind_line.trim_end_matches('\r').strip_prefix("Kind: ") else {
+            continue;
+        };
+        let Some((_, action_line)) = next_nonblank_certificate_line(&lines, kind_index + 1) else {
+            continue;
+        };
+        let Some(message) = action_line.trim_end_matches('\r').strip_prefix("Action: ") else {
             continue;
         };
         let message = message.trim();
@@ -96,6 +94,21 @@ pub(crate) fn candidate_goal_blocker_certificate(
         });
     }
     accepted
+}
+
+/// Return the next nonblank certificate field without advancing the outer
+/// heading scan. A malformed heading must not consume a later valid heading:
+/// agents sometimes repeat a corrected certificate after a partial attempt.
+fn next_nonblank_certificate_line<'a>(
+    lines: &'a [&'a str],
+    start: usize,
+) -> Option<(usize, &'a str)> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| (index, *line))
 }
 
 fn is_goal_blocker_heading(line: &str) -> bool {
@@ -315,6 +328,16 @@ mod tests {
                 "{invalid_heading:?} must not be accepted as a Goal blocker heading"
             );
         }
+        let corrected_after_partial =
+            "## Goal blocker\n\n## Goal blocker\nKind: needs_user_input\nAction: Choose A or B";
+        assert!(
+            candidate_goal_blocker_certificate(corrected_after_partial).is_some(),
+            "a partial certificate must not consume a later corrected certificate"
+        );
+        scope_goal_parent(async {
+            assert!(final_goal_blocker_ends_parent_turn(corrected_after_partial));
+        })
+        .await;
         assert!(
             candidate_goal_blocker_certificate(
                 "    ## Goal blocker\nKind: needs_user_input\nAction: Choose A or B"
