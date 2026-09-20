@@ -940,6 +940,7 @@ impl GoalParentPresentation {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Presentation state is owned by the active turn.
     async fn present_parent_result(
         context: &ChannelRuntimeContext,
         message: &ChannelMessage,
@@ -1109,6 +1110,7 @@ impl GoalParentPresentation {
 ///
 /// The caller has already applied the normal response sanitizer. This helper
 /// deliberately owns no Goal state: it is only the channel presentation step.
+#[allow(clippy::too_many_arguments)] // Mirrors the channel's complete delivery contract.
 async fn deliver_goal_parent_response(
     origin_channel: &dyn Channel,
     delivery_channel: &dyn Channel,
@@ -2020,7 +2022,7 @@ mod tests {
             "matrix",
             0,
         );
-        let error = anyhow::anyhow!("provider request failed (429)");
+        let error = anyhow::Error::msg("provider request failed (429)");
 
         let reply = goal_core_error_reply(&message, &error);
 
@@ -2368,7 +2370,7 @@ mod tests {
         let directive = ChatMessage::system("Continue until the objective is met.");
         let mut history = vec![
             goal_parent_system_message_with_session_prompts(
-                "old provider tools".to_owned(),
+                "old provider tools",
                 directive.content.clone(),
                 "saved session instructions",
                 0,

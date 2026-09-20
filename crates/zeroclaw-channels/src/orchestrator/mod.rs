@@ -2013,7 +2013,7 @@ fn is_matrix_goal_command_text(channel: &str, content: &str) -> bool {
     let trimmed = content.trim_start();
     let (token, _rest) = trimmed
         .split_once(char::is_whitespace)
-        .map_or((trimmed, ""), |parts| parts);
+        .unwrap_or((trimmed, ""));
     token.eq_ignore_ascii_case("/goal")
 }
 
@@ -2474,8 +2474,8 @@ fn load_required_session_prompt_attachments(
     }
 
     let backend = context.session_store.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "persistent session prompts are enabled but the session backend is unavailable"
+        anyhow::Error::msg(
+            "persistent session prompts are enabled but the session backend is unavailable",
         )
     })?;
     let prompts = backend
@@ -19088,12 +19088,16 @@ temperature = 0.3
             "openrouter.default",
             "startup",
         );
-        let mut ledger_config = zeroclaw_config::schema::Config::default();
-        ledger_config.data_dir = tmp.path().join("resident-ledger");
+        let ledger_config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("resident-ledger"),
+            ..Default::default()
+        };
         context.prompt_config = Arc::new(ledger_config);
 
-        let mut reloaded_config = zeroclaw_config::schema::Config::default();
-        reloaded_config.data_dir = tmp.path().join("hot-reload");
+        let reloaded_config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("hot-reload"),
+            ..Default::default()
+        };
         *context
             .runtime_defaults_override
             .lock()
