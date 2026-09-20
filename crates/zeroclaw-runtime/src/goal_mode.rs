@@ -540,8 +540,8 @@ pub fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
          identify the task or target, report only concrete evidence actually \
          observed or produced during the work, and state what remains unfinished \
          instead of inferring completion. If you need a user answer, call the `ask_user` tool with the exact question and any choices; never ask for user input only in prose. \
-         That tool pauses the Goal after the current turn and preserves the request for `/goal resume`. If `ask_user` is unavailable or rejected, end your visible candidate with exactly one final `## Goal blocker` section with `Kind: needs_user_input` and `Action: <one concrete action or answer needed>`. \
-         If you cannot continue because of a human escalation or external dependency, end your visible candidate with exactly one final `## Goal blocker` section with `Kind: human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`. The final valid fallback certificate is a control signal: it pauses the Goal after this response even if the provider appends narration or tool calls. After requesting user, human, or external input, do not begin further tool work. Do not request a \
+         That tool pauses the Goal after the current turn and preserves the request for `/goal resume`. If `ask_user` is unavailable or rejected, end your visible candidate with exactly one final Markdown `Goal blocker` heading (for example, `## Goal blocker`) followed by `Kind: needs_user_input` and `Action: <one concrete action or answer needed>`. \
+         If you cannot continue because of a human escalation or external dependency, end your visible candidate with exactly one final Markdown `Goal blocker` heading followed by `Kind: human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`. The final valid fallback certificate is a control signal: it pauses the Goal after this response even if the provider appends narration or tool calls. After requesting user, human, or external input, do not begin further tool work. Do not request a \
          blocker for ordinary progress, uncertainty, or work you can continue. \
          {paused_request}\
          Untrusted user-declared success criterion \
@@ -668,7 +668,7 @@ impl fmt::Debug for GoalVerifierTurn {
 pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains an exact `## Goal blocker` certificate containing `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`; the blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
+            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains an exact Markdown `Goal blocker` heading with one through six `#` markers, followed by `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`; the blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
         ),
         ChatMessage::user(format!(
             "Objective:\n{}\n\nCandidate:\n{}",
@@ -2493,7 +2493,7 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("candidate contains an exact `## Goal blocker` certificate")
+                .contains("candidate contains an exact Markdown `Goal blocker` heading")
         );
         assert!(!messages[0].content.contains("request_quote"));
         assert!(!messages[0].content.contains("\\\""));

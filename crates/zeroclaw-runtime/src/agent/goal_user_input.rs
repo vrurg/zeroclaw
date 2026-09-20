@@ -16,7 +16,7 @@ use crate::control_plane::GoalBlockerKind;
 /// the user and injected into the next resumed parent turn. All Goal blocker
 /// producers use this one bound because they share the same durable column.
 pub(crate) const MAX_GOAL_BLOCKER_MESSAGE_CHARS: usize = 2_000;
-pub(crate) const GOAL_BLOCKER_HEADING: &str = "## Goal blocker";
+pub(crate) const GOAL_BLOCKER_HEADING: &str = "Goal blocker";
 
 tokio::task_local! {
     static GOAL_USER_INPUT: Arc<Mutex<Option<GoalUserInputRequest>>>;
@@ -48,15 +48,17 @@ pub(crate) struct GoalBlockerCertificate {
 /// ordinary prose asking for help remains non-authoritative.
 ///
 /// Markdown commonly places blank lines between a heading and its fields, so
-/// those separators are accepted. Any nonblank line still has to match the
-/// exact `Kind:` and `Action:` fields; ordinary prose remains non-authoritative.
+/// those separators are accepted. A Markdown heading may use one through six
+/// `#` markers; agent renderers routinely vary the level while preserving the
+/// same visible section. Any nonblank field line still has to match the exact
+/// `Kind:` and `Action:` fields, so ordinary prose remains non-authoritative.
 pub(crate) fn candidate_goal_blocker_certificate(
     candidate: &str,
 ) -> Option<GoalBlockerCertificate> {
     let mut accepted = None;
     let mut lines = candidate.lines();
     while let Some(line) = lines.next() {
-        if line.trim_end_matches('\r') != GOAL_BLOCKER_HEADING {
+        if !is_goal_blocker_heading(line) {
             continue;
         }
         let Some(kind) = lines
@@ -91,6 +93,16 @@ pub(crate) fn candidate_goal_blocker_certificate(
         });
     }
     accepted
+}
+
+fn is_goal_blocker_heading(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
+    let marker_count = line.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&marker_count)
+        && line
+            .get(marker_count..)
+            .and_then(|suffix| suffix.strip_prefix(' '))
+            .is_some_and(|heading| heading == GOAL_BLOCKER_HEADING)
 }
 
 /// Whether a completed model response must terminate the current parent turn
@@ -242,6 +254,20 @@ mod tests {
             assert!(final_goal_blocker_ends_parent_turn(markdown_spaced));
         })
         .await;
+
+        let alternate_heading = "# Goal blocker\nKind: needs_user_input\nAction: Choose A or B";
+        assert!(candidate_goal_blocker_certificate(alternate_heading).is_some());
+        scope_goal_parent(async {
+            assert!(final_goal_blocker_ends_parent_turn(alternate_heading));
+        })
+        .await;
+
+        assert!(
+            candidate_goal_blocker_certificate(
+                "## Goal blocker checklist\nKind: needs_user_input\nAction: Choose A or B"
+            )
+            .is_none()
+        );
 
         assert!(
             candidate_goal_blocker_certificate("I need a decision before I can continue.")
