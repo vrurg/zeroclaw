@@ -389,7 +389,10 @@ impl GoalExecutionSupervisor {
         let worker = worker.lock().await;
         worker
             .cancellation_is_cancel
-            .store(is_cancel, Ordering::Release);
+            // Cancellation is the stronger terminal intent.  A later
+            // `/stop` or `/goal pause now` may not downgrade it while the
+            // parent loop is still unwinding.
+            .fetch_or(is_cancel, Ordering::AcqRel);
         worker.cancellation.cancel();
         true
     }
@@ -1329,7 +1332,9 @@ impl GoalExecutionEngine {
                         // interrupted in-flight provider call can have
                         // unknown spend, though, so never leave a paused Goal
                         // in the durable non-resumable accounting state.
-                        if !cancellation_is_cancel.load(Ordering::Acquire) {
+                        if cancellation_is_cancel.load(Ordering::Acquire) {
+                            self.settle_pending_operation_outcome_unknown(scope).await?;
+                        } else {
                             self.require_complete_accounting(scope, Some(&error))
                                 .await?;
                         }
@@ -1625,6 +1630,41 @@ impl GoalExecutionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Record the accounting uncertainty of a controller-cancelled parent
+    /// operation without changing the controller-owned terminal state.  The
+    /// cancelling command applies `Cancelled` only after this worker returns.
+    async fn settle_pending_operation_outcome_unknown(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<()> {
+        let goal = self
+            .registry
+            .get_goal_task(scope.task_id())
+            .await?
+            .context("Goal extension disappeared while classifying cancelled accounting")?;
+        let Some((pending_id, admitted_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+        else {
+            return Ok(());
+        };
+        match self
+            .registry
+            .settle_pending_operation(
+                scope.task_id(),
+                scope.session_id(),
+                admitted_epoch,
+                pending_id,
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                bail!("Goal cancelled accounting settlement lost its execution fence")
+            }
+        }
     }
 
     async fn exact_running_task(
@@ -2453,6 +2493,7 @@ mod tests {
         fallback_candidate: Option<String>,
         parent_errors: std::sync::Mutex<Vec<String>>,
         recorded_candidates: std::sync::Mutex<Vec<String>>,
+        cancelled: bool,
     }
 
     #[async_trait]
@@ -2463,6 +2504,10 @@ mod tests {
 
         fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
             Ok(self.canonical_history.clone())
+        }
+
+        fn execution_cancelled(&self) -> bool {
+            self.cancelled
         }
 
         async fn run_parent_turn(
@@ -2615,6 +2660,7 @@ mod tests {
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
@@ -2711,6 +2757,7 @@ mod tests {
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         let error = scope_goal_user_input(scope_goal_tool_pairing(
@@ -2751,6 +2798,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_parent_with_unsettled_usage_preserves_cancel_and_marks_outcome_unknown() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "cancelled-unsettled-parent-operation",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            canonical_history: Vec::new(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: None,
+            parent_failure: Some("provider request interrupted by cancellation".to_owned()),
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: true,
+        };
+
+        let outcome = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(true)),
+                &mut lease,
+            ),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, GoalExecutionOutcome::Paused);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    TaskStatus::Cancelled,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn markdown_heading_goal_blocker_pauses_without_waiting_for_the_verifier() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
         let engine = GoalExecutionEngine::new(
@@ -2784,6 +2924,7 @@ mod tests {
             ),
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
@@ -2860,6 +3001,7 @@ mod tests {
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         let paused_transcript = Arc::new(Mutex::new(None));
@@ -2944,6 +3086,7 @@ mod tests {
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         let paused_transcript = Arc::new(Mutex::new(None));
@@ -3031,6 +3174,7 @@ mod tests {
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
+            cancelled: false,
         };
 
         assert!(
