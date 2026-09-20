@@ -740,10 +740,14 @@ pub trait GoalSessionExecutionLease: Send {
         operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<String>;
-    /// Record one parent response that has reached the ordinary presentation
-    /// surface in the authoritative session history. Goal verification governs
-    /// lifecycle completion, not whether a visible agent response survives a
-    /// restart or later resume.
+    /// Retain one semantic parent response in authoritative session history
+    /// before its ordinary delivery attempt. Goal verification governs
+    /// lifecycle completion, not whether an ordinary agent response survives
+    /// a restart, a failed delivery, or a later resume.
+    ///
+    /// `candidate` is the raw parent result. A driver that derives the normal
+    /// post-hook, post-sanitization history value while presenting the result
+    /// retains that value instead, matching the ordinary channel path.
     async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()>;
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()>;
 }
