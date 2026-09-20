@@ -21,7 +21,10 @@ use zeroclaw_providers::{
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
-    agent::loop_::{LoopKnobs, ToolLoop, run_tool_call_loop, scope_session_key, scope_thread_id},
+    agent::loop_::{
+        LoopKnobs, ToolLoop, is_model_switch_requested, run_tool_call_loop, scope_session_key,
+        scope_thread_id,
+    },
     control_plane::control_plane,
     cost::CostTracker,
     goal_mode::{
@@ -42,8 +45,9 @@ use super::{
     callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
     get_route_selection, load_required_session_prompt_attachments, model_provider_entry_for_ref,
     outbound_content_format_for_channel, persist_session_routing_context,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
+    resolve_provider_ref_for_runtime_switch, runtime_defaults_from_config,
+    runtime_defaults_snapshot, sanitize_channel_response_for_format_with_leak_detection,
+    set_route_selection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
 
@@ -603,6 +607,35 @@ fn goal_continuation_history_for_parent_turn(
     Ok(history)
 }
 
+/// Rebuild the sole provider-sensitive message after a runtime route switch.
+///
+/// The rest of the transcript already contains the switch tool call and its
+/// result. Replacing only this message preserves the exact Goal directive and
+/// every preceding agent event while letting the next model see its own tool
+/// capabilities.
+fn refresh_goal_system_prompt_after_model_switch(
+    history: &mut [ChatMessage],
+    system_prompt: String,
+    directive: &ChatMessage,
+    session_prompt_attachments: &str,
+    max_system_prompt_chars: usize,
+) -> Result<()> {
+    let first = history
+        .first_mut()
+        .context("Goal model switch lost its system prompt")?;
+    ensure!(
+        first.role == "system",
+        "Goal model switch lost its system prompt"
+    );
+    *first = goal_parent_system_message_with_session_prompts(
+        system_prompt,
+        directive.content.clone(),
+        session_prompt_attachments,
+        max_system_prompt_chars,
+    )?;
+    Ok(())
+}
+
 /// The normal channel presentation plumbing for one Goal parent operation.
 ///
 /// Goal execution uses the same draft and tool-notification paths as an
@@ -1065,13 +1098,13 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
         let defaults = runtime_defaults_snapshot(self.context.as_ref());
-        let route = get_route_selection(
+        let mut route = get_route_selection(
             self.context.as_ref(),
             &self.message,
             &self.session_key.durable_id(),
             &defaults,
         );
-        let provider = get_or_create_provider(
+        let mut provider = get_or_create_provider(
             self.context.as_ref(),
             &route.model_provider,
             route.api_key.as_deref(),
@@ -1080,13 +1113,14 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         .await?;
         let memory_query = turn.objective.clone();
         let directive = goal_parent_directive(&turn);
+        let session_prompt_attachments = self.session_prompt_attachments()?;
         let mut history = match turn.history_source {
             zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical => {
                 goal_canonical_history_for_parent_turn(
                     turn,
                     self.goal_system_prompt(provider.as_ref(), &route),
-                    directive,
-                    &self.session_prompt_attachments()?,
+                    directive.clone(),
+                    &session_prompt_attachments,
                     self.context.agent_cfg.resolved.max_system_prompt_chars,
                 )?
             }
@@ -1094,8 +1128,8 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 goal_continuation_history_for_parent_turn(
                     turn,
                     self.goal_system_prompt(provider.as_ref(), &route),
-                    directive,
-                    &self.session_prompt_attachments()?,
+                    directive.clone(),
+                    &session_prompt_attachments,
                     self.context.agent_cfg.resolved.max_system_prompt_chars,
                 )?
             }
@@ -1104,13 +1138,6 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         // ordinary Matrix turn. Preserve the matching tool/backend scope too:
         // otherwise the agent sees instructions for a capability Goal Mode
         // has silently removed.
-        let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
-            history
-                .first()
-                .filter(|message| message.role == "system")
-                .map_or(0, |message| message.content.chars().count()),
-            self.context.agent_cfg.resolved.max_system_prompt_chars,
-        );
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut loop_knobs = LoopKnobs::default();
         if super::matrix_single_message_streaming_enabled(self.context.as_ref(), &self.message) {
@@ -1152,86 +1179,149 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         // leak to a concurrent Goal or ordinary channel turn.
         let turn_routing: zeroclaw_runtime::tools::TurnRoutingHandle =
             Arc::new(Mutex::new(Vec::new()));
-        let tool_loop = run_tool_call_loop(ToolLoop {
-            exec: resolved_channel_execution(
-                self.context.as_ref(),
-                provider.as_ref(),
-                &route,
-                presentation.observer.as_ref(),
-                &loop_knobs,
-                excluded_tools,
-                defaults.defaults.temperature,
-            ),
-            history: &mut history,
-            channel_name: "matrix",
-            channel_reply_target: Some(self.message.reply_target.as_str()),
-            cancellation_token: None,
-            on_delta: presentation.on_delta.clone(),
-            shared_budget: None,
-            channel: None,
-            collected_receipts: self
-                .context
-                .receipt_generator
-                .as_ref()
-                .map(|_| presentation.receipts.as_ref()),
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            ingress: zeroclaw_api::ingress::IngressContext::channel(),
-            memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
-                handle: self.context.memory.as_ref(),
-                query: memory_query,
-                sessions: memory_sessions,
-                suppress: false,
-                cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
-                    min_relevance_score: self.context.min_relevance_score,
-                    ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                        &self.context.prompt_config.memory,
-                        zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                    )
-                },
-            }),
-            agent_alias: Some(self.context.agent_alias.as_str()),
-            parent_agent_alias: None,
-            turn_id: &turn_id,
-            sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
-                config: self.context.prompt_config.as_ref(),
-            }),
-        });
         let receipt_scope = self.context.receipt_generator.as_ref().map(|generator| {
             zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
                 generator: generator.clone(),
                 collector: Arc::clone(&presentation.receipts),
             }
         });
-        let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-            .scope(receipt_scope, tool_loop);
-        let tool_loop =
-            zeroclaw_runtime::tools::TURN_ROUTING.scope(Some(Arc::clone(&turn_routing)), tool_loop);
-        let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
-            self.context.prompt_config.channels.session_prompts_enabled
-                && self.context.session_store.is_some(),
-            tool_loop,
-        );
-        let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
-            self.context
-                .session_store
-                .clone()
-                .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
-            tool_loop,
-        );
-        let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
-            .scope(Some(session_prompt_budget), tool_loop);
         // Mirror the normal Matrix turn's recovery scopes. The candidate stays
         // exact for verifier input and canonical history; only the surface
         // presentation receives the ordinary recovery footer.
-        let tool_loop = Box::pin(tool_loop);
         let (candidate, provider_fallback, safeguard_fallback) = scope_safeguard_fallback(async {
             let (candidate, provider_fallback) = scope_provider_fallback(async {
                 let candidate = scope_goal_parent_turn(scope_session_key(
                     Some(self.session_key.durable_id()),
-                    async { scope_thread_id(Some(thread_message_id), tool_loop).await },
+                    async {
+                        loop {
+                            let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+                                history
+                                    .first()
+                                    .filter(|message| message.role == "system")
+                                    .map_or(0, |message| message.content.chars().count()),
+                                self.context.agent_cfg.resolved.max_system_prompt_chars,
+                            );
+                            let tool_loop = run_tool_call_loop(ToolLoop {
+                                exec: resolved_channel_execution(
+                                    self.context.as_ref(),
+                                    provider.as_ref(),
+                                    &route,
+                                    presentation.observer.as_ref(),
+                                    &loop_knobs,
+                                    excluded_tools,
+                                    defaults.defaults.temperature,
+                                ),
+                                history: &mut history,
+                                channel_name: "matrix",
+                                channel_reply_target: Some(self.message.reply_target.as_str()),
+                                cancellation_token: None,
+                                on_delta: presentation.on_delta.clone(),
+                                shared_budget: None,
+                                channel: None,
+                                collected_receipts: self
+                                    .context
+                                    .receipt_generator
+                                    .as_ref()
+                                    .map(|_| presentation.receipts.as_ref()),
+                                event_tx: None,
+                                steering: None,
+                                new_messages_out: None,
+                                image_cache: None,
+                                ingress: zeroclaw_api::ingress::IngressContext::channel(),
+                                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                                    handle: self.context.memory.as_ref(),
+                                    query: memory_query.clone(),
+                                    sessions: memory_sessions.clone(),
+                                    suppress: false,
+                                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                                        min_relevance_score: self.context.min_relevance_score,
+                                        ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &self.context.prompt_config.memory,
+                                            zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        )
+                                    },
+                                }),
+                                agent_alias: Some(self.context.agent_alias.as_str()),
+                                parent_agent_alias: None,
+                                turn_id: &turn_id,
+                                sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                                    config: self.context.prompt_config.as_ref(),
+                                }),
+                            });
+                            let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope.clone(), tool_loop);
+                            let tool_loop = zeroclaw_runtime::tools::TURN_ROUTING
+                                .scope(Some(Arc::clone(&turn_routing)), tool_loop);
+                            let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                                self.context.prompt_config.channels.session_prompts_enabled
+                                    && self.context.session_store.is_some(),
+                                tool_loop,
+                            );
+                            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                                self.context
+                                    .session_store
+                                    .clone()
+                                    .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                                tool_loop,
+                            );
+                            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
+                                .scope(Some(session_prompt_budget), tool_loop);
+                            let result = scope_thread_id(Some(thread_message_id.clone()), tool_loop).await;
+
+                            let Err(error) = result else {
+                                break result;
+                            };
+                            let Some((requested_provider, requested_model)) =
+                                is_model_switch_requested(&error)
+                            else {
+                                break Err(error);
+                            };
+                            let resolved_provider = resolve_provider_ref_for_runtime_switch(
+                                defaults.config.as_ref(),
+                                &requested_provider,
+                            )?;
+                            let api_key = self
+                                .context
+                                .model_routes
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.model_provider.eq_ignore_ascii_case(&requested_provider)
+                                        && (candidate.model.eq_ignore_ascii_case(&requested_model)
+                                            || candidate.hint.eq_ignore_ascii_case(&requested_model))
+                                })
+                                .and_then(|candidate| candidate.api_key.clone());
+                            let next_provider = get_or_create_provider(
+                                self.context.as_ref(),
+                                &resolved_provider,
+                                api_key.as_deref(),
+                                &defaults,
+                            )
+                            .await?;
+
+                            // Match an ordinary Matrix turn: only commit the new route after its
+                            // provider is available, then regenerate the provider-sensitive Goal
+                            // system message while retaining the same directive and transcript.
+                            provider = next_provider;
+                            route = ChannelRouteSelection {
+                                model_provider: resolved_provider,
+                                model: requested_model,
+                                api_key,
+                            };
+                            set_route_selection(
+                                self.context.as_ref(),
+                                &self.session_key.durable_id(),
+                                route.clone(),
+                                &defaults,
+                            );
+                            refresh_goal_system_prompt_after_model_switch(
+                                &mut history,
+                                self.goal_system_prompt(provider.as_ref(), &route),
+                                &directive,
+                                &session_prompt_attachments,
+                                self.context.agent_cfg.resolved.max_system_prompt_chars,
+                            )?;
+                        }
+                    },
                 ))
                 .await;
                 (candidate, take_last_provider_fallback())
@@ -2023,6 +2113,47 @@ mod tests {
         .expect_err("continuation must retain the system prompt at history index zero");
 
         assert!(error.to_string().contains("lost its system prompt"));
+    }
+
+    #[test]
+    fn model_switch_rebuilds_only_the_goal_system_prompt() {
+        let directive = ChatMessage::system("Continue until the objective is met.");
+        let mut history = vec![
+            goal_parent_system_message_with_session_prompts(
+                "old provider tools".to_owned(),
+                directive.content.clone(),
+                "saved session instructions",
+                0,
+            )
+            .unwrap(),
+            ChatMessage::user("Finish the migration."),
+            ChatMessage::assistant("I will switch models for the next step."),
+            ChatMessage::user("[Tool results]\nmodel switch accepted"),
+        ];
+        let retained_tail: Vec<_> = history[1..]
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+
+        refresh_goal_system_prompt_after_model_switch(
+            &mut history,
+            "new provider tools".to_owned(),
+            &directive,
+            "saved session instructions",
+            0,
+        )
+        .unwrap();
+
+        assert!(history[0].content.contains("new provider tools"));
+        assert!(history[0].content.contains(&directive.content));
+        assert!(history[0].content.contains("saved session instructions"));
+        assert_eq!(
+            history[1..]
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            retained_tail
+        );
     }
 
     #[tokio::test]
