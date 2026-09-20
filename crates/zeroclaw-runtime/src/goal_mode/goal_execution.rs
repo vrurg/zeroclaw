@@ -2422,7 +2422,7 @@ mod tests {
             notices: std::sync::Mutex::new(Vec::new()),
             interruption: None,
             fallback_candidate: Some(
-                "I need an exact decision.\n\n# Goal blocker\n\nKind: needs_user_input\n\nAction: Choose A or B"
+                "I need an exact decision.\n\n   ### Goal blocker ###\n\nKind: needs_user_input\n\nAction: Choose A or B"
                     .to_owned(),
             ),
             parent_errors: std::sync::Mutex::new(Vec::new()),
@@ -2451,7 +2451,7 @@ mod tests {
         assert_eq!(
             lease.recorded_candidates.lock().unwrap().as_slice(),
             [
-                "I need an exact decision.\n\n# Goal blocker\n\nKind: needs_user_input\n\nAction: Choose A or B"
+                "I need an exact decision.\n\n   ### Goal blocker ###\n\nKind: needs_user_input\n\nAction: Choose A or B"
             ],
             "a presented blocker must survive a process restart even though it pauses before verification"
         );

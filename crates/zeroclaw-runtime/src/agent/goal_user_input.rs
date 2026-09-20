@@ -48,10 +48,12 @@ pub(crate) struct GoalBlockerCertificate {
 /// ordinary prose asking for help remains non-authoritative.
 ///
 /// Markdown commonly places blank lines between a heading and its fields, so
-/// those separators are accepted. A Markdown heading may use one through six
-/// `#` markers; agent renderers routinely vary the level while preserving the
-/// same visible section. Any nonblank field line still has to match the exact
-/// `Kind:` and `Action:` fields, so ordinary prose remains non-authoritative.
+/// those separators are accepted. A Markdown ATX heading may use one through
+/// six `#` markers, up to three leading spaces, and an optional closing marker
+/// run; agent renderers routinely vary those presentation details while
+/// preserving the same visible section. Any nonblank field line still has to
+/// match the exact `Kind:` and `Action:` fields, so ordinary prose remains
+/// non-authoritative.
 pub(crate) fn candidate_goal_blocker_certificate(
     candidate: &str,
 ) -> Option<GoalBlockerCertificate> {
@@ -97,12 +99,27 @@ pub(crate) fn candidate_goal_blocker_certificate(
 
 fn is_goal_blocker_heading(line: &str) -> bool {
     let line = line.trim_end_matches('\r');
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return false;
+    }
+    let line = &line[indentation..];
     let marker_count = line.bytes().take_while(|byte| *byte == b'#').count();
-    (1..=6).contains(&marker_count)
-        && line
-            .get(marker_count..)
-            .and_then(|suffix| suffix.strip_prefix(' '))
-            .is_some_and(|heading| heading == GOAL_BLOCKER_HEADING)
+    if !(1..=6).contains(&marker_count) {
+        return false;
+    }
+    let Some(heading) = line
+        .get(marker_count..)
+        .and_then(|suffix| suffix.strip_prefix(' '))
+    else {
+        return false;
+    };
+    let heading = heading.trim_end();
+    let heading = heading
+        .rsplit_once(' ')
+        .filter(|(_, closing)| !closing.is_empty() && closing.bytes().all(|byte| byte == b'#'))
+        .map_or(heading, |(title, _)| title);
+    heading == GOAL_BLOCKER_HEADING
 }
 
 /// Whether a completed model response must terminate the current parent turn
@@ -262,11 +279,28 @@ mod tests {
         })
         .await;
 
+        let indented_closing_heading =
+            "   ### Goal blocker ###\nKind: needs_user_input\nAction: Choose A or B";
+        assert!(candidate_goal_blocker_certificate(indented_closing_heading).is_some());
+        scope_goal_parent(async {
+            assert!(final_goal_blocker_ends_parent_turn(
+                indented_closing_heading
+            ));
+        })
+        .await;
+
         assert!(
             candidate_goal_blocker_certificate(
                 "## Goal blocker checklist\nKind: needs_user_input\nAction: Choose A or B"
             )
             .is_none()
+        );
+        assert!(
+            candidate_goal_blocker_certificate(
+                "    ## Goal blocker\nKind: needs_user_input\nAction: Choose A or B"
+            )
+            .is_none(),
+            "four spaces are a Markdown code block, not a heading"
         );
 
         assert!(
