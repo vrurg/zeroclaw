@@ -1256,6 +1256,21 @@ impl GoalExecutionEngine {
             } = parent;
             working_history = parent_history;
 
+            // A Goal controller must not make an ordinary, already-visible
+            // parent response disappear from the session merely because the
+            // verifier later asks it to continue or pause. In particular,
+            // process-local working history is intentionally lost on restart.
+            // Session history is the durable continuity authority, while the
+            // verifier still exclusively decides the Goal lifecycle outcome.
+            if !candidate.trim().is_empty()
+                && let Err(error) = lease
+                    .record_presented_parent_candidate(candidate.clone())
+                    .await
+            {
+                self.fail(scope, "executor_failed").await?;
+                return Err(error).context("record presented Goal parent candidate");
+            }
+
             if let Some(interruption) = interruption {
                 // This value originated at a provider or core boundary. It is
                 // presented twice, so sanitize it once before either surface
@@ -1407,7 +1422,7 @@ impl GoalExecutionEngine {
 
             match parse_verifier_response(&verifier, &candidate) {
                 Ok(VerifierDecision::Complete) => {
-                    self.complete(scope, lease, candidate).await?;
+                    self.complete(scope, lease).await?;
                     return Ok(GoalExecutionOutcome::Completed);
                 }
                 Ok(VerifierDecision::Continue { reason }) => {
@@ -1507,7 +1522,6 @@ impl GoalExecutionEngine {
         &self,
         scope: &GoalExecutionScope,
         lease: &mut dyn GoalSessionExecutionLease,
-        candidate: String,
     ) -> Result<()> {
         self.exact_running_task(scope).await?;
         match self
@@ -1526,9 +1540,6 @@ impl GoalExecutionEngine {
                 bail!("Goal completion lost its execution fence")
             }
         }
-        // Delivery failure is intentionally observable but does not rewrite
-        // the verified Completed lifecycle state.
-        lease.append_verified_candidate(candidate).await?;
         lease
             .publish_goal_notice(GoalExecutionNotice::Completed)
             .await
@@ -2186,6 +2197,7 @@ mod tests {
         interruption: Option<super::super::GoalParentInterruption>,
         fallback_candidate: Option<String>,
         parent_errors: std::sync::Mutex<Vec<String>>,
+        recorded_candidates: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -2258,7 +2270,8 @@ mod tests {
             Ok(r#"{"decision":"complete","reason":"unexpected"}"#.to_owned())
         }
 
-        async fn append_verified_candidate(&mut self, _candidate: String) -> Result<()> {
+        async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()> {
+            self.recorded_candidates.lock().unwrap().push(candidate);
             Ok(())
         }
 
@@ -2342,6 +2355,7 @@ mod tests {
             interruption: None,
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
         };
 
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
@@ -2412,6 +2426,7 @@ mod tests {
                     .to_owned(),
             ),
             parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
         };
 
         let outcome = scope_goal_user_input(scope_goal_tool_pairing(
@@ -2433,6 +2448,13 @@ mod tests {
         assert_eq!(outcome.unwrap(), GoalExecutionOutcome::Paused);
         assert_eq!(lease.presentation_finishes.load(Ordering::SeqCst), 1);
         assert_eq!(lease.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lease.recorded_candidates.lock().unwrap().as_slice(),
+            [
+                "I need an exact decision.\n\n## Goal blocker\n\nKind: needs_user_input\n\nAction: Choose A or B"
+            ],
+            "a presented blocker must survive a process restart even though it pauses before verification"
+        );
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
             &[GoalExecutionNotice::PausedForBlocker {
@@ -2478,6 +2500,7 @@ mod tests {
             }),
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
         };
 
         let paused_transcript = Arc::new(Mutex::new(None));
@@ -2561,6 +2584,7 @@ mod tests {
             ),
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
         };
 
         let paused_transcript = Arc::new(Mutex::new(None));

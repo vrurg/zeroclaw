@@ -358,7 +358,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(())
     }
 
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
+    async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()> {
         self.agent
             .lock()
             .await

@@ -69,7 +69,10 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         Ok(format!("verifier:{}", turn.candidate))
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn record_presented_parent_candidate(
+        &mut self,
+        _candidate: String,
+    ) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -169,7 +172,10 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         }
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn record_presented_parent_candidate(
+        &mut self,
+        _candidate: String,
+    ) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -277,8 +283,13 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         Ok(())
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        anyhow::bail!("a paused Goal must not deliver a candidate")
+    async fn record_presented_parent_candidate(
+        &mut self,
+        _candidate: String,
+    ) -> anyhow::Result<()> {
+        // Presentation already happened; a graceful operator pause must still
+        // retain that visible parent response for a later restart and resume.
+        Ok(())
     }
 }
 
@@ -352,8 +363,11 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         anyhow::bail!("parent failure must skip the verifier")
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        anyhow::bail!("parent failure must not deliver a candidate")
+    async fn record_presented_parent_candidate(
+        &mut self,
+        _candidate: String,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("parent failure must not record a candidate")
     }
 
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> anyhow::Result<()> {
@@ -552,8 +566,11 @@ impl GoalSessionExecutionLease for ReconnectLease {
         anyhow::bail!("lease execution test does not run verifier turns")
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        anyhow::bail!("lease execution test does not deliver candidates")
+    async fn record_presented_parent_candidate(
+        &mut self,
+        _candidate: String,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("lease execution test does not record candidates")
     }
 
     async fn publish_goal_notice(
@@ -1066,7 +1083,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         "verifier:candidate"
     );
     lease
-        .append_verified_candidate("candidate".into())
+        .record_presented_parent_candidate("candidate".into())
         .await
         .unwrap();
 
@@ -2378,7 +2395,11 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         engine.run(&settings, request).await.unwrap(),
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
     );
-    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        2,
+        "both visible parent candidates must reach durable session history, including the one the verifier continued"
+    );
     assert_eq!(
         parent_presentation_finishes.load(Ordering::SeqCst),
         2,
@@ -2418,9 +2439,10 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let notices = Arc::new(Mutex::new(Vec::new()));
+    let recorded_candidates = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
-        delivered: Arc::new(AtomicUsize::new(0)),
+        delivered: Arc::clone(&recorded_candidates),
         blocked: true,
         notices: Arc::clone(&notices),
         parent_histories: Arc::new(Mutex::new(Vec::new())),
@@ -2462,6 +2484,11 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
     assert_eq!(
         engine.run(&settings, request).await.unwrap(),
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Paused
+    );
+    assert_eq!(
+        recorded_candidates.load(Ordering::SeqCst),
+        1,
+        "a parent response visible before a verifier-blocked pause must be recorded for restart continuity"
     );
     assert_eq!(
         notices.lock().unwrap().as_slice(),

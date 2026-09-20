@@ -296,10 +296,11 @@ pub trait GoalSessionDriver: Send + Sync {
     /// Goal lifecycle needs. The executor treats `ingress` as admission-time
     /// audit data only; live policy stays with the driver and is revalidated
     /// there. `canonical_history` is read-only, parent and verifier calls
-    /// mutate only process-local working state, and `append_verified_candidate`
-    /// appends one already-verified final candidate. A driver may have already
-    /// presented that parent response through its ordinary transient channel
-    /// surface; completion must not duplicate it.
+    /// mutate only process-local working state, and each ordinary parent
+    /// response is recorded in the session history before Goal verification
+    /// decides whether to continue, pause, or complete. A driver may have
+    /// already presented that parent response through its ordinary transient
+    /// channel surface; recording it must not duplicate that delivery.
     /// The object is the sole transport bridge used by the later Goal executor.
     async fn acquire_execution(
         &self,
@@ -739,7 +740,11 @@ pub trait GoalSessionExecutionLease: Send {
         operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<String>;
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
+    /// Record one parent response that has reached the ordinary presentation
+    /// surface in the authoritative session history. Goal verification governs
+    /// lifecycle completion, not whether a visible agent response survives a
+    /// restart or later resume.
+    async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()>;
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()>;
 }
 

@@ -395,8 +395,8 @@ struct MatrixGoalExecutionLease {
     session_key: GoalSessionKey,
     message: ChannelMessage,
     /// A parent candidate may already have reached the normal Matrix response
-    /// surface before the verifier accepts it. Completion still appends it to
-    /// canonical history, but must not send that same response twice.
+    /// surface before Goal lifecycle processing records it in canonical history,
+    /// but recording must not send that same response twice.
     parent_candidate_presented: bool,
 }
 
@@ -782,10 +782,10 @@ impl GoalParentPresentation {
 
     /// Finish the same response presentation an ordinary Matrix turn uses.
     ///
-    /// This does not append an unverified candidate to canonical history. It
-    /// only makes the already-emitted parent response visible through the
-    /// configured channel surface, then lets the Goal verifier govern durable
-    /// completion separately.
+    /// This only makes the parent response visible through the configured
+    /// channel surface. The Goal controller then records that visible response
+    /// in ordinary session history before verification governs the Goal
+    /// lifecycle separately.
     async fn finish(
         self,
         candidate: Option<&str>,
@@ -1301,7 +1301,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         response.text.context("Goal verifier returned no text")
     }
 
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
+    async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()> {
         let delivered = sanitize_channel_response_for_format_with_leak_detection(
             &candidate,
             self.context.tools_registry.as_ref(),
@@ -1317,7 +1317,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                     &delivered,
                 ))
                 .await
-                .context("deliver verified Matrix Goal candidate")?;
+                .context("deliver presented Matrix Goal candidate")?;
         }
         self.parent_candidate_presented = false;
         append_sender_turn(
