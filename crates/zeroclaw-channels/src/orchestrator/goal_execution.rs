@@ -1123,6 +1123,17 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 )?
             }
         };
+        // A Goal turn restores the same saved session-prompt tail as an
+        // ordinary Matrix turn. Preserve the matching tool/backend scope too:
+        // otherwise the agent sees instructions for a capability Goal Mode
+        // has silently removed.
+        let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+            history
+                .first()
+                .filter(|message| message.role == "system")
+                .map_or(0, |message| message.content.chars().count()),
+            self.context.agent_cfg.resolved.max_system_prompt_chars,
+        );
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut loop_knobs = LoopKnobs::default();
         if super::matrix_single_message_streaming_enabled(self.context.as_ref(), &self.message) {
@@ -1148,6 +1159,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 .await;
         }
         let thread_message_id = self.message.id.clone();
+        let excluded_tools: &[String] =
+            if self.context.autonomy_level == zeroclaw_config::autonomy::AutonomyLevel::Full {
+                &[]
+            } else {
+                self.context.non_cli_excluded_tools.as_ref()
+            };
         // `send_via` is ordinary parent-turn behavior. Give this operation its
         // own routing handle so its requested destination and modality cannot
         // leak to a concurrent Goal or ordinary channel turn.
@@ -1160,7 +1177,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 &route,
                 presentation.observer.as_ref(),
                 &loop_knobs,
-                self.context.non_cli_excluded_tools.as_ref(),
+                excluded_tools,
                 defaults.defaults.temperature,
             ),
             history: &mut history,
@@ -1196,6 +1213,20 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .scope(receipt_scope, tool_loop);
         let tool_loop =
             zeroclaw_runtime::tools::TURN_ROUTING.scope(Some(Arc::clone(&turn_routing)), tool_loop);
+        let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+            self.context.prompt_config.channels.session_prompts_enabled
+                && self.context.session_store.is_some(),
+            tool_loop,
+        );
+        let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+            self.context
+                .session_store
+                .clone()
+                .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+            tool_loop,
+        );
+        let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
+            .scope(Some(session_prompt_budget), tool_loop);
         // Mirror the normal Matrix turn's recovery scopes. The candidate stays
         // exact for verifier input and canonical history; only the surface
         // presentation receives the ordinary recovery footer.
