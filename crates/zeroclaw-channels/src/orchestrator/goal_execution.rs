@@ -1102,6 +1102,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
+        let memory_query = turn.objective.clone();
         let directive = goal_parent_directive(&turn);
         let mut history = match turn.history_source {
             zeroclaw_runtime::goal_mode::GoalParentHistorySource::Canonical => {
@@ -1165,6 +1166,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             } else {
                 self.context.non_cli_excluded_tools.as_ref()
             };
+        // Goal Mode changes the parent directive, not the Matrix session's
+        // ordinary memory scope. Use the declared objective rather than the
+        // raw `/goal` command as the retrieval query so command grammar does
+        // not distort the agent's normal recall behavior.
+        let memory_sessions = goal_memory_sessions(&self.message, self.session_key.durable_id());
         // `send_via` is ordinary parent-turn behavior. Give this operation its
         // own routing handle so its requested destination and modality cannot
         // leak to a concurrent Goal or ordinary channel turn.
@@ -1197,11 +1203,25 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             new_messages_out: None,
             image_cache: None,
             ingress: zeroclaw_api::ingress::IngressContext::channel(),
-            memory: None,
+            memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                handle: self.context.memory.as_ref(),
+                query: memory_query,
+                sessions: memory_sessions,
+                suppress: false,
+                cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: self.context.min_relevance_score,
+                    ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                        &self.context.prompt_config.memory,
+                        zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    )
+                },
+            }),
             agent_alias: Some(self.context.agent_alias.as_str()),
             parent_agent_alias: None,
             turn_id: &turn_id,
-            sop_reassembly: None,
+            sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                config: self.context.prompt_config.as_ref(),
+            }),
         });
         let receipt_scope = self.context.receipt_generator.as_ref().map(|generator| {
             zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
@@ -1509,9 +1529,46 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
         }
     }
 }
+
+/// Builds the same memory scope as an ordinary Matrix turn. Goal Mode owns the
+/// directive and accounting, but not the conversation's recall boundaries.
+fn goal_memory_sessions(
+    message: &zeroclaw_api::channel::ChannelMessage,
+    session_id: String,
+) -> Vec<Option<String>> {
+    let mut sessions: Vec<Option<String>> = super::sender_memory_session_ids(message, &session_id)
+        .into_iter()
+        .map(Some)
+        .collect();
+    if super::is_group_reply_target(&message.reply_target) {
+        sessions.push(Some(session_id));
+    }
+    sessions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_memory_scope_matches_an_ordinary_matrix_group_turn() {
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "group:engineering",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        assert_eq!(
+            goal_memory_sessions(&message, "matrix:group:engineering:user".to_owned()),
+            vec![
+                Some("_user_example_test".to_owned()),
+                Some("matrix:group:engineering:user".to_owned()),
+            ]
+        );
+    }
 
     struct GoalPresentationChannel {
         events: tokio::sync::Mutex<Vec<String>>,
