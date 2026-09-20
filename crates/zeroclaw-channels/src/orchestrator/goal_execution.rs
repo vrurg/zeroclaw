@@ -1432,13 +1432,8 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     async fn present_core_error(&mut self, error: &Error) -> Result<()> {
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
-        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
-        let message = super::channel_user_error_message(error, &safe_error);
         channel
-            .send(&zeroclaw_api::channel::SendMessage::reply_to(
-                &self.message,
-                message,
-            ))
+            .send(&goal_core_error_reply(&self.message, error))
             .await
             .context("deliver Matrix Goal parent error")
     }
@@ -1514,6 +1509,18 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .await
             .context("deliver Matrix Goal lifecycle notice")
     }
+}
+
+/// Construct a Goal parent-error delivery using the exact ordinary channel
+/// error rendering and modality. Goal lifecycle handling must not cause an
+/// error to become a voice reply or otherwise diverge from a normal turn.
+fn goal_core_error_reply(
+    message: &ChannelMessage,
+    error: &Error,
+) -> zeroclaw_api::channel::SendMessage {
+    let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+    let content = super::channel_user_error_message(error, &safe_error);
+    zeroclaw_api::channel::SendMessage::reply_to(message, content).suppress_voice()
 }
 
 fn goal_notice_message(notice: GoalExecutionNotice) -> String {
@@ -1822,6 +1829,28 @@ mod tests {
         assert!(rendered.contains(
             "\n**Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue."
         ));
+    }
+
+    #[test]
+    fn goal_core_errors_use_the_ordinary_error_surface_and_suppress_voice() {
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+        let error = anyhow::anyhow!("provider request failed (429)");
+
+        let reply = goal_core_error_reply(&message, &error);
+
+        assert!(reply.suppress_voice);
+        assert_eq!(reply.recipient, "!room:test");
+        assert_eq!(
+            reply.content,
+            super::super::channel_user_error_message(&error, "provider request failed (429)")
+        );
     }
 
     #[test]
