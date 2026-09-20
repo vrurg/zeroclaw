@@ -2179,6 +2179,7 @@ mod tests {
 
     struct TypedInputLease {
         session_key: super::super::GoalSessionKey,
+        canonical_history: Vec<ChatMessage>,
         presentation_finishes: AtomicUsize,
         verifier_calls: AtomicUsize,
         notices: std::sync::Mutex<Vec<GoalExecutionNotice>>,
@@ -2194,7 +2195,7 @@ mod tests {
         }
 
         fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-            Ok(Vec::new())
+            Ok(self.canonical_history.clone())
         }
 
         async fn run_parent_turn(
@@ -2334,6 +2335,7 @@ mod tests {
         let mut lease = TypedInputLease {
             session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
                 .unwrap(),
+            canonical_history: Vec::new(),
             presentation_finishes: AtomicUsize::new(0),
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
@@ -2400,6 +2402,7 @@ mod tests {
         let mut lease = TypedInputLease {
             session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
                 .unwrap(),
+            canonical_history: Vec::new(),
             presentation_finishes: AtomicUsize::new(0),
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
@@ -2461,9 +2464,11 @@ mod tests {
             Arc::new(HashMap::new()),
         )
         .unwrap();
+        let canonical_history = vec![ChatMessage::user("original request")];
         let mut lease = TypedInputLease {
             session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
                 .unwrap(),
+            canonical_history: canonical_history.clone(),
             presentation_finishes: AtomicUsize::new(0),
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
@@ -2509,7 +2514,17 @@ mod tests {
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
         assert!(goal.blockers.is_empty());
         assert!(goal.pending_tool_batch_id.is_none());
-        assert!(paused_transcript.lock().await.is_some());
+        assert!(goal.pending_call_id.is_none());
+        let retained = paused_transcript.lock().await;
+        let retained = retained
+            .as_ref()
+            .expect("a paired loop interruption must retain its exact transcript");
+        assert_eq!(retained.working_history.len(), canonical_history.len());
+        assert_eq!(retained.canonical_history.len(), canonical_history.len());
+        assert_eq!(retained.working_history[0].role, "user");
+        assert_eq!(retained.working_history[0].content, "original request");
+        assert_eq!(retained.canonical_history[0].role, "user");
+        assert_eq!(retained.canonical_history[0].content, "original request");
     }
 
     #[tokio::test]
@@ -2535,6 +2550,7 @@ mod tests {
         let mut lease = TypedInputLease {
             session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
                 .unwrap(),
+            canonical_history: Vec::new(),
             presentation_finishes: AtomicUsize::new(0),
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
