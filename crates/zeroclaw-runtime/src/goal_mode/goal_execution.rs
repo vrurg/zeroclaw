@@ -1332,9 +1332,8 @@ impl GoalExecutionEngine {
                         // interrupted in-flight provider call can have
                         // unknown spend, though, so never leave a paused Goal
                         // in the durable non-resumable accounting state.
-                        if cancellation_is_cancel.load(Ordering::Acquire) {
-                            self.settle_pending_operation_outcome_unknown(scope).await?;
-                        } else {
+                        self.settle_pending_operation_outcome_unknown(scope).await?;
+                        if !cancellation_is_cancel.load(Ordering::Acquire) {
                             self.require_complete_accounting(scope, Some(&error))
                                 .await?;
                         }
@@ -4122,6 +4121,52 @@ mod tests {
                 .unwrap()
         );
         assert!(!supervisor.owns_scope(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_intent_cannot_be_downgraded_by_a_later_pause_request() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let supervisor = GoalExecutionSupervisor::new(Arc::new(
+            GoalExecutionEngine::new(
+                GoalRuntime::new(store),
+                Arc::new(
+                    CostTracker::new(
+                        zeroclaw_config::schema::CostConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        directory.path(),
+                    )
+                    .unwrap(),
+                ),
+                "main",
+                Arc::new(HashMap::new()),
+            )
+            .unwrap(),
+        ));
+        let intent = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let (_tx, completion) = watch::channel(None);
+        supervisor.workers.lock().await.insert(
+            scope.session_id().to_owned(),
+            Arc::new(Mutex::new(GoalWorker {
+                task_id: scope.task_id().to_owned(),
+                execution_epoch: scope.execution_epoch(),
+                completion,
+                paused_transcript: Arc::new(Mutex::new(None)),
+                cancellation: cancellation.clone(),
+                cancellation_is_cancel: Arc::clone(&intent),
+                _handle: zeroclaw_spawn::spawn!(async {}),
+            })),
+        );
+        assert!(supervisor.interrupt_session(scope.session_id(), true).await);
+        assert!(
+            supervisor
+                .interrupt_session(scope.session_id(), false)
+                .await
+        );
+        assert!(intent.load(Ordering::Acquire));
+        assert!(cancellation.is_cancelled());
     }
 
     #[tokio::test]
