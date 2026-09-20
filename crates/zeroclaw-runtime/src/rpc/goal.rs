@@ -344,7 +344,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(())
     }
 
-    async fn present_parent_error(&mut self, error: &anyhow::Error) -> Result<()> {
+    async fn present_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
         let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
         self.outbound
             .notify(
@@ -380,10 +380,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     blocker_messages,
                 }
             }
-            GoalExecutionNotice::PausedForInterruption { message } => {
+            GoalExecutionNotice::PausedForInterruption => {
                 crate::rpc::types::SessionGoalUpdate::PausedForInterruption {
                     session_id: self.raw_session_id()?.to_owned(),
-                    message,
+                    message: crate::i18n::get_required_cli_string(
+                        "goal-mode-paused-core-interruption-detail",
+                    ),
                 }
             }
             GoalExecutionNotice::Failed {

@@ -1260,7 +1260,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         })
     }
 
-    async fn present_parent_error(&mut self, error: &Error) -> Result<()> {
+    async fn present_core_error(&mut self, error: &Error) -> Result<()> {
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
         let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
@@ -1385,17 +1385,10 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
             }
             message
         }
-        GoalExecutionNotice::PausedForInterruption {
-            message: interruption,
-        } => {
+        GoalExecutionNotice::PausedForInterruption => {
             let mut message = zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-core-interruption",
             );
-            message.push('\n');
-            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                "goal-mode-paused-core-interruption-reason",
-                &[("reason", interruption.as_str())],
-            ));
             message.push('\n');
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-core-interruption-next",
@@ -1616,12 +1609,9 @@ mod tests {
 
     #[test]
     fn paired_safety_interruption_notice_is_not_mislabelled_as_a_blocker() {
-        let rendered = goal_notice_message(GoalExecutionNotice::PausedForInterruption {
-            message: "repeated tool calls".to_owned(),
-        });
+        let rendered = goal_notice_message(GoalExecutionNotice::PausedForInterruption);
 
-        assert!(rendered.starts_with("⏸️ Goal paused after a safety interruption."));
-        assert!(rendered.contains("**Reason:** repeated tool calls"));
+        assert!(rendered.starts_with("⏸️ Goal paused after a recoverable agent interruption."));
         assert!(rendered.contains("**Next:** Run `/goal resume`"));
         assert!(!rendered.contains("**Blocker:**"));
     }

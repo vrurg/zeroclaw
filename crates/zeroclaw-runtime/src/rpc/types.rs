@@ -311,8 +311,8 @@ rpc_type! {
         ParentTurnFinished { session_id: String },
         /// The ordinary parent loop failed. The error has already passed the
         /// same sanitization boundary as an ordinary session error and is sent
-        /// before the later Goal lifecycle update. The client owns display
-        /// framing and localization.
+        /// after the preceding resumable Goal pause update. The client owns
+        /// display framing and localization.
         ParentError { session_id: String, error: String },
         Completed { session_id: String },
         PausedForBlocker {
@@ -322,6 +322,9 @@ rpc_type! {
         },
         PausedForInterruption {
             session_id: String,
+            /// Stable lifecycle context; the following `ParentError` retains
+            /// the ordinary error surface without duplicating raw diagnostics
+            /// in Goal metadata.
             message: String,
         },
         Failed {

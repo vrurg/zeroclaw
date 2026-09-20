@@ -20,12 +20,12 @@ use zeroclaw_runtime::control_plane::{
     GoalTransitionResult, SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionNotice, GoalExecutionScope,
-    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentHistorySource, GoalParentTurn, GoalParentTurnKind,
-    GoalParentTurnResult, GoalPausedRequest, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-    GoalTerminalReason, GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionNotice, GoalExecutionOutcome,
+    GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentHistorySource, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalPausedRequest, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -328,8 +328,16 @@ impl GoalSessionDriver for PausingExecutionDriver {
 
 struct FailingExecutionLease {
     session_key: GoalSessionKey,
+    failure_point: FailurePoint,
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_errors: Arc<Mutex<Vec<String>>>,
+    presentation_events: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Copy)]
+enum FailurePoint {
+    Parent,
+    Verifier,
 }
 
 #[async_trait]
@@ -345,13 +353,24 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
     async fn run_parent_turn(
         &mut self,
         _operation: &GoalOperationScope,
-        _turn: GoalParentTurn,
+        turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
-        anyhow::bail!("simulated parent failure")
+        if matches!(self.failure_point, FailurePoint::Parent) {
+            anyhow::bail!("simulated parent failure")
+        }
+        Ok(GoalParentTurnResult {
+            candidate: "simulated parent candidate".to_owned(),
+            working_history: turn.working_history,
+            interruption: None,
+        })
     }
 
-    async fn present_parent_error(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
+    async fn present_core_error(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
         self.parent_errors.lock().unwrap().push(error.to_string());
+        self.presentation_events
+            .lock()
+            .unwrap()
+            .push(format!("error:{error}"));
         Ok(())
     }
 
@@ -360,6 +379,9 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
+        if matches!(self.failure_point, FailurePoint::Verifier) {
+            anyhow::bail!("simulated verifier failure")
+        }
         anyhow::bail!("parent failure must skip the verifier")
     }
 
@@ -367,10 +389,17 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
         &mut self,
         _candidate: String,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("parent failure must not record a candidate")
+        if matches!(self.failure_point, FailurePoint::Parent) {
+            anyhow::bail!("parent failure must not record a candidate")
+        }
+        Ok(())
     }
 
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> anyhow::Result<()> {
+        self.presentation_events
+            .lock()
+            .unwrap()
+            .push("notice:paused".to_owned());
         self.notices.lock().unwrap().push(notice);
         Ok(())
     }
@@ -378,8 +407,10 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
 
 struct FailingExecutionDriver {
     binding: GoalSessionBinding,
+    failure_point: FailurePoint,
     notices: Arc<Mutex<Vec<GoalExecutionNotice>>>,
     parent_errors: Arc<Mutex<Vec<String>>>,
+    presentation_events: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -399,8 +430,10 @@ impl GoalSessionDriver for FailingExecutionDriver {
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(FailingExecutionLease {
             session_key: self.binding.session_key().clone(),
+            failure_point: self.failure_point,
             notices: Arc::clone(&self.notices),
             parent_errors: Arc::clone(&self.parent_errors),
+            presentation_events: Arc::clone(&self.presentation_events),
         }))
     }
 }
@@ -2733,17 +2766,20 @@ async fn supervisor_resume_keeps_the_live_blocked_transcript_and_user_response()
 }
 
 #[tokio::test]
-async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the_goal() {
+async fn parent_execution_failure_pauses_and_preserves_the_ordinary_error_surface() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let notices = Arc::new(Mutex::new(Vec::new()));
     let parent_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(FailingExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::Parent,
         notices: Arc::clone(&notices),
         parent_errors: Arc::clone(&parent_errors),
+        presentation_events: Arc::clone(&presentation_events),
     });
     let request = runtime
         .submit(
@@ -2776,20 +2812,23 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
         .execution_engine(tracker, "main", Arc::default())
         .unwrap();
 
-    let error = engine.run(&settings, request).await.unwrap_err();
-
-    assert!(error.to_string().contains("Goal parent operation failed"));
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        GoalExecutionOutcome::Paused
+    );
     assert_eq!(
         parent_errors.lock().unwrap().as_slice(),
         ["simulated parent failure"],
-        "the ordinary parent error must be presented before the Goal lifecycle notice"
+        "the ordinary parent error must remain visible after the Goal lifecycle notice"
     );
     assert_eq!(
         notices.lock().unwrap().as_slice(),
-        &[GoalExecutionNotice::Failed {
-            terminal_reason: GoalTerminalReason::ParentOperationFailed,
-            terminal_provider: None,
-        }]
+        &[GoalExecutionNotice::PausedForInterruption]
+    );
+    assert_eq!(
+        presentation_events.lock().unwrap().as_slice(),
+        ["notice:paused", "error:simulated parent failure"],
+        "the Goal pause must bracket the unchanged ordinary error before a user resumes"
     );
     assert_eq!(
         store
@@ -2798,15 +2837,101 @@ async fn parent_execution_failure_publishes_a_failed_notice_and_terminalizes_the
             .unwrap()
             .unwrap()
             .status,
-        TaskStatus::Failed
+        TaskStatus::Paused
     );
     assert_eq!(
         store
-            .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+            .get_goal_task(scope.task_id())
             .await
             .unwrap()
-            .as_deref(),
-        Some("parent_operation_failed")
+            .expect("Goal extension should remain resumable")
+            .pause_reason,
+        Some(GoalPauseReason::CoreInterrupted)
+    );
+}
+
+#[tokio::test]
+async fn verifier_execution_failure_pauses_and_preserves_the_ordinary_error_surface() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let core_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::Verifier,
+        notices: Arc::clone(&notices),
+        parent_errors: Arc::clone(&core_errors),
+        presentation_events: Arc::clone(&presentation_events),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let scope = request.scope().clone();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        GoalExecutionOutcome::Paused
+    );
+    assert_eq!(
+        core_errors.lock().unwrap().as_slice(),
+        ["simulated verifier failure"],
+        "the verifier error must remain visible after the Goal lifecycle notice"
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::PausedForInterruption]
+    );
+    assert_eq!(
+        presentation_events.lock().unwrap().as_slice(),
+        ["notice:paused", "error:simulated verifier failure"],
+        "the Goal pause must bracket the unchanged verifier error before a user resumes"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Paused
+    );
+    assert_eq!(
+        store
+            .get_goal_task(scope.task_id())
+            .await
+            .unwrap()
+            .expect("Goal extension should remain resumable")
+            .pause_reason,
+        Some(GoalPauseReason::CoreInterrupted)
     );
 }
 

@@ -1222,27 +1222,21 @@ impl GoalExecutionEngine {
                     parent
                 }
                 Err(error) => {
-                    if let Err(presentation_error) = lease.present_parent_error(&error).await {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "task_id": scope.task_id(),
-                                "session_id": scope.session_id(),
-                                "error": zeroclaw_providers::sanitize_api_error(
-                                    &format!("{presentation_error:#}")
-                                ),
-                            })),
-                            "Goal parent error presentation failed"
-                        );
+                    // The ordinary loop settles every provider attempt before
+                    // returning an error. Preserve that same prerequisite on
+                    // the recovery path: a cleanly paired, completely
+                    // accounted core error is resumable, while an unsettled
+                    // tool batch or uncertain spend remains terminal.
+                    if let Err(pairing_error) = finalize_goal_tool_pairing().await {
+                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        return Err(pairing_error).context("Goal parent tool pairing failed");
                     }
-                    self.fail_operation(scope, "parent_operation_failed", &error)
-                        .await?;
-                    return Err(error).context("Goal parent operation failed");
+                    if self.publish_existing_budget_pause(scope, lease).await? {
+                        return Ok(GoalExecutionOutcome::Paused);
+                    }
+                    self.require_complete_accounting(scope).await?;
+                    self.pause_for_core_error(scope, lease, &error).await?;
+                    return Ok(GoalExecutionOutcome::Paused);
                 }
             };
             if let Err(error) = lease.finish_parent_turn_presentation().await {
@@ -1286,21 +1280,6 @@ impl GoalExecutionEngine {
                     }
                 };
                 let error = anyhow::anyhow!(message.clone());
-                if let Err(presentation_error) = lease.present_parent_error(&error).await {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "task_id": scope.task_id(),
-                                "session_id": scope.session_id(),
-                                "error": zeroclaw_providers::sanitize_api_error(
-                                    &format!("{presentation_error:#}")
-                                ),
-                            })),
-                        "Goal interruption presentation failed"
-                    );
-                }
                 if matches!(
                     interruption,
                     super::GoalParentInterruption::ToolLoopSafety { .. }
@@ -1323,8 +1302,9 @@ impl GoalExecutionEngine {
                 )
                 .await?;
                 lease
-                    .publish_goal_notice(GoalExecutionNotice::PausedForInterruption { message })
+                    .publish_goal_notice(GoalExecutionNotice::PausedForInterruption)
                     .await?;
+                self.present_core_error(scope, lease, &error).await;
                 return Ok(GoalExecutionOutcome::Paused);
             }
 
@@ -1414,9 +1394,20 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
-                    self.fail_operation(scope, "verifier_operation_failed", &error)
-                        .await?;
-                    return Err(error).context("Goal verifier operation failed");
+                    // Verifier-provider failures are ordinary recoverable core
+                    // errors too. The completed parent candidate is already
+                    // retained in canonical history, so a later resume can
+                    // retry verification without making the Goal terminal.
+                    if let Err(pairing_error) = finalize_goal_tool_pairing().await {
+                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        return Err(pairing_error).context("Goal verifier tool pairing failed");
+                    }
+                    if self.publish_existing_budget_pause(scope, lease).await? {
+                        return Ok(GoalExecutionOutcome::Paused);
+                    }
+                    self.require_complete_accounting(scope).await?;
+                    self.pause_for_core_error(scope, lease, &error).await?;
+                    return Ok(GoalExecutionOutcome::Paused);
                 }
             };
 
@@ -1574,6 +1565,100 @@ impl GoalExecutionEngine {
         }
     }
 
+    /// Pause a cleanly settled ordinary parent error instead of turning an
+    /// agent or provider fault into a terminal Goal-engine failure. The
+    /// lifecycle notice deliberately precedes the ordinary error so channels
+    /// retain their normal error presentation after the Goal state change.
+    async fn pause_for_core_error(
+        &self,
+        scope: &GoalExecutionScope,
+        lease: &mut dyn GoalSessionExecutionLease,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.pause_for_blockers(
+            scope,
+            GoalPauseReason::CoreInterrupted,
+            "The agent operation ended with an error. The ordinary agent error follows this notice."
+                .to_owned(),
+            Vec::new(),
+        )
+        .await?;
+        lease
+            .publish_goal_notice(GoalExecutionNotice::PausedForInterruption)
+            .await?;
+        self.present_core_error(scope, lease, error).await;
+        Ok(())
+    }
+
+    /// Preserve the accountant's durable budget transition when admission
+    /// rejects a new operation. That transition happens inside the ordinary
+    /// provider path and returns as an error to the session driver, but it is
+    /// not an agent-core failure and must not be reclassified as one.
+    async fn publish_existing_budget_pause(
+        &self,
+        scope: &GoalExecutionScope,
+        lease: &mut dyn GoalSessionExecutionLease,
+    ) -> Result<bool> {
+        let Some(task) = self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(paused_epoch) = scope.execution_epoch().checked_add(1) else {
+            return Ok(false);
+        };
+        if task.id != scope.task_id()
+            || task.execution_epoch != paused_epoch
+            || task.status != TaskStatus::Paused
+        {
+            return Ok(false);
+        }
+        let Some(goal) = self.registry.get_goal_task(scope.task_id()).await? else {
+            return Ok(false);
+        };
+        if goal.pause_reason != Some(GoalPauseReason::BudgetExhausted) {
+            return Ok(false);
+        }
+        lease
+            .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
+                blocker_messages: goal
+                    .blockers
+                    .into_iter()
+                    .map(|blocker| blocker.message)
+                    .collect(),
+            })
+            .await?;
+        Ok(true)
+    }
+
+    /// Preserve the ordinary channel error surface after Goal lifecycle
+    /// handling. A presentation failure is observable but cannot undo a
+    /// durable pause or turn an otherwise resumable core error terminal.
+    async fn present_core_error(
+        &self,
+        scope: &GoalExecutionScope,
+        lease: &mut dyn GoalSessionExecutionLease,
+        error: &anyhow::Error,
+    ) {
+        if let Err(presentation_error) = lease.present_core_error(error).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": scope.task_id(),
+                        "session_id": scope.session_id(),
+                        "error": zeroclaw_providers::sanitize_api_error(
+                            &format!("{presentation_error:#}")
+                        ),
+                    })),
+                "Goal core error presentation failed"
+            );
+        }
+    }
+
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
         self.fail_with_reason(scope, reason, GoalToolBatchFailureReason::PairingIncomplete)
             .await
@@ -1656,6 +1741,7 @@ impl GoalExecutionEngine {
         self.finish_failure(scope, reason).await
     }
 
+    #[cfg(test)]
     async fn fail_operation(
         &self,
         scope: &GoalExecutionScope,
@@ -2256,7 +2342,7 @@ mod tests {
             Ok(())
         }
 
-        async fn present_parent_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        async fn present_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
             self.parent_errors.lock().unwrap().push(error.to_string());
             Ok(())
         }
@@ -2529,9 +2615,7 @@ mod tests {
         );
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
-            &[GoalExecutionNotice::PausedForInterruption {
-                message: "Agent loop aborted by loop detector: Bearer [REDACTED]".to_owned(),
-            }]
+            &[GoalExecutionNotice::PausedForInterruption]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
@@ -2610,9 +2694,7 @@ mod tests {
         assert_eq!(lease.parent_errors.lock().unwrap().as_slice(), [message]);
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
-            &[GoalExecutionNotice::PausedForInterruption {
-                message: message.to_owned(),
-            }]
+            &[GoalExecutionNotice::PausedForInterruption]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::CoreInterrupted));
@@ -2620,6 +2702,77 @@ mod tests {
         assert!(goal.pending_tool_batch_id.is_none());
         assert!(goal.pending_call_id.is_none());
         assert!(paused_transcript.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn budget_admission_pause_is_not_reclassified_as_a_core_interruption() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::BudgetExhausted,
+                        description: Some("Goal usage has reached its effective budget".to_owned()),
+                        blockers: vec![GoalBlocker {
+                            kind: GoalBlockerKind::Budget,
+                            message: "Increase the Goal budget, then resume explicitly.".to_owned(),
+                            payload: None,
+                        }],
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            canonical_history: Vec::new(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: None,
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(
+            engine
+                .publish_existing_budget_pause(&scope, &mut lease)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            lease.notices.lock().unwrap().as_slice(),
+            &[GoalExecutionNotice::PausedForBlocker {
+                blocker_messages: vec![
+                    "Increase the Goal budget, then resume explicitly.".to_owned()
+                ],
+            }]
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::BudgetExhausted));
+        assert!(lease.parent_errors.lock().unwrap().is_empty());
     }
 
     #[test]

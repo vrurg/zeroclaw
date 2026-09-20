@@ -689,10 +689,10 @@ pub enum GoalExecutionNotice {
         blocker_messages: Vec<String>,
     },
     /// A normal agent-core interruption was safely paired and left the Goal
-    /// resumable. This is not a user-action blocker.
-    PausedForInterruption {
-        message: String,
-    },
+    /// resumable. This is not a user-action blocker. The driver presents the
+    /// exact ordinary error after this lifecycle notice, preserving the
+    /// channel's non-Goal error surface and its ordering.
+    PausedForInterruption,
     /// A safe projection of the exact durable failure that ended this Goal.
     /// Raw task diagnostics stay in the control plane and logs.
     Failed {
@@ -729,10 +729,15 @@ pub trait GoalSessionExecutionLease: Send {
     async fn finish_parent_turn_presentation(&mut self) -> Result<()> {
         Ok(())
     }
-    /// Present a terminal error from the ordinary parent loop before the Goal
-    /// controller publishes the lifecycle result. Implementations must apply
-    /// the same redaction and presentation policy as a non-Goal turn.
-    async fn present_parent_error(&mut self, _error: &Error) -> Result<()> {
+    /// Present a recoverable ordinary agent-core error after the Goal
+    /// controller publishes its pause lifecycle result. Implementations must
+    /// apply the same redaction and presentation policy as a non-Goal turn.
+    ///
+    /// The error may originate from either the parent loop or the verifier.
+    /// It remains a normal surface error rather than Goal metadata so a Goal
+    /// never hides diagnostics that the corresponding non-Goal execution
+    /// would have delivered.
+    async fn present_core_error(&mut self, _error: &Error) -> Result<()> {
         Ok(())
     }
     async fn run_verifier(
