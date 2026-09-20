@@ -662,9 +662,11 @@ impl CostTracker {
     /// Obtain the canonical process-global ledger even when ordinary cost
     /// tracking is disabled.
     ///
-    /// This is intentionally strict about an already-resident tracker at a
-    /// different path: a caller relying on durable task accounting must not
-    /// silently write to a ledger selected by another runtime configuration.
+    /// A resident ledger is authoritative. In particular, a Goal can race an
+    /// ordinary channel or RPC turn that initializes the process-global
+    /// tracker from a different (but already live) runtime context. Reusing
+    /// that tracker preserves the same accounting path ordinary work uses;
+    /// rejecting the Goal would make lifecycle control depend on timing.
     pub fn get_or_init_global_required(
         config: CostConfig,
         workspace_dir: &Path,
@@ -678,23 +680,12 @@ impl CostTracker {
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Result<Arc<Self>> {
-        let storage_path = resolve_storage_path(workspace_dir)?;
         if let Some(tracker) = slot.read().as_ref().cloned() {
-            anyhow::ensure!(
-                tracker.storage_path() == storage_path,
-                "required cost tracker storage path differs from the resident tracker"
-            );
-            tracker.update_config(config);
             return Ok(tracker);
         }
 
         let mut guard = slot.write();
         if let Some(tracker) = guard.as_ref().cloned() {
-            anyhow::ensure!(
-                tracker.storage_path() == storage_path,
-                "required cost tracker storage path differs from the resident tracker"
-            );
-            tracker.update_config(config);
             return Ok(tracker);
         }
 
@@ -2032,18 +2023,21 @@ mod tests {
     }
 
     #[test]
-    fn required_global_tracker_rejects_a_different_resident_ledger() {
+    fn required_global_tracker_reuses_a_different_resident_ledger() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         let slot = RwLock::new(None);
 
-        CostTracker::resolve_global_required(&slot, enabled_config(), first.path())
+        let resident = CostTracker::resolve_global_required(&slot, enabled_config(), first.path())
             .expect("first required tracker opens its canonical ledger");
 
+        let reused = CostTracker::resolve_global_required(&slot, enabled_config(), second.path())
+            .expect("a Goal must share the resident ordinary ledger");
         assert!(
-            CostTracker::resolve_global_required(&slot, enabled_config(), second.path()).is_err(),
-            "Goal accounting must not silently reuse a tracker bound to another data directory"
+            Arc::ptr_eq(&resident, &reused),
+            "Goal accounting must retain the process-resident ledger rather than rejecting start"
         );
+        assert_eq!(reused.storage_path(), resident.storage_path());
     }
 
     #[test]

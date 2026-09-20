@@ -359,15 +359,6 @@ pub(super) fn render_matrix_goal_command_error(error: &Error) -> String {
     if error.chain().any(|cause| {
         cause
             .to_string()
-            .contains("required cost tracker storage path differs")
-    }) {
-        return zeroclaw_runtime::i18n::get_required_cli_string(
-            "goal-mode-command-accounting-storage",
-        );
-    }
-    if error.chain().any(|cause| {
-        cause
-            .to_string()
             .contains("Goal control plane is unavailable")
     }) {
         return zeroclaw_runtime::i18n::get_required_cli_string(
@@ -2132,18 +2123,6 @@ mod tests {
         assert_eq!(
             rendered,
             "❌ Goal failed.\n**Reason:** The Goal worker could not continue.\n**Details:** agent loop: model request rejected (429)"
-        );
-    }
-
-    #[test]
-    fn command_error_classifies_a_conflicting_resident_ledger() {
-        let rendered = render_matrix_goal_command_error(&anyhow::anyhow!(
-            "required cost tracker storage path differs from the resident tracker"
-        ));
-
-        assert_eq!(
-            rendered,
-            "⚠️ Goal accounting cannot start because this process is using a different ledger. Ask an operator to align the configured data directory, then try again."
         );
     }
 
