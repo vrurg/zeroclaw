@@ -1748,6 +1748,10 @@ struct InFlightSenderTaskState {
     task_id: u64,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
+    /// Immutable conversation-history identity.  Interruption remains
+    /// sender-scoped, but a deferred Goal control must acknowledge work ahead
+    /// of it in the shared conversation lane regardless of who sent that work.
+    conversation_key: String,
     /// The debounce bucket this turn's payload is retained in for as long as
     /// its window is open. A turn killed before its window fires leaves that
     /// text behind, and the bucket's reserved slot *is* this turn — so whoever
@@ -2033,19 +2037,21 @@ fn deferred_goal_command_label(command: &GoalCommand) -> Option<&'static str> {
     }
 }
 
-/// Whether a prior turn from this sender's interruption scope is still
-/// registered. Goal commands retain their ordered lane position, but this lets
-/// us immediately acknowledge a lifecycle command that cannot run yet.
-fn has_registered_turn_in_scope(
+/// Whether a prior turn in this conversation is still registered. Goal
+/// commands retain their ordered lane position, but this lets us immediately
+/// acknowledge a lifecycle command that cannot run yet.  This cannot use the
+/// sender interruption scope: Matrix rooms can intentionally share one history
+/// and lane across several senders.
+fn has_registered_turn_in_conversation(
     in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
-    msg: &ChannelMessage,
+    conversation_key: &str,
 ) -> bool {
-    let scope_key = interruption_scope_key(msg);
     in_flight
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&scope_key)
-        .is_some_and(|states| !states.is_empty())
+        .values()
+        .flatten()
+        .any(|state| state.conversation_key == conversation_key)
 }
 
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
@@ -9946,6 +9952,7 @@ async fn register_inbound_turn(
     // keys a different history.
     let debounce_key =
         message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), msg), msg);
+    let conversation_key = runtime_conversation_history_key(ctx.as_ref(), msg);
     let cancellation = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
@@ -9981,6 +9988,7 @@ async fn register_inbound_turn(
             task_id,
             cancellation: cancellation.clone(),
             completion: Arc::clone(&completion),
+            conversation_key,
             debounce_key,
             superseded_completions,
         });
@@ -10979,7 +10987,10 @@ async fn run_message_dispatch_loop(
         // Goal state transition: the normal controller response remains the
         // sole authoritative confirmation when the queued command executes.
         if let Some(command) = deferred_goal_command
-            && has_registered_turn_in_scope(&in_flight_by_sender, &msg)
+            && has_registered_turn_in_conversation(
+                &in_flight_by_sender,
+                &runtime_conversation_history_key(ctx.as_ref(), &msg),
+            )
             && let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
         {
             let acknowledgement = channel_runtime_cli_string_with_args(
@@ -35071,6 +35082,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 task_id: 0,
                 cancellation: previous_token.clone(),
                 completion: Arc::clone(&previous_completion),
+                conversation_key: "picker-test".to_owned(),
                 // No debounce window is open for this hand-built predecessor.
                 debounce_key: String::new(),
                 superseded_completions: Vec::new(),
@@ -42749,34 +42761,41 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn deferred_goal_receipt_only_observes_earlier_turns_in_its_scope() {
-        let message = ChannelMessage {
-            channel: "matrix".to_string(),
-            sender: "user".to_string(),
-            reply_target: "!room:example.test".to_string(),
-            ..Default::default()
-        };
+    fn deferred_goal_receipt_observes_earlier_turns_in_its_conversation() {
         let in_flight = Arc::new(Mutex::new(HashMap::new()));
-        assert!(!has_registered_turn_in_scope(&in_flight, &message));
+        let conversation_key = "matrix_shared_room";
+        assert!(!has_registered_turn_in_conversation(
+            &in_flight,
+            conversation_key
+        ));
 
-        let scope = interruption_scope_key(&message);
+        let scope = "matrix_room_other_user".to_owned();
         in_flight.lock().unwrap().insert(
             scope,
             vec![InFlightSenderTaskState {
                 task_id: 1,
                 cancellation: CancellationToken::new(),
                 completion: Arc::new(InFlightTaskCompletion::new()),
+                conversation_key: conversation_key.to_owned(),
                 debounce_key: "matrix_room_user".to_string(),
                 superseded_completions: Vec::new(),
             }],
         );
-        assert!(has_registered_turn_in_scope(&in_flight, &message));
+        assert!(has_registered_turn_in_conversation(
+            &in_flight,
+            conversation_key
+        ));
 
-        let other_sender = ChannelMessage {
-            sender: "other-user".to_string(),
-            ..message
-        };
-        assert!(!has_registered_turn_in_scope(&in_flight, &other_sender));
+        // The registered turn belongs to another sender's interruption scope,
+        // but shares this room's ordered history/lane.
+        assert!(has_registered_turn_in_conversation(
+            &in_flight,
+            conversation_key
+        ));
+        assert!(!has_registered_turn_in_conversation(
+            &in_flight,
+            "matrix_other_room"
+        ));
     }
 
     #[test]
