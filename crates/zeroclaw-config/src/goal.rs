@@ -64,10 +64,8 @@ impl GoalConfig {
         {
             return Err(GoalConfigError::EmptyVerifierModel);
         }
-        if self.enabled {
-            if self.verifier.model_provider.as_str().trim().is_empty() {
-                return Err(GoalConfigError::MissingVerifierProvider);
-            }
+        if self.enabled && self.verifier.model_provider.as_str().trim().is_empty() {
+            return Err(GoalConfigError::MissingVerifierProvider);
         }
         Ok(())
     }
