@@ -603,25 +603,6 @@ fn goal_continuation_history_for_parent_turn(
     Ok(history)
 }
 
-/// Forward every parent-loop event through the ordinary channel presentation
-/// path.
-///
-/// Goal Mode is a lifecycle and verification layer, not a second presentation
-/// policy.  The channel's existing renderer remains the sole authority on
-/// whether an event is visible and how it is formatted.  Verification gates
-/// canonical history and Goal completion; it must not suppress an event that
-/// an ordinary parent turn would give to that renderer.
-async fn relay_goal_parent_events(
-    mut source: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
-    destination: tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>,
-) {
-    while let Some(event) = source.recv().await {
-        if destination.send(event).await.is_err() {
-            break;
-        }
-    }
-}
-
 /// The normal channel presentation plumbing for one Goal parent operation.
 ///
 /// Goal execution uses the same draft and tool-notification paths as an
@@ -639,7 +620,6 @@ struct GoalParentPresentation {
     receipts: Arc<Mutex<Vec<String>>>,
     on_delta: Option<tokio::sync::mpsc::Sender<zeroclaw_runtime::agent::loop_::StreamDelta>>,
     observer: Arc<super::ChannelNotifyObserver>,
-    relay: Option<tokio::task::JoinHandle<()>>,
     draft_updater: Option<tokio::task::JoinHandle<()>>,
     notify_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -654,12 +634,11 @@ impl GoalParentPresentation {
         let matrix_single_message_streaming =
             super::matrix_single_message_streaming_enabled(&context, message);
 
-        let (on_delta, relay, draft_updater, draft_id) = if use_draft_streaming {
-            let (source_tx, source_rx) = tokio::sync::mpsc::channel(64);
-            let (visible_tx, visible_rx) = tokio::sync::mpsc::channel(64);
-            let relay = Some(zeroclaw_spawn::spawn!(relay_goal_parent_events(
-                source_rx, visible_tx,
-            )));
+        let (on_delta, draft_updater, draft_id) = if use_draft_streaming {
+            // Use the ordinary one-hop channel-to-renderer queue. A Goal
+            // lifecycle must not introduce another buffer that can alter
+            // stream backpressure or event ordering.
+            let (on_delta, visible_rx) = tokio::sync::mpsc::channel(64);
             let draft_id = if let Some(channel) = channel.as_ref() {
                 match channel
                     .send_draft(&zeroclaw_api::channel::SendMessage::reply_to(
@@ -728,9 +707,9 @@ impl GoalParentPresentation {
                 }
                 _ => None,
             };
-            (Some(source_tx), relay, draft_updater, draft_id)
+            (Some(on_delta), draft_updater, draft_id)
         } else {
-            (None, None, None, None)
+            (None, None, None)
         };
 
         let is_partial_draft = channel.as_ref().is_some_and(|channel| {
@@ -777,7 +756,6 @@ impl GoalParentPresentation {
                 tx: notify_tx,
                 tools_used: std::sync::atomic::AtomicBool::new(false),
             }),
-            relay,
             draft_updater,
             notify_task,
         }
@@ -804,14 +782,10 @@ impl GoalParentPresentation {
             receipts,
             on_delta,
             observer,
-            relay,
             draft_updater,
             notify_task,
         } = self;
         drop(on_delta);
-        if let Some(relay) = relay {
-            let _ = relay.await;
-        }
         if let Some(draft_updater) = draft_updater {
             let _ = draft_updater.await;
         }
@@ -2049,101 +2023,6 @@ mod tests {
         .expect_err("continuation must retain the system prompt at history index zero");
 
         assert!(error.to_string().contains("lost its system prompt"));
-    }
-
-    #[tokio::test]
-    async fn goal_parent_relay_preserves_every_parent_event() {
-        use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
-
-        let (source_tx, source_rx) = tokio::sync::mpsc::channel(8);
-        let (visible_tx, mut visible_rx) = tokio::sync::mpsc::channel(8);
-        let relay = zeroclaw_spawn::spawn!(relay_goal_parent_events(source_rx, visible_tx));
-        let expected = vec![
-            StreamDelta::Lifecycle(ProgressEvent::Planning),
-            StreamDelta::Status("🤔 Thinking...".to_owned()),
-            StreamDelta::Reasoning("configured reasoning".to_owned()),
-            StreamDelta::Text("unverified candidate".to_owned()),
-        ];
-        for event in &expected {
-            source_tx
-                .send(event.clone())
-                .await
-                .expect("Goal relay should remain open");
-        }
-        drop(source_tx);
-        relay.await.expect("Goal relay should join");
-
-        let mut actual = Vec::new();
-        while let Some(event) = visible_rx.recv().await {
-            actual.push(event);
-        }
-        assert!(matches!(actual.as_slice(), [
-            StreamDelta::Lifecycle(ProgressEvent::Planning),
-            StreamDelta::Status(status),
-            StreamDelta::Reasoning(reason),
-            StreamDelta::Text(text),
-        ] if status == "🤔 Thinking..."
-            && reason == "configured reasoning"
-            && text == "unverified candidate"));
-    }
-
-    #[tokio::test]
-    async fn goal_parent_relay_preserves_representative_typed_stream_events() {
-        use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
-
-        let (source_tx, source_rx) = tokio::sync::mpsc::channel(8);
-        let (visible_tx, mut visible_rx) = tokio::sync::mpsc::channel(8);
-        let relay = zeroclaw_spawn::spawn!(relay_goal_parent_events(source_rx, visible_tx));
-        source_tx
-            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
-            .await
-            .unwrap();
-        source_tx
-            .send(StreamDelta::ToolStart {
-                tool: "file_read".to_owned(),
-                arguments: Arc::new(serde_json::json!({"path": "README.md"})),
-                tool_provenance: None,
-            })
-            .await
-            .unwrap();
-        source_tx
-            .send(StreamDelta::ToolComplete {
-                tool: "file_read".to_owned(),
-                arguments: Arc::new(serde_json::json!({"path": "README.md"})),
-                tool_provenance: None,
-                secs: 2,
-                success: true,
-                error: None,
-            })
-            .await
-            .unwrap();
-        drop(source_tx);
-        relay.await.unwrap();
-
-        assert!(matches!(
-            visible_rx.recv().await,
-            Some(StreamDelta::Lifecycle(ProgressEvent::Received))
-        ));
-        assert!(matches!(
-            visible_rx.recv().await,
-            Some(StreamDelta::ToolStart {
-                tool,
-                arguments,
-                tool_provenance: None,
-            }) if tool == "file_read" && arguments["path"] == "README.md"
-        ));
-        assert!(matches!(
-            visible_rx.recv().await,
-            Some(StreamDelta::ToolComplete {
-                tool,
-                arguments,
-                tool_provenance: None,
-                secs: 2,
-                success: true,
-                error: None,
-            }) if tool == "file_read" && arguments["path"] == "README.md"
-        ));
-        assert!(visible_rx.recv().await.is_none());
     }
 
     #[tokio::test]
