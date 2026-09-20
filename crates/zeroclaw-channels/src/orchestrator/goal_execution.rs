@@ -15,7 +15,8 @@ use zeroclaw_api::{
     model_provider::{ChatMessage, ChatRequest},
 };
 use zeroclaw_providers::{
-    reliable::{scope_provider_fallback, take_last_provider_fallback},
+    SafeguardFallbackNotice,
+    reliable::{ProviderFallbackInfo, scope_provider_fallback, take_last_provider_fallback},
     scope_safeguard_fallback, take_last_safeguard_fallback,
 };
 use zeroclaw_runtime::{
@@ -384,7 +385,7 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
             message: self.message.clone(),
-            parent_candidate_presented: false,
+            parent_candidate_history: None,
         }))
     }
 }
@@ -394,10 +395,10 @@ struct MatrixGoalExecutionLease {
     context: Arc<ChannelRuntimeContext>,
     session_key: GoalSessionKey,
     message: ChannelMessage,
-    /// A parent candidate may already have reached the normal Matrix response
-    /// surface before Goal lifecycle processing records it in canonical history,
-    /// but recording must not send that same response twice.
-    parent_candidate_presented: bool,
+    /// The exact post-hook, post-sanitization response ordinary Matrix session
+    /// history would retain. It deliberately excludes recovery presentation
+    /// footers, matching the non-Goal channel path.
+    parent_candidate_history: Option<String>,
 }
 
 impl MatrixGoalExecutionLease {
@@ -789,8 +790,10 @@ impl GoalParentPresentation {
     async fn finish(
         self,
         candidate: Option<&str>,
+        provider_fallback: Option<&ProviderFallbackInfo>,
+        safeguard_fallback: Option<&SafeguardFallbackNotice>,
         turn_route: Option<zeroclaw_runtime::tools::TurnRoutingEntry>,
-    ) -> bool {
+    ) -> Option<String> {
         let Self {
             context,
             message,
@@ -821,6 +824,8 @@ impl GoalParentPresentation {
             channel.as_ref(),
             draft_id.as_deref(),
             candidate,
+            provider_fallback,
+            safeguard_fallback,
             tools_used,
             receipts,
             turn_route,
@@ -834,18 +839,20 @@ impl GoalParentPresentation {
         channel: Option<&Arc<dyn Channel>>,
         draft_id: Option<&str>,
         candidate: Option<&str>,
+        provider_fallback: Option<&ProviderFallbackInfo>,
+        safeguard_fallback: Option<&SafeguardFallbackNotice>,
         tools_used: bool,
         receipts: Arc<Mutex<Vec<String>>>,
         turn_route: Option<zeroclaw_runtime::tools::TurnRoutingEntry>,
-    ) -> bool {
+    ) -> Option<String> {
         let Some(channel) = channel else {
-            return false;
+            return None;
         };
         let Some(candidate) = candidate else {
             if let Some(draft_id) = draft_id {
                 let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
             }
-            return false;
+            return None;
         };
         let mut outbound = candidate.to_owned();
         if let Some(hooks) = context.hooks.as_ref() {
@@ -861,7 +868,7 @@ impl GoalParentPresentation {
                     if let Some(draft_id) = draft_id {
                         let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
                     }
-                    return false;
+                    return None;
                 }
                 zeroclaw_runtime::hooks::HookResult::Continue((_, _, mut content)) => {
                     if content.chars().count() > super::CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
@@ -890,6 +897,15 @@ impl GoalParentPresentation {
             &outbound,
             &message.channel,
             &message.reply_target,
+        );
+        // This is the normal non-Goal history value. Provider-recovery
+        // footers are surface-only, so they are added only to the rendered
+        // response below and are not retained in session history.
+        let history_response = delivered.clone();
+        let delivered = super::append_provider_fallback_footer(
+            delivered,
+            provider_fallback,
+            safeguard_fallback,
         );
         let (delivery_channel, delivery_recipient, suppress_voice, force_voice, is_redirect) =
             if let Some(route) = turn_route {
@@ -932,7 +948,7 @@ impl GoalParentPresentation {
             if let Some(draft_id) = draft_id {
                 let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
             }
-            return false;
+            return Some(history_response);
         };
         let thread_ts = tools_used
             .then(|| super::followup_thread_id(message))
@@ -973,7 +989,7 @@ impl GoalParentPresentation {
                 }
             }
         }
-        delivered_to_channel
+        Some(history_response)
     }
 }
 
@@ -1110,7 +1126,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             loop_knobs.draft_reasoning =
                 super::matrix_stream_reasoning(self.context.as_ref(), &self.message);
         }
-        self.parent_candidate_presented = false;
+        self.parent_candidate_history = None;
         let presentation =
             GoalParentPresentation::start(Arc::clone(&self.context), &self.message).await;
         if let Some(on_delta) = presentation.on_delta.as_ref() {
@@ -1201,17 +1217,19 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                     .unwrap_or_else(|error| error.into_inner())
                     .last()
                     .cloned();
-                let presented = super::append_provider_fallback_footer(
-                    candidate.clone(),
-                    provider_fallback.as_ref(),
-                    safeguard_fallback.as_ref(),
-                );
-                self.parent_candidate_presented =
-                    presentation.finish(Some(&presented), turn_route).await;
+                let presentation = presentation
+                    .finish(
+                        Some(&candidate),
+                        provider_fallback.as_ref(),
+                        safeguard_fallback.as_ref(),
+                        turn_route,
+                    )
+                    .await;
+                self.parent_candidate_history = presentation;
                 candidate
             }
             Err(error) => {
-                presentation.finish(None, None).await;
+                presentation.finish(None, None, None, None).await;
                 let interruption =
                     if zeroclaw_runtime::agent::tool_loop_safety_interruption(&error).is_some() {
                         GoalParentInterruption::ToolLoopSafety {
@@ -1301,25 +1319,10 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         response.text.context("Goal verifier returned no text")
     }
 
-    async fn record_presented_parent_candidate(&mut self, candidate: String) -> Result<()> {
-        let delivered = sanitize_channel_response_for_format_with_leak_detection(
-            &candidate,
-            self.context.tools_registry.as_ref(),
-            &self.context.prompt_config.security.leak_detection,
-            outbound_content_format_for_channel(&self.message.channel),
-        );
-        if !self.parent_candidate_presented {
-            let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
-                .context("Matrix Goal channel is no longer available")?;
-            channel
-                .send_final(&zeroclaw_api::channel::SendMessage::reply_to(
-                    &self.message,
-                    &delivered,
-                ))
-                .await
-                .context("deliver presented Matrix Goal candidate")?;
-        }
-        self.parent_candidate_presented = false;
+    async fn record_presented_parent_candidate(&mut self, _candidate: String) -> Result<()> {
+        let Some(delivered) = self.parent_candidate_history.take() else {
+            return Ok(());
+        };
         append_sender_turn(
             self.context.as_ref(),
             &self.session_key.durable_id(),
