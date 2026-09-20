@@ -86,14 +86,13 @@ impl Tool for GoalAwareAskUser {
     }
     fn parameters_schema(&self) -> serde_json::Value {
         let mut schema = self.inner.parameters_schema();
-        if matches!(goal_turn_scope(), Some(GoalTurnScope::Parent)) {
-            if let Some(properties) = schema
+        if matches!(goal_turn_scope(), Some(GoalTurnScope::Parent))
+            && let Some(properties) = schema
                 .get_mut("properties")
                 .and_then(serde_json::Value::as_object_mut)
-            {
-                properties.remove("channel");
-                properties.remove("timeout_secs");
-            }
+        {
+            properties.remove("channel");
+            properties.remove("timeout_secs");
         }
         schema
     }

@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Error, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
@@ -470,10 +470,10 @@ impl GoalExecutionSupervisor {
             .into_parts_with_lease();
 
         if let Some(mut request) = execution {
-            if let Some(scope) = previous.as_ref() {
-                if let Some(retained_transcript) = self.drain_after_fence(scope).await? {
-                    request = request.with_retained_transcript(retained_transcript);
-                }
+            if let Some(scope) = previous.as_ref()
+                && let Some(retained_transcript) = self.drain_after_fence(scope).await?
+            {
+                request = request.with_retained_transcript(retained_transcript);
             }
             let scope = request.scope().clone();
             if let Err(error) = before_launch(&response).await {
@@ -1292,10 +1292,13 @@ impl GoalExecutionEngine {
                             && !retained_transcript)
                             .then(|| paused_request.take())
                             .flatten(),
-                        history_source: (retained_transcript
-                            || parent_turn_kind == super::GoalParentTurnKind::Continue)
-                            .then_some(super::GoalParentHistorySource::Continuation)
-                            .unwrap_or(super::GoalParentHistorySource::Canonical),
+                        history_source: if retained_transcript
+                            || parent_turn_kind == super::GoalParentTurnKind::Continue
+                        {
+                            super::GoalParentHistorySource::Continuation
+                        } else {
+                            super::GoalParentHistorySource::Canonical
+                        },
                         working_history: std::mem::take(&mut working_history),
                     },
                 )
@@ -1394,7 +1397,7 @@ impl GoalExecutionEngine {
                         "The selected model rejected the current context before it could produce a candidate."
                     }
                 };
-                let error = anyhow::anyhow!(message.clone());
+                let error = Error::msg(message.clone());
                 if matches!(
                     interruption,
                     super::GoalParentInterruption::ToolLoopSafety { .. }
@@ -1485,7 +1488,7 @@ impl GoalExecutionEngine {
             }
 
             if candidate.trim().is_empty() {
-                let error = anyhow::anyhow!("Goal parent returned an empty candidate");
+                let error = Error::msg("Goal parent returned an empty candidate");
                 self.pause_for_core_error(scope, lease, &error).await?;
                 return Ok(GoalExecutionOutcome::Paused);
             }

@@ -309,9 +309,9 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 self.cancellation.clone(),
             )
             .await;
-        event_relay
-            .await
-            .map_err(|error| anyhow::anyhow!("ZeroCode Goal event relay panicked: {error}"))?;
+        event_relay.await.map_err(|error| {
+            anyhow::Error::msg(format!("ZeroCode Goal event relay panicked: {error}"))
+        })?;
         let outcome = outcome?;
         Ok(GoalParentTurnResult {
             candidate: outcome.response,

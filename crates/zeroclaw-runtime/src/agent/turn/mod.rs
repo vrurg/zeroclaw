@@ -1148,16 +1148,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             crate::agent::goal_user_input::final_goal_blocker_ends_parent_turn(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
-        if let Some(ref tx) = on_delta {
-            if !tool_calls.is_empty() && !final_goal_blocker {
-                let llm_secs = llm_started_at.elapsed().as_secs();
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    )))
-                    .await;
-            }
+        if let Some(ref tx) = on_delta
+            && !tool_calls.is_empty()
+            && !final_goal_blocker
+        {
+            let llm_secs = llm_started_at.elapsed().as_secs();
+            let _ = tx
+                .send(StreamDelta::Status(format!(
+                    "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                    tool_calls.len()
+                )))
+                .await;
         }
 
         if tool_calls.is_empty() || final_goal_blocker {
@@ -1197,11 +1198,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // assistant tool-use record after the Goal blocker has declined
             // those calls.  Persist only the exact visible candidate which
             // the verifier will assess.
-            let msg = ChatMessage::assistant(
-                final_goal_blocker
-                    .then_some(display_text.clone())
-                    .unwrap_or(response_text.clone()),
-            );
+            let msg = ChatMessage::assistant(if final_goal_blocker {
+                display_text.clone()
+            } else {
+                response_text.clone()
+            });
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
