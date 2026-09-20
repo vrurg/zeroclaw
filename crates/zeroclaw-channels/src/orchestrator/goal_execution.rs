@@ -403,13 +403,15 @@ struct MatrixGoalExecutionLease {
 
 impl MatrixGoalExecutionLease {
     fn history(&self) -> Vec<ChatMessage> {
-        self.context
+        let history = self
+            .context
             .conversation_histories
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .peek(&self.session_key.durable_id())
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        super::prepare_cached_channel_history(history)
     }
 
     fn goal_system_prompt(
@@ -1568,6 +1570,18 @@ mod tests {
                 Some("matrix:group:engineering:user".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn goal_parent_history_uses_ordinary_matrix_cache_cleanup() {
+        let history = super::super::prepare_cached_channel_history(vec![
+            ChatMessage::user("task\n<tool_result>stale result</tool_result>"),
+            ChatMessage::assistant("[Used tools: file_read]\ncompleted report"),
+        ]);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "task");
+        assert_eq!(history[1].content, "completed report");
     }
 
     struct GoalPresentationChannel {

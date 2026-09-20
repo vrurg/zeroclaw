@@ -2637,6 +2637,37 @@ fn strip_inline_data_image_markers(content: &str) -> String {
     out.trim().to_string()
 }
 
+/// Prepares persisted channel history for another model turn. All channel
+/// execution paths, including Goal Mode, must use this exact cleanup so a
+/// cached internal envelope cannot change the model-visible transcript.
+pub(super) fn prepare_cached_channel_history(mut turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    turns = normalize_cached_channel_turns(turns);
+
+    // Strip stale tool_result blocks from cached turns so the LLM never sees
+    // a `<tool_result>` without a preceding `<tool_call>`, which causes
+    // hallucinated output on subsequent heartbeat ticks or sessions.
+    for turn in &mut turns {
+        if turn.content.contains("<tool_result") {
+            turn.content = strip_tool_result_content(&turn.content);
+        }
+    }
+
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the LLM
+    // never sees (and reproduces) this internal summary format.
+    for turn in &mut turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
+    // Collapse only heavy inline `data:` image payloads in older cached turns.
+    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
+    // re-inflate from disk while inline base64 is dropped to keep history
+    // within the context budget.
+    collapse_inline_image_payloads(&mut turns);
+    turns
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -8213,30 +8244,7 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-
-    // Strip stale tool_result blocks from cached turns so the LLM never
-    // sees a `<tool_result>` without a preceding `<tool_call>`, which
-    // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut prior_turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
-
-    // Strip [Used tools: ...] prefixes from cached assistant turns so the
-    // LLM never sees (and reproduces) this internal summary format.
-    for turn in &mut prior_turns {
-        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
-            turn.content = strip_tool_summary_prefix(&turn.content);
-        }
-    }
-
-    // Collapse only heavy inline `data:` image payloads in older cached turns.
-    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
-    // re-inflate from disk inline base64 is dropped to keep history
-    // within the context budget
-    collapse_inline_image_payloads(&mut prior_turns);
+    let prior_turns = prepare_cached_channel_history(prior_turns_raw);
 
     let is_group_chat = is_group_reply_target(&msg.reply_target);
     let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
