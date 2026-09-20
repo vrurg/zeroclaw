@@ -198,15 +198,18 @@ pub(super) async fn submit_matrix_goal(
         } else {
             let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::new(Arc::clone(&registry));
             // Reuse the exact tracker which ordinary Matrix turns already
-            // use. If ordinary cost tracking is disabled, this context has no
-            // retained tracker; use its original channel configuration rather
-            // than a hot-reloaded defaults snapshot. A reload can change the
-            // latter's data directory while the process-global ledger remains
-            // bound to this channel context's active directory.
+            // use. A context created while ordinary cost tracking was disabled
+            // has no retained tracker; in that case, prefer the ledger another
+            // resident Matrix context already established. This mirrors an
+            // ordinary disabled-cost context and avoids making Goal Mode reject
+            // a valid concurrent runtime solely because its old config names a
+            // different directory. If none exists, open this context's original
+            // ledger strictly rather than consulting hot-reloaded defaults.
             let tracker = context
                 .cost_tracking
                 .as_ref()
                 .map(|tracking| Arc::clone(&tracking.tracker))
+                .or_else(CostTracker::get_global)
                 .map(Ok)
                 .unwrap_or_else(|| {
                     let ledger_config = goal_ledger_config(&context);

@@ -648,6 +648,17 @@ impl CostTracker {
         Self::resolve_global(slot, config, workspace_dir)
     }
 
+    /// Return the resident process-global tracker without changing its policy
+    /// or storage binding.
+    ///
+    /// Consumers that must behave exactly like an already-running ordinary
+    /// channel turn can use this to retain that turn's canonical ledger when
+    /// their own context was created while cost tracking was disabled.
+    pub fn get_global() -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::existing_global(slot)
+    }
+
     /// Obtain the canonical process-global ledger even when ordinary cost
     /// tracking is disabled.
     ///
@@ -690,6 +701,10 @@ impl CostTracker {
         let tracker = Arc::new(Self::new(config, workspace_dir)?);
         *guard = Some(Arc::clone(&tracker));
         Ok(tracker)
+    }
+
+    fn existing_global(slot: &RwLock<Option<Arc<CostTracker>>>) -> Option<Arc<CostTracker>> {
+        slot.read().as_ref().cloned()
     }
 
     fn resolve_global(
@@ -1892,6 +1907,25 @@ mod tests {
                 .0,
             2
         );
+    }
+
+    #[test]
+    fn existing_global_returns_the_resident_ledger_without_reconfiguring_it() {
+        let first = TempDir::new().unwrap();
+        let slot = RwLock::new(None);
+        let tracker = CostTracker::resolve_global_required(&slot, enabled_config(), first.path())
+            .expect("fixture creates its resident ledger");
+        let original_config = tracker.config();
+
+        let existing =
+            CostTracker::existing_global(&slot).expect("the fixture has a resident tracker");
+
+        assert!(Arc::ptr_eq(&tracker, &existing));
+        assert_eq!(
+            existing.config().daily_limit_usd,
+            original_config.daily_limit_usd
+        );
+        assert_eq!(existing.storage_path(), tracker.storage_path());
     }
 
     #[test]
