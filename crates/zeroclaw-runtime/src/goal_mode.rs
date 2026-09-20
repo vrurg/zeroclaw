@@ -2414,6 +2414,13 @@ mod tests {
                     "If `ask_user` is unavailable or rejected, end your visible candidate"
                 )
             );
+            assert!(directive.content.contains("## Goal blocker"));
+            assert!(directive.content.contains("Kind: needs_user_input"));
+            assert!(
+                directive
+                    .content
+                    .contains("Action: <one concrete action or answer needed>")
+            );
             assert!(directive.content.contains(
                 "If you cannot continue because of a human escalation or external dependency"
             ));
