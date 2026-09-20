@@ -1233,7 +1233,7 @@ impl GoalExecutionEngine {
                             .await?;
                         return Err(error).context("Goal parent tool pairing failed");
                     }
-                    self.require_complete_accounting(scope).await?;
+                    self.require_complete_accounting(scope, None).await?;
                     parent
                 }
                 Err(error) => {
@@ -1250,7 +1250,15 @@ impl GoalExecutionEngine {
                     if self.publish_existing_budget_pause(scope, lease).await? {
                         return Ok(GoalExecutionOutcome::Paused);
                     }
-                    self.require_complete_accounting(scope).await?;
+                    if let Err(accounting_error) =
+                        self.require_complete_accounting(scope, Some(&error)).await
+                    {
+                        // An accounting failure can make the Goal terminal,
+                        // but it must not erase the ordinary model/provider
+                        // error that caused the missing report.
+                        self.present_core_error(scope, lease, &error).await;
+                        return Err(accounting_error);
+                    }
                     self.pause_for_core_error(scope, lease, &error).await?;
                     return Ok(GoalExecutionOutcome::Paused);
                 }
@@ -1409,7 +1417,7 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(response) => {
-                    self.require_complete_accounting(scope).await?;
+                    self.require_complete_accounting(scope, None).await?;
                     response
                 }
                 Err(error) => {
@@ -1425,7 +1433,14 @@ impl GoalExecutionEngine {
                     if self.publish_existing_budget_pause(scope, lease).await? {
                         return Ok(GoalExecutionOutcome::Paused);
                     }
-                    self.require_complete_accounting(scope).await?;
+                    if let Err(accounting_error) =
+                        self.require_complete_accounting(scope, Some(&error)).await
+                    {
+                        // Preserve the verifier's actual provider error even
+                        // when incomplete accounting makes this Goal terminal.
+                        self.present_core_error(scope, lease, &error).await;
+                        return Err(accounting_error);
+                    }
                     self.pause_for_core_error(scope, lease, &error).await?;
                     return Ok(GoalExecutionOutcome::Paused);
                 }
@@ -1476,7 +1491,11 @@ impl GoalExecutionEngine {
         }
     }
 
-    async fn require_complete_accounting(&self, scope: &GoalExecutionScope) -> Result<()> {
+    async fn require_complete_accounting(
+        &self,
+        scope: &GoalExecutionScope,
+        causal_error: Option<&anyhow::Error>,
+    ) -> Result<()> {
         let goal = self
             .registry
             .get_goal_task(scope.task_id())
@@ -1486,6 +1505,12 @@ impl GoalExecutionEngine {
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
+            if let Some(causal_error) = causal_error {
+                self.fail_with_error(scope, "accounting_missing_or_invalid", causal_error)
+                    .await?;
+                return Err(anyhow::Error::msg("Goal accounting is incomplete"))
+                    .context(causal_error.to_string());
+            }
             self.fail(scope, "accounting_missing_or_invalid").await?;
             bail!("Goal accounting is incomplete");
         }
@@ -1502,6 +1527,14 @@ impl GoalExecutionEngine {
             .context("join strict Goal usage lookup")?
             .context("Goal accounting ledger is invalid")?;
             if !pricing_complete {
+                if let Some(causal_error) = causal_error {
+                    self.fail_with_error(scope, "pricing_unavailable", causal_error)
+                        .await?;
+                    return Err(anyhow::Error::msg(
+                        "Goal cost budget lacks complete pricing for actual provider usage",
+                    ))
+                    .context(causal_error.to_string());
+                }
                 self.fail(scope, "pricing_unavailable").await?;
                 bail!("Goal cost budget lacks complete pricing for actual provider usage");
             }
@@ -2329,6 +2362,7 @@ mod tests {
         verifier_calls: AtomicUsize,
         notices: std::sync::Mutex<Vec<GoalExecutionNotice>>,
         interruption: Option<super::super::GoalParentInterruption>,
+        parent_failure: Option<String>,
         fallback_candidate: Option<String>,
         parent_errors: std::sync::Mutex<Vec<String>>,
         recorded_candidates: std::sync::Mutex<Vec<String>>,
@@ -2349,6 +2383,9 @@ mod tests {
             _operation: &GoalOperationScope,
             turn: super::super::GoalParentTurn,
         ) -> Result<super::super::GoalParentTurnResult> {
+            if let Some(error) = self.parent_failure.clone() {
+                return Err(anyhow::Error::msg(error));
+            }
             if let Some(interruption) = self.interruption.clone() {
                 let batch = crate::agent::goal_tool_pairing::admit_goal_tool_batch(1)
                     .await?
@@ -2487,6 +2524,7 @@ mod tests {
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
             interruption: None,
+            parent_failure: None,
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
@@ -2529,6 +2567,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_usage_terminal_preserves_the_parent_provider_error() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "missing-usage-parent-operation",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "missing-usage-parent-operation",
+                    GoalAccountingState::Missing,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        let provider_error = "openai.default: request failed with status 503";
+        let mut lease = TypedInputLease {
+            session_key: super::super::GoalSessionKey::matrix(scope.session_id().to_owned())
+                .unwrap(),
+            canonical_history: Vec::new(),
+            presentation_finishes: AtomicUsize::new(0),
+            verifier_calls: AtomicUsize::new(0),
+            notices: std::sync::Mutex::new(Vec::new()),
+            interruption: None,
+            parent_failure: Some(provider_error.to_owned()),
+            fallback_candidate: None,
+            parent_errors: std::sync::Mutex::new(Vec::new()),
+            recorded_candidates: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let error = scope_goal_user_input(scope_goal_tool_pairing(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope.clone(),
+            engine.run_scoped(
+                &scope,
+                "finish the work",
+                super::super::GoalParentTurnKind::Start,
+                None,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                &mut lease,
+            ),
+        ))
+        .await
+        .expect_err("missing provider usage must keep the RFC terminal accounting state");
+
+        assert!(format!("{error:#}").contains("Goal accounting is incomplete"));
+        assert_eq!(
+            lease.parent_errors.lock().unwrap().as_slice(),
+            [provider_error]
+        );
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        let detail = store
+            .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(detail.contains(provider_error));
+    }
+
+    #[tokio::test]
     async fn markdown_heading_goal_blocker_pauses_without_waiting_for_the_verifier() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
         let engine = GoalExecutionEngine::new(
@@ -2555,6 +2688,7 @@ mod tests {
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
             interruption: None,
+            parent_failure: None,
             fallback_candidate: Some(
                 "I need an exact decision.\n\n## Goal blocker\n\n   ### Goal blocker ###\n\nKind: needs_user_input\n\nAction: Choose A or B"
                     .to_owned(),
@@ -2632,6 +2766,7 @@ mod tests {
                 message: "Agent loop aborted by loop detector: Bearer gho_1234567890abcdef"
                     .to_owned(),
             }),
+            parent_failure: None,
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
@@ -2714,6 +2849,7 @@ mod tests {
                     message: message.to_owned(),
                 },
             ),
+            parent_failure: None,
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
@@ -2799,6 +2935,7 @@ mod tests {
             verifier_calls: AtomicUsize::new(0),
             notices: std::sync::Mutex::new(Vec::new()),
             interruption: None,
+            parent_failure: None,
             fallback_candidate: None,
             parent_errors: std::sync::Mutex::new(Vec::new()),
             recorded_candidates: std::sync::Mutex::new(Vec::new()),
@@ -3218,7 +3355,7 @@ mod tests {
         .unwrap();
 
         let error = engine
-            .require_complete_accounting(&scope)
+            .require_complete_accounting(&scope, None)
             .await
             .expect_err("incomplete accounting must block completion");
         assert!(error.to_string().contains("incomplete"));
@@ -3276,7 +3413,7 @@ mod tests {
         .unwrap();
 
         let error = engine
-            .require_complete_accounting(&scope)
+            .require_complete_accounting(&scope, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("complete pricing"));
