@@ -575,7 +575,10 @@ impl RpcGoalRuntime {
         )?;
         if matches!(&command, GoalCommand::PauseNow | GoalCommand::Cancel) {
             supervisor
-                .interrupt_and_drain_session(&driver.session_key().durable_id())
+                .interrupt_and_drain_session(
+                    &driver.session_key().durable_id(),
+                    matches!(command, GoalCommand::Cancel),
+                )
                 .await?;
         }
         let acknowledgement_outbound = Arc::clone(&driver.outbound);

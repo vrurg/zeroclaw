@@ -265,6 +265,7 @@ struct GoalWorker {
     completion: watch::Receiver<Option<GoalWorkerCompletion>>,
     paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
     cancellation: CancellationToken,
+    cancellation_is_cancel: Arc<AtomicBool>,
     // Retaining the join handle keeps the worker owned until a lifecycle
     // drainer has observed its completion. Drainers wait on `completion` so
     // multiple lifecycle paths can safely observe one terminal result.
@@ -325,6 +326,8 @@ impl GoalExecutionSupervisor {
         let worker_transcript = Arc::clone(&paused_transcript);
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
+        let cancellation_is_cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancellation_is_cancel = Arc::clone(&cancellation_is_cancel);
         let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine
                 .run_with_paused_transcript(
@@ -332,6 +335,7 @@ impl GoalExecutionSupervisor {
                     request,
                     worker_transcript,
                     worker_cancellation,
+                    worker_cancellation_is_cancel,
                 )
                 .await;
 
@@ -364,6 +368,7 @@ impl GoalExecutionSupervisor {
                 completion,
                 paused_transcript,
                 cancellation,
+                cancellation_is_cancel,
                 _handle: handle,
             })),
         );
@@ -373,7 +378,7 @@ impl GoalExecutionSupervisor {
     /// Cooperatively interrupt the active parent operation without changing
     /// durable Goal state. The queued controller command owns the transition
     /// after the parent loop has settled its tool pairing and accounting.
-    pub async fn interrupt_session(&self, session_id: &str) -> bool {
+    pub async fn interrupt_session(&self, session_id: &str, is_cancel: bool) -> bool {
         let worker = {
             let workers = self.workers.lock().await;
             workers.get(session_id).cloned()
@@ -381,7 +386,11 @@ impl GoalExecutionSupervisor {
         let Some(worker) = worker else {
             return false;
         };
-        worker.lock().await.cancellation.cancel();
+        let worker = worker.lock().await;
+        worker
+            .cancellation_is_cancel
+            .store(is_cancel, Ordering::Release);
+        worker.cancellation.cancel();
         true
     }
 
@@ -390,11 +399,15 @@ impl GoalExecutionSupervisor {
     /// commands remain queued and cooperative. Draining first makes the
     /// ordering explicit: the agent finishes its cancellation/accounting path
     /// before `/goal pause now` or `/goal cancel` changes durable state.
-    pub async fn interrupt_and_drain_session(&self, session_id: &str) -> Result<bool> {
+    pub async fn interrupt_and_drain_session(
+        &self,
+        session_id: &str,
+        is_cancel: bool,
+    ) -> Result<bool> {
         let Some(scope) = self.scope_for_session_id(session_id).await? else {
             return Ok(false);
         };
-        if !self.interrupt_session(session_id).await {
+        if !self.interrupt_session(session_id, is_cancel).await {
             return Ok(false);
         }
         // A cancellation can race an already-failing worker. The lifecycle
@@ -1100,6 +1113,7 @@ impl GoalExecutionEngine {
             request,
             Arc::new(Mutex::new(None)),
             CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
         )
         .await
     }
@@ -1110,6 +1124,7 @@ impl GoalExecutionEngine {
         request: GoalExecutionRequest,
         paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
         cancellation: CancellationToken,
+        cancellation_is_cancel: Arc<AtomicBool>,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let initial_turn_kind = request.initial_turn_kind();
@@ -1138,6 +1153,7 @@ impl GoalExecutionEngine {
                         paused_request,
                         initial_retained_transcript,
                         paused_transcript,
+                        cancellation_is_cancel,
                         lease.as_mut(),
                     ))
                     .await
@@ -1237,6 +1253,7 @@ impl GoalExecutionEngine {
         mut paused_request: Option<GoalPausedRequest>,
         initial_retained_transcript: Option<GoalRetainedTranscript>,
         paused_transcript: Arc<Mutex<Option<GoalRetainedTranscript>>>,
+        cancellation_is_cancel: Arc<AtomicBool>,
         lease: &mut dyn GoalSessionExecutionLease,
     ) -> Result<GoalExecutionOutcome> {
         let canonical_history = lease.take_canonical_history()?;
@@ -1312,8 +1329,10 @@ impl GoalExecutionEngine {
                         // interrupted in-flight provider call can have
                         // unknown spend, though, so never leave a paused Goal
                         // in the durable non-resumable accounting state.
-                        self.require_complete_accounting(scope, Some(&error))
-                            .await?;
+                        if !cancellation_is_cancel.load(Ordering::Acquire) {
+                            self.require_complete_accounting(scope, Some(&error))
+                                .await?;
+                        }
                         return Ok(GoalExecutionOutcome::Paused);
                     }
                     if let Err(accounting_error) =
@@ -2609,6 +2628,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
                 &mut lease,
             ),
         ))
@@ -2704,6 +2724,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
                 &mut lease,
             ),
         ))
@@ -2776,6 +2797,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
                 &mut lease,
             ),
         ))
@@ -2852,6 +2874,7 @@ mod tests {
                 None,
                 None,
                 Arc::clone(&paused_transcript),
+                Arc::new(AtomicBool::new(false)),
                 &mut lease,
             ),
         ))
@@ -2935,6 +2958,7 @@ mod tests {
                 None,
                 None,
                 Arc::clone(&paused_transcript),
+                Arc::new(AtomicBool::new(false)),
                 &mut lease,
             ),
         ))
@@ -3942,13 +3966,14 @@ mod tests {
                 completion,
                 paused_transcript: Arc::new(Mutex::new(None)),
                 cancellation: CancellationToken::new(),
+                cancellation_is_cancel: Arc::new(AtomicBool::new(false)),
                 _handle: zeroclaw_spawn::spawn!(async {}),
             })),
         );
 
         assert!(
             supervisor
-                .interrupt_and_drain_session(scope.session_id())
+                .interrupt_and_drain_session(scope.session_id(), false)
                 .await
                 .unwrap()
         );

@@ -248,7 +248,12 @@ pub(super) async fn submit_matrix_goal(
         // cooperative stop of the resident parent loop; the subsequent
         // runtime submission still owns the durable pause/cancel transition
         // and drains the settled worker before acknowledging the command.
-        supervisor.interrupt_and_drain_session(&history_key).await?;
+        supervisor
+            .interrupt_and_drain_session(
+                &history_key,
+                matches!(command, zeroclaw_commands::goal::GoalCommand::Cancel),
+            )
+            .await?;
     }
     let initial_notice = original;
     let initial_context = Arc::clone(&context);
@@ -342,7 +347,7 @@ pub(super) async fn request_active_matrix_goal_pause_now(
 
     let supervisor_slot = goal_supervisor_slot(&context.persist_locks, history_key);
     if let Some(supervisor) = supervisor_slot.lock().await.as_ref().cloned() {
-        let _ = supervisor.interrupt_session(history_key).await;
+        let _ = supervisor.interrupt_session(history_key, false).await;
     }
     Ok(true)
 }
