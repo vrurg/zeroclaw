@@ -472,6 +472,7 @@ async fn restart_fails_an_unpaired_goal_tool_batch_without_replaying_it() {
 async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let terminal_detail = "The exact tool result was not paired before the Goal stopped.";
     let task = session_goal_task("unsafe-tool-pair", "unsafe-tool-pair-session");
     assert_eq!(
         store
@@ -517,6 +518,7 @@ async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
                 1,
                 "unpaired-batch",
                 GoalToolBatchFailureReason::PairingIncomplete,
+                Some(terminal_detail),
             )
             .await
             .expect("fail atomically instead of reopening the Goal"),
@@ -529,6 +531,16 @@ async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
         .expect("terminal Goal remains visible");
     assert_eq!(terminal.status, TaskStatus::Failed);
     assert_eq!(terminal.execution_epoch, 3);
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal("unsafe-tool-pair", "unsafe-tool-pair-session")
+            .await
+            .expect("read persisted terminal reason")
+            .as_deref(),
+        Some(
+            "goal_tool_pairing_incomplete\nThe exact tool result was not paired before the Goal stopped."
+        )
+    );
     assert_eq!(
         store
             .resume_session_goal(

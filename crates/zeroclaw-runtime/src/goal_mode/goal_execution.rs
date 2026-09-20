@@ -866,6 +866,7 @@ impl GoalExecutionSupervisor {
                         admitted_epoch,
                         batch_id,
                         GoalToolBatchFailureReason::PairingIncomplete,
+                        None,
                     )
                     .await?
             };
@@ -1765,6 +1766,7 @@ impl GoalExecutionEngine {
                 .as_deref()
                 .zip(goal.pending_tool_epoch)
         }) {
+            let terminal_detail = detail.map(str::to_owned);
             match self
                 .registry
                 .fail_unpaired_tool_batch(
@@ -1774,6 +1776,7 @@ impl GoalExecutionEngine {
                     admitted_epoch,
                     batch_id,
                     tool_batch_failure,
+                    terminal_detail.as_deref(),
                 )
                 .await?
             {

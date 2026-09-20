@@ -507,6 +507,7 @@ pub trait GoalTaskRegistry: Send + Sync {
         _admitted_epoch: i64,
         _batch_id: &str,
         _failure_reason: GoalToolBatchFailureReason,
+        _terminal_detail: Option<&str>,
     ) -> anyhow::Result<GoalTransitionResult> {
         anyhow::bail!("goal registry does not support durable tool pairing")
     }

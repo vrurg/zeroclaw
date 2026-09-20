@@ -1467,7 +1467,15 @@ impl GoalTaskRegistry for SqliteTaskStore {
         admitted_epoch: i64,
         batch_id: &str,
         failure_reason: GoalToolBatchFailureReason,
+        terminal_detail: Option<&str>,
     ) -> Result<GoalTransitionResult> {
+        if terminal_detail.is_some_and(|detail| detail.len() > 2_048) {
+            anyhow::bail!("Goal tool-pairing terminal detail exceeds its storage bound");
+        }
+        let terminal_error = terminal_detail.map_or_else(
+            || failure_reason.durable_reason().to_owned(),
+            |detail| format!("{}\n{detail}", failure_reason.durable_reason()),
+        );
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1507,7 +1515,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 task_id,
                 session_id,
                 expected_epoch,
-                failure_reason.durable_reason(),
+                terminal_error,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
