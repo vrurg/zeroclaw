@@ -49,11 +49,11 @@ pub(crate) struct GoalBlockerCertificate {
 ///
 /// Markdown commonly places blank lines between a heading and its fields, so
 /// those separators are accepted. A Markdown ATX heading may use one through
-/// six `#` markers, up to three leading spaces, and an optional closing marker
-/// run; agent renderers routinely vary those presentation details while
-/// preserving the same visible section. Any nonblank field line still has to
-/// match the exact `Kind:` and `Action:` fields, so ordinary prose remains
-/// non-authoritative.
+/// six `#` markers, up to three leading spaces, space or tab separators, and
+/// an optional closing marker run; agent renderers routinely vary those
+/// presentation details while preserving the same visible section. Any
+/// nonblank field line still has to match the exact `Kind:` and `Action:`
+/// fields, so ordinary prose remains non-authoritative.
 pub(crate) fn candidate_goal_blocker_certificate(
     candidate: &str,
 ) -> Option<GoalBlockerCertificate> {
@@ -108,17 +108,21 @@ fn is_goal_blocker_heading(line: &str) -> bool {
     if !(1..=6).contains(&marker_count) {
         return false;
     }
-    let Some(heading) = line
-        .get(marker_count..)
-        .and_then(|suffix| suffix.strip_prefix(' '))
-    else {
+    let Some(heading) = line.get(marker_count..) else {
         return false;
     };
-    let heading = heading.trim_end();
-    let heading = heading
-        .rsplit_once(' ')
-        .filter(|(_, closing)| !closing.is_empty() && closing.bytes().all(|byte| byte == b'#'))
-        .map_or(heading, |(title, _)| title);
+    if !heading.starts_with([' ', '\t']) {
+        return false;
+    }
+    let heading = heading.trim_start_matches([' ', '\t']).trim_end();
+    let without_closing_markers = heading.trim_end_matches('#');
+    let heading = if without_closing_markers.len() != heading.len()
+        && without_closing_markers.ends_with([' ', '\t'])
+    {
+        without_closing_markers.trim_end_matches([' ', '\t'])
+    } else {
+        heading
+    };
     heading == GOAL_BLOCKER_HEADING
 }
 
@@ -279,15 +283,19 @@ mod tests {
         })
         .await;
 
-        let indented_closing_heading =
-            "   ### Goal blocker ###\nKind: needs_user_input\nAction: Choose A or B";
-        assert!(candidate_goal_blocker_certificate(indented_closing_heading).is_some());
-        scope_goal_parent(async {
-            assert!(final_goal_blocker_ends_parent_turn(
-                indented_closing_heading
-            ));
-        })
-        .await;
+        for standard_heading in [
+            "   ###  Goal blocker\t  ###",
+            "#\tGoal blocker",
+            "###### Goal blocker   ######",
+        ] {
+            let candidate =
+                format!("{standard_heading}\nKind: needs_user_input\nAction: Choose A or B");
+            assert!(candidate_goal_blocker_certificate(&candidate).is_some());
+            scope_goal_parent(async {
+                assert!(final_goal_blocker_ends_parent_turn(&candidate));
+            })
+            .await;
+        }
 
         assert!(
             candidate_goal_blocker_certificate(

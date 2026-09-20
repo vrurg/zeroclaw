@@ -668,7 +668,7 @@ impl fmt::Debug for GoalVerifierTurn {
 pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains an exact Markdown `Goal blocker` heading with one through six `#` markers, followed by `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`; the blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
+            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional JSON value}]}. Complete and continue require blockers: []; blocked requires exactly one blocker. Choose blocked only when the candidate contains a standard ATX Markdown heading whose exact visible title is `Goal blocker`: one through six `#` markers, up to three leading spaces, a space or tab separator, and an optional closing `#` marker run; it must be followed by `Kind: needs_user_input|human_escalation|external_dependency` and `Action: <one concrete action or answer needed>`. The blocker kind must match the final valid certificate. Otherwise choose continue, including when the candidate asks for input only in prose. Do not infer a blocker from missing context, a broad objective, or work you believe the agent should have done. Do not emit any other keys or blocker kinds.",
         ),
         ChatMessage::user(format!(
             "Objective:\n{}\n\nCandidate:\n{}",
@@ -2491,9 +2491,9 @@ mod tests {
                 .contains("{\"decision\":\"complete|continue|blocked\"")
         );
         assert!(
-            messages[0]
-                .content
-                .contains("candidate contains an exact Markdown `Goal blocker` heading")
+            messages[0].content.contains(
+                "standard ATX Markdown heading whose exact visible title is `Goal blocker`"
+            )
         );
         assert!(!messages[0].content.contains("request_quote"));
         assert!(!messages[0].content.contains("\\\""));
