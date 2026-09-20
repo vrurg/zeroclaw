@@ -330,13 +330,19 @@ impl GoalExecutionSupervisor {
             // Acquisition and other unexpected failures can occur before that
             // path. Do not leave their exact durable epoch Running without an
             // owner: terminalize it while the scope still proves the fence.
-            let result = if result.is_err() && engine.exact_running_task(&scope).await.is_ok() {
-                match engine.fail(&scope, "executor_failed").await {
-                    Ok(()) => result,
-                    Err(error) => Err(error.context("failed to terminalize Goal executor failure")),
+            let result = match result {
+                Err(error) if engine.exact_running_task(&scope).await.is_ok() => {
+                    match engine
+                        .fail_with_error(&scope, "executor_failed", &error)
+                        .await
+                    {
+                        Ok(()) => Err(error),
+                        Err(failure) => {
+                            Err(failure.context("failed to terminalize Goal executor failure"))
+                        }
+                    }
                 }
-            } else {
-                result
+                result => result,
             };
             let completion = result.map_err(|error| format!("{error:#}"));
             let _ = completion_tx.send(Some(completion));
@@ -1118,10 +1124,18 @@ impl GoalExecutionEngine {
                     .as_deref()
                     .map(GoalTerminalReason::from_durable_reason)
                     .unwrap_or((GoalTerminalReason::Unspecified, None));
+                // A terminal transition still must not hide the underlying
+                // agent/core failure. Keep the lifecycle category separate
+                // from this sanitized causal diagnostic so presentation
+                // surfaces can show both, just as they do outside Goal Mode.
+                let terminal_detail = Some(zeroclaw_providers::sanitize_api_error(&format!(
+                    "{error:#}"
+                )));
                 if let Err(notice_error) = lease
                     .publish_goal_notice(GoalExecutionNotice::Failed {
                         terminal_reason,
                         terminal_provider,
+                        terminal_detail,
                     })
                     .await
                 {
@@ -1215,7 +1229,8 @@ impl GoalExecutionEngine {
             {
                 Ok(parent) => {
                     if let Err(error) = finalize_goal_tool_pairing().await {
-                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        self.fail_with_error(scope, "goal_tool_pairing_incomplete", &error)
+                            .await?;
                         return Err(error).context("Goal parent tool pairing failed");
                     }
                     self.require_complete_accounting(scope).await?;
@@ -1228,7 +1243,8 @@ impl GoalExecutionEngine {
                     // accounted core error is resumable, while an unsettled
                     // tool batch or uncertain spend remains terminal.
                     if let Err(pairing_error) = finalize_goal_tool_pairing().await {
-                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        self.fail_with_error(scope, "goal_tool_pairing_incomplete", &pairing_error)
+                            .await?;
                         return Err(pairing_error).context("Goal parent tool pairing failed");
                     }
                     if self.publish_existing_budget_pause(scope, lease).await? {
@@ -1240,7 +1256,8 @@ impl GoalExecutionEngine {
                 }
             };
             if let Err(error) = lease.finish_parent_turn_presentation().await {
-                self.fail(scope, "executor_failed").await?;
+                self.fail_with_error(scope, "executor_failed", &error)
+                    .await?;
                 return Err(error).context("finish Goal parent-turn presentation");
             }
             let super::GoalParentTurnResult {
@@ -1261,7 +1278,8 @@ impl GoalExecutionEngine {
                     .record_presented_parent_candidate(candidate.clone())
                     .await
             {
-                self.fail(scope, "executor_failed").await?;
+                self.fail_with_error(scope, "executor_failed", &error)
+                    .await?;
                 return Err(error).context("record presented Goal parent candidate");
             }
 
@@ -1400,7 +1418,8 @@ impl GoalExecutionEngine {
                     // retained in canonical history, so a later resume can
                     // retry verification without making the Goal terminal.
                     if let Err(pairing_error) = finalize_goal_tool_pairing().await {
-                        self.fail(scope, "goal_tool_pairing_incomplete").await?;
+                        self.fail_with_error(scope, "goal_tool_pairing_incomplete", &pairing_error)
+                            .await?;
                         return Err(pairing_error).context("Goal verifier tool pairing failed");
                     }
                     if self.publish_existing_budget_pause(scope, lease).await? {
@@ -1662,17 +1681,39 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
-        self.fail_with_reason(scope, reason, GoalToolBatchFailureReason::PairingIncomplete)
-            .await
+        self.fail_with_reason_and_detail(
+            scope,
+            reason,
+            GoalToolBatchFailureReason::PairingIncomplete,
+            None,
+        )
+        .await
+    }
+
+    async fn fail_with_error(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let detail = zeroclaw_providers::sanitize_api_error(&format!("{error:#}"));
+        self.fail_with_reason_and_detail(
+            scope,
+            reason,
+            GoalToolBatchFailureReason::PairingIncomplete,
+            Some(detail.as_str()),
+        )
+        .await
     }
 
     /// Preserve tool-pairing cleanup for both stable lifecycle failures and
     /// failures augmented with a safe provider identifier.
-    async fn fail_with_reason(
+    async fn fail_with_reason_and_detail(
         &self,
         scope: &GoalExecutionScope,
         reason: &str,
         tool_batch_failure: GoalToolBatchFailureReason,
+        detail: Option<&str>,
     ) -> Result<()> {
         // A parent operation can fail after every dispatched tool result has
         // already been paired into its isolated transcript.  In that case the
@@ -1683,7 +1724,7 @@ impl GoalExecutionEngine {
             settle_goal_tool_pairing_if_clean().await?,
             GoalToolPairingDisposition::SettledClean
         ) {
-            return self.finish_failure(scope, reason).await;
+            return self.finish_failure(scope, reason, detail).await;
         }
         let goal = self.registry.get_goal_task(scope.task_id()).await?;
         if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
@@ -1740,7 +1781,7 @@ impl GoalExecutionEngine {
                 }
             }
         }
-        self.finish_failure(scope, reason).await
+        self.finish_failure(scope, reason, detail).await
     }
 
     #[cfg(test)]
@@ -1785,11 +1826,16 @@ impl GoalExecutionEngine {
             .then_some(GoalToolBatchFailureReason::LoopSafetyLimit)
             .unwrap_or(GoalToolBatchFailureReason::PairingIncomplete);
 
-        self.fail_with_reason(scope, &reason, tool_batch_failure)
+        self.fail_with_reason_and_detail(scope, &reason, tool_batch_failure, None)
             .await
     }
 
-    async fn finish_failure(&self, scope: &GoalExecutionScope, reason: &str) -> Result<()> {
+    async fn finish_failure(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
         match self
             .registry
             .finish_session_goal(
@@ -1797,7 +1843,7 @@ impl GoalExecutionEngine {
                 scope.session_id(),
                 scope.execution_epoch(),
                 TaskStatus::Failed,
-                Some(reason.to_owned()),
+                Some(super::durable_terminal_record(reason, detail)),
             )
             .await?
         {

@@ -335,6 +335,11 @@ rpc_type! {
             terminal_reason: Option<crate::goal_mode::GoalTerminalReason>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             terminal_provider: Option<String>,
+            /// Sanitized causal diagnostic for this particular terminal
+            /// execution. It complements, rather than replaces, the stable
+            /// lifecycle category above.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            terminal_detail: Option<String>,
         },
     }
 }

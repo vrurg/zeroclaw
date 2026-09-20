@@ -1398,6 +1398,7 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
         GoalExecutionNotice::Failed {
             terminal_reason,
             terminal_provider,
+            terminal_detail,
         } => {
             let mut message = zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failed");
             let reason = match terminal_reason {
@@ -1462,6 +1463,15 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
                 message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "goal-mode-summary-provider",
                     &[("provider", provider)],
+                ));
+            }
+            if let Some(detail) = terminal_detail.as_deref()
+                && !detail.trim().is_empty()
+            {
+                message.push('\n');
+                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "goal-mode-summary-details",
+                    &[("details", detail)],
                 ));
             }
             message
@@ -1638,6 +1648,7 @@ mod tests {
             terminal_reason:
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::GoalToolPairingIncomplete,
             terminal_provider: None,
+            terminal_detail: None,
         });
 
         assert_eq!(
@@ -1651,6 +1662,7 @@ mod tests {
         let rendered = goal_notice_message(GoalExecutionNotice::Failed {
             terminal_reason: zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentOperationFailed,
             terminal_provider: Some("openai.default".to_owned()),
+            terminal_detail: None,
         });
 
         assert_eq!(
@@ -1665,11 +1677,26 @@ mod tests {
             terminal_reason:
                 zeroclaw_runtime::goal_mode::GoalTerminalReason::ParentContextWindowExceeded,
             terminal_provider: Some("openai.default".to_owned()),
+            terminal_detail: None,
         });
 
         assert_eq!(
             rendered,
             "❌ Goal failed.\n**Reason:** The selected model could not accept the current conversation because it exceeds that model's context window.\n**Provider:** openai.default"
+        );
+    }
+
+    #[test]
+    fn failed_notice_keeps_the_sanitized_causal_diagnostic() {
+        let rendered = goal_notice_message(GoalExecutionNotice::Failed {
+            terminal_reason: zeroclaw_runtime::goal_mode::GoalTerminalReason::ExecutorFailed,
+            terminal_provider: None,
+            terminal_detail: Some("agent loop: model request rejected (429)".to_owned()),
+        });
+
+        assert_eq!(
+            rendered,
+            "❌ Goal failed.\n**Reason:** The Goal worker could not continue.\n**Details:** agent loop: model request rejected (429)"
         );
     }
 

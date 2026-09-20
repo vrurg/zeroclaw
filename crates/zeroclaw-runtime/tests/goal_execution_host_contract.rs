@@ -25,7 +25,7 @@ use zeroclaw_runtime::goal_mode::{
     GoalIngressPrincipal, GoalOperationScope, GoalParentHistorySource, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalPausedRequest, GoalResponse, GoalRuntime,
     GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalVerifierTurn,
+    GoalSessionLease, GoalTerminalReason, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -340,6 +340,7 @@ enum FailurePoint {
     Verifier,
     EmptyParentCandidate,
     InvalidVerifierProtocol,
+    Presentation,
 }
 
 #[async_trait]
@@ -377,6 +378,13 @@ impl GoalSessionExecutionLease for FailingExecutionLease {
             .lock()
             .unwrap()
             .push(format!("error:{error}"));
+        Ok(())
+    }
+
+    async fn finish_parent_turn_presentation(&mut self) -> anyhow::Result<()> {
+        if matches!(self.failure_point, FailurePoint::Presentation) {
+            anyhow::bail!("simulated presentation failure")
+        }
         Ok(())
     }
 
@@ -2859,6 +2867,74 @@ async fn parent_execution_failure_pauses_and_preserves_the_ordinary_error_surfac
             .expect("Goal extension should remain resumable")
             .pause_reason,
         Some(GoalPauseReason::CoreInterrupted)
+    );
+}
+
+#[tokio::test]
+async fn terminal_goal_notice_keeps_the_causal_execution_diagnostic() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let parent_errors = Arc::new(Mutex::new(Vec::new()));
+    let presentation_events = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        failure_point: FailurePoint::Presentation,
+        notices: Arc::clone(&notices),
+        parent_errors,
+        presentation_events,
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    let error = engine
+        .run(&settings, request)
+        .await
+        .expect_err("a failed representation boundary must be terminal");
+    assert!(
+        error
+            .to_string()
+            .contains("finish Goal parent-turn presentation")
+    );
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        &[GoalExecutionNotice::Failed {
+            terminal_reason: GoalTerminalReason::ExecutorFailed,
+            terminal_provider: None,
+            terminal_detail: Some(
+                "finish Goal parent-turn presentation: simulated presentation failure".to_owned()
+            ),
+        }],
+        "terminal lifecycle metadata must retain the sanitized causal diagnostic"
     );
 }
 

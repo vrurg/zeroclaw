@@ -1339,6 +1339,7 @@ goal-mode-no = no
 goal-mode-summary-status = **Status:** { $status }
 goal-mode-summary-reason = **Reason:** { $reason }
 goal-mode-summary-provider = **Provider:** { $provider }
+goal-mode-summary-details = **Details:** { $details }
 goal-mode-summary-budget = **Budget:** { $token_limit } tokens · USD { $cost_limit }
 goal-mode-summary-accounting = **Accounting:** { $accounting }
 goal-mode-summary-execution = **Execution:** epoch { $epoch } · resumable { $resumable }

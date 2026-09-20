@@ -391,10 +391,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             GoalExecutionNotice::Failed {
                 terminal_reason,
                 terminal_provider,
+                terminal_detail,
             } => crate::rpc::types::SessionGoalUpdate::Failed {
                 session_id: self.raw_session_id()?.to_owned(),
                 terminal_reason: Some(terminal_reason),
                 terminal_provider,
+                terminal_detail,
             },
         };
         self.outbound

@@ -805,6 +805,13 @@ fn render_goal_projection(
             &[("provider", provider)],
         ));
     }
+    if let Some(detail) = projection.terminal_detail.as_deref() {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-details",
+            &[("details", detail)],
+        ));
+    }
     message.push('\n');
     message.push_str(&channel_runtime_cli_string_with_args(
         "goal-mode-summary-budget",
@@ -879,6 +886,7 @@ mod goal_response_render_tests {
             pause_reason: None,
             terminal_reason: Some(GoalTerminalReason::AccountingOutcomeUnknown),
             terminal_provider: Some("openai.default".to_owned()),
+            terminal_detail: Some("tool pairing batch 72 could not be settled".to_owned()),
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: false,
@@ -887,6 +895,7 @@ mod goal_response_render_tests {
         assert!(rendered.contains("**Reason:** The last model operation did not settle cleanly."));
         assert!(rendered.contains("**Accounting:** usage may be incomplete"));
         assert!(rendered.contains("**Provider:** openai.default"));
+        assert!(rendered.contains("**Details:** tool pairing batch 72 could not be settled"));
         assert!(!rendered.contains("outcome_unknown"));
     }
 

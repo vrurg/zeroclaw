@@ -693,11 +693,16 @@ pub enum GoalExecutionNotice {
     /// exact ordinary error after this lifecycle notice, preserving the
     /// channel's non-Goal error surface and its ordering.
     PausedForInterruption,
-    /// A safe projection of the exact durable failure that ended this Goal.
-    /// Raw task diagnostics stay in the control plane and logs.
+    /// The stable public category for the failure that ended this Goal. The
+    /// accompanying detail, when present, is sanitized before it leaves the
+    /// control plane.
     Failed {
         terminal_reason: GoalTerminalReason,
         terminal_provider: Option<String>,
+        /// The sanitized causal diagnostic from the failing execution. This
+        /// preserves the normal error surface for a terminal Goal while the
+        /// reason remains a stable, controller-owned lifecycle category.
+        terminal_detail: Option<String>,
     },
 }
 
@@ -1361,6 +1366,7 @@ pub enum GoalTerminalReason {
 
 impl GoalTerminalReason {
     pub(crate) fn from_durable_reason(reason: &str) -> (Self, Option<String>) {
+        let (reason, _) = split_durable_terminal_record(reason);
         let (reason, provider) = reason
             .split_once('@')
             .map_or((reason, None), |(reason, provider)| {
@@ -1394,6 +1400,40 @@ impl GoalTerminalReason {
     }
 }
 
+/// The task error column retains a compact, stable lifecycle code and an
+/// optional sanitized causal diagnostic. Keeping the code first preserves
+/// compatibility with existing terminal records while allowing `/goal status`
+/// to remain actionable after the transient failure event has passed.
+pub(crate) fn split_durable_terminal_record(record: &str) -> (&str, Option<String>) {
+    let (reason, detail) = record
+        .split_once('\n')
+        .map_or((record, None), |(reason, detail)| {
+            (reason, safe_terminal_detail(detail))
+        });
+    (reason, detail)
+}
+
+pub(crate) fn durable_terminal_record(reason: &str, detail: Option<&str>) -> String {
+    let detail = detail.and_then(safe_terminal_detail);
+    detail.map_or_else(|| reason.to_owned(), |detail| format!("{reason}\n{detail}"))
+}
+
+fn safe_terminal_detail(detail: &str) -> Option<String> {
+    let detail = zeroclaw_providers::sanitize_api_error(detail)
+        .trim()
+        .to_owned();
+    (!detail.is_empty()).then(|| {
+        const MAX_DETAIL_CHARS: usize = 2048;
+        let mut chars = detail.chars();
+        let prefix: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{prefix}…")
+        } else {
+            prefix
+        }
+    })
+}
+
 /// Provider profile names are safe to surface only in the narrow established
 /// identifier grammar. Terminal diagnostics and endpoint text stay private.
 fn safe_terminal_provider(provider: &str) -> Option<String> {
@@ -1417,8 +1457,7 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
-    /// Safe, controller-derived explanation for a terminal Goal. Raw task
-    /// errors remain internal and never cross this transport-neutral boundary.
+    /// Safe, controller-derived explanation for a terminal Goal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<GoalTerminalReason>,
     /// The known terminal provider profile for a failed model operation. This
@@ -1426,6 +1465,10 @@ pub struct GoalStatusProjection {
     /// for a user-visible surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_provider: Option<String>,
+    /// Sanitized causal diagnostic retained with the terminal Goal record.
+    /// Unlike `terminal_reason`, this is specific to the failed execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_detail: Option<String>,
     /// Controller-authored explanation for a paused Goal. This is display data
     /// derived from the canonical Goal extension, not a second lifecycle fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1450,6 +1493,7 @@ impl GoalStatusProjection {
             pause_reason: goal.pause_reason,
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: goal.pause_description,
             blocker_messages: goal
                 .blockers
@@ -1462,10 +1506,12 @@ impl GoalStatusProjection {
 
     pub(super) fn with_durable_terminal_reason(mut self, reason: Option<&str>) -> Self {
         if let Some(reason) = reason {
+            let (_, terminal_detail) = split_durable_terminal_record(reason);
             let (terminal_reason, terminal_provider) =
                 GoalTerminalReason::from_durable_reason(reason);
             self.terminal_reason = Some(terminal_reason);
             self.terminal_provider = terminal_provider;
+            self.terminal_detail = terminal_detail;
         }
         self
     }
@@ -2024,6 +2070,7 @@ mod tests {
             pause_reason: Some(GoalPauseReason::VerifierBlocked),
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -2248,6 +2295,18 @@ mod tests {
             Some(GoalTerminalReason::InitialNoticeFailed)
         );
         assert_eq!(initial_notice.terminal_provider, None);
+
+        let detailed = known.clone().with_durable_terminal_reason(Some(
+            "executor_failed\nsession presentation delivery failed: channel closed",
+        ));
+        assert_eq!(
+            detailed.terminal_reason,
+            Some(GoalTerminalReason::ExecutorFailed)
+        );
+        assert_eq!(
+            detailed.terminal_detail.as_deref(),
+            Some("session presentation delivery failed: channel closed")
+        );
 
         let provider = known
             .clone()
