@@ -1207,6 +1207,19 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             loop_knobs.draft_reasoning =
                 super::matrix_stream_reasoning(self.context.as_ref(), &self.message);
         }
+        // `run_parent_turn` invokes the shared tool loop directly, so it must
+        // bracket that loop exactly as an ordinary channel turn does. This
+        // keeps API/observer consumers from losing the parent turn merely
+        // because Goal Mode governs its lifecycle.
+        let turn_observer = Arc::clone(&self.context.observer);
+        let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            route.model_provider.clone(),
+            route.model.clone(),
+            Some(self.message.channel.clone()),
+            Some(self.context.agent_alias.to_string()),
+            Some(turn_id.clone()),
+        );
         self.parent_candidate_history = None;
         let presentation =
             GoalParentPresentation::start(Arc::clone(&self.context), &self.message).await;
@@ -1399,6 +1412,11 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             (candidate, provider_fallback, take_last_safeguard_fallback())
         })
         .await;
+        // Attribute the matching end event to the final route if a model
+        // switch occurred. Goal accounting is owned by the Goal engine, so
+        // this observer guard supplies lifecycle parity only.
+        turn_guard.set_model_route(route.model_provider.clone(), route.model.clone());
+        turn_guard.finish();
         let candidate = match candidate {
             Ok(candidate) => {
                 let turn_route = turn_routing
