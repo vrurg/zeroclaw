@@ -42764,13 +42764,31 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn deferred_goal_receipt_observes_earlier_turns_in_its_conversation() {
         let in_flight = Arc::new(Mutex::new(HashMap::new()));
-        let conversation_key = "matrix_shared_room";
+        let earlier = ChannelMessage {
+            channel: "matrix".to_owned(),
+            sender: "@user:example.test".to_owned(),
+            reply_target: "!room:example.test".to_owned(),
+            thread_ts: Some("$thread-a".to_owned()),
+            interruption_scope_id: Some("$thread-a".to_owned()),
+            ..Default::default()
+        };
+        let command = ChannelMessage {
+            thread_ts: Some("$thread-b".to_owned()),
+            interruption_scope_id: Some("$thread-b".to_owned()),
+            ..earlier.clone()
+        };
+        let conversation_key = conversation_history_key(&earlier);
+        assert_eq!(conversation_key, conversation_history_key(&command));
+        assert_ne!(
+            interruption_scope_key(&earlier),
+            interruption_scope_key(&command)
+        );
         assert!(!has_registered_turn_in_conversation(
             &in_flight,
-            conversation_key
+            &conversation_key
         ));
 
-        let scope = "matrix_room_other_user".to_owned();
+        let scope = interruption_scope_key(&earlier);
         in_flight.lock().unwrap().insert(
             scope,
             vec![InFlightSenderTaskState {
@@ -42784,14 +42802,7 @@ This is an example JSON object for profile settings."#;
         );
         assert!(has_registered_turn_in_conversation(
             &in_flight,
-            conversation_key
-        ));
-
-        // The registered turn belongs to another sender's interruption scope,
-        // but shares this room's ordered history/lane.
-        assert!(has_registered_turn_in_conversation(
-            &in_flight,
-            conversation_key
+            &conversation_history_key(&command)
         ));
         assert!(!has_registered_turn_in_conversation(
             &in_flight,
