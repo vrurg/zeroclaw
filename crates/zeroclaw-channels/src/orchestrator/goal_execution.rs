@@ -186,10 +186,11 @@ pub(super) async fn submit_matrix_goal(
     if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope)
         && retired_supervisor.owns_scope(&scope).await
     {
-        retired_supervisor
-            .drain(&scope)
-            .await
-            .context("drain terminal Matrix Goal worker before replacement")?;
+        // A terminal worker may already have reported the error that made its
+        // Goal terminal. Its control response remains useful (and must not be
+        // replaced with a generic submission failure), so terminal cleanup is
+        // best-effort just as the sibling lifecycle fences are.
+        let _ = retired_supervisor.drain(&scope).await;
     }
     let supervisor = {
         let mut slot = supervisor_slot.lock().await;
@@ -297,7 +298,9 @@ pub(super) async fn pause_active_matrix_goal_now(
     let Some(current) = registry.current_goal_for_session(&history_key).await? else {
         return Ok(None);
     };
-    if current.status != zeroclaw_runtime::control_plane::TaskStatus::Running {
+    if current.status != zeroclaw_runtime::control_plane::TaskStatus::Running
+        && !current.status.is_terminal()
+    {
         return Ok(None);
     }
     let (response, _already_delivered) = submit_matrix_goal(
@@ -308,6 +311,40 @@ pub(super) async fn pause_active_matrix_goal_now(
     )
     .await?;
     Ok(Some(response))
+}
+
+/// Request the immediate, cooperative half of Matrix's `/stop` shortcut.
+///
+/// This intentionally does not await the worker or make a durable lifecycle
+/// transition. The dispatcher calls it from a detached control task so one
+/// long-running tool cannot stall ingress for every channel; the follow-up
+/// [`pause_active_matrix_goal_now`] submission owns the fenced pause once the
+/// parent operation has settled.
+pub(super) async fn request_active_matrix_goal_pause_now(
+    context: Arc<ChannelRuntimeContext>,
+    history_key: &str,
+) -> Result<bool> {
+    if !runtime_defaults_snapshot(context.as_ref())
+        .config
+        .goal
+        .enabled
+    {
+        return Ok(false);
+    }
+    let control_plane = control_plane().context("Goal control plane is unavailable")?;
+    let registry = control_plane.goal_store()?;
+    let Some(current) = registry.current_goal_for_session(history_key).await? else {
+        return Ok(false);
+    };
+    if current.status != zeroclaw_runtime::control_plane::TaskStatus::Running {
+        return Ok(false);
+    }
+
+    let supervisor_slot = goal_supervisor_slot(&context.persist_locks, history_key);
+    if let Some(supervisor) = supervisor_slot.lock().await.as_ref().cloned() {
+        let _ = supervisor.interrupt_session(history_key).await;
+    }
+    Ok(true)
 }
 
 /// Render only stable, actionable command failures. The original error stays

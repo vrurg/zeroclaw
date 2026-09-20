@@ -397,7 +397,12 @@ impl GoalExecutionSupervisor {
         if !self.interrupt_session(session_id).await {
             return Ok(false);
         }
-        self.drain(&scope).await?;
+        // A cancellation can race an already-failing worker. The lifecycle
+        // command still owns the durable state projection in that case: the
+        // normal submit path will observe and render the terminal result.
+        // Propagating the worker error here turns a successful operator
+        // control into a spurious generic command failure.
+        let _ = self.drain(&scope).await;
         Ok(true)
     }
 
@@ -1303,7 +1308,12 @@ impl GoalExecutionEngine {
                         // `/goal pause now` and `/goal cancel` deliberately
                         // interrupt the ordinary parent loop, but the queued
                         // command remains the sole owner of the durable
-                        // transition once this operation has settled.
+                        // transition once this operation has settled. An
+                        // interrupted in-flight provider call can have
+                        // unknown spend, though, so never leave a paused Goal
+                        // in the durable non-resumable accounting state.
+                        self.require_complete_accounting(scope, Some(&error))
+                            .await?;
                         return Ok(GoalExecutionOutcome::Paused);
                     }
                     if let Err(accounting_error) =
@@ -3899,6 +3909,50 @@ mod tests {
                 .as_deref(),
             Some("accounting_outcome_unknown")
         );
+    }
+
+    #[tokio::test]
+    async fn immediate_control_absorbs_a_worker_failure_for_the_lifecycle_projection() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        let supervisor = GoalExecutionSupervisor::new(Arc::new(
+            GoalExecutionEngine::new(
+                GoalRuntime::new(store),
+                Arc::new(
+                    CostTracker::new(
+                        zeroclaw_config::schema::CostConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        directory.path(),
+                    )
+                    .unwrap(),
+                ),
+                "main",
+                Arc::new(HashMap::new()),
+            )
+            .unwrap(),
+        ));
+        let (completion_tx, completion) = watch::channel(Some(Err("worker failed".to_owned())));
+        drop(completion_tx);
+        supervisor.workers.lock().await.insert(
+            scope.session_id().to_owned(),
+            Arc::new(Mutex::new(GoalWorker {
+                task_id: scope.task_id().to_owned(),
+                execution_epoch: scope.execution_epoch(),
+                completion,
+                paused_transcript: Arc::new(Mutex::new(None)),
+                cancellation: CancellationToken::new(),
+                _handle: zeroclaw_spawn::spawn!(async {}),
+            })),
+        );
+
+        assert!(
+            supervisor
+                .interrupt_and_drain_session(scope.session_id())
+                .await
+                .unwrap()
+        );
+        assert!(!supervisor.owns_scope(&scope).await);
     }
 
     #[tokio::test]

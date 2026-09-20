@@ -148,7 +148,7 @@ use self::foreground::{
 };
 use self::goal_execution::{
     dispose_matrix_goal, pause_active_matrix_goal_now, render_matrix_goal_command_error,
-    submit_matrix_goal,
+    request_active_matrix_goal_pause_now, submit_matrix_goal,
 };
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -10769,30 +10769,7 @@ async fn run_message_dispatch_loop(
             // cooperatively settles the active parent operation before the
             // durable Goal pause. A failed Goal shortcut must not undo the
             // established ordinary `/stop` behavior above.
-            let goal_pause_response = if is_matrix_channel_name(&msg.channel) {
-                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-                let original = matrix_goal_message_snapshot(&msg);
-                match pause_active_matrix_goal_now(Arc::clone(&ctx), history_key, original).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
-                            })),
-                            "stop command could not pause active Matrix Goal"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let matrix_stop = is_matrix_channel_name(&msg.channel);
 
             // `/stop` is also a debounce boundary. Retiring the open bucket
             // wakes its reserved inbound slot, whose RAII registration then
@@ -10851,15 +10828,96 @@ async fn run_message_dispatch_loop(
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(response) = goal_pause_response {
-                if let Some(channel) = channel.as_ref() {
-                    let _ = channel
-                        .send(&SendMessage::reply_to(
-                            &msg,
-                            render_goal_response(&response),
-                        ))
-                        .await;
-                }
+            if matrix_stop {
+                // Do not await a Goal worker from the global ingress loop.
+                // The detached control task first cancels the resident parent
+                // operation and then submits the fenced pause after it has
+                // settled. This preserves `/stop`'s immediate effect without
+                // letting one long-running tool stall every channel.
+                let context = Arc::clone(&ctx);
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                let original = matrix_goal_message_snapshot(&msg);
+                let reply_message = msg.clone();
+                let reply_permit = Arc::clone(&stop_reply_budget).try_acquire_owned().ok();
+                let control_task = ingress_tasks.track();
+                zeroclaw_spawn::spawn!(async move {
+                    let goal_active = match request_active_matrix_goal_pause_now(
+                        Arc::clone(&context),
+                        &history_key,
+                    )
+                    .await
+                    {
+                        Ok(active) => active,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
+                                })),
+                                "stop command could not inspect active Matrix Goal"
+                            );
+                            false
+                        }
+                    };
+
+                    if let Some(reply_permit) = reply_permit {
+                        let acknowledgement = if goal_active {
+                            zeroclaw_runtime::i18n::get_required_cli_string(
+                                "goal-mode-pause-requested",
+                            )
+                        } else {
+                            reply.to_owned()
+                        };
+                        if let Some(channel) = channel.clone() {
+                            send_notice_with_timeout(
+                                channel,
+                                SendMessage::reply_to(&reply_message, acknowledgement),
+                                "stop_ack",
+                            )
+                            .await;
+                        }
+                        drop(reply_permit);
+                    }
+
+                    if goal_active {
+                        match pause_active_matrix_goal_now(context, history_key, original).await {
+                            Ok(Some(response)) => {
+                                if let Some(channel) = channel {
+                                    send_notice_with_timeout(
+                                        channel,
+                                        SendMessage::reply_to(
+                                            &reply_message,
+                                            render_goal_response(&response),
+                                        ),
+                                        "goal_stop_result",
+                                    )
+                                    .await;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({
+                                        "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
+                                    })),
+                                    "stop command could not pause active Matrix Goal"
+                                );
+                            }
+                        }
+                    }
+                    drop(control_task);
+                });
             } else if let Some(channel) = channel {
                 // `/stop` bypasses every admission budget so cancellation
                 // stays reachable, but its acknowledgement must not: a
