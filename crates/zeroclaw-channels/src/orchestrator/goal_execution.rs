@@ -845,11 +845,8 @@ impl GoalParentPresentation {
         receipts: Arc<Mutex<Vec<String>>>,
         turn_route: Option<zeroclaw_runtime::tools::TurnRoutingEntry>,
     ) -> Option<String> {
-        let Some(channel) = channel else {
-            return None;
-        };
         let Some(candidate) = candidate else {
-            if let Some(draft_id) = draft_id {
+            if let (Some(channel), Some(draft_id)) = (channel, draft_id) {
                 let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
             }
             return None;
@@ -865,7 +862,7 @@ impl GoalParentPresentation {
                 .await
             {
                 zeroclaw_runtime::hooks::HookResult::Cancel(_) => {
-                    if let Some(draft_id) = draft_id {
+                    if let (Some(channel), Some(draft_id)) = (channel, draft_id) {
                         let _ = channel.cancel_draft(&message.reply_target, draft_id).await;
                     }
                     return None;
@@ -907,6 +904,12 @@ impl GoalParentPresentation {
             provider_fallback,
             safeguard_fallback,
         );
+        // Ordinary channel turns retain their semantic assistant response
+        // before attempting delivery. A transiently unavailable Matrix
+        // channel must not make a Goal-managed session forget that turn.
+        let Some(channel) = channel else {
+            return Some(history_response);
+        };
         let (delivery_channel, delivery_recipient, suppress_voice, force_voice, is_redirect) =
             if let Some(route) = turn_route {
                 let delivery_channel = match route.channel.as_deref() {
@@ -1478,6 +1481,7 @@ mod tests {
 
     struct GoalPresentationChannel {
         events: tokio::sync::Mutex<Vec<String>>,
+        fail_final: bool,
     }
 
     impl zeroclaw_api::attribution::Attributable for GoalPresentationChannel {
@@ -1487,6 +1491,46 @@ mod tests {
 
         fn alias(&self) -> &str {
             "goal-presentation"
+        }
+    }
+
+    struct CancelOutboundGoalParentHook;
+
+    #[async_trait]
+    impl zeroclaw_api::hook::HookHandler for CancelOutboundGoalParentHook {
+        fn name(&self) -> &str {
+            "cancel-goal-parent-output"
+        }
+
+        async fn on_message_sending(
+            &self,
+            _channel: String,
+            _recipient: String,
+            _content: String,
+        ) -> zeroclaw_api::hook::HookResult<(String, String, String)> {
+            zeroclaw_api::hook::HookResult::Cancel("suppressed by test hook".to_owned())
+        }
+    }
+
+    struct RewriteOutboundGoalParentHook;
+
+    #[async_trait]
+    impl zeroclaw_api::hook::HookHandler for RewriteOutboundGoalParentHook {
+        fn name(&self) -> &str {
+            "rewrite-goal-parent-output"
+        }
+
+        async fn on_message_sending(
+            &self,
+            channel: String,
+            recipient: String,
+            _content: String,
+        ) -> zeroclaw_api::hook::HookResult<(String, String, String)> {
+            zeroclaw_api::hook::HookResult::Continue((
+                channel,
+                recipient,
+                "hook-rewritten parent report".to_owned(),
+            ))
         }
     }
 
@@ -1509,6 +1553,9 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("final:{}", message.content));
+            if self.fail_final {
+                bail!("test delivery failure");
+            }
             Ok(())
         }
 
@@ -1984,6 +2031,7 @@ mod tests {
     async fn goal_parent_candidate_uses_the_normal_draft_finalization_surface() {
         let channel = GoalPresentationChannel {
             events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
         };
         let message = ChannelMessage::new(
             "event",
@@ -2016,9 +2064,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_parent_candidate_keeps_history_when_its_channel_has_gone_away() {
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        let history = GoalParentPresentation::present_parent_result(
+            super::super::tests::router_test_ctx_with_hooks(None).as_ref(),
+            &message,
+            None,
+            None,
+            Some("parent report"),
+            None,
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert_eq!(history.as_deref(), Some("parent report"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_honors_outbound_hook_cancellation() {
+        let channel = Arc::new(GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
+        });
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(CancelOutboundGoalParentHook));
+
+        let history = GoalParentPresentation::present_parent_result(
+            super::super::tests::router_test_ctx_with_hooks(Some(Arc::new(hooks))).as_ref(),
+            &message,
+            Some(&(channel.clone() as Arc<dyn Channel>)),
+            None,
+            Some("suppressed parent report"),
+            None,
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert!(history.is_none());
+        assert!(channel.events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_retains_hook_rewritten_history() {
+        let channel = Arc::new(GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
+        });
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteOutboundGoalParentHook));
+
+        let history = GoalParentPresentation::present_parent_result(
+            super::super::tests::router_test_ctx_with_hooks(Some(Arc::new(hooks))).as_ref(),
+            &message,
+            Some(&(channel.clone() as Arc<dyn Channel>)),
+            None,
+            Some("raw parent report"),
+            None,
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert_eq!(history.as_deref(), Some("hook-rewritten parent report"));
+        assert_eq!(
+            channel.events.lock().await.as_slice(),
+            ["final:hook-rewritten parent report"]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_keeps_recovery_footer_out_of_history() {
+        let channel = Arc::new(GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
+        });
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+        let fallback = ProviderFallbackInfo {
+            requested_provider: "openai.primary".to_owned(),
+            requested_model: "model-a".to_owned(),
+            actual_provider: "anthropic.backup".to_owned(),
+            actual_model: "model-b".to_owned(),
+        };
+
+        let history = GoalParentPresentation::present_parent_result(
+            super::super::tests::router_test_ctx_with_hooks(None).as_ref(),
+            &message,
+            Some(&(channel.clone() as Arc<dyn Channel>)),
+            None,
+            Some("accepted parent report"),
+            Some(&fallback),
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert_eq!(history.as_deref(), Some("accepted parent report"));
+        let events = channel.events.lock().await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("final:accepted parent report\n\n---\n"));
+        assert!(events[0].contains("openai.primary"));
+        assert!(events[0].contains("anthropic.backup"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_candidate_keeps_history_when_delivery_fails() {
+        let channel = Arc::new(GoalPresentationChannel {
+            events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: true,
+        });
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+
+        let history = GoalParentPresentation::present_parent_result(
+            super::super::tests::router_test_ctx_with_hooks(None).as_ref(),
+            &message,
+            Some(&(channel.clone() as Arc<dyn Channel>)),
+            None,
+            Some("durable parent report"),
+            None,
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        )
+        .await;
+
+        assert_eq!(history.as_deref(), Some("durable parent report"));
+        assert_eq!(
+            channel.events.lock().await.as_slice(),
+            ["final:durable parent report"]
+        );
+    }
+
+    #[tokio::test]
     async fn goal_parent_candidate_without_a_draft_uses_the_normal_final_surface() {
         let channel = GoalPresentationChannel {
             events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
         };
         let message = ChannelMessage::new(
             "event",
@@ -2054,9 +2283,11 @@ mod tests {
     async fn goal_parent_candidate_honors_send_via_delivery() {
         let origin = GoalPresentationChannel {
             events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
         };
         let destination = GoalPresentationChannel {
             events: tokio::sync::Mutex::new(Vec::new()),
+            fail_final: false,
         };
         let message = ChannelMessage::new(
             "event",

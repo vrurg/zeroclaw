@@ -4519,6 +4519,59 @@ mod tool_lifecycle_abandonment_tests {
         .await
     }
 
+    #[tokio::test]
+    async fn goal_parent_turn_stops_on_a_standard_markdown_blocker_before_tools() {
+        let blocker = "I need an explicit decision.\n\n## Goal blocker\n\nKind: needs_user_input\nAction: Choose A or B";
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                ChatResponse {
+                    text: Some(blocker.to_owned()),
+                    tool_calls: vec![tool_call(
+                        "would-run-without-goal-pause",
+                        "echo",
+                        serde_json::json!({"decision": "A"}),
+                    )],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("the blocker was ignored".to_owned()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        };
+        let registry = registry_with(vec![Box::new(EchoTool {
+            name: "echo".to_owned(),
+        })]);
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("continue the Goal".to_owned())];
+
+        let response = crate::goal_mode::scope_goal_parent_turn(run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            None,
+            &pacing,
+            "goal-blocker-turn",
+            false,
+            None,
+            &mut history,
+        ))
+        .await
+        .expect("a certified Goal blocker must end the parent turn");
+
+        assert_eq!(response, blocker);
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some(blocker),
+            "the exact certified candidate must become the retained final parent turn"
+        );
+    }
+
     fn registry_with(
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {

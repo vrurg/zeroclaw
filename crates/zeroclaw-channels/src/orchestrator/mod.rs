@@ -17717,6 +17717,12 @@ temperature = 0.3
     /// checks (`Arc::ptr_eq`). Every dependency is a no-op default — these
     /// ctxs aren't usable for actually running the dispatch loop.
     fn router_test_ctx() -> Arc<ChannelRuntimeContext> {
+        router_test_ctx_with_hooks(None)
+    }
+
+    pub(super) fn router_test_ctx_with_hooks(
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+    ) -> Arc<ChannelRuntimeContext> {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
@@ -17762,7 +17768,7 @@ temperature = 0.3
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
-            hooks: None,
+            hooks,
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
