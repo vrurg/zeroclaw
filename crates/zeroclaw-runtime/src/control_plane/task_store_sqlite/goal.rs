@@ -466,6 +466,36 @@ impl SqliteTaskStore {
             )
             .context("clear classified interrupted terminal goal operation")?;
 
+        // A process restart interrupted this physical operation before the
+        // provider layer could publish an immutable attempt report.  Even an
+        // unlimited Goal cannot safely treat that as the same thing as a
+        // settled fallback with one unknown prior attempt: the operation
+        // itself has not been paired with a result at all.
+        let failed_unsettled = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'failed', error = 'accounting_outcome_unknown',
+                        finished_at = COALESCE(finished_at, ?2),
+                        execution_epoch = CASE
+                            WHEN execution_epoch < 9223372036854775807
+                            THEN execution_epoch + 1
+                            ELSE execution_epoch
+                        END
+                  WHERE kind = 'goal' AND session_id IS NOT NULL
+                    AND owner_boot_id != ?1
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
+                    AND status IN ('running', 'paused')
+                    AND EXISTS (
+                        SELECT 1 FROM goal_tasks
+                         WHERE task_id = tasks.id
+                           AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
+                    )",
+                params![boot_id, &now],
+            )
+            .context("fail interrupted Goal operation without a settled attempt report")?;
+
         tx.execute(
             "UPDATE goal_tasks
                 SET pending_call_id = NULL, pending_call_epoch = NULL
@@ -476,7 +506,7 @@ impl SqliteTaskStore {
                        AND EXISTS (SELECT 1 FROM goal_recovery_candidates
                                    WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
                                      AND owner_boot_id = tasks.owner_boot_id)
-                       AND status IN ('running', 'paused')
+                       AND status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
               ) AND accounting_state = 'outcome_unknown'
                 AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
@@ -511,7 +541,10 @@ impl SqliteTaskStore {
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
                            AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
-                                OR accounting_state != 'complete')
+                                OR (accounting_state != 'complete'
+                                    AND NOT (accounting_state = 'outcome_unknown'
+                                             AND effective_token_limit IS NULL
+                                             AND effective_cost_limit_usd IS NULL)))
                     )",
                 params![boot_id, &now],
             )
@@ -572,7 +605,10 @@ impl SqliteTaskStore {
                        AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                     AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
-                    AND accounting_state = 'complete'",
+                    AND (accounting_state = 'complete'
+                         OR (accounting_state = 'outcome_unknown'
+                             AND effective_token_limit IS NULL
+                             AND effective_cost_limit_usd IS NULL))",
             params![boot_id, daemon_restart],
         )
         .context("mark interrupted goal pause")?;
@@ -591,7 +627,10 @@ impl SqliteTaskStore {
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                            AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
-                           AND accounting_state = 'complete'
+                           AND (accounting_state = 'complete'
+                                OR (accounting_state = 'outcome_unknown'
+                                    AND effective_token_limit IS NULL
+                                    AND effective_cost_limit_usd IS NULL))
                     )",
                 params![boot_id],
             )
@@ -612,7 +651,10 @@ impl SqliteTaskStore {
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                            AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
-                           AND accounting_state = 'complete'
+                           AND (accounting_state = 'complete'
+                                OR (accounting_state = 'outcome_unknown'
+                                    AND effective_token_limit IS NULL
+                                    AND effective_cost_limit_usd IS NULL))
                     )",
                 params![boot_id, &now],
             )
@@ -620,6 +662,7 @@ impl SqliteTaskStore {
         tx.commit().context("commit goal boot reconciliation")?;
         Ok((missing_extension
             + failed_accounting
+            + failed_unsettled
             + failed_tool_pairing
             + cleared_terminal_pending
             + paused
@@ -1283,7 +1326,11 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 AND execution_epoch < 9223372036854775807
                 AND EXISTS (
                     SELECT 1 FROM goal_tasks
-                     WHERE task_id = tasks.id AND accounting_state = 'complete'
+                     WHERE task_id = tasks.id
+                       AND (accounting_state = 'complete'
+                            OR (accounting_state = 'outcome_unknown'
+                                AND effective_token_limit IS NULL
+                                AND effective_cost_limit_usd IS NULL))
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                        AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                 )",
@@ -1359,7 +1406,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
             "UPDATE goal_tasks
                 SET pending_call_id = ?4, pending_call_epoch = ?3
               WHERE task_id = ?1 AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                AND accounting_state = 'complete'
+                AND (accounting_state = 'complete'
+                     OR (accounting_state = 'outcome_unknown'
+                         AND effective_token_limit IS NULL
+                         AND effective_cost_limit_usd IS NULL))
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
@@ -1384,7 +1434,12 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let conn = self.conn.lock();
         let updated = conn.execute(
             "UPDATE goal_tasks
-                SET pending_call_id = NULL, pending_call_epoch = NULL, accounting_state = ?5
+                SET pending_call_id = NULL, pending_call_epoch = NULL,
+                    accounting_state = CASE
+                        WHEN ?5 IN ('missing', 'invalid') THEN ?5
+                        WHEN accounting_state = 'outcome_unknown' THEN 'outcome_unknown'
+                        ELSE ?5
+                    END
               WHERE task_id = ?1 AND pending_call_id = ?4 AND pending_call_epoch = ?3
                 AND EXISTS (
                     SELECT 1 FROM tasks
@@ -1420,7 +1475,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 SET pending_tool_batch_id = ?4, pending_tool_epoch = ?3
               WHERE task_id = ?1
                 AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
-                AND accounting_state = 'complete'
+                AND (accounting_state = 'complete'
+                     OR (accounting_state = 'outcome_unknown'
+                         AND effective_token_limit IS NULL
+                         AND effective_cost_limit_usd IS NULL))
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2

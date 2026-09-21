@@ -320,9 +320,9 @@ fn combine_goal_accounting_state(
     use crate::control_plane::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
 
     match (current, next) {
-        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Invalid, _) | (_, Invalid) => Invalid,
         (Missing, _) | (_, Missing) => Missing,
+        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Complete, Complete) => Complete,
     }
 }
@@ -861,6 +861,20 @@ mod tests {
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn missing_or_invalid_attempt_usage_overrides_a_prior_unknown_attempt() {
+        use crate::control_plane::GoalAccountingState::{Invalid, Missing, OutcomeUnknown};
+
+        assert_eq!(
+            combine_goal_accounting_state(OutcomeUnknown, Missing),
+            Missing
+        );
+        assert_eq!(
+            combine_goal_accounting_state(OutcomeUnknown, Invalid),
+            Invalid
+        );
     }
 
     fn model_stats(

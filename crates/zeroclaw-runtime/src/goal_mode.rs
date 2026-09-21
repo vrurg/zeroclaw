@@ -1578,7 +1578,7 @@ impl GoalStatusProjection {
 fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
     task.status == TaskStatus::Paused
         && task.execution_epoch < i64::MAX
-        && goal.accounting_state == GoalAccountingState::Complete
+        && goal.allows_continuation()
         && goal.pending_call_id.is_none()
         && goal.pending_call_epoch.is_none()
         && goal.pending_tool_batch_id.is_none()

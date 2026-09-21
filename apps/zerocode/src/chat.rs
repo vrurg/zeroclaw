@@ -65,6 +65,20 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
     message
 }
 
+/// Format exact token counts for presentation without routing them through a
+/// floating-point localization value.
+fn format_goal_tokens(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted.chars().rev().collect()
+}
+
 fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     use crate::wire::GoalResponse;
 
@@ -160,7 +174,7 @@ fn goal_accounting_state_message(state: &str) -> String {
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
     let token_limit = projection
         .token_limit
-        .map(|value| value.to_string())
+        .map(format_goal_tokens)
         .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
     let cost_limit = projection
         .cost_limit_usd
@@ -207,7 +221,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         (Some(tokens), Some(cost)) => message.push_str(&crate::i18n::t_args(
             "zc-goal-summary-accounting",
             &[
-                ("tokens", &tokens.to_string()),
+                ("tokens", &format_goal_tokens(tokens)),
                 ("cost", &format!("{cost:.6}")),
                 ("accounting", &accounting),
                 (
@@ -10832,13 +10846,21 @@ mod tests {
 
         assert!(rendered.contains("⏸️ Goal paused."));
         assert!(rendered.contains("Status: paused"));
-        assert!(rendered.contains("Budget: 12000 tokens · USD unlimited"));
+        assert!(rendered.contains("Budget: 12,000 tokens · USD unlimited"));
         assert!(rendered.contains(
-            "Accounting: 1234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
+            "Accounting: 1,234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
         ));
         assert!(rendered.contains("Pause: needs_user_input"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
+
+    #[test]
+    fn goal_token_counts_are_grouped_without_losing_precision() {
+        assert_eq!(format_goal_tokens(0), "0");
+        assert_eq!(format_goal_tokens(1_000), "1,000");
+        assert_eq!(format_goal_tokens(59_875_761), "59,875,761");
+        assert_eq!(format_goal_tokens(u64::MAX), "18,446,744,073,709,551,615");
     }
 
     #[tokio::test]
@@ -10896,7 +10918,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Accounting: 1234 tokens"));
+        assert!(rendered.contains("Accounting: 1,234 tokens"));
         assert!(rendered.contains("usage may be incomplete"));
         assert!(!rendered.contains("outcome_unknown"));
     }

@@ -1247,8 +1247,8 @@ impl GoalExecutionEngine {
             "Goal execution begins with an unsettled operation"
         );
         ensure!(
-            goal.accounting_state == GoalAccountingState::Complete,
-            "Goal execution begins with incomplete accounting"
+            goal.allows_continuation(),
+            "Goal execution begins with accounting that cannot safely continue"
         );
         Ok(goal.objective)
     }
@@ -1599,7 +1599,7 @@ impl GoalExecutionEngine {
             .get_goal_task(scope.task_id())
             .await?
             .context("Goal extension disappeared while settling accounting")?;
-        if goal.accounting_state != GoalAccountingState::Complete
+        if !goal.allows_continuation()
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
@@ -2206,8 +2206,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
 
         let (_task, goal) = self.current_running_goal().await?;
         ensure!(
-            goal.accounting_state == GoalAccountingState::Complete,
-            "Goal accounting is incomplete"
+            goal.allows_continuation(),
+            "Goal accounting cannot safely continue"
         );
         ensure!(
             goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
@@ -3563,6 +3563,195 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    }
+
+    #[tokio::test]
+    async fn unlimited_goal_continues_after_an_unknown_attempt_with_a_known_fallback() {
+        let (store, accountant, scope, directory) = accountant_fixture().await;
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::OutcomeUnknown,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        engine
+            .require_complete_accounting(&scope, None)
+            .await
+            .expect("an unlimited Goal may continue with explicitly unknown prior usage");
+
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect("the next operation must not be blocked by the uncertain primary attempt");
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_missing_usage_overrides_an_unlimited_goal_unknown_attempt() {
+        let (store, accountant, scope, directory) = accountant_fixture().await;
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::OutcomeUnknown,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                }],
+            })
+            .await
+            .unwrap();
+
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .expect("an unlimited Goal may continue after a settled unknown attempt");
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Missing);
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        assert!(
+            engine
+                .require_complete_accounting(&scope, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn limited_goal_still_rejects_continuation_after_unknown_usage() {
+        let (store, accountant, scope, directory) =
+            accountant_fixture_with_cost_limit(Some(1.0)).await;
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::OutcomeUnknown,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .is_err()
+        );
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+        assert!(
+            engine
+                .require_complete_accounting(&scope, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
     }
 
     #[tokio::test]

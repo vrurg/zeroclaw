@@ -68,6 +68,21 @@ impl Default for GoalTaskRecord {
     }
 }
 
+impl GoalTaskRecord {
+    /// Whether another operation can run without falsely enforcing a budget.
+    ///
+    /// A timed-out provider request can leave its billable usage unknown even
+    /// when a later fallback produced a fully accounted response.  Unlimited
+    /// Goals may continue with that durable warning; a Goal with either limit
+    /// cannot, because its cap can no longer be enforced honestly.
+    pub(crate) fn allows_continuation(&self) -> bool {
+        self.accounting_state == GoalAccountingState::Complete
+            || (self.accounting_state == GoalAccountingState::OutcomeUnknown
+                && self.effective_token_limit.is_none()
+                && self.effective_cost_limit_usd.is_none())
+    }
+}
+
 /// Safe, durable classification for why an admitted tool batch could not be
 /// paired with its session-history results. This stays deliberately smaller
 /// than arbitrary runtime errors: task storage must not persist or surface a

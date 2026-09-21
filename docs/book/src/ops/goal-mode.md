@@ -216,11 +216,16 @@ the whole logical operation has one Goal admission. Every surfaced usage event
 is attributed to the Goal task and its actual provider/model route before that
 operation settles.
 
-Missing, invalid, uncertain, or insufficiently attributed usage is not treated
-as zero. The Goal fails and admits no further Goal-owned model call. A finite
-cost limit also fails if pricing cannot be established. This conservative rule
-is intentional: recorded known usage is only a lower bound after an accounting
-failure.
+Missing, invalid, or insufficiently attributed usage is not treated as zero.
+The Goal fails and admits no further Goal-owned model call. A settled operation
+whose only uncertainty is an earlier attempt with unknown usage is different:
+when both effective limits are unlimited, the Goal may continue while retaining
+the `outcome_unknown` warning. Any finite token or cost limit still fails,
+because the cap can no longer be enforced honestly. A later missing or invalid
+usage result also fails the Goal; uncertainty never masks a more severe
+accounting failure. A finite cost limit also fails if pricing cannot be
+established. This conservative rule is intentional: recorded known usage is
+only a lower bound after an accounting failure.
 
 Goal admission also requires the canonical cost ledger to be structurally
 readable. A malformed or empty ledger row has no trustworthy Goal attribution,

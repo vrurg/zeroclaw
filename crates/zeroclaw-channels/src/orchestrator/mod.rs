@@ -359,6 +359,20 @@ fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> Str
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
 }
 
+/// Format exact token counts for presentation without routing them through a
+/// floating-point localization value.
+fn format_goal_tokens(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted.chars().rev().collect()
+}
+
 fn append_provider_fallback_footer(
     mut response: String,
     fallback: Option<&ProviderFallbackInfo>,
@@ -710,7 +724,7 @@ fn render_goal_projection(
 
     let token_limit = projection
         .token_limit
-        .map(|value| value.to_string())
+        .map(format_goal_tokens)
         .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
     let cost_limit = projection
         .cost_limit_usd
@@ -825,7 +839,7 @@ fn render_goal_projection(
         (Some(tokens), Some(cost)) => message.push_str(&channel_runtime_cli_string_with_args(
             "goal-mode-summary-accounting",
             &[
-                ("tokens", &tokens.to_string()),
+                ("tokens", &format_goal_tokens(tokens)),
                 ("cost", &format!("{cost:.6}")),
                 ("accounting", &accounting),
                 (
@@ -889,7 +903,7 @@ fn render_goal_projection(
 
 #[cfg(test)]
 mod goal_response_render_tests {
-    use super::render_goal_response;
+    use super::{format_goal_tokens, render_goal_response};
     use zeroclaw_runtime::{
         control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus},
         goal_mode::{GoalResponse, GoalStatusProjection, GoalTerminalReason},
@@ -919,7 +933,7 @@ mod goal_response_render_tests {
         assert!(rendered.contains("**Reason:** The last model operation did not settle cleanly."));
         assert!(
             rendered
-                .contains("**Accounting:** 1234 tokens · USD 0.012345 · usage may be incomplete")
+                .contains("**Accounting:** 1,234 tokens · USD 0.012345 · usage may be incomplete")
         );
         assert!(rendered.contains("**Provider:** openai.default"));
         assert!(rendered.contains("**Details:** tool pairing batch 72 could not be settled"));
@@ -1007,8 +1021,16 @@ mod goal_response_render_tests {
         }));
 
         assert!(rendered.contains(
-            "**Accounting:** 1234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
+            "**Accounting:** 1,234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
         ));
+    }
+
+    #[test]
+    fn goal_token_counts_are_grouped_without_losing_precision() {
+        assert_eq!(format_goal_tokens(0), "0");
+        assert_eq!(format_goal_tokens(1_000), "1,000");
+        assert_eq!(format_goal_tokens(59_875_761), "59,875,761");
+        assert_eq!(format_goal_tokens(u64::MAX), "18,446,744,073,709,551,615");
     }
 }
 

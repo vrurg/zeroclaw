@@ -2036,7 +2036,7 @@ mod tests {
         let events = channel.events.lock().await;
         assert!(events.iter().any(|event| {
             event.contains(
-                "**Accounting:** 1234 tokens · USD 0.012345 · usage may be incomplete · recorded usage may be incomplete"
+                "**Accounting:** 1,234 tokens · USD 0.012345 · usage may be incomplete · recorded usage may be incomplete"
             )
                 && !event.contains("outcome_unknown")
         }));

@@ -415,6 +415,83 @@ async fn a_fenced_goal_tool_batch_can_settle_after_the_pause_epoch() {
 }
 
 #[tokio::test]
+async fn unlimited_goal_with_unknown_usage_can_resume_but_limited_goal_cannot() {
+    for (task_id, session_id, token_limit, expected) in [
+        (
+            "unknown-unlimited",
+            "unknown-unlimited-session",
+            None,
+            GoalTransitionResult::Applied,
+        ),
+        (
+            "unknown-limited",
+            "unknown-limited-session",
+            Some(1),
+            GoalTransitionResult::Stale,
+        ),
+    ] {
+        let store = SqliteTaskStore::new_in_memory().expect("initialize control-plane schema");
+        let task = session_goal_task(task_id, session_id);
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "continue after a recovered provider failure".into(),
+            effective_token_limit: token_limit,
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .expect("create current Goal"),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_operation(task_id, session_id, 1, "unknown-operation")
+                .await
+                .expect("admit exact operation"),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    task_id,
+                    session_id,
+                    1,
+                    "unknown-operation",
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await
+                .expect("persist unknown attempted spend"),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    task_id,
+                    session_id,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::CoreInterrupted,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .expect("pause after the core interruption"),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .resume_session_goal(task_id, session_id, 2, 1, "boot-b")
+                .await
+                .expect("apply the exact resume policy"),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn restart_fails_an_unpaired_goal_tool_batch_without_replaying_it() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
