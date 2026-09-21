@@ -2539,6 +2539,7 @@ mod tests {
             None,
             None,
         )
+        .expect("production registry must build")
         .tools;
         let git_operations = tools
             .iter()
