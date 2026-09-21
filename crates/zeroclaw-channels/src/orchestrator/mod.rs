@@ -821,10 +821,28 @@ fn render_goal_projection(
         &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
     ));
     message.push('\n');
-    message.push_str(&channel_runtime_cli_string_with_args(
-        "goal-mode-summary-accounting",
-        &[("accounting", &accounting)],
-    ));
+    match (projection.recorded_tokens, projection.recorded_cost_usd) {
+        (Some(tokens), Some(cost)) => message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-accounting",
+            &[
+                ("tokens", &tokens.to_string()),
+                ("cost", &format!("{cost:.6}")),
+                ("accounting", &accounting),
+                (
+                    "incomplete",
+                    &if projection.recorded_usage_incomplete {
+                        channel_runtime_cli_string("goal-mode-summary-accounting-incomplete")
+                    } else {
+                        String::new()
+                    },
+                ),
+            ],
+        )),
+        _ => message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-summary-accounting-unavailable",
+            &[("accounting", &accounting)],
+        )),
+    }
     message.push('\n');
     message.push_str(&channel_runtime_cli_string_with_args(
         "goal-mode-summary-execution",
@@ -885,6 +903,9 @@ mod goal_response_render_tests {
             execution_epoch: 2,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(1_234),
+            recorded_cost_usd: Some(0.012345),
+            recorded_usage_incomplete: false,
             accounting_state: GoalAccountingState::OutcomeUnknown,
             pause_reason: None,
             terminal_reason: Some(GoalTerminalReason::AccountingOutcomeUnknown),
@@ -896,7 +917,10 @@ mod goal_response_render_tests {
         }));
 
         assert!(rendered.contains("**Reason:** The last model operation did not settle cleanly."));
-        assert!(rendered.contains("**Accounting:** usage may be incomplete"));
+        assert!(
+            rendered
+                .contains("**Accounting:** 1234 tokens · USD 0.012345 · usage may be incomplete")
+        );
         assert!(rendered.contains("**Provider:** openai.default"));
         assert!(rendered.contains("**Details:** tool pairing batch 72 could not be settled"));
         assert!(!rendered.contains("outcome_unknown"));
@@ -918,6 +942,9 @@ mod goal_response_render_tests {
             execution_epoch: 2,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: GoalAccountingState::Complete,
             pause_reason: Some(GoalPauseReason::NeedsUserInput),
             terminal_reason: None,
@@ -931,6 +958,57 @@ mod goal_response_render_tests {
         assert!(rendered.contains("**Status:** paused"));
         assert!(rendered.contains("**Pause:** waiting for your input"));
         assert!(!rendered.contains("needs_user_input"));
+    }
+
+    #[test]
+    fn unavailable_ledger_usage_is_never_rendered_as_zero() {
+        let rendered = render_goal_response(&GoalResponse::Status(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Paused,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            recorded_tokens: None,
+            recorded_cost_usd: None,
+            recorded_usage_incomplete: false,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
+            terminal_detail: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        }));
+
+        assert!(rendered.contains("**Accounting:** usage unavailable · complete"));
+        assert!(!rendered.contains("0 tokens · USD 0.000000 · complete"));
+    }
+
+    #[test]
+    fn partial_ledger_usage_is_rendered_as_a_lower_bound() {
+        let rendered = render_goal_response(&GoalResponse::Status(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Paused,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            recorded_tokens: Some(1_234),
+            recorded_cost_usd: Some(0.012345),
+            recorded_usage_incomplete: true,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: None,
+            terminal_reason: None,
+            terminal_provider: None,
+            terminal_detail: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        }));
+
+        assert!(rendered.contains(
+            "**Accounting:** 1234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
+        ));
     }
 }
 

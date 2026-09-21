@@ -147,6 +147,16 @@ fn goal_terminal_reason_message(reason: &str) -> String {
     }
 }
 
+fn goal_accounting_state_message(state: &str) -> String {
+    match state {
+        "complete" => crate::i18n::t("zc-goal-accounting-complete"),
+        "missing" => crate::i18n::t("zc-goal-accounting-missing"),
+        "invalid" => crate::i18n::t("zc-goal-accounting-invalid"),
+        "outcome_unknown" => crate::i18n::t("zc-goal-accounting-outcome-unknown"),
+        _ => crate::i18n::t("zc-goal-accounting-unknown"),
+    }
+}
+
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
     let token_limit = projection
         .token_limit
@@ -156,6 +166,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         .cost_limit_usd
         .map(|value| format!("{value:.6}"))
         .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let accounting = goal_accounting_state_message(&projection.accounting_state);
     let pause_reason = projection.pause_reason.as_deref();
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
@@ -179,16 +190,41 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             &[("provider", provider)],
         ));
     }
+    if let Some(detail) = projection.terminal_detail.as_deref() {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-details",
+            &[("details", detail)],
+        ));
+    }
     message.push('\n');
     message.push_str(&crate::i18n::t_args(
         "zc-goal-summary-budget",
         &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
     ));
     message.push('\n');
-    message.push_str(&crate::i18n::t_args(
-        "zc-goal-summary-accounting",
-        &[("accounting", &projection.accounting_state)],
-    ));
+    match (projection.recorded_tokens, projection.recorded_cost_usd) {
+        (Some(tokens), Some(cost)) => message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-accounting",
+            &[
+                ("tokens", &tokens.to_string()),
+                ("cost", &format!("{cost:.6}")),
+                ("accounting", &accounting),
+                (
+                    "incomplete",
+                    &if projection.recorded_usage_incomplete {
+                        crate::i18n::t("zc-goal-summary-accounting-incomplete")
+                    } else {
+                        String::new()
+                    },
+                ),
+            ],
+        )),
+        _ => message.push_str(&crate::i18n::t_args(
+            "zc-goal-summary-accounting-unavailable",
+            &[("accounting", &accounting)],
+        )),
+    }
     message.push('\n');
     message.push_str(&crate::i18n::t_args(
         "zc-goal-summary-execution",
@@ -251,6 +287,7 @@ enum GoalUpdate<'a> {
         session_id: &'a str,
         terminal_reason: Option<&'a str>,
         terminal_provider: Option<&'a str>,
+        terminal_detail: Option<&'a str>,
     },
 }
 
@@ -295,6 +332,9 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
                 .and_then(serde_json::Value::as_str),
             terminal_provider: payload
                 .get("terminal_provider")
+                .and_then(serde_json::Value::as_str),
+            terminal_detail: payload
+                .get("terminal_detail")
                 .and_then(serde_json::Value::as_str),
         }),
         _ => None,
@@ -2476,12 +2516,12 @@ impl Chat {
                         GoalUpdate::Failed {
                             terminal_reason,
                             terminal_provider,
+                            terminal_detail,
                             ..
                         } => {
                             state.finish_goal_agent_presentation();
                             let mut message = crate::i18n::t("zc-goal-failed");
-                            let reason =
-                                terminal_reason.as_deref().map(goal_terminal_reason_message);
+                            let reason = terminal_reason.map(goal_terminal_reason_message);
                             if let Some(reason) = reason {
                                 message.push('\n');
                                 message.push_str(&crate::i18n::t_args(
@@ -2494,6 +2534,13 @@ impl Chat {
                                 message.push_str(&crate::i18n::t_args(
                                     "zc-goal-summary-provider",
                                     &[("provider", provider)],
+                                ));
+                            }
+                            if let Some(detail) = terminal_detail {
+                                message.push('\n');
+                                message.push_str(&crate::i18n::t_args(
+                                    "zc-goal-summary-details",
+                                    &[("details", detail)],
                                 ));
                             }
                             state
@@ -10768,10 +10815,14 @@ mod tests {
             execution_epoch: 4,
             token_limit: Some(12_000),
             cost_limit_usd: None,
+            recorded_tokens: Some(1_234),
+            recorded_cost_usd: Some(0.012345),
+            recorded_usage_incomplete: true,
             accounting_state: "complete".to_owned(),
             pause_reason: Some("needs_user_input".to_owned()),
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: Some("Select a target.".to_owned()),
             blocker_messages: vec!["Which target should receive the change?".to_owned()],
             resumable: true,
@@ -10782,9 +10833,124 @@ mod tests {
         assert!(rendered.contains("⏸️ Goal paused."));
         assert!(rendered.contains("Status: paused"));
         assert!(rendered.contains("Budget: 12000 tokens · USD unlimited"));
+        assert!(rendered.contains(
+            "Accounting: 1234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
+        ));
         assert!(rendered.contains("Pause: needs_user_input"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_goal_accounting_reaches_the_tui_transcript() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let response = crate::wire::GoalResponse::Terminal(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "failed".to_owned(),
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            recorded_tokens: Some(1_234),
+            recorded_cost_usd: Some(0.012345),
+            recorded_usage_incomplete: false,
+            accounting_state: "outcome_unknown".to_owned(),
+            pause_reason: None,
+            terminal_reason: Some("accounting_outcome_unknown".to_owned()),
+            terminal_provider: None,
+            terminal_detail: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: false,
+        });
+        let mut chat = active_chat();
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!();
+        };
+        state
+            .entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                goal_response_message(&response),
+            )));
+        state.mark_dirty_full();
+
+        // This is the rendered user boundary: English locale, 120 columns.
+        let area = Rect::new(0, 0, 120, 20);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let ChatPhase::Active(state) = &mut chat.phase else {
+                    unreachable!();
+                };
+                render(frame, state, area, PaneKind::Chat);
+            })
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Accounting: 1234 tokens"));
+        assert!(rendered.contains("usage may be incomplete"));
+        assert!(!rendered.contains("outcome_unknown"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_goal_usage_preserves_the_durable_accounting_state_in_the_tui() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let raw = serde_json::json!({
+            "task_id": "goal-1",
+            "status": "paused",
+            "execution_epoch": 2,
+            "token_limit": null,
+            "cost_limit_usd": null,
+            "accounting_state": "complete",
+            "pause_reason": null,
+            "resumable": true
+        });
+        let projection = serde_json::from_value(raw).expect("older Goal projection");
+        let response = crate::wire::GoalResponse::Status(projection);
+        let mut chat = active_chat();
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!();
+        };
+        state
+            .entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                goal_response_message(&response),
+            )));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 120, 20);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let ChatPhase::Active(state) = &mut chat.phase else {
+                    unreachable!();
+                };
+                render(frame, state, area, PaneKind::Chat);
+            })
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Accounting: usage unavailable · complete"));
+        assert!(!rendered.contains("usage may be incomplete"));
     }
 
     #[test]
@@ -10795,10 +10961,14 @@ mod tests {
             execution_epoch: 1,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -10822,10 +10992,14 @@ mod tests {
             execution_epoch: 1,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -10859,10 +11033,14 @@ mod tests {
             execution_epoch: 1,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -10879,10 +11057,14 @@ mod tests {
             execution_epoch: 2,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: "outcome_unknown".to_owned(),
             pause_reason: None,
             terminal_reason: Some("accounting_outcome_unknown".to_owned()),
             terminal_provider: None,
+            terminal_detail: Some("tool pairing batch 72 could not be settled".to_owned()),
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: false,
@@ -10891,6 +11073,9 @@ mod tests {
         let rendered = goal_response_message(&response);
 
         assert!(rendered.contains("Reason: The last model operation did not settle cleanly."));
+        assert!(rendered.contains("Accounting: 0 tokens · USD 0.000000 · usage may be incomplete"));
+        assert!(rendered.contains("Details: tool pairing batch 72 could not be settled"));
+        assert!(!rendered.contains("outcome_unknown"));
     }
 
     #[test]
@@ -22123,7 +22308,8 @@ mod tests {
                     "failed": {
                         "session_id": "sess-1",
                         "terminal_reason": "parent_operation_failed",
-                        "terminal_provider": "openai.default"
+                        "terminal_provider": "openai.default",
+                        "terminal_detail": "OpenAI quota exhausted"
                     }
                 }),
             })
@@ -22135,7 +22321,7 @@ mod tests {
             &active_state(&mut chat).entries()[0],
             ChatEntry::SystemMessage(text)
                 if text.as_ref()
-                    == "❌ Goal failed.\nReason: The agent's model operation failed before it produced a verified result.\nProvider: openai.default"
+                    == "❌ Goal failed.\nReason: The agent's model operation failed before it produced a verified result.\nProvider: openai.default\nDetails: OpenAI quota exhausted"
         ));
     }
 
@@ -22237,10 +22423,14 @@ mod tests {
                         execution_epoch: 1,
                         token_limit: None,
                         cost_limit_usd: None,
+                        recorded_tokens: Some(0),
+                        recorded_cost_usd: Some(0.0),
+                        recorded_usage_incomplete: false,
                         accounting_state: "complete".to_owned(),
                         pause_reason: None,
                         terminal_reason: None,
                         terminal_provider: None,
+                        terminal_detail: None,
                         pause_description: None,
                         blocker_messages: Vec::new(),
                         resumable: false,
@@ -22271,10 +22461,14 @@ mod tests {
                         execution_epoch: 1,
                         token_limit: None,
                         cost_limit_usd: None,
+                        recorded_tokens: Some(0),
+                        recorded_cost_usd: Some(0.0),
+                        recorded_usage_incomplete: false,
                         accounting_state: "complete".to_owned(),
                         pause_reason: None,
                         terminal_reason: None,
                         terminal_provider: None,
+                        terminal_detail: None,
                         pause_description: None,
                         blocker_messages: Vec::new(),
                         resumable: false,

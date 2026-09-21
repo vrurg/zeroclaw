@@ -25,6 +25,19 @@ pub struct CostTracker {
     session_totals: Arc<Mutex<HashMap<Option<String>, AgentTotals>>>,
 }
 
+/// Task-attributed usage read from the canonical cost ledger.
+///
+/// `records_complete` is false when the compatibility reader had to skip an
+/// unrecoverable row anywhere in the shared ledger. The totals then remain
+/// useful lower bounds for a user-facing report, but must not be presented as
+/// complete accounting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TaskUsageTotals {
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub records_complete: bool,
+}
+
 /// Cheap process-local totals for one optional agent attribution bucket.
 /// This never replaces the persisted ledger. It only avoids rereading JSONL for
 /// current-session summary fields while the daemon is alive.
@@ -513,6 +526,20 @@ impl CostTracker {
     pub fn get_usage_totals_for_task(&self, task_id: &str) -> Result<(u64, f64)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task(task_id)
+    }
+
+    /// Get task-attributed usage together with the reporting ledger integrity.
+    ///
+    /// Unlike strict admission accounting, this keeps recoverable records
+    /// available to user-facing status reports when another ledger row is
+    /// malformed. Callers must label totals as incomplete when
+    /// `records_complete` is false.
+    pub fn get_usage_totals_for_task_with_integrity(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskUsageTotals> {
+        let mut storage = self.lock_storage();
+        storage.usage_totals_for_task_with_integrity(task_id)
     }
 
     pub fn get_usage_totals_for_task_with_pricing(
@@ -1029,12 +1056,21 @@ impl CostStorage {
         Ok(())
     }
 
-    fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
+    fn for_each_record<F>(&self, on_record: F) -> Result<()>
+    where
+        F: FnMut(CostRecord),
+    {
+        self.for_each_record_with_integrity(on_record).map(|_| ())
+    }
+
+    /// Iterates records using the legacy-tolerant reader and reports whether
+    /// every non-empty ledger row was parsed or recovered.
+    fn for_each_record_with_integrity<F>(&self, mut on_record: F) -> Result<bool>
     where
         F: FnMut(CostRecord),
     {
         if !self.path.exists() {
-            return Ok(());
+            return Ok(true);
         }
 
         let file = File::open(&self.path).with_context(|| {
@@ -1045,6 +1081,7 @@ impl CostStorage {
         })?;
         let reader = BufReader::new(file);
 
+        let mut records_complete = true;
         for (line_number, line) in reader.lines().enumerate() {
             let raw_line = line.with_context(|| {
                 format!(
@@ -1064,6 +1101,7 @@ impl CostStorage {
                 Err(_) => {
                     if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
                     {
+                        records_complete = false;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1083,7 +1121,7 @@ impl CostStorage {
             }
         }
 
-        Ok(())
+        Ok(records_complete)
     }
 
     fn for_each_record_strict<F>(&self, mut on_record: F) -> Result<()>
@@ -1331,6 +1369,22 @@ impl CostStorage {
         let (total_tokens, cost_usd, _pricing_available) =
             self.usage_totals_for_task_with_pricing(task_id)?;
         Ok((total_tokens, cost_usd))
+    }
+
+    fn usage_totals_for_task_with_integrity(&mut self, task_id: &str) -> Result<TaskUsageTotals> {
+        let mut total_tokens = 0_u64;
+        let mut cost_usd = 0.0_f64;
+        let records_complete = self.for_each_record_with_integrity(|record| {
+            if record.task_id.as_deref() == Some(task_id) {
+                total_tokens = total_tokens.saturating_add(record.usage.total_tokens);
+                cost_usd += record.usage.cost_usd;
+            }
+        })?;
+        Ok(TaskUsageTotals {
+            total_tokens,
+            cost_usd,
+            records_complete,
+        })
     }
 
     fn usage_totals_for_task_with_pricing(&mut self, task_id: &str) -> Result<(u64, f64, bool)> {
@@ -1788,6 +1842,34 @@ mod tests {
                 .get_strict_usage_totals_for_task_with_pricing("goal-a")
                 .is_err(),
             "an unreadable row has no trustworthy task attribution, so Goal admission must fail closed rather than treating it as no usage"
+        );
+    }
+
+    #[test]
+    fn reporting_task_usage_marks_totals_partial_when_a_ledger_row_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_usage_with_task_attribution(
+                TokenUsage::new("test/model", 1_000, 200, 0, 1.0, 2.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a"),
+            )
+            .unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{{not-json}}").unwrap();
+        file.sync_all().unwrap();
+
+        let totals = tracker
+            .get_usage_totals_for_task_with_integrity("goal-a")
+            .unwrap();
+
+        assert_eq!(totals.total_tokens, 1_200);
+        assert!(totals.cost_usd > 0.0);
+        assert!(
+            !totals.records_complete,
+            "a report may retain readable records but must mark the skipped row"
         );
     }
 

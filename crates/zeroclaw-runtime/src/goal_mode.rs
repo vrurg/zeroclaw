@@ -1109,6 +1109,16 @@ impl GoalRuntime {
         }
     }
 
+    /// Attach the canonical runtime ledger used by this Goal's execution.
+    ///
+    /// Goal status is a read-only projection, so it derives usage from the
+    /// existing task-attributed ledger rather than persisting a second total
+    /// in the Goal control-plane record.
+    fn with_cost_tracker(mut self, tracker: Arc<zeroclaw_config::cost::CostTracker>) -> Self {
+        self.controller = self.controller.with_cost_tracker(tracker);
+        self
+    }
+
     /// Create an execution engine bound to this runtime's canonical task
     /// registry. This prevents an adapter from admitting a Goal through one
     /// control plane and running/accounting it through another.
@@ -1118,7 +1128,12 @@ impl GoalRuntime {
         agent_alias: impl Into<String>,
         pricing: Arc<crate::agent::cost::ModelProviderPricing>,
     ) -> Result<GoalExecutionEngine> {
-        GoalExecutionEngine::new(self.clone(), tracker, agent_alias, pricing)
+        GoalExecutionEngine::new(
+            self.clone().with_cost_tracker(Arc::clone(&tracker)),
+            tracker,
+            agent_alias,
+            pricing,
+        )
     }
 
     pub async fn submit(
@@ -1467,6 +1482,17 @@ pub struct GoalStatusProjection {
     pub execution_epoch: i64,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
+    /// Task-attributed usage already recorded in the canonical cost ledger.
+    /// These are lower bounds when accounting is incomplete. `None` means the
+    /// reporting ledger itself could not be read, never zero consumption.
+    #[serde(default)]
+    pub recorded_tokens: Option<u64>,
+    #[serde(default)]
+    pub recorded_cost_usd: Option<f64>,
+    /// True when the reporting ledger skipped malformed rows, so the recorded
+    /// figures are lower bounds rather than complete totals.
+    #[serde(default)]
+    pub recorded_usage_incomplete: bool,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
     /// Safe, controller-derived explanation for a terminal Goal.
@@ -1501,6 +1527,9 @@ impl GoalStatusProjection {
             execution_epoch: task.execution_epoch,
             token_limit: goal.effective_token_limit,
             cost_limit_usd: goal.effective_cost_limit_usd,
+            recorded_tokens: None,
+            recorded_cost_usd: None,
+            recorded_usage_incomplete: false,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
             terminal_reason: None,
@@ -1514,6 +1543,19 @@ impl GoalStatusProjection {
                 .collect(),
             resumable,
         }
+    }
+
+    fn with_recorded_usage(
+        mut self,
+        usage: Option<zeroclaw_config::cost::TaskUsageTotals>,
+    ) -> Self {
+        let Some(usage) = usage else {
+            return self;
+        };
+        self.recorded_tokens = Some(usage.total_tokens);
+        self.recorded_cost_usd = Some(usage.cost_usd);
+        self.recorded_usage_incomplete = !usage.records_complete;
+        self
     }
 
     pub(super) fn with_durable_terminal_reason(mut self, reason: Option<&str>) -> Self {
@@ -1548,11 +1590,91 @@ fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
 #[derive(Clone)]
 pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
+    cost_tracker: Option<Arc<zeroclaw_config::cost::CostTracker>>,
 }
 
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            cost_tracker: None,
+        }
+    }
+
+    fn with_cost_tracker(mut self, tracker: Arc<zeroclaw_config::cost::CostTracker>) -> Self {
+        self.cost_tracker = Some(tracker);
+        self
+    }
+
+    async fn recorded_usage_for_task(
+        &self,
+        task_id: &str,
+    ) -> Option<zeroclaw_config::cost::TaskUsageTotals> {
+        let Some(tracker) = self.cost_tracker.as_ref().cloned() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"task_id": task_id})),
+                "Goal accounting tracker is unavailable for status projection"
+            );
+            return None;
+        };
+        let task_id = task_id.to_owned();
+        let lookup_task_id = task_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            tracker.get_usage_totals_for_task_with_integrity(&lookup_task_id)
+        })
+        .await
+        {
+            Ok(Ok(usage)) => {
+                if !usage.records_complete {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"task_id": task_id})),
+                        "Goal accounting status contains partial ledger totals"
+                    );
+                }
+                Some(usage)
+            }
+            Ok(Err(error)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                            "error": zeroclaw_providers::sanitize_api_error(&format!("{error:#}")),
+                        })),
+                    "Goal accounting ledger lookup failed"
+                );
+                None
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                            "error": error.to_string(),
+                        })),
+                    "Goal accounting ledger lookup worker failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn projection_from_parts(
+        &self,
+        task: &TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> GoalStatusProjection {
+        let usage = self.recorded_usage_for_task(&task.id).await;
+        GoalStatusProjection::from_parts(task, goal).with_recorded_usage(usage)
     }
 
     /// Apply a previously host-validated Goal submission through guarded
@@ -1981,7 +2103,8 @@ impl GoalController {
                     None
                 };
                 Ok(Some(
-                    GoalStatusProjection::from_parts(task, goal)
+                    self.projection_from_parts(task, goal)
+                        .await
                         .with_durable_terminal_reason(terminal_reason.as_deref()),
                 ))
             }
@@ -2080,6 +2203,9 @@ mod tests {
             execution_epoch: 1,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: GoalAccountingState::Complete,
             pause_reason: Some(GoalPauseReason::VerifierBlocked),
             terminal_reason: None,
@@ -2221,6 +2347,109 @@ mod tests {
             projection.blocker_messages,
             ["Which environment should receive the change?"]
         );
+    }
+
+    #[tokio::test]
+    async fn status_projection_keeps_recorded_usage_when_accounting_is_incomplete() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            zeroclaw_config::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                zeroclaw_config::cost::types::TokenUsage::new(
+                    "model", 1_000, 200, 0, 3.0, 15.0, 0.0,
+                ),
+                Some("main"),
+                Some("goal-status-accounting".to_owned()),
+                "provider",
+            )
+            .unwrap();
+        let controller = GoalController::new(Arc::new(
+            crate::control_plane::SqliteTaskStore::new_in_memory().unwrap(),
+        ))
+        .with_cost_tracker(tracker);
+        let task = TaskRecord {
+            id: "goal-status-accounting".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Failed,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+
+        let projection = controller
+            .projection_from_parts(
+                &task,
+                GoalTaskRecord {
+                    task_id: task.id.clone(),
+                    accounting_state: GoalAccountingState::Missing,
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await;
+
+        assert_eq!(projection.recorded_tokens, Some(1_200));
+        assert!((projection.recorded_cost_usd.unwrap() - 0.006).abs() < f64::EPSILON);
+        assert!(!projection.recorded_usage_incomplete);
+        assert_eq!(projection.accounting_state, GoalAccountingState::Missing);
+    }
+
+    #[test]
+    fn status_projection_marks_partial_ledger_totals() {
+        let task = TaskRecord {
+            id: "goal-status-accounting".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let projection = GoalStatusProjection::from_parts(
+            &task,
+            GoalTaskRecord {
+                task_id: task.id.clone(),
+                ..GoalTaskRecord::default()
+            },
+        )
+        .with_recorded_usage(Some(zeroclaw_config::cost::TaskUsageTotals {
+            total_tokens: 1_200,
+            cost_usd: 0.006,
+            records_complete: false,
+        }));
+
+        assert_eq!(projection.recorded_tokens, Some(1_200));
+        assert!((projection.recorded_cost_usd.unwrap() - 0.006).abs() < f64::EPSILON);
+        assert!(projection.recorded_usage_incomplete);
     }
 
     #[test]

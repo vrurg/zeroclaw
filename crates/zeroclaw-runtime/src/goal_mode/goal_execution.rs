@@ -954,7 +954,12 @@ impl GoalExecutionSupervisor {
         } else {
             None
         };
-        let projection = super::GoalStatusProjection::from_parts(&current, goal)
+        let projection = self
+            .engine
+            .runtime
+            .controller
+            .projection_from_parts(&current, goal)
+            .await
             .with_durable_terminal_reason(terminal_reason.as_deref());
         Ok(Some(match current.status {
             TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
@@ -1089,6 +1094,7 @@ impl GoalExecutionEngine {
             !agent_alias.trim().is_empty(),
             "Goal execution agent alias must be nonblank"
         );
+        let runtime = runtime.with_cost_tracker(Arc::clone(&tracker));
         Ok(Self {
             registry: Arc::clone(&runtime.controller.registry),
             runtime,
@@ -2618,6 +2624,33 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history.last().unwrap().role, "assistant");
         assert_eq!(history.last().unwrap().content, "answer");
+    }
+
+    #[test]
+    fn engine_constructor_attaches_its_ledger_to_status_projection() {
+        let directory = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(Arc::new(SqliteTaskStore::new_in_memory().unwrap())),
+            tracker,
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        assert!(
+            engine.runtime.controller.cost_tracker.is_some(),
+            "the public engine constructor must not bypass ledger-backed status projection"
+        );
     }
 
     #[test]

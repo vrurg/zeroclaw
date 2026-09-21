@@ -13,12 +13,20 @@ pub struct GoalStatusProjection {
     pub execution_epoch: i64,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub recorded_tokens: Option<u64>,
+    #[serde(default)]
+    pub recorded_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub recorded_usage_incomplete: bool,
     pub accounting_state: String,
     pub pause_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -73,6 +81,9 @@ mod goal_wire_tests {
         assert!(projection.blocker_messages.is_empty());
         assert_eq!(projection.terminal_reason, None);
         assert_eq!(projection.terminal_provider, None);
+        assert_eq!(projection.recorded_tokens, None);
+        assert_eq!(projection.recorded_cost_usd, None);
+        assert!(!projection.recorded_usage_incomplete);
     }
 
     #[test]
@@ -83,10 +94,14 @@ mod goal_wire_tests {
             execution_epoch: 4,
             token_limit: None,
             cost_limit_usd: None,
+            recorded_tokens: Some(0),
+            recorded_cost_usd: Some(0.0),
+            recorded_usage_incomplete: false,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             terminal_reason: None,
             terminal_provider: None,
+            terminal_detail: None,
             pause_description: None,
             blocker_messages: Vec::new(),
             resumable: true,
@@ -98,6 +113,7 @@ mod goal_wire_tests {
         assert!(raw.get("blocker_messages").is_none());
         assert!(raw.get("terminal_reason").is_none());
         assert!(raw.get("terminal_provider").is_none());
+        assert!(raw.get("terminal_detail").is_none());
     }
 }
 

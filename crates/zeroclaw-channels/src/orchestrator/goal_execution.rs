@@ -257,23 +257,17 @@ pub(super) async fn submit_matrix_goal(
     }
     let initial_notice = original;
     let initial_context = Arc::clone(&context);
-    let submission = supervisor
-        .submit_with_before_launch(settings, ingress, driver, command, move |response| {
-            let message = initial_notice.clone();
-            let context = Arc::clone(&initial_context);
-            let rendered = super::render_goal_response(response);
-            async move {
-                let channel = find_channel_for_message(&context.channels_by_name, &message)
-                    .context("Matrix Goal channel is no longer available")?;
-                channel
-                    .send(&zeroclaw_api::channel::SendMessage::reply_to(
-                        &message, rendered,
-                    ))
-                    .await
-                    .context("deliver Matrix Goal initial notice")
-            }
-        })
-        .await?;
+    let submission =
+        supervisor
+            .submit_with_before_launch(settings, ingress, driver, command, move |response| {
+                let message = initial_notice.clone();
+                let context = Arc::clone(&initial_context);
+                let rendered = super::render_goal_response(response);
+                async move {
+                    deliver_matrix_goal_initial_notice(context.as_ref(), &message, rendered).await
+                }
+            })
+            .await?;
     if submission.response().retires_resident_supervisor() {
         // Pause and cancellation drain the old worker before the supervisor
         // returns. Rebuilding on an explicit resume picks up live policy and
@@ -287,6 +281,21 @@ pub(super) async fn submit_matrix_goal(
             | zeroclaw_runtime::goal_mode::GoalResponse::Resumed(_)
     );
     Ok((response, initial_notice_delivered))
+}
+
+async fn deliver_matrix_goal_initial_notice(
+    context: &ChannelRuntimeContext,
+    message: &ChannelMessage,
+    rendered: String,
+) -> Result<()> {
+    let channel = find_channel_for_message(&context.channels_by_name, message)
+        .context("Matrix Goal channel is no longer available")?;
+    channel
+        .send(&zeroclaw_api::channel::SendMessage::reply_to(
+            message, rendered,
+        ))
+        .await
+        .context("deliver Matrix Goal initial notice")
 }
 
 /// Apply Matrix's `/stop` shortcut to a live Goal, if this exact conversation
@@ -1971,6 +1980,66 @@ mod tests {
         assert!(rendered.contains(
             "\n**Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue."
         ));
+    }
+
+    #[tokio::test]
+    async fn initial_goal_notice_delivers_incomplete_accounting_to_matrix() {
+        use zeroclaw_runtime::{
+            control_plane::{GoalAccountingState, TaskStatus},
+            goal_mode::{GoalResponse, GoalStatusProjection, GoalTerminalReason},
+        };
+
+        let channel = Arc::new(GoalPresentationChannel::new(false));
+        let channel_handle: Arc<dyn Channel> = channel.clone();
+        let mut context = super::super::tests::router_test_ctx_with_hooks(None);
+        Arc::get_mut(&mut context)
+            .expect("test context is unshared")
+            .channels_by_name = Arc::new(std::collections::HashMap::from([(
+            "matrix".to_owned(),
+            channel_handle,
+        )]));
+        let message = ChannelMessage::new(
+            "event",
+            "@user:example.test",
+            "!room:test",
+            "goal",
+            "matrix",
+            0,
+        );
+        let response = GoalResponse::Terminal(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Failed,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            recorded_tokens: Some(1_234),
+            recorded_cost_usd: Some(0.012345),
+            recorded_usage_incomplete: true,
+            accounting_state: GoalAccountingState::OutcomeUnknown,
+            pause_reason: None,
+            terminal_reason: Some(GoalTerminalReason::AccountingOutcomeUnknown),
+            terminal_provider: None,
+            terminal_detail: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: false,
+        });
+
+        deliver_matrix_goal_initial_notice(
+            context.as_ref(),
+            &message,
+            super::super::render_goal_response(&response),
+        )
+        .await
+        .expect("initial Goal notice reaches Matrix");
+
+        let events = channel.events.lock().await;
+        assert!(events.iter().any(|event| {
+            event.contains(
+                "**Accounting:** 1234 tokens · USD 0.012345 · usage may be incomplete · recorded usage may be incomplete"
+            )
+                && !event.contains("outcome_unknown")
+        }));
     }
 
     #[tokio::test]
