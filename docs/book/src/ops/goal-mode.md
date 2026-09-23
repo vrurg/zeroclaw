@@ -187,8 +187,12 @@ terminal audit record while the session still exists. Closing, deleting,
 killing, or truly replacing a session fences and disposes its Goal control
 state; the canonical usage ledger remains intact.
 
-If the admitted operation cannot settle while pausing, Goal Mode fails it
-closed as outcome-unknown instead of leaving a resumable paused Goal.
+If an admitted operation cannot settle while an explicit pause is draining,
+Goal Mode fails it closed as outcome-unknown rather than leaving a resumable
+paused Goal. The daemon-restart recovery rule below is narrower: it can pause
+an explicitly unlimited Goal after an interrupted provider operation, but never
+replays that operation. An unpaired tool-use/tool-result batch is always
+terminal and non-resumable.
 
 On daemon restart, settled running Goals pause and require an explicit resume.
 A reload first re-evaluates Goal policy. A reload that revokes a Goal, for
@@ -196,9 +200,11 @@ example by disabling Goal Mode or removing or disabling its owning agent or
 bound Matrix channel, durably cancels that Goal; later re-enablement cannot
 resume it. A reload that retains authorization pauses settled running Goals in
 the same way as restart. Goal Mode does not transfer an in-progress executor.
-If an operation was still unsettled, the Goal fails closed as outcome-unknown
-and is never replayed. Resuming can therefore repeat externally visible side
-effects; use it only when that is acceptable.
+An interrupted provider operation is never replayed: for explicitly unlimited
+Goals it remains outcome-unknown and pauses for explicit resume; finite-budget
+Goals fail closed because their next admission cannot enforce the budget.
+Resuming starts a successor operation and can therefore repeat externally
+visible side effects; use it only when that is acceptable.
 
 ## Budget and accounting
 

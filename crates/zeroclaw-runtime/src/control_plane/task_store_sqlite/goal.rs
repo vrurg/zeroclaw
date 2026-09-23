@@ -345,8 +345,11 @@ pub(super) fn converge_schema(conn: &Connection) -> Result<()> {
 
 impl SqliteTaskStore {
     /// Fence a Goal interrupted by a previous daemon without reconstructing its
-    /// process-local transcript. A pending operation is fail-closed; a settled
-    /// operation becomes resumable after restart.
+    /// process-local transcript. A settled operation becomes resumable after
+    /// restart. An interrupted provider operation is outcome-unknown: an
+    /// explicitly unlimited Goal may become resumable, while a finite-budget
+    /// Goal fails closed because its next admission can no longer enforce the
+    /// budget. Unpaired tool work is always terminal.
     pub fn reconcile_goal_boot_state(&self, boot_id: &str) -> Result<u64> {
         let mut conn = self.conn.lock();
         let recoverable_goals = {
@@ -466,35 +469,30 @@ impl SqliteTaskStore {
             )
             .context("clear classified interrupted terminal goal operation")?;
 
-        // A process restart interrupted this physical operation before the
-        // provider layer could publish an immutable attempt report.  Even an
-        // unlimited Goal cannot safely treat that as the same thing as a
-        // settled fallback with one unknown prior attempt: the operation
-        // itself has not been paired with a result at all.
-        let failed_unsettled = tx
-            .execute(
-                "UPDATE tasks
-                    SET status = 'failed', error = 'accounting_outcome_unknown',
-                        finished_at = COALESCE(finished_at, ?2),
-                        execution_epoch = CASE
-                            WHEN execution_epoch < 9223372036854775807
-                            THEN execution_epoch + 1
-                            ELSE execution_epoch
-                        END
-                  WHERE kind = 'goal' AND session_id IS NOT NULL
-                    AND owner_boot_id != ?1
-                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
-                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
-                                  AND owner_boot_id = tasks.owner_boot_id)
-                    AND status IN ('running', 'paused')
-                    AND EXISTS (
-                        SELECT 1 FROM goal_tasks
-                         WHERE task_id = tasks.id
-                           AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
-                    )",
-                params![boot_id, &now],
-            )
-            .context("fail interrupted Goal operation without a settled attempt report")?;
+        // The abandoned provider operation cannot be replayed because its
+        // result and exact spend are unknown.  An explicitly unlimited Goal
+        // may still continue after an operator resumes it: `outcome_unknown`
+        // preserves that uncertainty while the cleared fence prevents the old
+        // operation from being mistaken for the successor.  A finite-budget
+        // Goal deliberately keeps the fence here so the accounting transition
+        // below records its non-enforceable budget as terminal instead.
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pending_call_id = NULL, pending_call_epoch = NULL
+              WHERE task_id IN (
+                    SELECT id FROM tasks
+                     WHERE kind = 'goal' AND session_id IS NOT NULL
+                       AND owner_boot_id != ?1
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
+                       AND status IN ('running', 'paused')
+              ) AND accounting_state = 'outcome_unknown'
+                AND effective_token_limit IS NULL AND effective_cost_limit_usd IS NULL
+                AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
+            params![boot_id],
+        )
+        .context("clear resumable interrupted Goal operation")?;
 
         tx.execute(
             "UPDATE goal_tasks
@@ -662,7 +660,6 @@ impl SqliteTaskStore {
         tx.commit().context("commit goal boot reconciliation")?;
         Ok((missing_extension
             + failed_accounting
-            + failed_unsettled
             + failed_tool_pairing
             + cleared_terminal_pending
             + paused

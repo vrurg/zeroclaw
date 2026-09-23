@@ -1633,7 +1633,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
 }
 
 #[tokio::test]
-async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
+async fn boot_recovery_pauses_clean_and_unlimited_unsettled_goals() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize store");
     assert_eq!(
@@ -1654,6 +1654,21 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
             )
             .await
             .expect("create pending Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("limited", "limited-session"),
+                GoalTaskRecord {
+                    task_id: "limited".into(),
+                    objective: "produce a verified result".into(),
+                    effective_token_limit: Some(1),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .expect("create finite-budget Goal"),
         GoalTransitionResult::Applied
     );
     assert_eq!(
@@ -1682,6 +1697,13 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
     );
     assert_eq!(
         store
+            .admit_pending_operation("limited", "limited-session", 1, "operation-limited")
+            .await
+            .expect("admit finite-budget operation"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
             .settle_pending_operation(
                 "missing",
                 "missing-session",
@@ -1700,7 +1722,7 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         reopened
             .reconcile_goal_boot_state("boot-new")
             .expect("reconcile previous boot"),
-        3
+        4
     );
     let clean = reopened
         .current_goal_for_session("clean-session")
@@ -1721,7 +1743,8 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         .await
         .expect("read pending Goal")
         .expect("pending Goal exists");
-    assert_eq!(pending.status, TaskStatus::Failed);
+    assert_eq!(pending.status, TaskStatus::Paused);
+    assert_eq!(pending.execution_epoch, 2);
     let pending_extension = reopened
         .get_goal_task("pending")
         .await
@@ -1732,6 +1755,28 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         GoalAccountingState::OutcomeUnknown
     );
     assert!(pending_extension.pending_call_id.is_none());
+    assert_eq!(
+        pending_extension.pause_reason,
+        Some(GoalPauseReason::DaemonRestart)
+    );
+    assert_eq!(
+        reopened
+            .resume_session_goal("pending", "pending-session", 2, 2, "boot-new")
+            .await
+            .expect("resume post-restart unlimited Goal"),
+        GoalTransitionResult::Applied,
+        "manual resume starts a successor instead of replaying the interrupted operation"
+    );
+    assert_eq!(
+        reopened
+            .current_goal_for_session("limited-session")
+            .await
+            .expect("read finite-budget Goal")
+            .expect("finite-budget Goal exists")
+            .status,
+        TaskStatus::Failed,
+        "unknown spend remains terminal when a finite budget cannot be enforced"
+    );
     assert_eq!(
         reopened
             .terminal_reason_for_session_goal("missing", "missing-session")
