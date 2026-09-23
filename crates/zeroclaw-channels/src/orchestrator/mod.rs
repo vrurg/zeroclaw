@@ -719,7 +719,7 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
 fn render_goal_projection(
     projection: &zeroclaw_runtime::goal_mode::GoalStatusProjection,
 ) -> String {
-    use zeroclaw_runtime::control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus};
+    use zeroclaw_runtime::control_plane::{GoalAccountingState, TaskStatus};
     use zeroclaw_runtime::goal_mode::GoalTerminalReason;
 
     let token_limit = projection
@@ -866,18 +866,7 @@ fn render_goal_projection(
         ],
     ));
     if let Some(reason) = projection.pause_reason {
-        let reason = channel_runtime_cli_string(match reason {
-            GoalPauseReason::OperatorPaused => "goal-mode-pause-operator-paused",
-            GoalPauseReason::NeedsUserInput => "goal-mode-pause-needs-user-input",
-            GoalPauseReason::HumanEscalation => "goal-mode-pause-human-escalation",
-            GoalPauseReason::ExternalDependency => "goal-mode-pause-external-dependency",
-            GoalPauseReason::CoreInterrupted => "goal-mode-pause-core-interrupted",
-            GoalPauseReason::ProviderUnavailable => "goal-mode-pause-provider-unavailable",
-            GoalPauseReason::VerifierBlocked => "goal-mode-pause-verifier-blocked",
-            GoalPauseReason::BudgetExhausted => "goal-mode-pause-budget-exhausted",
-            GoalPauseReason::BudgetUnavailable => "goal-mode-pause-budget-unavailable",
-            GoalPauseReason::DaemonRestart => "goal-mode-pause-daemon-restarted",
-        });
+        let reason = channel_runtime_cli_string(goal_pause_reason_key(reason));
         message.push('\n');
         message.push_str(&channel_runtime_cli_string_with_args(
             "goal-mode-summary-pause",
@@ -899,6 +888,23 @@ fn render_goal_projection(
         ));
     }
     message
+}
+
+fn goal_pause_reason_key(reason: zeroclaw_runtime::control_plane::GoalPauseReason) -> &'static str {
+    use zeroclaw_runtime::control_plane::GoalPauseReason;
+
+    match reason {
+        GoalPauseReason::OperatorPaused => "goal-mode-pause-operator-paused",
+        GoalPauseReason::NeedsUserInput => "goal-mode-pause-needs-user-input",
+        GoalPauseReason::HumanEscalation => "goal-mode-pause-human-escalation",
+        GoalPauseReason::ExternalDependency => "goal-mode-pause-external-dependency",
+        GoalPauseReason::CoreInterrupted => "goal-mode-pause-core-interrupted",
+        GoalPauseReason::ProviderUnavailable => "goal-mode-pause-provider-unavailable",
+        GoalPauseReason::VerifierBlocked => "goal-mode-pause-verifier-blocked",
+        GoalPauseReason::BudgetExhausted => "goal-mode-pause-budget-exhausted",
+        GoalPauseReason::BudgetUnavailable => "goal-mode-pause-budget-unavailable",
+        GoalPauseReason::DaemonRestart => "goal-mode-pause-daemon-restarted",
+    }
 }
 
 #[cfg(test)]

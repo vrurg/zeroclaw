@@ -171,6 +171,24 @@ fn goal_accounting_state_message(state: &str) -> String {
     }
 }
 
+/// Render the controller-owned pause class without replaying an agent's
+/// already-presented question or report in Goal lifecycle chrome.
+fn goal_pause_reason_message(reason: Option<&str>) -> String {
+    crate::i18n::t(match reason {
+        Some("operator_paused") => "zc-goal-pause-operator-paused",
+        Some("needs_user_input") => "zc-goal-pause-needs-user-input",
+        Some("human_escalation") => "zc-goal-pause-human-escalation",
+        Some("external_dependency") => "zc-goal-pause-external-dependency",
+        Some("core_interrupted") => "zc-goal-pause-core-interrupted",
+        Some("provider_unavailable") => "zc-goal-pause-provider-unavailable",
+        Some("verifier_blocked") => "zc-goal-pause-verifier-blocked",
+        Some("budget_exhausted") => "zc-goal-pause-budget-exhausted",
+        Some("budget_unavailable") => "zc-goal-pause-budget-unavailable",
+        Some("daemon_restarted" | "daemon_restart") => "zc-goal-pause-daemon-restarted",
+        _ => "zc-goal-pause-unknown",
+    })
+}
+
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
     let token_limit = projection
         .token_limit
@@ -181,7 +199,10 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         .map(|value| format!("{value:.6}"))
         .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
     let accounting = goal_accounting_state_message(&projection.accounting_state);
-    let pause_reason = projection.pause_reason.as_deref();
+    let pause_reason = projection
+        .pause_reason
+        .as_deref()
+        .map(|reason| goal_pause_reason_message(Some(reason)));
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
     } else {
@@ -251,7 +272,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         message.push('\n');
         message.push_str(&crate::i18n::t_args(
             "zc-goal-summary-pause",
-            &[("pause_reason", pause_reason)],
+            &[("pause_reason", &pause_reason)],
         ));
     }
     if let Some(description) = projection.pause_description.as_deref() {
@@ -291,7 +312,10 @@ enum GoalUpdate<'a> {
     },
     PausedForBlocker {
         session_id: &'a str,
-        blocker_messages: Vec<&'a str>,
+        /// Optional for compatibility with a daemon from before pause causes
+        /// were carried over this notification. Unknown is still rendered as
+        /// a concise lifecycle classification rather than dropping the event.
+        pause_reason: Option<&'a str>,
     },
     PausedForInterruption {
         session_id: &'a str,
@@ -326,13 +350,9 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker {
             session_id,
-            blocker_messages: match payload.get("blocker_messages") {
-                Some(value) => value
-                    .as_array()?
-                    .iter()
-                    .map(serde_json::Value::as_str)
-                    .collect::<Option<Vec<_>>>()?,
-                None => Vec::new(),
+            pause_reason: match payload.get("pause_reason") {
+                Some(value) => Some(value.as_str()?),
+                None => None,
             },
         }),
         "paused_for_interruption" => Some(GoalUpdate::PausedForInterruption {
@@ -2480,24 +2500,17 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        GoalUpdate::PausedForBlocker {
-                            blocker_messages, ..
-                        } => {
+                        GoalUpdate::PausedForBlocker { pause_reason, .. } => {
                             // Preserve the ordinary agent question or report
                             // before the Goal lifecycle notice that reacts to it.
                             state.finish_goal_agent_presentation();
                             let mut message = crate::i18n::t("zc-goal-paused-blocked");
-                            if !blocker_messages.is_empty() {
-                                message.push('\n');
-                                message.push_str(&crate::i18n::t("zc-goal-paused-blocker-heading"));
-                                for blocker in blocker_messages {
-                                    message.push('\n');
-                                    message.push_str(&crate::i18n::t_args(
-                                        "zc-goal-paused-notice-blocker",
-                                        &[("blocker", blocker)],
-                                    ));
-                                }
-                            }
+                            let reason = goal_pause_reason_message(pause_reason);
+                            message.push('\n');
+                            message.push_str(&crate::i18n::t_args(
+                                "zc-goal-paused-reason",
+                                &[("reason", &reason)],
+                            ));
                             message.push('\n');
                             message.push_str(&crate::i18n::t("zc-goal-paused-blocked-next"));
                             for action_key in [
@@ -10850,7 +10863,7 @@ mod tests {
         assert!(rendered.contains(
             "Accounting: 1,234 tokens · USD 0.012345 · complete · recorded usage may be incomplete"
         ));
-        assert!(rendered.contains("Pause: needs_user_input"));
+        assert!(rendered.contains("Pause: user input is required"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
     }
@@ -10861,6 +10874,39 @@ mod tests {
         assert_eq!(format_goal_tokens(1_000), "1,000");
         assert_eq!(format_goal_tokens(59_875_761), "59,875,761");
         assert_eq!(format_goal_tokens(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn pause_reason_messages_cover_every_current_and_legacy_wire_spelling() {
+        for reason in [
+            "operator_paused",
+            "needs_user_input",
+            "human_escalation",
+            "external_dependency",
+            "core_interrupted",
+            "provider_unavailable",
+            "verifier_blocked",
+            "budget_exhausted",
+            "budget_unavailable",
+            "daemon_restarted",
+            "daemon_restart",
+        ] {
+            assert_ne!(
+                goal_pause_reason_message(Some(reason)),
+                crate::i18n::t("zc-goal-pause-unknown"),
+                "wire spelling {reason} must not silently degrade to the unknown pause reason"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_restart_pause_reason_uses_the_canonical_wire_spelling() {
+        let expected = crate::i18n::t("zc-goal-pause-daemon-restarted");
+        assert_eq!(
+            goal_pause_reason_message(Some("daemon_restarted")),
+            expected
+        );
+        assert_eq!(goal_pause_reason_message(Some("daemon_restart")), expected);
     }
 
     #[tokio::test]
@@ -22369,7 +22415,7 @@ mod tests {
                 params: serde_json::json!({
                     "paused_for_blocker": {
                         "session_id": "sess-1",
-                        "blocker_messages": ["Choose the target."]
+                        "pause_reason": "needs_user_input"
                     }
                 }),
             })
@@ -22513,7 +22559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_goal_update_displays_the_verifier_blocker() {
+    async fn blocked_goal_update_displays_the_pause_reason_without_repeating_the_agent_report() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
         let (notif_tx, notif_rx) = broadcast::channel(1);
@@ -22524,10 +22570,7 @@ mod tests {
                 params: serde_json::json!({
                     "paused_for_blocker": {
                         "session_id": "sess-1",
-                        "blocker_messages": [
-                            "Provide the task packet reference.",
-                            "State its scope."
-                        ]
+                        "pause_reason": "needs_user_input"
                     }
                 }),
             })
@@ -22540,16 +22583,15 @@ mod tests {
         let ChatEntry::SystemMessage(text) = &entries[0] else {
             panic!("expected blocked Goal system message");
         };
-        assert!(
-            text.contains("\nBlocker:\n• Provide the task packet reference.\n• State its scope.")
-        );
+        assert!(text.contains("\nReason: user input is required"));
+        assert!(!text.contains("Provide the task packet reference."));
         assert!(text.contains(
-            "\nNext: Resolve the blocker, then run /goal resume [RESPONSE] to continue."
+            "\nNext: Address this reason, then run /goal resume [RESPONSE] to continue."
         ));
     }
 
     #[tokio::test]
-    async fn blocked_goal_update_without_blockers_stays_compatible_and_compact() {
+    async fn legacy_blocked_goal_update_stays_compatible_and_uses_a_generic_reason() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
         let (notif_tx, notif_rx) = broadcast::channel(1);
@@ -22570,19 +22612,19 @@ mod tests {
         let ChatEntry::SystemMessage(text) = &entries[0] else {
             panic!("expected blocked Goal system message");
         };
-        assert!(!text.contains("\nBlocker:"));
+        assert!(text.contains("\nReason: requires attention"));
         assert!(text.contains(
-            "\nNext: Resolve the blocker, then run /goal resume [RESPONSE] to continue."
+            "\nNext: Address this reason, then run /goal resume [RESPONSE] to continue."
         ));
     }
 
     #[test]
-    fn malformed_blocker_messages_goal_update_is_rejected() {
+    fn malformed_pause_reason_goal_update_is_rejected() {
         assert!(
             parse_goal_update(&serde_json::json!({
                 "paused_for_blocker": {
                     "session_id": "sess-1",
-                    "blocker_messages": "not an array"
+                    "pause_reason": ["not a string"]
                 }
             }))
             .is_none()

@@ -317,8 +317,11 @@ rpc_type! {
         Completed { session_id: String },
         PausedForBlocker {
             session_id: String,
-            #[serde(default)]
-            blocker_messages: Vec<String>,
+            /// Stable lifecycle cause. Optional for clients decoding a
+            /// notification emitted before this field existed; the ordinary
+            /// agent response carries any question or requested action.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pause_reason: Option<crate::control_plane::GoalPauseReason>,
         },
         PausedForInterruption {
             session_id: String,

@@ -1446,14 +1446,14 @@ impl GoalExecutionEngine {
                     "The agent requested user input.".to_owned(),
                     vec![GoalBlocker {
                         kind: GoalBlockerKind::NeedsUserInput,
-                        message: request_message.clone(),
+                        message: request_message,
                         payload: None,
                     }],
                 )
                 .await?;
                 lease
                     .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
-                        blocker_messages: vec![request_message],
+                        pause_reason: GoalPauseReason::NeedsUserInput,
                     })
                     .await?;
                 return Ok(GoalExecutionOutcome::Paused);
@@ -1468,7 +1468,6 @@ impl GoalExecutionEngine {
                     GoalBlockerKind::ExternalDependency => GoalPauseReason::ExternalDependency,
                     _ => bail!("Goal blocker certificate has an unsupported pause kind"),
                 };
-                let message = certificate.message;
                 append_candidate_if_missing(&mut working_history, &candidate);
                 *paused_transcript.lock().await = Some(GoalRetainedTranscript {
                     working_history,
@@ -1480,15 +1479,13 @@ impl GoalExecutionEngine {
                     "The agent reported a Goal blocker.".to_owned(),
                     vec![GoalBlocker {
                         kind: certificate.kind,
-                        message: message.clone(),
+                        message: certificate.message,
                         payload: None,
                     }],
                 )
                 .await?;
                 lease
-                    .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
-                        blocker_messages: vec![message],
-                    })
+                    .publish_goal_notice(GoalExecutionNotice::PausedForBlocker { pause_reason })
                     .await?;
                 return Ok(GoalExecutionOutcome::Paused);
             }
@@ -1557,26 +1554,36 @@ impl GoalExecutionEngine {
                     parent_turn_kind = super::GoalParentTurnKind::Continue;
                 }
                 Ok(VerifierDecision::Blocked { reason, blockers }) => {
-                    let blocker_messages = blockers
-                        .iter()
-                        .map(|blocker| blocker.message.clone())
-                        .collect();
+                    let pause_reason = match blockers.as_slice() {
+                        [
+                            GoalBlocker {
+                                kind: GoalBlockerKind::NeedsUserInput,
+                                ..
+                            },
+                        ] => GoalPauseReason::NeedsUserInput,
+                        [
+                            GoalBlocker {
+                                kind: GoalBlockerKind::HumanEscalation,
+                                ..
+                            },
+                        ] => GoalPauseReason::HumanEscalation,
+                        [
+                            GoalBlocker {
+                                kind: GoalBlockerKind::ExternalDependency,
+                                ..
+                            },
+                        ] => GoalPauseReason::ExternalDependency,
+                        _ => bail!("Goal verifier returned an unsupported blocker kind"),
+                    };
                     append_candidate_if_missing(&mut working_history, &candidate);
                     *paused_transcript.lock().await = Some(GoalRetainedTranscript {
                         working_history,
                         canonical_history,
                     });
-                    self.pause_for_blockers(
-                        scope,
-                        GoalPauseReason::VerifierBlocked,
-                        reason,
-                        blockers,
-                    )
-                    .await?;
+                    self.pause_for_blockers(scope, pause_reason, reason, blockers)
+                        .await?;
                     lease
-                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
-                            blocker_messages,
-                        })
+                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker { pause_reason })
                         .await?;
                     return Ok(GoalExecutionOutcome::Paused);
                 }
@@ -1810,11 +1817,7 @@ impl GoalExecutionEngine {
         }
         lease
             .publish_goal_notice(GoalExecutionNotice::PausedForBlocker {
-                blocker_messages: goal
-                    .blockers
-                    .into_iter()
-                    .map(|blocker| blocker.message)
-                    .collect(),
+                pause_reason: GoalPauseReason::BudgetExhausted,
             })
             .await?;
         Ok(true)
@@ -2721,9 +2724,7 @@ mod tests {
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
             &[GoalExecutionNotice::PausedForBlocker {
-                blocker_messages: vec![
-                    "Which implementation should I use? — 1. A / 2. B".to_owned()
-                ],
+                pause_reason: GoalPauseReason::NeedsUserInput,
             }]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
@@ -2992,7 +2993,7 @@ mod tests {
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
             &[GoalExecutionNotice::PausedForBlocker {
-                blocker_messages: vec!["Choose A or B".to_owned()],
+                pause_reason: GoalPauseReason::NeedsUserInput,
             }]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
@@ -3221,9 +3222,7 @@ mod tests {
         assert_eq!(
             lease.notices.lock().unwrap().as_slice(),
             &[GoalExecutionNotice::PausedForBlocker {
-                blocker_messages: vec![
-                    "Increase the Goal budget, then resume explicitly.".to_owned()
-                ],
+                pause_reason: GoalPauseReason::BudgetExhausted,
             }]
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();

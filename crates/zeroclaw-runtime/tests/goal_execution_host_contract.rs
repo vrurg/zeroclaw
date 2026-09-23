@@ -2486,7 +2486,7 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
 }
 
 #[tokio::test]
-async fn verifier_blocked_notice_carries_the_parsed_blockers() {
+async fn verifier_blocked_notice_carries_the_parsed_pause_reason() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
@@ -2546,7 +2546,7 @@ async fn verifier_blocked_notice_carries_the_parsed_blockers() {
     assert_eq!(
         notices.lock().unwrap().as_slice(),
         &[GoalExecutionNotice::PausedForBlocker {
-            blocker_messages: vec!["Provide the task packet reference.".to_owned()],
+            pause_reason: GoalPauseReason::NeedsUserInput,
         }]
     );
 }

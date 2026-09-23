@@ -1633,22 +1633,17 @@ fn goal_notice_message(notice: GoalExecutionNotice) -> String {
         GoalExecutionNotice::Completed => {
             zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-completed")
         }
-        GoalExecutionNotice::PausedForBlocker { blocker_messages } => {
+        GoalExecutionNotice::PausedForBlocker { pause_reason } => {
             let mut message =
                 zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-paused-blocked");
-            if !blocker_messages.is_empty() {
-                message.push('\n');
-                message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
-                    "goal-mode-paused-blocker-heading",
-                ));
-                for blocker in blocker_messages {
-                    message.push('\n');
-                    message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                        "goal-mode-paused-notice-blocker",
-                        &[("blocker", blocker.as_str())],
-                    ));
-                }
-            }
+            let reason = zeroclaw_runtime::i18n::get_required_cli_string(
+                super::goal_pause_reason_key(pause_reason),
+            );
+            message.push('\n');
+            message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "goal-mode-paused-reason",
+                &[("reason", reason.as_str())],
+            ));
             message.push('\n');
             message.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
                 "goal-mode-paused-blocked-next",
@@ -1969,16 +1964,16 @@ mod tests {
     }
 
     #[test]
-    fn blocked_notice_includes_the_verifier_blocker() {
+    fn blocked_notice_explains_the_pause_without_repeating_the_agent_report() {
         let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
-            blocker_messages: vec!["Provide the task packet reference.".to_owned()],
+            pause_reason: zeroclaw_runtime::control_plane::GoalPauseReason::NeedsUserInput,
         });
 
         assert!(rendered.starts_with("⏸️ Goal paused."));
-        assert!(rendered.contains("\n**Blocker:**\n• Provide the task packet reference."));
-        assert!(!rendered.contains("verifier requires resolution"));
+        assert!(rendered.contains("\n**Reason:** waiting for your input"));
+        assert!(!rendered.contains("Provide the task packet reference."));
         assert!(rendered.contains(
-            "\n**Next:** Resolve the blocker, then run `/goal resume [RESPONSE]` to continue."
+            "\n**Next:** Address this reason, then run `/goal resume [RESPONSE]` to continue."
         ));
     }
 
@@ -2111,13 +2106,13 @@ mod tests {
     }
 
     #[test]
-    fn blocked_notice_without_blocker_details_stays_compact() {
+    fn external_dependency_notice_explains_the_pause() {
         let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
-            blocker_messages: Vec::new(),
+            pause_reason: zeroclaw_runtime::control_plane::GoalPauseReason::ExternalDependency,
         });
 
         assert!(rendered.starts_with("⏸️ Goal paused."));
-        assert!(!rendered.contains("**Blocker:**"));
+        assert!(rendered.contains("**Reason:** waiting for an external dependency"));
         assert!(rendered.contains("\n**Next:**"));
     }
 
@@ -2127,23 +2122,16 @@ mod tests {
 
         assert!(rendered.starts_with("⏸️ Goal paused after a recoverable agent interruption."));
         assert!(rendered.contains("**Next:** Run `/goal resume`"));
-        assert!(!rendered.contains("**Blocker:**"));
+        assert!(!rendered.contains("**Reason:**"));
     }
 
     #[test]
-    fn blocked_notice_renders_each_blocker_as_a_uniform_localized_item() {
+    fn budget_notice_explains_the_controller_owned_reason() {
         let rendered = goal_notice_message(GoalExecutionNotice::PausedForBlocker {
-            blocker_messages: vec![
-                "Provide the task packet reference.".to_owned(),
-                "State its scope.".to_owned(),
-            ],
+            pause_reason: zeroclaw_runtime::control_plane::GoalPauseReason::BudgetExhausted,
         });
 
-        assert!(
-            rendered.contains(
-                "\n**Blocker:**\n• Provide the task packet reference.\n• State its scope."
-            )
-        );
+        assert!(rendered.contains("\n**Reason:** budget exhausted"));
     }
 
     #[test]

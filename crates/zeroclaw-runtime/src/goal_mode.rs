@@ -687,7 +687,10 @@ pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
 pub enum GoalExecutionNotice {
     Completed,
     PausedForBlocker {
-        blocker_messages: Vec<String>,
+        /// Stable, controller-owned explanation for the pause. The ordinary
+        /// agent report has already reached the presentation surface and must
+        /// not be restated or paraphrased by this lifecycle notice.
+        pause_reason: GoalPauseReason,
     },
     /// A normal agent-core interruption was safely paired and left the Goal
     /// resumable. This is not a user-action blocker. The driver presents the

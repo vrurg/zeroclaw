@@ -391,10 +391,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             GoalExecutionNotice::Completed => crate::rpc::types::SessionGoalUpdate::Completed {
                 session_id: self.raw_session_id()?.to_owned(),
             },
-            GoalExecutionNotice::PausedForBlocker { blocker_messages } => {
+            GoalExecutionNotice::PausedForBlocker { pause_reason } => {
                 crate::rpc::types::SessionGoalUpdate::PausedForBlocker {
                     session_id: self.raw_session_id()?.to_owned(),
-                    blocker_messages,
+                    pause_reason: Some(pause_reason),
                 }
             }
             GoalExecutionNotice::PausedForInterruption => {
