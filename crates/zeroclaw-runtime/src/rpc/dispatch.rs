@@ -3666,7 +3666,7 @@ impl RpcDispatcher {
             .ctx
             .sessions
             .session_queue
-            .generation(&req.session_id)
+            .lifecycle_generation(&req.session_id)
             .await;
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
@@ -3688,7 +3688,7 @@ impl RpcDispatcher {
                 .ctx
                 .sessions
                 .session_queue
-                .generation(&req.session_id)
+                .lifecycle_generation(&req.session_id)
                 .await
                 != expected_queue_generation
         {
@@ -3781,7 +3781,12 @@ impl RpcDispatcher {
             .get_generation(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
+        let expected_queue_generation = self
+            .ctx
+            .sessions
+            .session_queue
+            .lifecycle_generation(sid)
+            .await;
         let chat_mode = self
             .ctx
             .sessions
@@ -3810,7 +3815,13 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         if self.ctx.sessions.get_generation(sid).await != Some(expected_generation)
-            || self.ctx.sessions.session_queue.generation(sid).await != expected_queue_generation
+            || self
+                .ctx
+                .sessions
+                .session_queue
+                .lifecycle_generation(sid)
+                .await
+                != expected_queue_generation
         {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
@@ -4453,7 +4464,12 @@ impl RpcDispatcher {
             .get_generation(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
+        let expected_queue_generation = self
+            .ctx
+            .sessions
+            .session_queue
+            .lifecycle_generation(sid)
+            .await;
 
         // Admit before reading mutable session metadata. Session replacement
         // (session/new and rehydration insert) uses the same queue, so the
@@ -4491,7 +4507,13 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         if session_generation != expected_session_generation
-            || self.ctx.sessions.session_queue.generation(sid).await != expected_queue_generation
+            || self
+                .ctx
+                .sessions
+                .session_queue
+                .lifecycle_generation(sid)
+                .await
+                != expected_queue_generation
         {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
@@ -5731,7 +5753,7 @@ impl RpcDispatcher {
             .ctx
             .sessions
             .session_queue
-            .generation(&req.session_id)
+            .lifecycle_generation(&req.session_id)
             .await;
         // The first PR owns only Chat deletion. Reject ACP before triggering a
         // cancellation so an unsupported lifecycle request cannot disrupt a
@@ -5799,7 +5821,7 @@ impl RpcDispatcher {
                 .ctx
                 .sessions
                 .session_queue
-                .generation(&req.session_id)
+                .lifecycle_generation(&req.session_id)
                 .await
                 != expected_queue_generation
         {
@@ -20578,7 +20600,7 @@ mod tests {
             .await
             .expect("predecessor session/new should succeed");
         let predecessor_generation = sessions.get_generation(sid).await;
-        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.lifecycle_generation(sid).await;
 
         let error = dispatcher
             .handle_session_new_for_test(&json!({
@@ -20591,7 +20613,7 @@ mod tests {
         assert_eq!(error.code, INVALID_PARAMS);
         assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
         assert_eq!(
-            sessions.session_queue.generation(sid).await,
+            sessions.session_queue.lifecycle_generation(sid).await,
             predecessor_queue_generation,
             "a failed replacement must not invalidate the predecessor queue incarnation"
         );
@@ -20626,7 +20648,7 @@ mod tests {
             .await
             .expect("predecessor session/new should succeed");
         let predecessor_generation = sessions.get_generation(sid).await;
-        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.lifecycle_generation(sid).await;
 
         let error = dispatcher
             .handle_session_new_for_test(&json!({
@@ -20638,7 +20660,7 @@ mod tests {
         assert_eq!(error.code, SESSION_LIMIT_REACHED);
         assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
         assert_eq!(
-            sessions.session_queue.generation(sid).await,
+            sessions.session_queue.lifecycle_generation(sid).await,
             predecessor_queue_generation,
             "a rejected replacement must not invalidate the predecessor queue incarnation"
         );
@@ -20673,7 +20695,7 @@ mod tests {
             .await
             .expect("chat predecessor session/new should succeed");
         let predecessor_generation = sessions.get_generation(sid).await;
-        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.lifecycle_generation(sid).await;
 
         let error = dispatcher
             .handle_session_new_for_test(&json!({
@@ -20686,7 +20708,7 @@ mod tests {
         assert_eq!(error.code, INTERNAL_ERROR);
         assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
         assert_eq!(
-            sessions.session_queue.generation(sid).await,
+            sessions.session_queue.lifecycle_generation(sid).await,
             predecessor_queue_generation,
             "a failed ACP replacement must not invalidate the Chat predecessor"
         );
@@ -20874,7 +20896,7 @@ mod tests {
                 .ctx
                 .sessions
                 .session_queue
-                .generation("reaped-chat")
+                .lifecycle_generation("reaped-chat")
                 .await,
             0,
             "a failed durable delete must not publish a lifecycle invalidation"
@@ -20904,7 +20926,7 @@ mod tests {
             .await
             .expect("session/new should succeed");
         let generation = sessions.get_generation(sid).await;
-        let queue_generation = sessions.session_queue.generation(sid).await;
+        let queue_generation = sessions.session_queue.lifecycle_generation(sid).await;
         let token = tokio_util::sync::CancellationToken::new();
         let _registration = sessions.register_cancel_token_guard_at_session_generation(
             sid,
@@ -20919,7 +20941,7 @@ mod tests {
         assert_eq!(error.code, INTERNAL_ERROR);
         assert_eq!(sessions.get_generation(sid).await, generation);
         assert_eq!(
-            sessions.session_queue.generation(sid).await,
+            sessions.session_queue.lifecycle_generation(sid).await,
             queue_generation
         );
         assert!(
@@ -21311,7 +21333,7 @@ mod tests {
             .expect_err("missing session kill must fail");
 
         assert_eq!(error.code, SESSION_NOT_FOUND);
-        assert_eq!(sessions.session_queue.generation(sid).await, 0);
+        assert_eq!(sessions.session_queue.lifecycle_generation(sid).await, 0);
     }
 
     #[tokio::test]
@@ -21330,7 +21352,7 @@ mod tests {
             .await
             .expect("chat session/new should succeed");
         let generation = sessions.get_generation(sid).await;
-        let queue_generation = sessions.session_queue.generation(sid).await;
+        let queue_generation = sessions.session_queue.lifecycle_generation(sid).await;
 
         let error = dispatcher
             .handle_session_delete(&json!({"session_id": sid, "chat_mode": "acp"}))
@@ -21339,7 +21361,7 @@ mod tests {
         assert_eq!(error.code, INVALID_PARAMS);
         assert_eq!(sessions.get_generation(sid).await, generation);
         assert_eq!(
-            sessions.session_queue.generation(sid).await,
+            sessions.session_queue.lifecycle_generation(sid).await,
             queue_generation
         );
         assert!(

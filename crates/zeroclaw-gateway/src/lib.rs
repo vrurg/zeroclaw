@@ -3759,7 +3759,7 @@ async fn run_gateway_chat_streaming_response(
             )
         }
     };
-    let session_generation = state.session_queue.generation(&session_key).await;
+    let session_generation = state.session_queue.lifecycle_generation(&session_key).await;
     register_cancel_token(
         &state.cancel_tokens,
         &cancel_key,

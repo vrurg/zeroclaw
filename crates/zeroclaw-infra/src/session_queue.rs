@@ -129,7 +129,7 @@ impl SessionActorQueue {
     }
 
     /// Return the current lifecycle incarnation for a session key.
-    pub async fn generation(&self, session_id: &str) -> u64 {
+    pub async fn lifecycle_generation(&self, session_id: &str) -> u64 {
         self.generations
             .lock()
             .await
@@ -350,18 +350,18 @@ mod tests {
     #[tokio::test]
     async fn invalidation_advances_the_session_incarnation() {
         let queue = SessionActorQueue::new(8, 5, 600);
-        assert_eq!(queue.generation("s1").await, 0);
+        assert_eq!(queue.lifecycle_generation("s1").await, 0);
         let guard = queue.acquire("s1").await.unwrap();
         assert_eq!(queue.invalidate("s1").await, 1);
         drop(guard);
-        assert_eq!(queue.generation("s1").await, 1);
+        assert_eq!(queue.lifecycle_generation("s1").await, 1);
     }
 
     #[tokio::test]
-    async fn generation_reads_do_not_retain_unseen_session_ids() {
+    async fn lifecycle_generation_reads_do_not_retain_unseen_session_ids() {
         let queue = SessionActorQueue::new(8, 5, 600);
         for i in 0..128 {
-            assert_eq!(queue.generation(&format!("unseen-{i}")).await, 0);
+            assert_eq!(queue.lifecycle_generation(&format!("unseen-{i}")).await, 0);
         }
         assert!(queue.generations.lock().await.is_empty());
     }
@@ -409,7 +409,7 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.await.unwrap(), Some(1));
         assert_eq!(invalidation.await.unwrap(), 2);
-        assert_eq!(queue.generation("s1").await, 2);
+        assert_eq!(queue.lifecycle_generation("s1").await, 2);
     }
 
     #[tokio::test]
@@ -421,7 +421,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(queue.evict_idle().await, 1);
-        assert_eq!(queue.generation("deleted-session").await, 0);
+        assert_eq!(queue.lifecycle_generation("deleted-session").await, 0);
         assert!(queue.generations.lock().await.is_empty());
     }
 
@@ -435,11 +435,11 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(queue.evict_idle().await, 0);
-        assert_eq!(queue.generation("connected-session").await, 1);
+        assert_eq!(queue.lifecycle_generation("connected-session").await, 1);
 
         drop(lease);
         assert_eq!(queue.evict_idle().await, 1);
-        assert_eq!(queue.generation("connected-session").await, 0);
+        assert_eq!(queue.lifecycle_generation("connected-session").await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -480,10 +480,10 @@ mod tests {
 
         let lease = retain.await.unwrap();
         assert_eq!(eviction.await.unwrap(), 0);
-        assert_eq!(queue.generation("connected-session").await, 1);
+        assert_eq!(queue.lifecycle_generation("connected-session").await, 1);
         drop(lease);
         assert_eq!(queue.evict_idle().await, 1);
-        assert_eq!(queue.generation("connected-session").await, 0);
+        assert_eq!(queue.lifecycle_generation("connected-session").await, 0);
     }
 
     #[tokio::test]

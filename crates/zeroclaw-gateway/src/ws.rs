@@ -485,7 +485,7 @@ async fn handle_socket(
     // DELETE advances this queue-owned value while holding the same queue.
     // This connection can therefore never write into a successor that reuses
     // its caller-selected session ID.
-    let session_generation = state.session_queue.generation(&session_key).await;
+    let session_generation = state.session_queue.lifecycle_generation(&session_key).await;
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -789,7 +789,9 @@ async fn handle_socket(
                             return;
                         }
                     };
-                    if state.session_queue.generation(&session_key).await != session_generation {
+                    if state.session_queue.lifecycle_generation(&session_key).await
+                        != session_generation
+                    {
                         let err = serde_json::json!({
                             "type": "error",
                             "message": "Session not found",
@@ -980,7 +982,7 @@ async fn handle_socket(
                         continue;
                     }
                 };
-                if state.session_queue.generation(&session_key).await != session_generation
+                if state.session_queue.lifecycle_generation(&session_key).await != session_generation
                 {
                     let err = serde_json::json!({
                         "type": "error",
@@ -3965,7 +3967,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .acquire(session_key)
             .await
             .expect("WebSocket turn admission");
-        let generation = state.session_queue.generation(session_key).await;
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
         let cancellation = GatewayCancelTokenRegistration::register(
             &state,
             session_key,
@@ -4033,7 +4035,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .acquire(session_key)
             .await
             .expect("WebSocket turn admission");
-        let generation = state.session_queue.generation(session_key).await;
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
 
         let delete =
             crate::api::signal_gateway_deletion_at_generation(&state, session_key, generation);
@@ -4084,7 +4086,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .acquire(session_key)
             .await
             .expect("dotted WebSocket turn admission");
-        let generation = state.session_queue.generation(session_key).await;
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
         let delete =
             crate::api::signal_gateway_deletion_at_generation(&state, session_key, generation);
         let registration = GatewayCancelTokenRegistration::register(

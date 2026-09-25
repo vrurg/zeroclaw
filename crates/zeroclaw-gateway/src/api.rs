@@ -1908,7 +1908,7 @@ pub async fn handle_api_session_message_post(
     // Deletion shares this queue. Re-check after waiting so a queued POST
     // cannot recreate metadata that DELETE removed while it was pending.
     if !backend.session_exists(&session_key)
-        || state.session_queue.generation(&session_key).await != expected_generation
+        || state.session_queue.lifecycle_generation(&session_key).await != expected_generation
     {
         return (
             StatusCode::NOT_FOUND,
@@ -2024,7 +2024,7 @@ pub async fn handle_api_session_delete(
     };
 
     if !backend.session_exists(&session_key)
-        || state.session_queue.generation(&session_key).await != expected_generation
+        || state.session_queue.lifecycle_generation(&session_key).await != expected_generation
     {
         return (
             StatusCode::NOT_FOUND,
