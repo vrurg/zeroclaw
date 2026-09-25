@@ -28911,6 +28911,14 @@ BTC is currently around $65,000 based on latest tool output."#
                 "a failed durable reset must leave the in-memory session intact; \
                  session_prompts_enabled={session_prompts_enabled}"
             );
+            assert!(
+                !ctx.pending_new_sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&history_key),
+                "a failed durable reset must not mark the sender fresh; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
             assert_eq!(
                 backend.list_session_prompts(&history_key).unwrap().len(),
                 1,
