@@ -932,7 +932,10 @@ mod payload_capture_tests {
         let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
         let expected = prefix_fingerprint(&history, Some(&tools));
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(
             &ctx,
             &history,

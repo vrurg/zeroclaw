@@ -3559,11 +3559,11 @@ mod surface3_tests {
     }
 
     #[test]
-    fn tool_protocol_framings_have_equal_byte_length() {
+    fn tool_protocol_framings_have_equal_char_length() {
         assert_eq!(
-            NATIVE_TOOLS_TASK_FRAMING.len(),
-            NO_TOOLS_TASK_FRAMING.len(),
-            "post-budget anchor refresh must not change prompt length"
+            NATIVE_TOOLS_TASK_FRAMING.chars().count(),
+            NO_TOOLS_TASK_FRAMING.chars().count(),
+            "post-budget anchor refresh must not change prompt character count"
         );
     }
 

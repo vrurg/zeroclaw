@@ -3944,19 +3944,21 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        // Nested delegations compose several scoped futures; keep the turn
+        // future off the test/runtime thread stack before adding this scope.
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
                         params.native_thinking,
                         zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                            .scope(false, delegated_turn),
+                            .scope(false, Box::pin(delegated_turn)),
                     )
                     .await
             }
             None => {
                 zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                    .scope(false, delegated_turn)
+                    .scope(false, Box::pin(delegated_turn))
                     .await
             }
         };
