@@ -442,6 +442,14 @@ sections! {
                 Mutual opt-in: two agents become peers only when both appear in the \
                 same group's `agents` list.",
     },
+    DecisionModels => {
+        key:   "decision_models",
+        shape: OneTierAliasMap,
+        group: Agent,
+        help:  "Typed-decision models an SOP can select to gate its triggers and \
+                choose each run's execution mode: TypeSafe Jev (hosted), a \
+                self-hosted Laya, or a custom endpoint.",
+    },
     Cron => {
         key:   "cron",
         shape: OneTierAliasMap,
@@ -542,6 +550,7 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         | Section::SessionPromptApproval
         | Section::PeerGroups
         | Section::Storage
+        | Section::DecisionModels
         | Section::Cron
         | Section::Mcp
         | Section::McpBundles
@@ -625,6 +634,7 @@ mod tests {
         let paths: std::collections::BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
         let alias_map_sections = [
             Section::PeerGroups,
+            Section::DecisionModels,
             Section::Cron,
             Section::McpServers,
             Section::McpBundles,

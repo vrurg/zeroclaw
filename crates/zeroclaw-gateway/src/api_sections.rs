@@ -494,6 +494,7 @@ fn picker_items_for(
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -935,6 +936,7 @@ pub async fn handle_section_select(
         }
         Section::Agents
         | Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -1495,6 +1497,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
         }
     }
 
