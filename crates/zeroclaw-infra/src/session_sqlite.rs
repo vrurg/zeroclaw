@@ -995,7 +995,7 @@ impl SessionBackend for SqliteSessionBackend {
             )
             .map_err(std::io::Error::other)?;
         transaction.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
             params![Utc::now().to_rfc3339(), session_key],
         ).map_err(std::io::Error::other)?;
         transaction.commit().map_err(std::io::Error::other)?;
@@ -1953,6 +1953,64 @@ mod tests {
             .unwrap();
         assert!(backend.delete_session("reset").unwrap());
         assert!(backend.list_session_prompts("reset").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_session_clears_trim_breadcrumb_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        assert_eq!(backend.reset_session("session").unwrap(), 1);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            None
+        );
+
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        assert_eq!(backend.reset_session("session").unwrap(), 0);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_session_rolls_back_transcript_prompts_and_breadcrumb_on_metadata_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("session", "task", "current task")
+            .unwrap();
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_session_reset BEFORE UPDATE ON session_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.reset_session("session").is_err());
+        assert_eq!(backend.load("session").len(), 1);
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            Some(true)
+        );
     }
 
     #[test]
