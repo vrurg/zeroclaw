@@ -250,9 +250,10 @@ pub(crate) async fn execute_one_tool(
         tool = %call_name,
     );
 
-    // Auto tool I/O propagation: emit Start with full input, run the
-    // tool, then emit Complete or Fail with full output. Per-tool
-    // execute() impls add zero logging.
+    // Auto tool I/O propagation: ordinary tools log full input/output.
+    // Session-prompt tools retain only the tool identity and outcome in logs:
+    // even a failure string can contain attachment text. Their receipts and
+    // stream cards remain suppressed because those paths carry tool payloads.
     let _start_guard = tool_span.clone().entered();
     if !sensitive_session_prompt {
         ::zeroclaw_log::record!(
@@ -265,6 +266,17 @@ pub(crate) async fn execute_one_tool(
                     "input": call_arguments,
                 })),
             format!("tool call: {call_name}")
+        );
+    } else {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "tool": call_name,
+                    "tool_call_id": tool_call_id,
+                })),
+            format!("tool call: {call_name} (content redacted)")
         );
     }
     drop(_start_guard);
@@ -346,6 +358,41 @@ pub(crate) async fn execute_one_tool(
                         format!("tool failed: {call_name}")
                     );
                 }
+                if sensitive_session_prompt {
+                    if r.success {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Complete
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_duration(duration.as_millis() as u64)
+                            .with_attrs(::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": tool_call_id,
+                            })),
+                            format!("tool result: {call_name} (content redacted)")
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(duration.as_millis() as u64)
+                            .with_attrs(::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": tool_call_id,
+                            })),
+                            format!("tool failed: {call_name} (content redacted)")
+                        );
+                    }
+                }
                 if r.success {
                     let normalized_output = if r.output.is_empty() {
                         "(no output)"
@@ -414,7 +461,7 @@ pub(crate) async fn execute_one_tool(
                         duration,
                         success: false,
                         arguments: observable_args.clone(),
-                        result: Some(model_visible.clone()),
+                        result: (!sensitive_session_prompt).then(|| model_visible.clone()),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -447,6 +494,19 @@ pub(crate) async fn execute_one_tool(
                             })),
                         format!("tool error: {call_name}")
                     );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(duration.as_millis() as u64)
+                            .with_attrs(::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": tool_call_id,
+                            })),
+                        format!("tool error: {call_name} (content redacted)")
+                    );
                 }
                 let reason = format!("Error executing {call_name}: {e}");
                 // Same model-visible egress boundary as the
@@ -461,7 +521,7 @@ pub(crate) async fn execute_one_tool(
                     duration,
                     success: false,
                     arguments: observable_args.clone(),
-                    result: Some(model_visible.clone()),
+                    result: (!sensitive_session_prompt).then(|| model_visible.clone()),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
                     parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -1523,17 +1583,23 @@ mod tests {
     /// distinct from what `ToolExecutionOutcome.output` sends to the model.
     struct RecordingObserver {
         last_result: Mutex<Option<String>>,
+        tool_calls: Mutex<usize>,
     }
 
     impl RecordingObserver {
         fn new() -> Self {
             Self {
                 last_result: Mutex::new(None),
+                tool_calls: Mutex::new(0),
             }
         }
 
         fn last_result(&self) -> Option<String> {
             self.last_result.lock().unwrap().clone()
+        }
+
+        fn tool_calls(&self) -> usize {
+            *self.tool_calls.lock().unwrap()
         }
     }
 
@@ -1541,6 +1607,7 @@ mod tests {
         fn record_event(&self, event: &ObserverEvent) {
             if let ObserverEvent::ToolCall { result, .. } = event {
                 *self.last_result.lock().unwrap() = result.clone();
+                *self.tool_calls.lock().unwrap() += 1;
             }
         }
 
@@ -1552,6 +1619,88 @@ mod tests {
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+    }
+
+    struct FailingSessionPromptTool {
+        return_error: bool,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::attribution::Attributable for FailingSessionPromptTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-failing-session-prompt-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingSessionPromptTool {
+        fn name(&self) -> &str {
+            "session_prompt_set"
+        }
+
+        fn description(&self) -> &str {
+            "Fails with prompt text for observer redaction tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            const MARKER: &str = "SESSION_PROMPT_PRIVATE_MARKER";
+            if self.return_error {
+                anyhow::bail!("rejected {MARKER}");
+            }
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: format!("rejected {MARKER}").into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_prompt_tool_keeps_text_out_of_observer() {
+        for return_error in [false, true] {
+            let tools: Vec<Box<dyn Tool>> =
+                vec![Box::new(FailingSessionPromptTool { return_error })];
+            let observer = RecordingObserver::new();
+            let meta = test_turn_meta();
+            let outcome = execute_one_tool(
+                "session_prompt_set",
+                serde_json::json!({"text": "SESSION_PROMPT_PRIVATE_MARKER"}),
+                None,
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &observer,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("failure should produce a tool outcome");
+
+            assert!(!outcome.success);
+            assert!(outcome.output.contains("SESSION_PROMPT_PRIVATE_MARKER"));
+            assert_eq!(observer.tool_calls(), 1, "terminal event must be recorded");
+            assert_eq!(
+                observer.last_result(),
+                None,
+                "observer must not receive prompt text"
+            );
         }
     }
 
