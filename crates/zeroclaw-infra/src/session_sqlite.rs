@@ -168,6 +168,10 @@ impl SqliteSessionBackend {
                 "trim_breadcrumb",
                 "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER",
             ),
+            (
+                "principal_id",
+                "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
+            ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
@@ -191,6 +195,11 @@ impl SqliteSessionBackend {
                 "idx_session_metadata_sender_id",
                 "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
                  ON session_metadata(sender_id)",
+            ),
+            (
+                "idx_session_metadata_principal_id",
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_principal_id \
+                 ON session_metadata(principal_id)",
             ),
         ] {
             conn.execute(ddl, [])
@@ -1216,7 +1225,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -1233,6 +1242,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -1252,6 +1262,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1359,6 +1370,90 @@ impl SessionBackend for SqliteSessionBackend {
         self.delete_session_key_set(&[session_key])
     }
 
+    fn delete_session_key_set_owned(
+        &self,
+        session_keys: &[&str],
+        owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let mut owned_keys = Vec::new();
+        for session_key in session_keys {
+            if owned_keys.contains(session_key) {
+                continue;
+            }
+            let owner: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(std::io::Error::other)?;
+            match owner {
+                Some(Some(owner)) if owner == owner_principal_id => {
+                    owned_keys.push(*session_key);
+                }
+                Some(_) => return Ok(false),
+                None => {}
+            }
+        }
+
+        for session_key in &owned_keys {
+            // Keep the predicate on the deleting statement as well as the
+            // transaction-wide preflight. No alias can be deleted if another
+            // existing alias belongs to a different principal.
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
+                    params![session_key, owner_principal_id],
+                )
+                .map_err(std::io::Error::other)?;
+            if deleted != 1 {
+                return Err(std::io::Error::other(
+                    "owned session key changed during deletion",
+                ));
+            }
+            transaction
+                .execute(
+                    "DELETE FROM sessions WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
+        }
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(!owned_keys.is_empty())
+    }
+
+    fn delete_session_owned(
+        &self,
+        session_key: &str,
+        owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        // The predicated metadata delete IS the ownership check: zero rows
+        // means not-owned (or missing) and nothing else is touched.
+        let owned_rows = conn
+            .execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
+                params![session_key, owner_principal_id],
+            )
+            .map_err(std::io::Error::other)?;
+        if owned_rows == 0 {
+            return Ok(false);
+        }
+        // Ownership proven and consumed; clean up the message rows (the
+        // FTS5 trigger handles sessions_fts).
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
         let rows = conn
@@ -1429,7 +1524,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -1442,6 +1537,7 @@ impl SessionBackend for SqliteSessionBackend {
                 let channel_id: Option<String> = row.get(6)?;
                 let room_id: Option<String> = row.get(7)?;
                 let sender_id: Option<String> = row.get(8)?;
+                let principal_id: Option<String> = row.get(9)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -1461,6 +1557,7 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    principal_id,
                 })
             },
         )
@@ -1520,7 +1617,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -1537,6 +1634,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1554,6 +1652,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1568,7 +1667,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -1587,6 +1686,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1604,6 +1704,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1649,7 +1750,7 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
@@ -1660,6 +1761,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let channel_id: Option<String> = row.get(5)?;
                         let room_id: Option<String> = row.get(6)?;
                         let sender_id: Option<String> = row.get(7)?;
+                        let principal_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -1675,6 +1777,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            principal_id,
                         })
                     },
                 )
@@ -1696,6 +1799,24 @@ impl SessionBackend for SqliteSessionBackend {
              VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
             params![session_key, now, now, alias_val],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let principal_val = if principal_id.is_empty() {
+            None
+        } else {
+            Some(principal_id)
+        };
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, principal_id)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET principal_id = excluded.principal_id",
+            params![session_key, now, now, principal_val],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
@@ -2072,6 +2193,90 @@ mod tests {
     }
 
     #[test]
+    fn owned_key_set_deletes_every_alias_and_its_prompts() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend.set_session_prompt(key, "task", "context").unwrap();
+        }
+
+        assert!(
+            backend
+                .delete_session_key_set_owned(&keys, "user:alice")
+                .unwrap()
+        );
+        for key in keys {
+            assert!(!backend.session_exists(key));
+            assert!(backend.load(key).is_empty());
+            assert!(backend.list_session_prompts(key).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn owned_key_set_refuses_a_foreign_or_ownerless_alias_without_partial_delete() {
+        for other_owner in [Some("user:bob"), None] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+            for key in keys {
+                backend.append(key, &ChatMessage::user("hello")).unwrap();
+                backend.set_session_prompt(key, "task", "context").unwrap();
+                if key != keys[2] {
+                    backend.set_session_principal(key, "user:alice").unwrap();
+                } else if let Some(owner) = other_owner {
+                    backend.set_session_principal(key, owner).unwrap();
+                }
+            }
+
+            assert!(
+                !backend
+                    .delete_session_key_set_owned(&keys, "user:alice")
+                    .unwrap()
+            );
+            for key in keys {
+                assert!(backend.session_exists(key), "{key} must remain");
+                assert_eq!(backend.load(key).len(), 1);
+                assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_key_set_rolls_back_when_a_later_alias_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend.set_session_prompt(key, "task", "context").unwrap();
+        }
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_gateway_alias_delete BEFORE DELETE ON session_metadata \
+                 WHEN OLD.session_key = 'gw_raw-owned' \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            backend
+                .delete_session_key_set_owned(&keys, "user:alice")
+                .is_err()
+        );
+        for key in keys {
+            assert!(backend.session_exists(key), "{key} must be rolled back");
+            assert_eq!(backend.load(key).len(), 1);
+            assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn remove_last_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -2336,6 +2541,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(!backend.delete_session("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn owned_delete_is_an_atomic_ownership_predicate() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_principal("s1", "user:alice").unwrap();
+
+        // The wrong owner deletes nothing and leaves the session intact.
+        assert!(!backend.delete_session_owned("s1", "user:bob").unwrap());
+        assert!(!backend.load("s1").is_empty());
+        assert_eq!(
+            backend
+                .get_session_metadata("s1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string())
+        );
+
+        // The owner's predicated delete removes the session and its rows.
+        assert!(backend.delete_session_owned("s1", "user:alice").unwrap());
+        assert!(backend.load("s1").is_empty());
+        assert!(backend.get_session_metadata("s1").is_none());
+    }
+
+    #[test]
+    fn owned_delete_refuses_null_owner_rows() {
+        // A legacy row with no owner is not deletable through the owned
+        // path: NULL never equals a principal id, so scoped principals
+        // cannot destroy pre-principal sessions.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("legacy", &ChatMessage::user("old")).unwrap();
+        assert!(
+            !backend
+                .delete_session_owned("legacy", "user:alice")
+                .unwrap()
+        );
+        assert!(!backend.load("legacy").is_empty());
     }
 
     #[test]

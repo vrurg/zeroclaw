@@ -43,7 +43,7 @@ pub struct SessionGuard {
     _permit: OwnedSemaphorePermit,
     _registration: PendingRegistration,
     /// The session this guard admits. Lets admission-aware helpers (e.g.
-    /// `SessionStore::insert_admitted`) verify the caller holds the permit
+    /// `SessionStore::insert_admitted_if_absent`) verify the caller holds the permit
     /// for the session it is about to mutate.
     session_id: String,
 }
