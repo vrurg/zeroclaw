@@ -4834,25 +4834,7 @@ impl crate::widgets::HelpContext for Chat {
                     return HelpNode::entries(entries);
                 }
                 if state.pending_approval().is_some() {
-                    use crate::keymap::{ChatTabAction as C, action_key_labels};
-                    return HelpNode::entries(vec![
-                        E::new(
-                            action_key_labels(C::ApprovalApprove),
-                            crate::i18n::t("zc-chat-help-approve"),
-                        ),
-                        E::new(
-                            action_key_labels(C::ApprovalApproveAll),
-                            crate::i18n::t("zc-chat-help-always-approve"),
-                        ),
-                        E::new(
-                            action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-deny"),
-                        ),
-                        E::new(
-                            action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-cancel-turn"),
-                        ),
-                    ]);
+                    return HelpNode::entries(pending_approval_help_entries(state));
                 }
                 if state.in_browse_mode() {
                     use crate::keymap::{ChatTabAction as C, action_key_labels};
@@ -6579,7 +6561,38 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
 }
 
 fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session_prompt_set" | "session_prompt_delete")
+    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
+}
+
+fn pending_approval_help_entries(state: &ChatState) -> Vec<crate::widgets::HelpEntry> {
+    use crate::keymap::{ChatTabAction as C, action_key_labels};
+    use crate::widgets::HelpEntry as E;
+
+    let mut entries = vec![E::new(
+        action_key_labels(C::ApprovalApprove),
+        crate::i18n::t("zc-chat-help-approve"),
+    )];
+    let is_session_prompt_mutation = state
+        .pending_approval()
+        .map(|pa| is_session_prompt_mutation_tool(&pa.tool_name))
+        .unwrap_or(false);
+    if !is_session_prompt_mutation {
+        entries.push(E::new(
+            action_key_labels(C::ApprovalApproveAll),
+            crate::i18n::t("zc-chat-help-always-approve"),
+        ));
+    }
+    entries.extend([
+        E::new(
+            action_key_labels(C::CancelTurn),
+            crate::i18n::t("zc-chat-help-deny"),
+        ),
+        E::new(
+            action_key_labels(C::CancelTurn),
+            crate::i18n::t("zc-chat-help-cancel-turn"),
+        ),
+    ]);
+    entries
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
@@ -18519,6 +18532,42 @@ mod tests {
                 "single-use session-prompt approval must not advertise an Always action at {width} columns"
             );
         }
+    }
+
+    #[test]
+    fn approval_help_hides_always_for_session_prompt_mutations() {
+        let mut session_prompt_state = state();
+        session_prompt_state.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "session_prompt_set".to_string(),
+            arguments_summary: "id: rule".to_string(),
+            timeout_secs: 30,
+        });
+
+        let session_prompt_entries = pending_approval_help_entries(&session_prompt_state);
+        assert!(
+            !session_prompt_entries
+                .iter()
+                .any(|entry| entry.keys.iter().any(|key| key == "a")),
+            "help must not advertise approve-all for one-shot session-prompt approval"
+        );
+
+        let mut ordinary_state = state();
+        ordinary_state.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-2".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "command: true".to_string(),
+            timeout_secs: 30,
+        });
+        let ordinary_entries = pending_approval_help_entries(&ordinary_state);
+        assert!(
+            ordinary_entries
+                .iter()
+                .any(|entry| entry.keys.iter().any(|key| key == "a")),
+            "ordinary approval must retain the approve-all help action"
+        );
     }
 
     #[test]
