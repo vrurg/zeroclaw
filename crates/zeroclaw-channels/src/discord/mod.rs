@@ -48,6 +48,36 @@ mod approval;
 // module) can still name it.
 use pending::ComponentIntent;
 
+enum PlaintextApprovalResolution {
+    Resolved,
+    Rejected,
+    Unknown,
+}
+
+fn resolve_plaintext_approval(
+    pending: &mut HashMap<String, approval::PendingApproval>,
+    token: &str,
+    response: ChannelApprovalResponse,
+) -> PlaintextApprovalResolution {
+    if pending.get(token).is_some_and(|entry| {
+        entry.strict_session_prompt_approval
+            && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+    }) {
+        // Keep the one-shot parked: a stale `always` reply is not an approval
+        // for a required session-prompt mutation, and the operator must still
+        // be able to answer it with the one-time choice.
+        return PlaintextApprovalResolution::Rejected;
+    }
+
+    pending
+        .remove(token)
+        .map(|entry| {
+            let _ = entry.sender.send(response);
+            PlaintextApprovalResolution::Resolved
+        })
+        .unwrap_or(PlaintextApprovalResolution::Unknown)
+}
+
 mod chunk;
 pub(crate) use chunk::*;
 
@@ -114,7 +144,7 @@ pub struct DiscordChannel {
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, approval::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -3307,9 +3337,10 @@ impl Channel for DiscordChannel {
                         crate::util::parse_approval_reply(&final_content)
                     {
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
-                            continue;
+                        match resolve_plaintext_approval(&mut map, &token, response) {
+                            PlaintextApprovalResolution::Resolved
+                            | PlaintextApprovalResolution::Rejected => continue,
+                            PlaintextApprovalResolution::Unknown => {}
                         }
                     }
 
@@ -3954,12 +3985,19 @@ impl Channel for DiscordChannel {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
         let token = crate::util::new_approval_token();
+        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
+            &request.tool_name,
+            request.raw_arguments.as_ref(),
+        );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval,
+            },
+        );
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
@@ -7811,13 +7849,47 @@ mod tests {
             mention_only,
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
+        let entry = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        entry.sender.send(ChannelApprovalResponse::Deny).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    #[tokio::test]
+    async fn plaintext_strict_always_is_rejected_without_consuming() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            "abc123".to_string(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: true,
+            },
+        );
+
+        assert!(matches!(
+            resolve_plaintext_approval(
+                &mut pending,
+                "abc123",
+                ChannelApprovalResponse::AlwaysApprove,
+            ),
+            PlaintextApprovalResolution::Rejected
+        ));
+        assert!(pending.contains_key("abc123"));
+        assert!(rx.try_recv().is_err());
+
+        assert!(matches!(
+            resolve_plaintext_approval(&mut pending, "abc123", ChannelApprovalResponse::Approve,),
+            PlaintextApprovalResolution::Resolved
+        ));
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(pending.is_empty());
     }
 
     /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
@@ -7828,10 +7900,7 @@ mod tests {
         user_id: &str,
         custom_id: &str,
         pending_components: &parking_lot::Mutex<pending::PendingComponents>,
-        pending_approvals: &mut std::collections::HashMap<
-            String,
-            oneshot::Sender<ChannelApprovalResponse>,
-        >,
+        pending_approvals: &mut std::collections::HashMap<String, approval::PendingApproval>,
     ) -> bool {
         // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
         // with an empty peer list = nobody, exactly like the message path.
@@ -7872,7 +7941,13 @@ mod tests {
         );
         let mut approvals = std::collections::HashMap::new();
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.insert(
+            token.to_string(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         let resolved =
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
@@ -7898,7 +7973,13 @@ mod tests {
         );
         let mut approvals = std::collections::HashMap::new();
         let (tx, mut rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.insert(
+            token.to_string(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         // "intruder" is not in the (specific, non-wildcard) peer list → gate
         // denies BEFORE the take.
@@ -7942,7 +8023,13 @@ mod tests {
         );
         let mut approvals = std::collections::HashMap::new();
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.insert(
+            token.to_string(),
+            approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         assert!(dispatch_approval_click(
             &[String::from("*")],

@@ -4274,8 +4274,12 @@ async fn process_whatsapp_message(
         };
         // The async registry helper keeps the stale `always` guard adjacent to
         // the one-shot removal so webhook and channel paths cannot diverge.
-        if !wa.resolve_pending_approval_response(&token, response).await {
-            routed_messages.push(msg);
+        match wa.resolve_pending_approval_response(&token, response).await {
+            zeroclaw_channels::whatsapp::PendingApprovalResolution::Resolved
+            | zeroclaw_channels::whatsapp::PendingApprovalResolution::Rejected => {}
+            zeroclaw_channels::whatsapp::PendingApprovalResolution::Unknown => {
+                routed_messages.push(msg);
+            }
         }
     }
     verified = routed_messages;

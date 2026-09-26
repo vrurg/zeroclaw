@@ -510,7 +510,15 @@ pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
 /// Returns whether a tool mutates the session-persistent prompt collection.
 /// Keep this vocabulary in the API crate so every approval and presentation
 /// boundary makes the same decision.
-#[allow(dead_code)]
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-mattermost",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
 pub(crate) fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
     zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
 }
@@ -545,15 +553,6 @@ pub fn parse_approval_reply(
 /// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
 /// are protocol-exact values echoed verbatim — never localized — so a locale
 /// switch cannot desync the prompt from [`parse_approval_reply`].
-#[cfg(any(
-    feature = "channel-discord",
-    feature = "channel-mattermost",
-    feature = "channel-signal",
-    feature = "channel-slack",
-    feature = "channel-whatsapp-cloud",
-    feature = "whatsapp-web",
-    test
-))]
 #[cfg(test)]
 pub(crate) fn build_yesno_approval_prompt(
     token: &str,

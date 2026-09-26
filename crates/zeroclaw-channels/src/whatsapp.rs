@@ -237,6 +237,16 @@ pub struct WhatsAppChannel {
     approval_timeout_secs: u64,
 }
 
+/// Outcome of resolving an approval-shaped webhook message. Unknown tokens
+/// remain ordinary inbound messages; a known strict-session `always` reply is
+/// rejected and must be suppressed without consuming the parked request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingApprovalResolution {
+    Unknown,
+    Rejected,
+    Resolved,
+}
+
 impl WhatsAppChannel {
     pub fn new(
         access_token: String,
@@ -284,18 +294,22 @@ impl WhatsAppChannel {
         &self,
         token: &str,
         response: ChannelApprovalResponse,
-    ) -> bool {
+    ) -> PendingApprovalResolution {
         let mut approvals = PENDING_APPROVALS.lock().await;
         if approvals.get(token).is_some_and(|pending| {
             pending.strict_session_prompt_approval
                 && matches!(response, ChannelApprovalResponse::AlwaysApprove)
         }) {
-            return false;
+            return PendingApprovalResolution::Rejected;
         }
         let Some(pending) = approvals.remove(token) else {
-            return false;
+            return PendingApprovalResolution::Unknown;
         };
-        pending.sender.send(response).is_ok()
+        if pending.sender.send(response).is_ok() {
+            PendingApprovalResolution::Resolved
+        } else {
+            PendingApprovalResolution::Unknown
+        }
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -3248,6 +3262,43 @@ mod tests {
             !PENDING_APPROVALS.lock().await.contains_key(token),
             "the reply handler removed the entry; the guard must not re-add one"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_always_webhook_reply_is_rejected_without_consuming() {
+        let token = "strict";
+        let (tx, mut rx) = oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: true,
+            },
+        );
+        let channel = WhatsAppChannel::new(
+            "access-token".to_string(),
+            "endpoint".to_string(),
+            "verify-token".to_string(),
+            "test",
+            Arc::new(Vec::new),
+        );
+
+        assert_eq!(
+            channel
+                .resolve_pending_approval_response(token, ChannelApprovalResponse::AlwaysApprove)
+                .await,
+            PendingApprovalResolution::Rejected
+        );
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            channel
+                .resolve_pending_approval_response(token, ChannelApprovalResponse::Approve)
+                .await,
+            PendingApprovalResolution::Resolved
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
 
     /// The success arm must DISARM, not merely finish.
