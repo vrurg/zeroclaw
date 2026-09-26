@@ -182,6 +182,11 @@ async fn register_pending_approval(
 enum ApprovalRefusal {
     /// No such token, or it was already answered or timed out.
     UnknownToken,
+    /// The request uses strict session-prompt approval, so `always` is not a
+    /// permitted reply. Keep it distinct from an unknown token: the handler
+    /// must consume this rejection instead of routing the plaintext reply to
+    /// the agent as ordinary chat.
+    StrictAlwaysRejected,
     /// The token exists but the reply came from a different chat.
     ForeignChat,
     /// The reply came from the right chat, but the responder is not on
@@ -250,7 +255,7 @@ async fn resolve_approval_reply(
     if pending.strict_session_prompt_approval
         && matches!(response, ChannelApprovalResponse::AlwaysApprove)
     {
-        return Err(ApprovalRefusal::UnknownToken);
+        return Err(ApprovalRefusal::StrictAlwaysRejected);
     }
     // Only remove once the reply has cleared every gate. A refused reply must
     // leave the request pending so the real operator can still answer it,
@@ -8221,6 +8226,44 @@ mod tests {
             .is_ok()
         );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn strict_session_prompt_always_reply_is_rejected_without_consuming() {
+        let (responder, mut rx) = tokio::sync::oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            "aaa-strict".to_string(),
+            PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                responder,
+                binding: ApprovalBinding {
+                    alias: "default".to_string(),
+                    chat: "1234@s.whatsapp.net".to_string(),
+                    is_group: false,
+                },
+                strict_session_prompt_approval: true,
+            },
+        );
+
+        assert_eq!(
+            resolve_approval_reply(
+                "aaa-strict",
+                ChannelApprovalResponse::AlwaysApprove,
+                "default",
+                "1234@s.whatsapp.net",
+                true,
+            )
+            .await,
+            Err(ApprovalRefusal::StrictAlwaysRejected)
+        );
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key("aaa-strict"),
+            "a rejected strict reply must leave the request pending"
+        );
+        assert!(rx.try_recv().is_err());
+
+        PENDING_APPROVALS.lock().await.remove("aaa-strict");
     }
 
     /// A reply carrying a VALID token, from the right chat, but from a number

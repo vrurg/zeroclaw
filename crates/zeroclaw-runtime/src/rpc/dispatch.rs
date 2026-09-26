@@ -9883,11 +9883,17 @@ fn replace_rpc_chat_conversation_state(
     durable: &[zeroclaw_providers::ChatMessage],
     breadcrumb_present: bool,
 ) -> bool {
+    // RPC Chat is also a non-provider export boundary: its durable transcript
+    // is exposed through session-history APIs and searchable SQLite storage.
+    // Keep opaque session-prompt bodies out of that durable copy while the
+    // provider-facing history remains unchanged for the active turn.
+    let export = crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable);
+
     // Guarded replacement, not check-then-act: a delete committing between a
     // separate existence probe and the write would be silently undone by the
     // replace recreating the session row/files. When deletion already won
     // (`Ok(false)`) there is nothing left to persist, so skip quietly.
-    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
+    match backend.replace_conversation_state_if_exists(session_key, &export, breadcrumb_present) {
         Ok(_) => true,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -28077,6 +28083,20 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].id, "task");
         assert_eq!(prompts[0].content, "persisted RPC marker");
+
+        let durable = backend.load(&session_key);
+        assert!(
+            durable
+                .iter()
+                .all(|message| !message.content.contains("persisted RPC marker")),
+            "RPC durable history must not retain opaque session-prompt bodies"
+        );
+        assert!(
+            durable.iter().any(|message| {
+                message.content == "[Session-prompt tool exchange omitted from export]"
+            }),
+            "RPC durable history must retain an explicit redaction marker"
+        );
 
         dispatcher
             .handle_session_prompt(&json!({"session_id": sid, "prompt": "second turn"}))

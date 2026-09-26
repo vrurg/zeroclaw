@@ -244,6 +244,9 @@ pub struct WhatsAppChannel {
 pub enum PendingApprovalResolution {
     Unknown,
     Rejected,
+    /// The token was consumed, but its requesting future no longer exists.
+    /// This must be suppressed rather than routed to the agent as chat.
+    ReceiverGone,
     Resolved,
 }
 
@@ -308,7 +311,7 @@ impl WhatsAppChannel {
         if pending.sender.send(response).is_ok() {
             PendingApprovalResolution::Resolved
         } else {
-            PendingApprovalResolution::Unknown
+            PendingApprovalResolution::ReceiverGone
         }
     }
 
@@ -3299,6 +3302,35 @@ mod tests {
             PendingApprovalResolution::Resolved
         );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn consumed_webhook_reply_with_dead_receiver_is_not_unknown_chat() {
+        let token = "receiver-gone";
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        PENDING_APPROVALS.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
+        let channel = WhatsAppChannel::new(
+            "access-token".to_string(),
+            "endpoint".to_string(),
+            "verify-token".to_string(),
+            "test",
+            Arc::new(Vec::new),
+        );
+
+        assert_eq!(
+            channel
+                .resolve_pending_approval_response(token, ChannelApprovalResponse::Approve)
+                .await,
+            PendingApprovalResolution::ReceiverGone
+        );
+        assert!(!PENDING_APPROVALS.lock().await.contains_key(token));
     }
 
     /// The success arm must DISARM, not merely finish.

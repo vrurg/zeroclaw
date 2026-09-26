@@ -1116,9 +1116,9 @@ impl Tool for SessionPromptDeleteTool {
 
 // ── SessionResetTool ────────────────────────────────────────────────
 
-/// Resets a session by clearing its message history. The session key
-/// remains valid for new messages. Useful for cleaning up stale
-/// conversations without deleting the session entry itself.
+/// Resets a session by clearing its message history and session-prompt
+/// attachments. The session key remains valid for new messages. Useful for
+/// cleaning up stale conversations without deleting the session entry itself.
 pub struct SessionResetTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,

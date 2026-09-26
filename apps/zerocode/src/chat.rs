@@ -6597,32 +6597,15 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
         None => return,
     };
 
-    // Anchor to the bottom of the given area. The action footer remains visible
-    // while a long exact approval binding scrolls in the body above it.
-    let max_height = area.height.saturating_sub(2).max(3);
-    let overlay_height = APPROVAL_OVERLAY_MAX_HEIGHT.min(max_height).max(3);
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(overlay_height)])
-        .split(area);
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(5),
-            Constraint::Min(60),
-            Constraint::Percentage(5),
-        ])
-        .split(vert[1])[1];
-
-    f.render_widget(Clear, overlay_area);
-
     let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
     let allow = crate::i18n::t("zc-chat-approval-action-allow");
     let always = crate::i18n::t("zc-chat-approval-action-always");
     let reject = crate::i18n::t("zc-chat-approval-action-reject");
     let edit = crate::i18n::t("zc-chat-approval-action-edit");
-    let keys = if is_edit_tool {
+    let keys = if is_edit_tool && pa.allow_always {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
+    } else if is_edit_tool {
+        format!("Enter={allow}  Ctrl+D={reject}  e={edit}")
     } else if pa.allow_always {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     } else {
@@ -6646,6 +6629,57 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
         "zc-chat-approval-title",
         &[("tool", &pa.tool_name), ("secs", &secs)],
     );
+    let text = if summary.is_empty() {
+        title
+    } else {
+        format!("{title}\n\n{summary}")
+    };
+
+    // Size ordinary approvals to their content while keeping a fixed maximum
+    // for long exact bindings. The transcript still reserves the maximum
+    // footprint below, so changing the modal height never moves conversation
+    // content underneath it.
+    let overlay_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(5),
+            Constraint::Min(60),
+            Constraint::Percentage(5),
+        ])
+        .split(Rect::new(area.x, area.y, area.width, 1));
+    let estimated_inner_width = overlay_columns[1].width.saturating_sub(2).max(1);
+    let estimated_footer_height = Paragraph::new(footer.as_str())
+        .wrap(Wrap { trim: true })
+        .line_count(estimated_inner_width)
+        .max(1) as u16;
+    let content_height = Paragraph::new(text.as_str())
+        .wrap(Wrap { trim: true })
+        .line_count(estimated_inner_width) as u16;
+    let desired_height = content_height
+        .saturating_add(estimated_footer_height)
+        .saturating_add(2);
+
+    // Anchor to the bottom of the given area. The action footer remains visible
+    // while a long exact approval binding scrolls in the body above it.
+    let max_height = area.height.saturating_sub(2).max(3);
+    let overlay_height = desired_height
+        .clamp(3, APPROVAL_OVERLAY_MAX_HEIGHT)
+        .min(max_height);
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(overlay_height)])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(5),
+            Constraint::Min(60),
+            Constraint::Percentage(5),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
     let fill = theme::fill_style();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -6664,11 +6698,6 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(inner);
-    let text = if summary.is_empty() {
-        title
-    } else {
-        format!("{title}\n\n{summary}")
-    };
     let body_area = body_and_footer[0];
     let max_scroll = Paragraph::new(text.clone())
         .wrap(Wrap { trim: true })
@@ -18466,6 +18495,36 @@ mod tests {
             cell.style().bg,
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn ordinary_approval_overlay_uses_content_height() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "command: pwd".to_string(),
+            timeout_secs: 120,
+            allow_always: true,
+        });
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_approval_overlay(frame, &mut s, area))
+            .expect("draw approval overlay");
+
+        let top_border = (0..area.height)
+            .find(|&y| (0..area.width).any(|x| terminal.backend().buffer()[(x, y)].symbol() == "┌"))
+            .expect("approval overlay has a top border");
+        assert!(
+            top_border > area.height - APPROVAL_OVERLAY_MAX_HEIGHT,
+            "a short ordinary approval should not reserve the fixed maximum height"
         );
     }
 

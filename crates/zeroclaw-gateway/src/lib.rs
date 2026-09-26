@@ -4276,7 +4276,8 @@ async fn process_whatsapp_message(
         // the one-shot removal so webhook and channel paths cannot diverge.
         match wa.resolve_pending_approval_response(&token, response).await {
             zeroclaw_channels::whatsapp::PendingApprovalResolution::Resolved
-            | zeroclaw_channels::whatsapp::PendingApprovalResolution::Rejected => {}
+            | zeroclaw_channels::whatsapp::PendingApprovalResolution::Rejected
+            | zeroclaw_channels::whatsapp::PendingApprovalResolution::ReceiverGone => {}
             zeroclaw_channels::whatsapp::PendingApprovalResolution::Unknown => {
                 routed_messages.push(msg);
             }
