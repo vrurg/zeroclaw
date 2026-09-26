@@ -6066,8 +6066,7 @@ impl Channel for SlackChannel {
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
                 strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
-                    &request.tool_name,
-                    request.raw_arguments.as_ref(),
+                    request,
                 ),
             },
         );
@@ -6081,10 +6080,7 @@ impl Channel for SlackChannel {
                 &request.tool_name,
                 &request.arguments_summary,
                 request.position_counter(),
-                zeroclaw_api::is_strict_session_prompt_approval(
-                    &request.tool_name,
-                    request.raw_arguments.as_ref(),
-                ),
+                zeroclaw_api::is_strict_session_prompt_approval(request),
             );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
@@ -6101,10 +6097,7 @@ impl Channel for SlackChannel {
                     &request.tool_name,
                     &request.arguments_summary,
                     request.position_counter(),
-                    zeroclaw_api::is_strict_session_prompt_approval(
-                        &request.tool_name,
-                        request.raw_arguments.as_ref(),
-                    ),
+                    zeroclaw_api::is_strict_session_prompt_approval(request),
                 ),
                 recipient,
             ))

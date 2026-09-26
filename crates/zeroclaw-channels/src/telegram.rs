@@ -8457,10 +8457,8 @@ Ensure only one `zeroclaw` process is using this bot token."
         let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
         let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
         let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
@@ -10785,6 +10783,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let result = ch.request_approval("123", &request).await.unwrap();
@@ -10850,6 +10849,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let started = std::time::Instant::now();
@@ -23571,6 +23571,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -23664,6 +23665,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -23807,6 +23809,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -23894,6 +23897,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+            strict_session_prompt_approval: false,
         };
 
         // Nothing resolves the pending oneshot; the short timeout returns a
@@ -23979,6 +23983,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+            strict_session_prompt_approval: false,
         };
 
         let _ = ch.request_approval("12345", &request).await;

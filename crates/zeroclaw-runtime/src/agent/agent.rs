@@ -16934,6 +16934,7 @@ mod approval_route_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
     }
 

@@ -3179,10 +3179,8 @@ impl Channel for LarkChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let card = build_approval_card(
             &approval_id,
             &request.tool_name,
@@ -7002,6 +7000,7 @@ mod tests {
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
                         position: None,
+                        strict_session_prompt_approval: false,
                     },
                 )
                 .await

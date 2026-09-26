@@ -1494,6 +1494,7 @@ mod tests {
             arguments_summary: "action: deactivate".to_string(),
             raw_arguments: None,
             position: Some(ApprovalPosition { index: 2, total: 3 }),
+            strict_session_prompt_approval: false,
         };
 
         assert_eq!(request.position_counter(), Some((2, 3)));
@@ -1508,6 +1509,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         assert_eq!(request.position_counter(), None);

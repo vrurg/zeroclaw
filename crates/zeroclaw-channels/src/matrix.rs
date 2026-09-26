@@ -5427,10 +5427,8 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let prompt = crate::util::build_approve_deny_approval_prompt_with_policy(
             &token,
             &request.tool_name,

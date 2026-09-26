@@ -1051,10 +1051,8 @@ impl Channel for WhatsAppChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,

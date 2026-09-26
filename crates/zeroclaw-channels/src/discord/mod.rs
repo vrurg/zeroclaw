@@ -856,10 +856,8 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let text = crate::util::build_yesno_approval_prompt_with_policy(
             token,
             &request.tool_name,
@@ -876,10 +874,8 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let (row, bindings) = approval::build_approval_row(token, strict_session_prompt_approval);
         // Register every button's intent first. Single-use is enforced by the
         // registry's `take`; the per-click `interaction_gate` is enforced by the
@@ -3985,10 +3981,8 @@ impl Channel for DiscordChannel {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
         let token = crate::util::new_approval_token();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals.lock().await.insert(

@@ -60,6 +60,7 @@ pub(crate) async fn gate_tool_approval(
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
                     position: Some(position),
+                    strict_session_prompt_approval: false,
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 // Narration rides the async delta queue to the draft updater,
@@ -459,6 +460,7 @@ async fn gate_session_prompt_approval(
             // generic structured arguments that downstream event consumers log.
             raw_arguments: None,
             position: Some(position),
+            strict_session_prompt_approval: true,
         };
         let response = if let Some(cancel) = ctx.cancellation_token {
             tokio::select! {

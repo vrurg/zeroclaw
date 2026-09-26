@@ -163,10 +163,8 @@ impl Channel for WsApprovalChannel {
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         self.pending.lock().insert(
             request_id.clone(),
             PendingApproval {
@@ -240,6 +238,7 @@ mod tests {
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
     }
 

@@ -43,15 +43,10 @@ pub const SESSION_PROMPT_MUTATION_TOOL_NAMES: [&str; 2] =
     ["session_prompt_set", "session_prompt_delete"];
 
 /// Whether an approval request is the dedicated one-time confirmation for a
-/// session-prompt mutation. The required path marks the request by omitting
-/// raw arguments from approval metadata; ordinary requests, including the
-/// explicit `session_prompt_approval = "disabled"` override, keep the normal
-/// persistent-approval action.
-pub fn is_strict_session_prompt_approval(
-    tool_name: &str,
-    raw_arguments: Option<&serde_json::Value>,
-) -> bool {
-    SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name) && raw_arguments.is_none()
+/// session-prompt mutation. The producer sets this marker explicitly; the
+/// approval adapters must not infer policy from unrelated payload fields.
+pub fn is_strict_session_prompt_approval(request: &crate::channel::ChannelApprovalRequest) -> bool {
+    request.strict_session_prompt_approval
 }
 
 tokio::task_local! {

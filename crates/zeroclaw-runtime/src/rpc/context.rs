@@ -83,6 +83,10 @@ impl ApprovalPendingMap {
         }
     }
 
+    /// Test-only compatibility helper for ordinary approvals. Production
+    /// callers must use [`Self::register`] or [`Self::insert_with_policy`] so
+    /// strict session-prompt policy is always explicit at the insertion site.
+    #[cfg(test)]
     pub fn insert(
         &self,
         request_id: String,

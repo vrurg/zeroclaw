@@ -1153,11 +1153,37 @@ mod tests {
             arguments_summary: "command: ls -la".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ChannelApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
         assert_eq!(parsed.arguments_summary, "command: ls -la");
+        assert!(!parsed.strict_session_prompt_approval);
+    }
+
+    #[test]
+    fn strict_session_prompt_approval_marker_is_explicit() {
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        let strict = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "id=task".into(),
+            // The marker, not this unrelated field's shape, owns the policy.
+            raw_arguments: Some(serde_json::json!({"id": "task"})),
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        let ordinary = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "id=task".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: false,
+        };
+
+        assert!(zeroclaw_api::is_strict_session_prompt_approval(&strict));
+        assert!(!zeroclaw_api::is_strict_session_prompt_approval(&ordinary));
     }
 
     #[test]

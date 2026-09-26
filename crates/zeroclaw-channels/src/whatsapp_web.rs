@@ -3839,10 +3839,7 @@ impl Channel for WhatsAppWebChannel {
             mut guard,
         } = register_pending_approval(
             binding,
-            zeroclaw_api::is_strict_session_prompt_approval(
-                &request.tool_name,
-                request.raw_arguments.as_ref(),
-            ),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         )
         .await;
 
@@ -3855,10 +3852,7 @@ impl Channel for WhatsAppWebChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
-            zeroclaw_api::is_strict_session_prompt_approval(
-                &request.tool_name,
-                request.raw_arguments.as_ref(),
-            ),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in
@@ -6950,6 +6944,7 @@ mod tests {
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let err = channel
@@ -7013,6 +7008,7 @@ mod tests {
                 arguments_summary: "ls -la".to_string(),
                 raw_arguments: None,
                 position: None,
+                strict_session_prompt_approval: false,
             };
             channel
                 .request_approval(recipient, &request)
@@ -7408,6 +7404,7 @@ mod tests {
                 arguments_summary: format!("echo {word}"),
                 raw_arguments: None,
                 position: None,
+                strict_session_prompt_approval: false,
             };
 
             let asking = channel.request_approval(&chat, &request);
@@ -7548,6 +7545,7 @@ mod tests {
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let err = channel
             .request_approval("1@s.whatsapp.net", &request)
@@ -8517,6 +8515,7 @@ mod tests {
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let decision = channel
@@ -8595,6 +8594,7 @@ mod tests {
                 arguments_summary: "ls".to_string(),
                 raw_arguments: None,
                 position: None,
+                strict_session_prompt_approval: false,
             };
 
             let started = tokio::time::Instant::now();

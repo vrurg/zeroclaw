@@ -173,10 +173,8 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
-            &request.tool_name,
-            request.raw_arguments.as_ref(),
-        );
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
         let mut pending_request = self.pending.register(
@@ -362,6 +360,7 @@ mod tests {
             arguments_summary: "ls /tmp".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let pending_for_resolve = Arc::clone(&pending);
@@ -391,6 +390,7 @@ mod tests {
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
@@ -424,6 +424,7 @@ mod tests {
             arguments_summary: "sleep 60".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))

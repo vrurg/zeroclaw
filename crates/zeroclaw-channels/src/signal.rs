@@ -970,10 +970,7 @@ impl Channel for SignalChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
-            zeroclaw_api::is_strict_session_prompt_approval(
-                &request.tool_name,
-                request.raw_arguments.as_ref(),
-            ),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         );
 
         let (tx, rx) = oneshot::channel();
@@ -982,8 +979,7 @@ impl Channel for SignalChannel {
             PendingApproval {
                 sender: tx,
                 strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
-                    &request.tool_name,
-                    request.raw_arguments.as_ref(),
+                    request,
                 ),
             },
         );

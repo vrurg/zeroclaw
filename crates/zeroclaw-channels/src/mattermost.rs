@@ -1286,8 +1286,7 @@ impl Channel for MattermostChannel {
                     channel_id: recipient_channel_id(recipient).to_string(),
                     sender: tx,
                     strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
-                        &request.tool_name,
-                        request.raw_arguments.as_ref(),
+                        request,
                     ),
                 },
             );
@@ -1299,10 +1298,7 @@ impl Channel for MattermostChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
-            zeroclaw_api::is_strict_session_prompt_approval(
-                &request.tool_name,
-                request.raw_arguments.as_ref(),
-            ),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         );
         // Armed from here on: every exit below — including a dropped future —
         // retires this registration and any post bound to it. Cleanup is keyed
@@ -4908,6 +4904,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
     }
 
@@ -5112,6 +5109,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         // `send` fails against the unreachable test host, which surfaces as an
