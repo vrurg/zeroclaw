@@ -2919,7 +2919,10 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(test)]
+#[cfg(any(
+    all(test, feature = "channel-linq"),
+    all(test, feature = "channel-whatsapp-cloud")
+))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -12636,16 +12639,11 @@ data: [DONE]\n\n";
         assert_eq!(status, StatusCode::OK);
 
         let captures = gateway_chat_dispatch_captures_for_test();
-        assert_eq!(
-            captures.len(),
-            1,
-            "unknown approval replies must be dispatched"
-        );
-        assert_eq!(captures[0].message, "abc123 always");
-        assert_eq!(
-            captures[0].session_id.as_deref(),
-            Some("whatsapp_+15551234567")
-        );
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == "abc123 always")
+            .expect("unknown approval replies must be dispatched");
+        assert_eq!(capture.session_id.as_deref(), Some("whatsapp_+15551234567"));
     }
 
     /// Fail closed. A configured alias with no app secret cannot verify

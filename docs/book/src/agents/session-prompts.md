@@ -9,12 +9,14 @@ them. Resetting or deleting the session removes them atomically with its chat
 history. They are stored only by the SQLite session backend.
 
 `/new` attempts that same durable cleanup even when prompt injection is
-currently disabled. If the backend cannot prove that cleanup completed, the
-command reports failure and leaves the existing session intact; it never
-claims a fresh session while the old attachment rows may still exist. A later
-turn may therefore still use those attachments after an operator explicitly
-re-enables the feature, which is the visible and recoverable result of a
-failed reset rather than a silent reset-success transition.
+currently disabled, provided a durable session backend is attached. If that
+backend cannot prove that cleanup completed, the command reports failure and
+leaves the existing session intact; it never claims a fresh session while the
+old attachment rows may still exist. When no durable backend is configured and
+prompt injection is disabled, `/new` retains the legacy ephemeral reset
+behavior because that runtime has no attached durable owner it can clear. An
+operator switching back to durable persistence should reset the session after
+the backend is re-enabled before relying on the old durable rows being gone.
 
 ## Enable the feature
 

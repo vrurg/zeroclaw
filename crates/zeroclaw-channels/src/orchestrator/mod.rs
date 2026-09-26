@@ -731,6 +731,9 @@ impl ModelPickerDispatchOwnership {
 }
 
 #[cfg(not(feature = "channel-telegram"))]
+// This deliberate no-op Drop keeps the feature-neutral ownership guard
+// non-movable, matching the Telegram-backed guard's scope semantics and
+// satisfying the feature-specific clippy/ownership contract.
 impl Drop for ModelPickerDispatchOwnership {
     fn drop(&mut self) {}
 }
@@ -4195,7 +4198,16 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 
 /// Persistent-prompt mutation arguments are private provider context. Retained
 /// channel history must not turn them into a later transcript/API export.
-fn redact_sensitive_session_prompt_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn redact_sensitive_session_prompt_tool_messages(
+    messages: Vec<ChatMessage>,
+    session_prompts_enabled: bool,
+) -> Vec<ChatMessage> {
+    if !session_prompts_enabled {
+        // With the feature disabled, preserve ordinary transcript content
+        // instead of applying a prompt-specific heuristic to prose or
+        // malformed tool diagnostics that merely mention its names.
+        return messages;
+    }
     zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages)
 }
 
@@ -5123,11 +5135,11 @@ async fn handle_runtime_command_for_delivery(
                     "Session prompts are enabled but the persisted session backend is unavailable"
                 );
             }
-            // Even while the prompt tool is disabled, a prior attachment may
-            // remain in this durable session and become active again after a
-            // config reload. Never report a successful reset unless durable
-            // cleanup succeeded; otherwise the old prompt could reappear in a
-            // session the operator believes was cleared.
+            // When a durable session backend is attached, a reset must not
+            // report success until it has proved that the session (including
+            // any prompt attachments) was deleted. With no backend configured
+            // and prompt injection disabled, retain the legacy ephemeral
+            // reset behavior; that runtime has no durable owner it can clear.
             if delete_error.is_some() || missing_required_store {
                 channel_runtime_cli_string("channel-runtime-new-session-failed")
             } else {
@@ -10228,6 +10240,7 @@ async fn process_channel_message_body(
                 // assistant response that matches our delivered text.
                 let tool_messages = redact_sensitive_session_prompt_tool_messages(
                     extract_current_turn_tool_messages(&history),
+                    ctx.prompt_config.channels.session_prompts_enabled,
                 );
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
@@ -28983,6 +28996,65 @@ BTC is currently around $65,000 based on latest tool output."#
                 .peek(&history_key)
                 .is_some(),
             "a reset with an unavailable required backend must preserve live history"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_preserves_ephemeral_reset_without_a_durable_backend() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let config = zeroclaw_config::schema::Config::default();
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            session_store: None,
+            ..(*base).clone()
+        });
+        let mut msg = channel_message("test-channel", None);
+        msg.content = "/new".to_string();
+        let history_key = runtime_conversation_history_key(&ctx, &msg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![ChatMessage::user("existing history")],
+            );
+
+        assert!(
+            handle_runtime_command_if_needed(
+                &ctx,
+                &msg,
+                Some(&(channel_impl.clone() as Arc<dyn Channel>))
+            )
+            .await
+        );
+
+        let expected = channel_runtime_cli_string("channel-runtime-new-session");
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            [format!("r1:{expected}")]
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_none(),
+            "the legacy ephemeral reset must still clear in-memory history"
+        );
+        assert!(
+            ctx.pending_new_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&history_key),
+            "the successor turn must still be marked fresh"
         );
     }
 
@@ -51451,7 +51523,7 @@ Done."#;
             ChatMessage::tool("shell result"),
         ];
 
-        let retained = redact_sensitive_session_prompt_tool_messages(messages);
+        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
         assert_eq!(retained.len(), 4);
         assert!(
             retained
@@ -51474,7 +51546,7 @@ Done."#;
             ChatMessage::tool("shell result"),
             ChatMessage::tool("private marker from list"),
         ];
-        let retained = redact_sensitive_session_prompt_tool_messages(messages);
+        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
         assert_eq!(retained.len(), 3);
         assert!(
             retained
@@ -51492,7 +51564,24 @@ Done."#;
             ChatMessage::tool("session prompt tool name echoed"),
         ];
 
-        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone());
+        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), true);
+        assert_eq!(retained.len(), messages.len());
+        for (actual, expected) in retained.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
+    }
+
+    #[test]
+    fn retained_tool_history_preserves_malformed_prompt_mentions_when_disabled() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"diagnostic: <tool_call name=\"shell\">session_prompt_set was mentioned</tool_call>"#,
+            ),
+            ChatMessage::tool("ordinary diagnostic details"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), false);
         assert_eq!(retained.len(), messages.len());
         for (actual, expected) in retained.iter().zip(&messages) {
             assert_eq!(actual.role, expected.role);
