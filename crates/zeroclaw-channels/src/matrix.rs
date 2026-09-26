@@ -5427,7 +5427,7 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let strict_session_prompt_approval = crate::util::is_strict_session_prompt_approval(
+        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
             &request.tool_name,
             request.raw_arguments.as_ref(),
         );
@@ -7679,6 +7679,7 @@ mod tests {
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7687,6 +7688,7 @@ mod tests {
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7695,6 +7697,7 @@ mod tests {
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -7857,6 +7860,7 @@ mod tests {
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
 
@@ -7921,6 +7925,7 @@ mod tests {
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             assert_eq!(

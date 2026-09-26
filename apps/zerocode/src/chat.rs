@@ -3544,11 +3544,11 @@ impl Chat {
                 }
             }
             Some(ChatTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
-                let is_session_prompt_mutation = state
+                let allow_always = state
                     .pending_approval()
-                    .map(|pa| is_session_prompt_mutation_tool(&pa.tool_name))
+                    .map(|pa| pa.allow_always)
                     .unwrap_or(false);
-                if !is_session_prompt_mutation && let Some(pa) = state.take_pending_approval() {
+                if allow_always && let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
                         .session_approve(
@@ -6560,10 +6560,6 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
     );
 }
 
-fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
-    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
-}
-
 fn pending_approval_help_entries(state: &ChatState) -> Vec<crate::widgets::HelpEntry> {
     use crate::keymap::{ChatTabAction as C, action_key_labels};
     use crate::widgets::HelpEntry as E;
@@ -6572,11 +6568,11 @@ fn pending_approval_help_entries(state: &ChatState) -> Vec<crate::widgets::HelpE
         action_key_labels(C::ApprovalApprove),
         crate::i18n::t("zc-chat-help-approve"),
     )];
-    let is_session_prompt_mutation = state
+    let allow_always = state
         .pending_approval()
-        .map(|pa| is_session_prompt_mutation_tool(&pa.tool_name))
+        .map(|pa| pa.allow_always)
         .unwrap_or(false);
-    if !is_session_prompt_mutation {
+    if allow_always {
         entries.push(E::new(
             action_key_labels(C::ApprovalApproveAll),
             crate::i18n::t("zc-chat-help-always-approve"),
@@ -6621,19 +6617,18 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     f.render_widget(Clear, overlay_area);
 
     let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
-    let is_session_prompt_mutation = is_session_prompt_mutation_tool(&pa.tool_name);
     let allow = crate::i18n::t("zc-chat-approval-action-allow");
     let always = crate::i18n::t("zc-chat-approval-action-always");
     let reject = crate::i18n::t("zc-chat-approval-action-reject");
     let edit = crate::i18n::t("zc-chat-approval-action-edit");
     let keys = if is_edit_tool {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
-    } else if is_session_prompt_mutation {
+    } else if pa.allow_always {
+        format!("Enter={allow}  a={always}  Ctrl+D={reject}")
+    } else {
         // Required session-prompt approval is deliberately single-use. Keep
         // ZeroCode from advertising an Always action that the daemon rejects.
         format!("Enter={allow}  Ctrl+D={reject}")
-    } else {
-        format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     };
     let scroll_hint = crate::i18n::t("zc-chat-approval-scroll-hint");
     let footer = format!("↑/↓ {scroll_hint} · {keys}");
@@ -7452,6 +7447,11 @@ pub struct PendingApproval {
     pub tool_name: String,
     pub arguments_summary: String,
     pub timeout_secs: u64,
+    /// Daemon-owned policy marker. `false` hides the persistent action; it
+    /// must not be inferred from the tool name because the explicit
+    /// `session_prompt_approval = "disabled"` override keeps the ordinary
+    /// action for these tools.
+    pub allow_always: bool,
     /// Ephemeral viewport offset for the approval details. It is client-local:
     /// the daemon owns the approval request and never needs presentation state.
     pub scroll_offset: u16,
@@ -9419,6 +9419,7 @@ impl ChatState {
                 tool_name,
                 arguments_summary,
                 timeout_secs,
+                allow_always,
                 ..
             } => {
                 self.pending_approval = Some(PendingApproval {
@@ -9426,6 +9427,7 @@ impl ChatState {
                     tool_name,
                     arguments_summary,
                     timeout_secs,
+                    allow_always,
                     scroll_offset: 0,
                 });
                 if self.turn_in_flight {
@@ -12164,6 +12166,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         }
     }
@@ -13514,6 +13517,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
         prior.pending_elicitation = Some(PendingElicitation {
@@ -13669,6 +13673,7 @@ mod tests {
             tool_name: "shell".into(),
             arguments_summary: "ls".into(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
         assert_eq!(
@@ -13896,6 +13901,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
         active.pending_elicitation = Some(PendingElicitation {
@@ -16232,6 +16238,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
         chat.phase = ChatPhase::Active(Box::new(active));
@@ -18415,6 +18422,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "rm -rf /".to_string(),
             timeout_secs: 30,
+            allow_always: true,
         });
         assert!(s.pending_approval().is_some());
         let pa = s.pending_approval().unwrap();
@@ -18441,6 +18449,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "command: pwd".to_string(),
             timeout_secs: 120,
+            allow_always: true,
         });
 
         let area = Rect::new(0, 0, 100, 30);
@@ -18469,6 +18478,7 @@ mod tests {
             tool_name: "session_prompt_set".to_string(),
             arguments_summary: "content_escaped: a long exact binding".to_string(),
             timeout_secs: 30,
+            allow_always: false,
         });
 
         s.scroll_pending_approval(5);
@@ -18497,6 +18507,7 @@ mod tests {
             tool_name: "session_prompt_set".to_string(),
             arguments_summary: details,
             timeout_secs: 30,
+            allow_always: false,
         });
         s.scroll_pending_approval(24);
 
@@ -18543,6 +18554,7 @@ mod tests {
             tool_name: "session_prompt_set".to_string(),
             arguments_summary: "id: rule".to_string(),
             timeout_secs: 30,
+            allow_always: false,
         });
 
         let session_prompt_entries = pending_approval_help_entries(&session_prompt_state);
@@ -18560,6 +18572,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "command: true".to_string(),
             timeout_secs: 30,
+            allow_always: true,
         });
         let ordinary_entries = pending_approval_help_entries(&ordinary_state);
         assert!(
@@ -18567,6 +18580,22 @@ mod tests {
                 .iter()
                 .any(|entry| entry.keys.iter().any(|key| key == "a")),
             "ordinary approval must retain the approve-all help action"
+        );
+
+        let mut disabled_state = state();
+        disabled_state.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-3".to_string(),
+            tool_name: "session_prompt_set".to_string(),
+            arguments_summary: "id: rule".to_string(),
+            timeout_secs: 30,
+            allow_always: true,
+        });
+        assert!(
+            pending_approval_help_entries(&disabled_state)
+                .iter()
+                .any(|entry| entry.keys.iter().any(|key| key == "a")),
+            "the disabled session-prompt policy must retain the approve-all action"
         );
     }
 
@@ -18585,6 +18614,7 @@ mod tests {
             tool_name: "session_prompt_set".to_string(),
             arguments_summary: details,
             timeout_secs: 30,
+            allow_always: false,
         });
         s.scroll_pending_approval(200);
 
@@ -22205,6 +22235,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
 
@@ -22359,6 +22390,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
             scroll_offset: 0,
         });
         assert!(!chat.claims_pane_navigation(&word_left));

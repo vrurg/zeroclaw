@@ -3834,7 +3834,7 @@ impl Channel for WhatsAppWebChannel {
             mut guard,
         } = register_pending_approval(
             binding,
-            crate::util::is_strict_session_prompt_approval(
+            zeroclaw_api::is_strict_session_prompt_approval(
                 &request.tool_name,
                 request.raw_arguments.as_ref(),
             ),
@@ -3850,7 +3850,7 @@ impl Channel for WhatsAppWebChannel {
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
-            crate::util::is_strict_session_prompt_approval(
+            zeroclaw_api::is_strict_session_prompt_approval(
                 &request.tool_name,
                 request.raw_arguments.as_ref(),
             ),

@@ -6065,7 +6065,7 @@ impl Channel for SlackChannel {
                 sender: tx,
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
-                strict_session_prompt_approval: crate::util::is_strict_session_prompt_approval(
+                strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
                     &request.tool_name,
                     request.raw_arguments.as_ref(),
                 ),
@@ -6081,7 +6081,7 @@ impl Channel for SlackChannel {
                 &request.tool_name,
                 &request.arguments_summary,
                 request.position_counter(),
-                crate::util::is_strict_session_prompt_approval(
+                zeroclaw_api::is_strict_session_prompt_approval(
                     &request.tool_name,
                     request.raw_arguments.as_ref(),
                 ),
@@ -6101,7 +6101,7 @@ impl Channel for SlackChannel {
                     &request.tool_name,
                     &request.arguments_summary,
                     request.position_counter(),
-                    crate::util::is_strict_session_prompt_approval(
+                    zeroclaw_api::is_strict_session_prompt_approval(
                         &request.tool_name,
                         request.raw_arguments.as_ref(),
                     ),

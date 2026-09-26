@@ -938,12 +938,24 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         continue;
                     }
-                    if !crate::ws_approval::resolve_pending_approval(
+                    let resolution = crate::ws_approval::resolve_pending_approval(
                         &pending_approvals,
                         request_id,
                         decision.expect("checked above"),
-                    ) {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
+                    );
+                    match resolution {
+                        crate::ws_approval::ApprovalResolution::RejectedPersistentAction => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": "This approval accepts only the one-time approve action",
+                                "code": "APPROVAL_ACTION_UNAVAILABLE"
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        }
+                        crate::ws_approval::ApprovalResolution::Unknown => {
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
+                        }
+                        crate::ws_approval::ApprovalResolution::Resolved => {}
                     }
                     continue;
                 }
@@ -2037,12 +2049,24 @@ async fn process_chat_message(
                                         if request_id.is_empty() || decision.is_none() {
                                             continue;
                                         }
-                                        if !crate::ws_approval::resolve_pending_approval(
+                                        let resolution = crate::ws_approval::resolve_pending_approval(
                                             pending_approvals,
                                             request_id,
                                             decision.expect("checked above"),
-                                        ) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                        );
+                                        match resolution {
+                                            crate::ws_approval::ApprovalResolution::RejectedPersistentAction => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "This approval accepts only the one-time approve action",
+                                                    "code": "APPROVAL_ACTION_UNAVAILABLE"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            crate::ws_approval::ApprovalResolution::Unknown => {
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                            }
+                                            crate::ws_approval::ApprovalResolution::Resolved => {}
                                         }
                                     }
                                     Some("message") => {

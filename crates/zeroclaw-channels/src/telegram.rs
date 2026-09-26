@@ -8457,7 +8457,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
         let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
         let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-        let strict_session_prompt_approval = crate::util::is_strict_session_prompt_approval(
+        let strict_session_prompt_approval = zeroclaw_api::is_strict_session_prompt_approval(
             &request.tool_name,
             request.raw_arguments.as_ref(),
         );

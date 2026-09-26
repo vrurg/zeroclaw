@@ -280,6 +280,11 @@ pub enum SessionUpdate {
         tool_name: String,
         arguments_summary: String,
         timeout_secs: u64,
+        /// Whether the parked request accepts the persistent `always` action.
+        /// This is daemon-owned policy metadata; clients must not infer it
+        /// from the tool name because the explicit `disabled` override keeps
+        /// ordinary approval semantics for session-prompt mutations.
+        allow_always: bool,
     },
     /// Emitted once per LLM call with current context size and configured limit.
     /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
@@ -399,6 +404,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             tool_name: params.get("tool_name")?.as_str()?.to_string(),
             arguments_summary: params.get("arguments_summary")?.as_str()?.to_string(),
             timeout_secs: params.get("timeout_secs")?.as_u64().unwrap_or(30),
+            allow_always: params
+                .get("allow_always")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
         }),
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
@@ -6321,10 +6330,17 @@ mod notification_tests {
             "request_id": "req-1",
             "tool_name": "shell",
             "arguments_summary": "ls /tmp",
-            "timeout_secs": 60
+            "timeout_secs": 60,
+            "allow_always": false
         });
         let update = parse_session_update(&params).unwrap();
-        assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+        assert!(matches!(
+            update,
+            SessionUpdate::ApprovalRequest {
+                allow_always: false,
+                ..
+            }
+        ));
     }
 
     #[test]

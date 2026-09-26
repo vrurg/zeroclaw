@@ -17,6 +17,8 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
 
+type PendingApprovalEntry = (String, oneshot::Sender<ChannelApprovalResponse>, bool);
+
 #[derive(Default)]
 pub struct ApprovalPendingMap {
     /// `request_id -> (originating session_id, responder, strict_prompt)`. The session id
@@ -24,8 +26,7 @@ pub struct ApprovalPendingMap {
     /// `session/approve` authorizes against THAT session's owner instead
     /// of trusting a client-supplied `session_id` or the bare
     /// `request_id`.
-    inner:
-        std::sync::Mutex<HashMap<String, (String, oneshot::Sender<ChannelApprovalResponse>, bool)>>,
+    inner: std::sync::Mutex<HashMap<String, PendingApprovalEntry>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

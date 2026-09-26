@@ -515,18 +515,6 @@ pub(crate) fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
     zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
 }
 
-/// Whether the approval request is the dedicated, one-time session-prompt
-/// confirmation. The relaxed `session_prompt_approval = "disabled"` path
-/// still uses ordinary approval metadata (`raw_arguments: Some(...)`) and
-/// must retain the normal `always` affordance.
-#[allow(dead_code)]
-pub(crate) fn is_strict_session_prompt_approval(
-    tool_name: &str,
-    raw_arguments: Option<&serde_json::Value>,
-) -> bool {
-    is_session_prompt_mutation_tool(tool_name) && raw_arguments.is_none()
-}
-
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -566,7 +554,7 @@ pub fn parse_approval_reply(
     feature = "whatsapp-web",
     test
 ))]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_yesno_approval_prompt(
     token: &str,
     tool_name: &str,
@@ -664,7 +652,7 @@ pub(crate) fn approval_position_line(position: Option<(u32, u32)>) -> String {
 /// Localized text-reply approval prompt using approve/deny/always reply
 /// keywords: Matrix's own reply parser (distinct from
 /// [`parse_approval_reply`]) expects this shape.
-#[cfg(any(feature = "channel-matrix", test))]
+#[cfg(test)]
 pub(crate) fn build_approve_deny_approval_prompt(
     token: &str,
     tool_name: &str,
