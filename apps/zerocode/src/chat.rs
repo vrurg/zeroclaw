@@ -3544,7 +3544,11 @@ impl Chat {
                 }
             }
             Some(ChatTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
-                if let Some(pa) = state.take_pending_approval() {
+                let is_session_prompt_mutation = state
+                    .pending_approval()
+                    .map(|pa| is_session_prompt_mutation_tool(&pa.tool_name))
+                    .unwrap_or(false);
+                if !is_session_prompt_mutation && let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
                         .session_approve(
@@ -6574,6 +6578,10 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
     );
 }
 
+fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "session_prompt_set" | "session_prompt_delete")
+}
+
 fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let pa = match state.pending_approval() {
         Some(p) => p.clone(),
@@ -6600,12 +6608,17 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     f.render_widget(Clear, overlay_area);
 
     let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
+    let is_session_prompt_mutation = is_session_prompt_mutation_tool(&pa.tool_name);
     let allow = crate::i18n::t("zc-chat-approval-action-allow");
     let always = crate::i18n::t("zc-chat-approval-action-always");
     let reject = crate::i18n::t("zc-chat-approval-action-reject");
     let edit = crate::i18n::t("zc-chat-approval-action-edit");
     let keys = if is_edit_tool {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
+    } else if is_session_prompt_mutation {
+        // Required session-prompt approval is deliberately single-use. Keep
+        // ZeroCode from advertising an Always action that the daemon rejects.
+        format!("Enter={allow}  Ctrl+D={reject}")
     } else {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     };
@@ -18500,6 +18513,10 @@ mod tests {
             assert!(
                 rendered.contains("Enter=Allow") && rendered.contains("Ctrl+D=Reject"),
                 "all approval actions must remain visible while details scroll at {width} columns"
+            );
+            assert!(
+                !rendered.contains("Always"),
+                "single-use session-prompt approval must not advertise an Always action at {width} columns"
             );
         }
     }
