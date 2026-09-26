@@ -99,3 +99,9 @@ policy during a turn.
 Prompt content is opaque. It is sent to the model as part of the system prompt
 and returned by an explicit `session_prompt_list` call, but it is omitted from
 generic tool events, receipts, progress, telemetry, and observer records.
+Generic completion records for these mutation tools are intentionally omitted,
+including when an operator has selected `session_prompt_approval = "disabled"`
+and ordinary auto-approval permits the call; this keeps the opaque content out
+of generic sinks at the cost of less detailed completion visibility. The
+explicit list result and the provider request remain the only content-bearing
+surfaces.

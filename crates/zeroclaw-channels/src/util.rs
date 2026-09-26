@@ -531,12 +531,8 @@ pub fn parse_approval_reply(
     Some((token, response))
 }
 
-/// Localized text-reply approval prompt using yes/no/always reply keywords:
-/// Discord's plaintext fallback, Signal, WhatsApp, and Slack's polling-mode
-/// fallback all send this exact shape. The heading/labels/instruction come
-/// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
-/// are protocol-exact values echoed verbatim — never localized — so a locale
-/// switch cannot desync the prompt from [`parse_approval_reply`].
+/// Compatibility wrapper for ordinary approval tests; strict callers pass the
+/// daemon-owned marker through [`build_yesno_approval_prompt_with_policy`].
 #[cfg(test)]
 pub(crate) fn build_yesno_approval_prompt(
     token: &str,
@@ -544,14 +540,17 @@ pub(crate) fn build_yesno_approval_prompt(
     arguments_summary: &str,
     position: Option<(u32, u32)>,
 ) -> String {
-    // Compatibility wrapper for ordinary approval tests; strict callers pass
-    // the daemon-owned marker through the policy-aware helper below.
     build_yesno_approval_prompt_with_policy(token, tool_name, arguments_summary, position, false)
 }
 
-/// Variant of [`build_yesno_approval_prompt`] that carries the approval policy
-/// marker from the runtime request. Keeping the compatibility wrapper above
-/// avoids making test-only callers invent request metadata.
+/// Localized text-reply approval prompt using yes/no/always reply keywords:
+/// Discord's plaintext fallback, Signal, WhatsApp, and Slack's polling-mode
+/// fallback all send this exact shape. The heading/labels/instruction come
+/// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
+/// are protocol-exact values echoed verbatim - never localized - so a locale
+/// switch cannot desync the prompt from [`parse_approval_reply`]. The
+/// daemon-owned policy marker is the only input that can suppress the
+/// persistent-action `always` reply.
 #[cfg(any(
     feature = "channel-discord",
     feature = "channel-mattermost",

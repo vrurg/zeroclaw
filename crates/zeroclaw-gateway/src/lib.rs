@@ -2919,7 +2919,7 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(test)]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -4265,26 +4265,29 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let messages = verified.take_messages();
-    let mut routed_messages = Vec::with_capacity(messages.len());
-    for msg in messages {
-        let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
-        else {
-            routed_messages.push(msg);
-            continue;
-        };
-        // The async registry helper keeps the stale `always` guard adjacent to
-        // the one-shot removal so webhook and channel paths cannot diverge.
-        match wa.resolve_pending_approval_response(&token, response).await {
-            zeroclaw_channels::whatsapp::PendingApprovalResolution::Resolved
-            | zeroclaw_channels::whatsapp::PendingApprovalResolution::Rejected
-            | zeroclaw_channels::whatsapp::PendingApprovalResolution::ReceiverGone => {}
-            zeroclaw_channels::whatsapp::PendingApprovalResolution::Unknown => {
-                routed_messages.push(msg);
-            }
-        }
-    }
-    verified.replace_messages(routed_messages);
+    let approval_channel = Arc::clone(wa);
+    verified
+        .retain_messages(move |msg| {
+            let approval_channel = Arc::clone(&approval_channel);
+            Box::pin(async move {
+                let Some((token, response)) =
+                    zeroclaw_channels::util::parse_approval_reply(&msg.content)
+                else {
+                    return true;
+                };
+                // The async registry helper keeps the stale `always` guard
+                // adjacent to the one-shot removal so webhook and channel
+                // paths cannot diverge. Unknown tokens remain ordinary inbound
+                // messages.
+                matches!(
+                    approval_channel
+                        .resolve_pending_approval_response(&token, response)
+                        .await,
+                    zeroclaw_channels::whatsapp::PendingApprovalResolution::Unknown
+                )
+            })
+        })
+        .await;
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
@@ -12572,6 +12575,77 @@ data: [DONE]\n\n";
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_keeps_unknown_approval_reply_in_agent_dispatch() {
+        // The webhook router must consume only replies for a registered
+        // approval. An approval-shaped message with an unknown token remains
+        // an ordinary inbound message instead of disappearing at the routing
+        // boundary. The companion WhatsApp-channel test covers the strict
+        // `always` rejection/parking decision for a registered token.
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let channel = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "work",
+            peer_resolver,
+        ));
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), Arc::clone(&channel))]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        let body = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "15551234567",
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": { "body": "abc123 always" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&body).expect("test webhook JSON serializes");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", &body)).unwrap(),
+        );
+
+        let (status, _) = process_whatsapp_message(
+            &state,
+            "work",
+            &channel,
+            Some("app-secret"),
+            headers,
+            Bytes::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert_eq!(
+            captures.len(),
+            1,
+            "unknown approval replies must be dispatched"
+        );
+        assert_eq!(captures[0].message, "abc123 always");
+        assert_eq!(
+            captures[0].session_id.as_deref(),
+            Some("whatsapp_+15551234567")
+        );
     }
 
     /// Fail closed. A configured alias with no app secret cannot verify
