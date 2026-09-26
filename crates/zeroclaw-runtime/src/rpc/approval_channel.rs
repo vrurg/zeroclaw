@@ -25,6 +25,13 @@ use super::context::ApprovalPendingMap;
 
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn is_strict_session_prompt_approval(
+    tool_name: &str,
+    raw_arguments: Option<&serde_json::Value>,
+) -> bool {
+    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name) && raw_arguments.is_none()
+}
+
 pub struct RpcApprovalChannel {
     name: String,
     session_id: String,
@@ -173,11 +180,16 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+        let strict_session_prompt_approval =
+            is_strict_session_prompt_approval(&request.tool_name, request.raw_arguments.as_ref());
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
-        let mut pending_request =
-            self.pending
-                .register(request_id.clone(), self.session_id.clone(), tx);
+        let mut pending_request = self.pending.register(
+            request_id.clone(),
+            self.session_id.clone(),
+            tx,
+            strict_session_prompt_approval,
+        );
 
         self.rpc
             .notify(
@@ -189,6 +201,7 @@ impl RpcApprovalChannel {
                     "tool_name": request.tool_name,
                     "arguments_summary": request.arguments_summary,
                     "timeout_secs": timeout.as_secs(),
+                    "allow_always": !strict_session_prompt_approval,
                 }),
             )
             .await;

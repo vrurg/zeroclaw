@@ -507,6 +507,26 @@ pub(crate) const APPROVAL_REPLY_NO_SHORT: &str = "n";
 pub(crate) const APPROVAL_REPLY_DENY: &str = "deny";
 pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
 
+/// Returns whether a tool mutates the session-persistent prompt collection.
+/// Keep this vocabulary in the API crate so every approval and presentation
+/// boundary makes the same decision.
+#[allow(dead_code)]
+pub(crate) fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
+    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
+}
+
+/// Whether the approval request is the dedicated, one-time session-prompt
+/// confirmation. The relaxed `session_prompt_approval = "disabled"` path
+/// still uses ordinary approval metadata (`raw_arguments: Some(...)`) and
+/// must retain the normal `always` affordance.
+#[allow(dead_code)]
+pub(crate) fn is_strict_session_prompt_approval(
+    tool_name: &str,
+    raw_arguments: Option<&serde_json::Value>,
+) -> bool {
+    is_session_prompt_mutation_tool(tool_name) && raw_arguments.is_none()
+}
+
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -546,11 +566,34 @@ pub fn parse_approval_reply(
     feature = "whatsapp-web",
     test
 ))]
+#[allow(dead_code)]
 pub(crate) fn build_yesno_approval_prompt(
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+) -> String {
+    build_yesno_approval_prompt_with_policy(token, tool_name, arguments_summary, position, true)
+}
+
+/// Variant of [`build_yesno_approval_prompt`] that carries the approval policy
+/// marker from the runtime request. Keeping the compatibility wrapper above
+/// avoids making test-only callers invent request metadata.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-mattermost",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
+pub(crate) fn build_yesno_approval_prompt_with_policy(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+    strict_session_prompt_approval: bool,
 ) -> String {
     let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
@@ -558,15 +601,25 @@ pub(crate) fn build_yesno_approval_prompt(
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
     let yes_command = format!("{token} {APPROVAL_REPLY_YES}");
     let no_command = format!("{token} {APPROVAL_REPLY_NO}");
-    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
-    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-        "channel-approval-reply-instruction-yesno",
-        &[
-            ("yes_command", yes_command.as_str()),
-            ("no_command", no_command.as_str()),
-            ("always_command", always_command.as_str()),
-        ],
-    );
+    let reply = if strict_session_prompt_approval && is_session_prompt_mutation_tool(tool_name) {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reply-instruction-yesno-once",
+            &[
+                ("yes_command", yes_command.as_str()),
+                ("no_command", no_command.as_str()),
+            ],
+        )
+    } else {
+        let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reply-instruction-yesno",
+            &[
+                ("yes_command", yes_command.as_str()),
+                ("no_command", no_command.as_str()),
+                ("always_command", always_command.as_str()),
+            ],
+        )
+    };
     format!(
         "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
@@ -618,21 +671,48 @@ pub(crate) fn build_approve_deny_approval_prompt(
     arguments_summary: &str,
     position: Option<(u32, u32)>,
 ) -> String {
+    build_approve_deny_approval_prompt_with_policy(
+        token,
+        tool_name,
+        arguments_summary,
+        position,
+        true,
+    )
+}
+
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn build_approve_deny_approval_prompt_with_policy(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+    strict_session_prompt_approval: bool,
+) -> String {
     let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
     let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
     let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
-    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
-    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-        "channel-approval-reply-instruction-approve-deny",
-        &[
-            ("approve_command", approve_command.as_str()),
-            ("deny_command", deny_command.as_str()),
-            ("always_command", always_command.as_str()),
-        ],
-    );
+    let reply = if strict_session_prompt_approval && is_session_prompt_mutation_tool(tool_name) {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reply-instruction-approve-deny-once",
+            &[
+                ("approve_command", approve_command.as_str()),
+                ("deny_command", deny_command.as_str()),
+            ],
+        )
+    } else {
+        let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reply-instruction-approve-deny",
+            &[
+                ("approve_command", approve_command.as_str()),
+                ("deny_command", deny_command.as_str()),
+                ("always_command", always_command.as_str()),
+            ],
+        )
+    };
     format!(
         "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
@@ -648,6 +728,7 @@ pub(crate) struct PendingApproval {
     pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
     pub(crate) destination: String,
     pub(crate) tool_name: String,
+    pub(crate) strict_session_prompt_approval: bool,
 }
 
 #[cfg(any(
@@ -714,6 +795,17 @@ pub(crate) async fn resolve_pending_approval_with_tool(
         return (PendingApprovalResolution::NotFound, None);
     };
     if !responder_allowed || destination.is_empty() || pending.destination != destination {
+        return (PendingApprovalResolution::Rejected, None);
+    }
+
+    // Required session-prompt approval is single-use. Keep the request parked
+    // when an old client or stale button submits `always`; consuming it here
+    // would prevent the operator from answering with the valid one-time action.
+    if matches!(
+        response,
+        zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+    ) && pending.strict_session_prompt_approval
+    {
         return (PendingApprovalResolution::Rejected, None);
     }
 
@@ -1354,6 +1446,21 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_text_approval_prompt_hides_persistent_action() {
+        let prompt =
+            super::build_yesno_approval_prompt("ab12cd", "session_prompt_set", "action: set", None);
+        assert!(prompt.contains("ab12cd yes"));
+        assert!(prompt.contains("ab12cd no"));
+        assert!(
+            !prompt.contains("ab12cd always"),
+            "strict session-prompt approval must not advertise always: {prompt:?}"
+        );
+
+        let ordinary = super::build_yesno_approval_prompt("ab12cd", "shell", "ls", None);
+        assert!(ordinary.contains("ab12cd always"));
+    }
+
+    #[test]
     fn approval_prompt_shows_batch_position_when_batch_has_several_calls() {
         // Back-to-back cards from one message are indistinguishable before the
         // operator taps, so a multi-call batch must say which call it is.
@@ -1434,6 +1541,19 @@ mod tests {
                 "prompt should show the exact reply {reply:?}; got {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_prompt_matrix_approval_prompt_hides_persistent_action() {
+        let prompt = super::build_approve_deny_approval_prompt(
+            "AB12CD34",
+            "session_prompt_delete",
+            "action: delete",
+            None,
+        );
+        assert!(prompt.contains("AB12CD34 approve"));
+        assert!(prompt.contains("AB12CD34 deny"));
+        assert!(!prompt.contains("AB12CD34 always"));
     }
 
     #[test]
@@ -1519,6 +1639,7 @@ mod tests {
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -1593,6 +1714,7 @@ mod tests {
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -1610,5 +1732,45 @@ mod tests {
             "a consumed approval must not fall through after its receiver closes"
         );
         assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_always_does_not_consume_session_prompt_approval() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "approval-id".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "room-a".to_string(),
+                tool_name: "session_prompt_set".to_string(),
+                strict_session_prompt_approval: true,
+            },
+        );
+
+        let resolution = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::AlwaysApprove,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolution, PendingApprovalResolution::Rejected);
+        assert!(pending.lock().await.contains_key("approval-id"));
+        assert!(rx.try_recv().is_err());
+
+        let resolution = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Approve,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolution, PendingApprovalResolution::Resolved);
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
 }

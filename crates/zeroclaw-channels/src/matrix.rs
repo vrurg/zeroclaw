@@ -5427,11 +5427,16 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let prompt = crate::util::build_approve_deny_approval_prompt(
+        let strict_session_prompt_approval = crate::util::is_strict_session_prompt_approval(
+            &request.tool_name,
+            request.raw_arguments.as_ref(),
+        );
+        let prompt = crate::util::build_approve_deny_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -5441,6 +5446,7 @@ impl Channel for MatrixChannel {
                 sender: tx,
                 destination,
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
 

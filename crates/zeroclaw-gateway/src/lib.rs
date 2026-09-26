@@ -4265,19 +4265,20 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut approvals = wa.pending_approvals().lock().await;
-    verified.retain(|msg| {
+    let mut routed_messages = Vec::with_capacity(verified.len());
+    for msg in verified {
         let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         else {
-            return true;
+            routed_messages.push(msg);
+            continue;
         };
-        let Some(sender) = approvals.remove(&token) else {
-            return true;
-        };
-        let _ = sender.send(response);
-        false
-    });
-    drop(approvals);
+        // The async registry helper keeps the stale `always` guard adjacent to
+        // the one-shot removal so webhook and channel paths cannot diverge.
+        if !wa.resolve_pending_approval_response(&token, response).await {
+            routed_messages.push(msg);
+        }
+    }
+    verified = routed_messages;
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(

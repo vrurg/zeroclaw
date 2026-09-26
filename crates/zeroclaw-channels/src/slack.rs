@@ -5017,13 +5017,21 @@ fn build_socket_mode_approval_body(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    strict_session_prompt_approval: bool,
 ) -> serde_json::Value {
     let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = i18n::get_required_cli_string("channel-approval-args-label");
     let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
     let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-    let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+    let mut elements = vec![
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" }),
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" }),
+    ];
+    if !strict_session_prompt_approval {
+        let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+        elements.push(serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") }));
+    }
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
     serde_json::json!({
@@ -5037,11 +5045,7 @@ fn build_socket_mode_approval_body(
             }
         }, {
             "type": "actions",
-            "elements": [
-                { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
-            ]
+            "elements": elements
         }]
     })
 }
@@ -6061,6 +6065,10 @@ impl Channel for SlackChannel {
                 sender: tx,
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval: crate::util::is_strict_session_prompt_approval(
+                    &request.tool_name,
+                    request.raw_arguments.as_ref(),
+                ),
             },
         );
 
@@ -6073,6 +6081,10 @@ impl Channel for SlackChannel {
                 &request.tool_name,
                 &request.arguments_summary,
                 request.position_counter(),
+                crate::util::is_strict_session_prompt_approval(
+                    &request.tool_name,
+                    request.raw_arguments.as_ref(),
+                ),
             );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
@@ -6084,11 +6096,15 @@ impl Channel for SlackChannel {
                 .map_err(anyhow::Error::from)
         } else {
             self.send(&SendMessage::new(
-                crate::util::build_yesno_approval_prompt(
+                crate::util::build_yesno_approval_prompt_with_policy(
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
                     request.position_counter(),
+                    crate::util::is_strict_session_prompt_approval(
+                        &request.tool_name,
+                        request.raw_arguments.as_ref(),
+                    ),
                 ),
                 recipient,
             ))
@@ -8877,6 +8893,7 @@ mod tests {
                 sender: tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8931,6 +8948,7 @@ mod tests {
                 sender: approve_tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         assert_eq!(
@@ -8994,6 +9012,7 @@ mod tests {
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9002,6 +9021,7 @@ mod tests {
                     sender: wrong_tx,
                     destination: "C_OTHER".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9010,6 +9030,7 @@ mod tests {
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
         }
@@ -9071,6 +9092,7 @@ mod tests {
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9079,6 +9101,7 @@ mod tests {
                     sender: wrong_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9087,6 +9110,7 @@ mod tests {
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
         }
@@ -9202,6 +9226,7 @@ mod tests {
             "shell",
             "ls -la",
             Some((2, 3)),
+            false,
         );
         let expected = crate::util::approval_position_line(Some((2, 3)));
         assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
@@ -9229,9 +9254,11 @@ mod tests {
             "shell",
             "ls -la",
             Some((1, 1)),
+            false,
         );
-        let none =
-            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None);
+        let none = super::build_socket_mode_approval_body(
+            "C123", "ab12cd", "shell", "ls -la", None, false,
+        );
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"

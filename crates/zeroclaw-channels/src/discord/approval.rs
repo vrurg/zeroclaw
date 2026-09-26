@@ -130,7 +130,13 @@ pub(crate) fn resolve_parked_approval(
     map: &mut HashMap<String, oneshot::Sender<ChannelApprovalResponse>>,
     token: &str,
     decision: ApprovalDecision,
+    strict_session_prompt_approval: bool,
 ) -> bool {
+    if matches!(decision.response(), ChannelApprovalResponse::AlwaysApprove)
+        && strict_session_prompt_approval
+    {
+        return false;
+    }
     map.remove(token)
         .map(|sender| sender.send(decision.response()).is_ok())
         .unwrap_or(false)
@@ -142,9 +148,17 @@ pub(crate) fn resolve_parked_approval(
 /// makes a click resolvable (an unregistered id resolves to nothing).
 pub(crate) fn build_approval_row(
     token: &str,
+    strict_session_prompt_approval: bool,
 ) -> (DiscordActionRow, Vec<(CustomId, ApprovalDecision)>) {
     let bindings: Vec<(CustomId, ApprovalDecision)> = APPROVAL_BUTTONS
         .iter()
+        .filter(|decision| {
+            !strict_session_prompt_approval
+                || matches!(
+                    decision,
+                    ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+                )
+        })
         .map(|d| approval_button_binding(token, *d))
         .collect();
     let buttons = bindings
@@ -182,8 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_session_prompt_row_has_only_one_time_choices() {
+        let (row, bindings) = build_approval_row("abc123", true);
+        assert_eq!(row.components.len(), 2);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|(_, decision)| matches!(
+            decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+        )));
+    }
+
+    #[test]
     fn row_has_four_buttons_with_unique_ids_carrying_the_token() {
-        let (row, bindings) = build_approval_row("abc123");
+        let (row, bindings) = build_approval_row("abc123", false);
         assert_eq!(row.components.len(), 4, "four approval buttons");
         assert_eq!(bindings.len(), 4);
 
@@ -201,7 +226,7 @@ mod tests {
 
     #[test]
     fn bindings_cover_every_decision_exactly_once() {
-        let (_, bindings) = build_approval_row("tok");
+        let (_, bindings) = build_approval_row("tok", false);
         let decisions: Vec<ApprovalDecision> = bindings.iter().map(|(_, d)| *d).collect();
         assert!(decisions.contains(&ApprovalDecision::AllowOnce));
         assert!(decisions.contains(&ApprovalDecision::AllowSession));
@@ -235,7 +260,7 @@ mod tests {
             map.insert("tok".to_string(), tx);
 
             assert!(
-                resolve_parked_approval(&mut map, "tok", decision),
+                resolve_parked_approval(&mut map, "tok", decision, false),
                 "live oneshot resolves"
             );
             assert_eq!(rx.await.unwrap(), expected, "decision: {decision:?}");
@@ -252,12 +277,13 @@ mod tests {
         assert!(resolve_parked_approval(
             &mut map,
             "tok",
-            ApprovalDecision::Deny
+            ApprovalDecision::Deny,
+            false
         ));
         // A second click on the same (now-drained) token resolves nothing — the
         // approval layer is single-use even if a stale button is clicked.
         assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
+            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce, false),
             "replay refused"
         );
     }
@@ -272,7 +298,8 @@ mod tests {
         assert!(!resolve_parked_approval(
             &mut map,
             "forged",
-            ApprovalDecision::AllowOnce
+            ApprovalDecision::AllowOnce,
+            false,
         ));
         assert!(map.contains_key("real"), "the real entry is not drained");
     }
@@ -287,7 +314,7 @@ mod tests {
         map.insert("tok".to_string(), tx);
         drop(rx); // receiver gone, as after a timeout
         assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
+            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce, false),
             "send to a dropped receiver is not a successful resolve"
         );
     }

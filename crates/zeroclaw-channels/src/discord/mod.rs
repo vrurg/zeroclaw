@@ -826,11 +826,16 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let text = crate::util::build_yesno_approval_prompt(
+        let strict_session_prompt_approval = crate::util::is_strict_session_prompt_approval(
+            &request.tool_name,
+            request.raw_arguments.as_ref(),
+        );
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -841,7 +846,11 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let (row, bindings) = approval::build_approval_row(token);
+        let strict_session_prompt_approval = crate::util::is_strict_session_prompt_approval(
+            &request.tool_name,
+            request.raw_arguments.as_ref(),
+        );
+        let (row, bindings) = approval::build_approval_row(token, strict_session_prompt_approval);
         // Register every button's intent first. Single-use is enforced by the
         // registry's `take`; the per-click `interaction_gate` is enforced by the
         // type-3 dispatch before any `take`.
@@ -854,6 +863,7 @@ impl DiscordChannel {
                         ComponentIntent::Approval {
                             token: token.to_string(),
                             decision: *decision,
+                            strict_session_prompt_approval,
                         },
                     );
                 }
@@ -2888,11 +2898,18 @@ impl Channel for DiscordChannel {
                                          // → refuse, don't act.
                                         let intent = pending_components.lock().take(&custom_id_raw);
                                         let prompt = match intent {
-                                            Some(ComponentIntent::Approval { token, decision }) => {
+                                            Some(ComponentIntent::Approval {
+                                                token,
+                                                decision,
+                                                strict_session_prompt_approval,
+                                            }) => {
                                                 let resolved = {
                                                     let mut guard = pending_approvals.lock().await;
                                                     approval::resolve_parked_approval(
-                                                        &mut guard, &token, decision,
+                                                        &mut guard,
+                                                        &token,
+                                                        decision,
+                                                        strict_session_prompt_approval,
                                                     )
                                                 };
                                                 let key = if resolved {
@@ -7823,9 +7840,16 @@ mod tests {
         }
         let intent = pending_components.lock().take(custom_id);
         match intent {
-            Some(ComponentIntent::Approval { token, decision }) => {
-                approval::resolve_parked_approval(pending_approvals, &token, decision)
-            }
+            Some(ComponentIntent::Approval {
+                token,
+                decision,
+                strict_session_prompt_approval,
+            }) => approval::resolve_parked_approval(
+                pending_approvals,
+                &token,
+                decision,
+                strict_session_prompt_approval,
+            ),
             _ => false,
         }
     }
@@ -7843,6 +7867,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let mut approvals = std::collections::HashMap::new();
@@ -7868,6 +7893,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let mut approvals = std::collections::HashMap::new();
@@ -7911,6 +7937,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let mut approvals = std::collections::HashMap::new();
@@ -7948,7 +7975,7 @@ mod tests {
         // Register exactly what send_buttoned_approval registers, then confirm
         // every button id resolves to its bound decision (and only its own).
         let token = "abc123";
-        let (_, bindings) = approval::build_approval_row(token);
+        let (_, bindings) = approval::build_approval_row(token, false);
         {
             let mut reg = ch.pending_components.lock();
             for (cid, decision) in &bindings {
@@ -7957,6 +7984,7 @@ mod tests {
                     ComponentIntent::Approval {
                         token: token.to_string(),
                         decision: *decision,
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -7968,6 +7996,7 @@ mod tests {
                 Some(ComponentIntent::Approval {
                     token: token.to_string(),
                     decision: *decision,
+                    strict_session_prompt_approval: false,
                 }),
                 "each button resolves to its server-bound decision"
             );

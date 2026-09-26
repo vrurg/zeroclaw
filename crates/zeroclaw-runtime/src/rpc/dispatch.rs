@@ -6355,12 +6355,23 @@ impl RpcDispatcher {
             }
         };
 
-        self.ctx.approval_pending.resolve(&p.request_id, response);
+        let acknowledged = match self
+            .ctx
+            .approval_pending
+            .resolve_status(&p.request_id, response)
+        {
+            // Keep the pre-existing idempotent no-op contract for unknown or
+            // already-retired request ids. Only a known strict request that
+            // rejects `always` is an unacknowledged response.
+            super::context::ApprovalResolution::Unknown
+            | super::context::ApprovalResolution::Resolved => true,
+            super::context::ApprovalResolution::Rejected => false,
+        };
 
         to_result(SessionApproveResult {
             session_id: p.session_id,
             request_id: p.request_id,
-            acknowledged: true,
+            acknowledged,
         })
     }
 

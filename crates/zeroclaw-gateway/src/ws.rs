@@ -938,9 +938,11 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         continue;
                     }
-                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                        let _ = tx.send(decision.expect("checked above"));
-                    } else {
+                    if !crate::ws_approval::resolve_pending_approval(
+                        &pending_approvals,
+                        request_id,
+                        decision.expect("checked above"),
+                    ) {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
                     }
                     continue;
@@ -1047,6 +1049,10 @@ async fn handle_socket(
                         "tool": tool_name,
                         "arguments_summary": arguments_summary,
                         "timeout_secs": timeout_secs,
+                        "allow_always": crate::ws_approval::allow_always(
+                            &pending_approvals,
+                            &request_id,
+                        ),
                     }),
                     other => {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
@@ -2031,9 +2037,11 @@ async fn process_chat_message(
                                         if request_id.is_empty() || decision.is_none() {
                                             continue;
                                         }
-                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                            let _ = tx.send(decision.expect("checked above"));
-                                        } else {
+                                        if !crate::ws_approval::resolve_pending_approval(
+                                            pending_approvals,
+                                            request_id,
+                                            decision.expect("checked above"),
+                                        ) {
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
                                         }
                                     }
@@ -2092,6 +2100,10 @@ async fn process_chat_message(
                                         "tool": tool_name,
                                         "arguments_summary": arguments_summary,
                                         "timeout_secs": timeout_secs,
+                                        "allow_always": crate::ws_approval::allow_always(
+                                            pending_approvals,
+                                            &request_id,
+                                        ),
                                     });
                                     if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
                                         detach_mid_turn(session_key, &turn_id, pending_approvals);
@@ -2148,6 +2160,10 @@ async fn process_chat_message(
                                             "tool": tool_name,
                                             "arguments_summary": arguments_summary,
                                             "timeout_secs": timeout_secs,
+                                            "allow_always": crate::ws_approval::allow_always(
+                                                pending_approvals,
+                                                &request_id,
+                                            ),
                                         })
                                     }
                                     TurnEvent::HistoryTrimmed {
@@ -4945,7 +4961,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     fn detach_mid_turn_drops_parked_approvals_so_they_fail_closed() {
         let pending = new_pending_approvals();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        pending.lock().insert("req-1".to_string(), tx);
+        pending.lock().insert(
+            "req-1".to_string(),
+            crate::ws_approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         detach_mid_turn("gw_detached", "turn-1", &pending);
 

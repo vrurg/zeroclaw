@@ -49,6 +49,7 @@ struct PendingApproval {
     registration_id: uuid::Uuid,
     responder: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
     binding: ApprovalBinding,
+    strict_session_prompt_approval: bool,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -143,7 +144,10 @@ async fn remove_pending_approval_if_matches(token: &str, registration_id: uuid::
 
 /// Reserve an unused reply token and tie its map entry to a cancellation guard.
 #[cfg(feature = "whatsapp-web")]
-async fn register_pending_approval(binding: ApprovalBinding) -> PendingApprovalRegistration {
+async fn register_pending_approval(
+    binding: ApprovalBinding,
+    strict_session_prompt_approval: bool,
+) -> PendingApprovalRegistration {
     loop {
         let token = crate::util::new_approval_token();
         let mut pending = PENDING_APPROVALS.lock().await;
@@ -155,6 +159,7 @@ async fn register_pending_approval(binding: ApprovalBinding) -> PendingApprovalR
                 registration_id,
                 responder,
                 binding: binding.clone(),
+                strict_session_prompt_approval,
             });
             drop(pending);
 
@@ -241,6 +246,11 @@ async fn resolve_approval_reply(
     }
     if !responder_is_allowlisted {
         return Err(ApprovalRefusal::UnauthorizedResponder);
+    }
+    if pending.strict_session_prompt_approval
+        && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+    {
+        return Err(ApprovalRefusal::UnknownToken);
     }
     // Only remove once the reply has cleared every gate. A refused reply must
     // leave the request pending so the real operator can still answer it,
@@ -3822,17 +3832,28 @@ impl Channel for WhatsAppWebChannel {
             receiver,
             binding,
             mut guard,
-        } = register_pending_approval(binding).await;
+        } = register_pending_approval(
+            binding,
+            crate::util::is_strict_session_prompt_approval(
+                &request.tool_name,
+                request.raw_arguments.as_ref(),
+            ),
+        )
+        .await;
 
         // Shared with the Cloud transport, discord, signal and slack, so the
         // prompt's prose comes from the runtime Fluent catalogue while the
         // token and the yes/no/always keywords stay protocol-exact ASCII that
         // `parse_approval_reply` can still read.
-        let mut text = crate::util::build_yesno_approval_prompt(
+        let mut text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            crate::util::is_strict_session_prompt_approval(
+                &request.tool_name,
+                request.raw_arguments.as_ref(),
+            ),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in
@@ -6863,6 +6884,7 @@ mod tests {
                     chat: chat.to_string(),
                     is_group,
                 },
+                strict_session_prompt_approval: false,
             },
         );
         rx
@@ -6911,6 +6933,7 @@ mod tests {
                     chat: "1@s.whatsapp.net".to_string(),
                     is_group: false,
                 },
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -7195,11 +7218,14 @@ mod tests {
             receiver,
             mut guard,
             ..
-        } = register_pending_approval(ApprovalBinding {
-            alias: alias.to_string(),
-            chat: chat.clone(),
-            is_group: false,
-        })
+        } = register_pending_approval(
+            ApprovalBinding {
+                alias: alias.to_string(),
+                chat: chat.clone(),
+                is_group: false,
+            },
+            false,
+        )
         .await;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -7502,6 +7528,7 @@ mod tests {
                             chat: "2@s.whatsapp.net".to_string(),
                             is_group: false,
                         },
+                        strict_session_prompt_approval: false,
                     },
                 );
                 *receiver_slot.lock().unwrap() = Some(receiver);
@@ -7546,11 +7573,14 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn cancelled_request_leaves_no_live_token() {
-        let registration = register_pending_approval(ApprovalBinding {
-            alias: "alias-a".into(),
-            chat: "1@s.whatsapp.net".into(),
-            is_group: false,
-        })
+        let registration = register_pending_approval(
+            ApprovalBinding {
+                alias: "alias-a".into(),
+                chat: "1@s.whatsapp.net".into(),
+                is_group: false,
+            },
+            false,
+        )
         .await;
         let token = registration.token.clone();
         assert!(PENDING_APPROVALS.lock().await.contains_key(&token));
@@ -7605,6 +7635,7 @@ mod tests {
                     chat: "1@s.whatsapp.net".into(),
                     is_group: false,
                 },
+                strict_session_prompt_approval: false,
             },
         );
 
