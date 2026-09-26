@@ -730,6 +730,11 @@ impl ModelPickerDispatchOwnership {
     }
 }
 
+#[cfg(not(feature = "channel-telegram"))]
+impl Drop for ModelPickerDispatchOwnership {
+    fn drop(&mut self) {}
+}
+
 /// A turn waiting for its conversation lane.
 struct PendingTurn {
     ctx: Arc<ChannelRuntimeContext>,

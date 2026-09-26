@@ -367,12 +367,18 @@ impl VerifiedWebhookMessages {
         self.messages.is_empty()
     }
 
-    /// Remove messages handled entirely by the transport adapter, such as
-    /// WhatsApp approval replies. This can narrow the parsed set but cannot
-    /// introduce content that did not come from the verified body.
+    /// Move the parsed messages out while retaining the authenticated ingress
+    /// metadata needed by the final dispatch step.
     #[cfg(feature = "channel-whatsapp-cloud")]
-    pub(crate) fn retain(&mut self, keep: impl FnMut(&ChannelMessage) -> bool) {
-        self.messages.retain(keep);
+    pub(crate) fn take_messages(&mut self) -> Vec<ChannelMessage> {
+        std::mem::take(&mut self.messages)
+    }
+
+    /// Put the messages that were not consumed by transport-specific routing
+    /// back into the authenticated batch for dispatch.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    pub(crate) fn replace_messages(&mut self, messages: Vec<ChannelMessage>) {
+        self.messages = messages;
     }
 }
 

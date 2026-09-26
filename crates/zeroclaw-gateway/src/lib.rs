@@ -4265,8 +4265,9 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut routed_messages = Vec::with_capacity(verified.len());
-    for msg in verified {
+    let messages = verified.take_messages();
+    let mut routed_messages = Vec::with_capacity(messages.len());
+    for msg in messages {
         let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         else {
             routed_messages.push(msg);
@@ -4283,7 +4284,7 @@ async fn process_whatsapp_message(
             }
         }
     }
-    verified = routed_messages;
+    verified.replace_messages(routed_messages);
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
