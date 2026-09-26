@@ -507,22 +507,6 @@ pub(crate) const APPROVAL_REPLY_NO_SHORT: &str = "n";
 pub(crate) const APPROVAL_REPLY_DENY: &str = "deny";
 pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
 
-/// Returns whether a tool mutates the session-persistent prompt collection.
-/// Keep this vocabulary in the API crate so every approval and presentation
-/// boundary makes the same decision.
-#[cfg(any(
-    feature = "channel-discord",
-    feature = "channel-mattermost",
-    feature = "channel-signal",
-    feature = "channel-slack",
-    feature = "channel-whatsapp-cloud",
-    feature = "whatsapp-web",
-    test
-))]
-pub(crate) fn is_session_prompt_mutation_tool(tool_name: &str) -> bool {
-    zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&tool_name)
-}
-
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -560,7 +544,9 @@ pub(crate) fn build_yesno_approval_prompt(
     arguments_summary: &str,
     position: Option<(u32, u32)>,
 ) -> String {
-    build_yesno_approval_prompt_with_policy(token, tool_name, arguments_summary, position, true)
+    // Compatibility wrapper for ordinary approval tests; strict callers pass
+    // the daemon-owned marker through the policy-aware helper below.
+    build_yesno_approval_prompt_with_policy(token, tool_name, arguments_summary, position, false)
 }
 
 /// Variant of [`build_yesno_approval_prompt`] that carries the approval policy
@@ -588,7 +574,7 @@ pub(crate) fn build_yesno_approval_prompt_with_policy(
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
     let yes_command = format!("{token} {APPROVAL_REPLY_YES}");
     let no_command = format!("{token} {APPROVAL_REPLY_NO}");
-    let reply = if strict_session_prompt_approval && is_session_prompt_mutation_tool(tool_name) {
+    let reply = if strict_session_prompt_approval {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(
             "channel-approval-reply-instruction-yesno-once",
             &[
@@ -663,7 +649,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
         tool_name,
         arguments_summary,
         position,
-        true,
+        false,
     )
 }
 
@@ -681,7 +667,7 @@ pub(crate) fn build_approve_deny_approval_prompt_with_policy(
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
     let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
     let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
-    let reply = if strict_session_prompt_approval && is_session_prompt_mutation_tool(tool_name) {
+    let reply = if strict_session_prompt_approval {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(
             "channel-approval-reply-instruction-approve-deny-once",
             &[
@@ -1434,8 +1420,13 @@ mod tests {
 
     #[test]
     fn session_prompt_text_approval_prompt_hides_persistent_action() {
-        let prompt =
-            super::build_yesno_approval_prompt("ab12cd", "session_prompt_set", "action: set", None);
+        let prompt = super::build_yesno_approval_prompt_with_policy(
+            "ab12cd",
+            "session_prompt_set",
+            "action: set",
+            None,
+            true,
+        );
         assert!(prompt.contains("ab12cd yes"));
         assert!(prompt.contains("ab12cd no"));
         assert!(
@@ -1443,8 +1434,16 @@ mod tests {
             "strict session-prompt approval must not advertise always: {prompt:?}"
         );
 
-        let ordinary = super::build_yesno_approval_prompt("ab12cd", "shell", "ls", None);
+        let ordinary =
+            super::build_yesno_approval_prompt_with_policy("ab12cd", "shell", "ls", None, false);
         assert!(ordinary.contains("ab12cd always"));
+
+        let explicit_strict =
+            super::build_yesno_approval_prompt_with_policy("ab12cd", "shell", "ls", None, true);
+        assert!(
+            !explicit_strict.contains("ab12cd always"),
+            "the explicit policy marker must be the only strictness input: {explicit_strict:?}"
+        );
     }
 
     #[test]
@@ -1534,15 +1533,21 @@ mod tests {
 
     #[test]
     fn session_prompt_matrix_approval_prompt_hides_persistent_action() {
-        let prompt = super::build_approve_deny_approval_prompt(
+        let prompt = super::build_approve_deny_approval_prompt_with_policy(
             "AB12CD34",
             "session_prompt_delete",
             "action: delete",
             None,
+            true,
         );
         assert!(prompt.contains("AB12CD34 approve"));
         assert!(prompt.contains("AB12CD34 deny"));
         assert!(!prompt.contains("AB12CD34 always"));
+
+        let explicit_strict = super::build_approve_deny_approval_prompt_with_policy(
+            "AB12CD34", "shell", "ls", None, true,
+        );
+        assert!(!explicit_strict.contains("AB12CD34 always"));
     }
 
     #[test]

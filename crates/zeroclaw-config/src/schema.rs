@@ -261,8 +261,9 @@ pub struct Config {
     pub pacing: PacingConfig,
 
     /// Operator policy for approving mutations to persistent session prompts.
-    /// Default: `required`. A risk-profile override may relax this only to
-    /// `disabled`; agents cannot select this policy for themselves.
+    /// Default: `required`. A risk-profile override may replace the global
+    /// value with either `required` or `disabled`; agents cannot select this
+    /// policy for themselves.
     #[serde(default)]
     #[group = "Agent"]
     pub session_prompt_approval: SessionPromptApproval,
