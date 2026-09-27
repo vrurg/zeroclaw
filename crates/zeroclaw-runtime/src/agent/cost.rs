@@ -4,6 +4,10 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use zeroclaw_config::schema::Config;
+use zeroclaw_goal::accounting::{
+    GOAL_OPERATION_ACCOUNTING, GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent,
+    combine_accounting_state,
+};
 use zeroclaw_providers::pricing::ModelRates;
 
 // ── Cost tracking via task-local ──
@@ -198,93 +202,6 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
-/// Transient admission facts for one Goal-owned model operation.
-///
-/// The normal provider path remains responsible for retry, fallback, and
-/// streaming recovery. This carries only the configured route the operation
-/// started with so the Goal controller can fence and budget that one logical
-/// operation before the provider is polled.
-#[derive(Clone, Debug)]
-pub(crate) struct GoalOperationRequest {
-    pub(crate) model_provider: String,
-    pub(crate) model: String,
-}
-
-impl GoalOperationRequest {
-    pub(crate) fn new(model_provider: impl Into<String>, model: impl Into<String>) -> Self {
-        Self {
-            model_provider: model_provider.into(),
-            model: model.into(),
-        }
-    }
-}
-
-/// One observed usage event from the actual provider route selected by the
-/// configured provider path.
-#[derive(Clone, Debug)]
-pub(crate) struct GoalUsageEvent {
-    pub(crate) provider_ref: String,
-    pub(crate) model: String,
-    pub(crate) usage: zeroclaw_providers::traits::TokenUsage,
-}
-
-/// Complete accounting projection for one admitted Goal operation.
-///
-/// `events` preserves known lower-bound usage even when the report's overall
-/// state is incomplete. The Goal controller decides whether that state is
-/// resumable; this bridge never retries or replays a provider operation.
-#[derive(Clone, Debug)]
-pub(crate) struct GoalOperationSettlement {
-    pub(crate) accounting_state: crate::control_plane::GoalAccountingState,
-    pub(crate) events: Vec<GoalUsageEvent>,
-}
-
-impl GoalOperationSettlement {
-    /// Downgrade a seemingly complete report when an observed event cannot be
-    /// used as durable Goal accounting. This is deliberately local to the
-    /// immutable provider report: it neither retries a provider nor treats a
-    /// malformed event as zero consumption.
-    fn normalize(&mut self) {
-        use crate::control_plane::GoalAccountingState;
-
-        let invalid_event = self.events.iter().any(|event| {
-            if event.provider_ref.trim().is_empty() || event.model.trim().is_empty() {
-                return true;
-            }
-            let Some(input) = event.usage.input_tokens else {
-                return true;
-            };
-            let Some(output) = event.usage.output_tokens else {
-                return true;
-            };
-            let Some(total) = input.checked_add(output) else {
-                return true;
-            };
-            total == 0 || event.usage.cached_input_tokens.unwrap_or(0) > input
-        });
-
-        if invalid_event {
-            self.accounting_state =
-                combine_goal_accounting_state(self.accounting_state, GoalAccountingState::Invalid);
-        }
-    }
-}
-
-/// Private bridge from the ordinary provider loop to Goal execution.
-///
-/// It has no provider construction or retry controls. A Goal executor scopes
-/// an implementation around a normal turn; every model-call boundary then
-/// performs guarded admission and settles the immutable #10144 attempt report.
-#[async_trait::async_trait]
-pub(crate) trait GoalOperationAccounting: Send + Sync {
-    async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
-    async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
-}
-
-tokio::task_local! {
-    pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
-}
-
 /// Admit an operation only when the enclosing execution is Goal-scoped.
 /// Ordinary turns never enter this branch.
 pub(crate) async fn admit_goal_operation_if_scoped(
@@ -317,20 +234,6 @@ pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
         .unwrap_or(false)
 }
 
-fn combine_goal_accounting_state(
-    current: crate::control_plane::GoalAccountingState,
-    next: crate::control_plane::GoalAccountingState,
-) -> crate::control_plane::GoalAccountingState {
-    use crate::control_plane::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
-
-    match (current, next) {
-        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
-        (Invalid, _) | (_, Invalid) => Invalid,
-        (Missing, _) | (_, Missing) => Missing,
-        (Complete, Complete) => Complete,
-    }
-}
-
 fn goal_operation_settlement(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
 ) -> GoalOperationSettlement {
@@ -341,21 +244,17 @@ fn goal_operation_settlement(
     let mut events = Vec::new();
 
     for attempt in attempts {
-        let (usage, state) = match attempt.outcome() {
-            AttemptUsageOutcome::Complete(usage) => (Some(usage), GoalAccountingState::Complete),
-            AttemptUsageOutcome::Missing => (None, GoalAccountingState::Missing),
-            AttemptUsageOutcome::Invalid { .. } => (None, GoalAccountingState::Invalid),
-            AttemptUsageOutcome::OutcomeUnknown { observed } => {
-                (observed.as_ref(), GoalAccountingState::OutcomeUnknown)
-            }
-        };
-        accounting_state = combine_goal_accounting_state(accounting_state, state);
-        if let Some(usage) = usage {
-            events.push(GoalUsageEvent {
-                provider_ref: attempt.provider_ref().to_string(),
-                model: attempt.model().to_string(),
-                usage: usage.clone(),
-            });
+        let (usage, state) = goal_usage_event_for_attempt(
+            attempt.provider_ref(),
+            attempt.model(),
+            attempt.outcome(),
+        );
+        accounting_state = combine_accounting_state(accounting_state, state);
+        if let Some(event) = usage {
+            events.push(event);
+        } else if matches!(attempt.outcome(), AttemptUsageOutcome::Complete(_)) {
+            accounting_state =
+                combine_accounting_state(accounting_state, GoalAccountingState::Invalid);
         }
     }
 
@@ -365,6 +264,81 @@ fn goal_operation_settlement(
     };
     settlement.normalize();
     settlement
+}
+
+fn goal_usage_event_for_attempt(
+    provider_ref: &str,
+    model: &str,
+    outcome: &zeroclaw_providers::dispatch::AttemptUsageOutcome,
+) -> (
+    Option<GoalUsageEvent>,
+    crate::control_plane::GoalAccountingState,
+) {
+    use crate::control_plane::GoalAccountingState;
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    match outcome {
+        AttemptUsageOutcome::Complete(usage) => (
+            lower_bound_usage_event(provider_ref, model, usage),
+            GoalAccountingState::Complete,
+        ),
+        AttemptUsageOutcome::Missing => (None, GoalAccountingState::Missing),
+        AttemptUsageOutcome::Invalid { observed, .. } => (
+            lower_bound_usage_event(provider_ref, model, observed),
+            GoalAccountingState::Invalid,
+        ),
+        AttemptUsageOutcome::OutcomeUnknown { observed } => (
+            observed
+                .as_ref()
+                .and_then(|usage| lower_bound_usage_event(provider_ref, model, usage)),
+            GoalAccountingState::OutcomeUnknown,
+        ),
+    }
+}
+
+/// Preserve representable observed token counts without manufacturing missing
+/// dimensions. Cache sub-counts can establish a lower bound for input tokens,
+/// but an inconsistent cache partition is not safe to price.
+fn lower_bound_usage_event(
+    provider_ref: &str,
+    model: &str,
+    observed: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<GoalUsageEvent> {
+    let cached = observed.cached_input_tokens.unwrap_or(0);
+    let cache_write = observed.cache_creation_input_tokens.unwrap_or(0);
+    let cache_lower_bound = cached.checked_add(cache_write);
+    let reported_input = observed.input_tokens;
+    let input = observed
+        .input_tokens
+        .unwrap_or(0)
+        .max(cache_lower_bound.unwrap_or(0));
+    let output = observed.output_tokens.unwrap_or(0);
+    let total = input.checked_add(output)?;
+    if total == 0 {
+        return None;
+    }
+
+    let cache_partition_is_valid = cache_lower_bound.is_some()
+        && reported_input.is_some_and(|reported_input| {
+            cached <= reported_input && cache_write <= reported_input.saturating_sub(cached)
+        });
+    let (cached_input_tokens, cache_creation_input_tokens) = if cache_partition_is_valid {
+        (Some(cached), Some(cache_write))
+    } else {
+        (Some(0), Some(0))
+    };
+
+    Some(GoalUsageEvent {
+        provider_ref: provider_ref.to_string(),
+        model: model.to_string(),
+        usage: zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        },
+        priceable: cache_partition_is_valid,
+    })
 }
 
 /// Resolve the configured rate map for an immutable actual provider/model
@@ -933,7 +907,9 @@ mod tests {
     use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
     use zeroclaw_providers::ProviderDispatch;
-    use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+    use zeroclaw_providers::dispatch::{
+        AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, with_exact_dispatch_route,
+    };
 
     struct ResetGlobalPricingCatalog;
 
@@ -1257,7 +1233,9 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), Some(1));
+                settle_provider_attempts(report.attempts(), Some(1))
+                    .await
+                    .expect("provider attempt settlement");
             })
             .await;
 
@@ -1272,6 +1250,135 @@ mod tests {
             "turn input_tokens includes rejected A"
         );
         assert_eq!(turn_usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn goal_settlement_preserves_known_counts_from_invalid_usage() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: None,
+                    cached_input_tokens: Some(12),
+                    cache_creation_input_tokens: Some(4),
+                },
+                reason: InvalidUsageReason::MissingOutput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("known usage must be retained as a lower bound");
+        assert_eq!(event.provider_ref, "provider.primary");
+        assert_eq!(event.model, "model-a");
+        assert_eq!(event.usage.input_tokens, Some(41));
+        assert_eq!(event.usage.output_tokens, Some(0));
+        assert_eq!(event.usage.cached_input_tokens, Some(12));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(4));
+        assert!(event.priceable);
+    }
+
+    #[test]
+    fn goal_settlement_keeps_fallback_and_partial_unknown_usage_with_actual_routes() {
+        let primary = goal_usage_event_for_attempt(
+            "openai.primary",
+            "model-a",
+            &AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(reported_usage(10, 2)),
+            },
+        );
+        let fallback = goal_usage_event_for_attempt(
+            "anthropic.fallback",
+            "model-b",
+            &AttemptUsageOutcome::Complete(reported_usage(15, 3)),
+        );
+        let events = [primary.0.clone(), fallback.0.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            combine_accounting_state(primary.1, fallback.1),
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider_ref, "openai.primary");
+        assert_eq!(events[0].model, "model-a");
+        assert_eq!(events[1].provider_ref, "anthropic.fallback");
+        assert_eq!(events[1].model, "model-b");
+        assert_eq!(events[0].usage.input_tokens, Some(10));
+        assert_eq!(events[1].usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn goal_settlement_does_not_invent_a_total_for_overflowed_usage() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(u64::MAX),
+                    output_tokens: Some(1),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                },
+                reason: InvalidUsageReason::TotalOverflow,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn goal_settlement_keeps_known_counts_when_cache_subcounts_overflow() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(u64::MAX),
+                    cache_creation_input_tokens: Some(1),
+                },
+                reason: InvalidUsageReason::CachedInputExceedsInput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("known input/output counts remain a safe lower bound");
+        assert_eq!(event.usage.input_tokens, Some(41));
+        assert_eq!(event.usage.output_tokens, Some(2));
+        assert_eq!(event.usage.cached_input_tokens, Some(0));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(0));
+        assert!(!event.priceable);
+    }
+
+    #[test]
+    fn goal_settlement_does_not_price_cache_counts_that_exceed_reported_input() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(50),
+                    cache_creation_input_tokens: Some(0),
+                },
+                reason: InvalidUsageReason::CachedInputExceedsInput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("cache lower bounds establish known input usage");
+        assert_eq!(event.usage.input_tokens, Some(50));
+        assert_eq!(event.usage.output_tokens, Some(2));
+        assert_eq!(event.usage.cached_input_tokens, Some(0));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(0));
+        assert!(!event.priceable);
     }
 
     #[tokio::test]
