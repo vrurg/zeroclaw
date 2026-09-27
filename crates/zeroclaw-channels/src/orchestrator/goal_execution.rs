@@ -12,6 +12,7 @@ use zeroclaw_api::{
     model_provider::{ChatMessage, ChatRequest},
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
+use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
@@ -30,7 +31,6 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
 };
-use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
