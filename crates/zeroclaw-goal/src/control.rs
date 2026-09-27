@@ -13,16 +13,20 @@ use anyhow::{Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
-use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
+use zeroclaw_api::{
+    model_provider::ChatMessage,
+    session_keys::sanitize_session_key,
+    task::{TaskKind, TaskRecord, TaskStatus},
+};
 use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
 use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
 
-use crate::control_plane::{
+use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
+    GoalTransitionResult,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.
