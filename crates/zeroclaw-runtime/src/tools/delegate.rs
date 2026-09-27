@@ -2205,7 +2205,7 @@ impl Tool for DelegateTool {
             DelegateAction::Delegate => {}
         }
 
-        let goal_scoped = crate::agent::goal_child_fence::is_goal_scoped();
+        let goal_scoped = zeroclaw_goal::control::goal_child_fence::is_goal_scoped();
 
         // --- Parallel mode ---
         if let Some(parallel_agents) = args.get("parallel").and_then(|v| v.as_array()) {
@@ -2287,17 +2287,18 @@ impl Tool for DelegateTool {
         }
 
         // --- Synchronous delegation (original path) ---
-        let _goal_child_guard = match crate::agent::goal_child_fence::admit_goal_child().await {
-            Ok(guard) => guard,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error.to_string()),
-                });
-            }
-        };
-        crate::agent::goal_child_fence::scope_goal_child(Box::pin(
+        let _goal_child_guard =
+            match zeroclaw_goal::control::goal_child_fence::admit_goal_child().await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    });
+                }
+            };
+        zeroclaw_goal::control::goal_child_fence::scope_goal_child(Box::pin(
             self.execute_sync(agent_name, prompt, &args),
         ))
         .await
@@ -7884,7 +7885,7 @@ mod tests {
     async fn goal_scope_rejects_background_and_parallel_before_child_creation() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security());
 
-        crate::agent::goal_child_fence::scope_goal_parent(async {
+        zeroclaw_goal::control::goal_child_fence::scope_goal_parent(async {
             let background = tool
                 .execute(json!({"agent": "missing", "prompt": "test", "background": true}))
                 .await
