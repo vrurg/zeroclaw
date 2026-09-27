@@ -33,8 +33,7 @@ mod goal_execution;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
-    GoalExecutionSubmission, GoalExecutionSupervisor,
-    dispose_unowned_session_goal,
+    GoalExecutionSubmission, GoalExecutionSupervisor, dispose_unowned_session_goal,
 };
 
 /// Scope one adapter-owned parent turn as an isolated Goal turn.
