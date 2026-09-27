@@ -847,6 +847,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             served_route_sink: None,
             sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                 config: self.context.prompt_config.as_ref(),
+                live_config: Some(Arc::clone(&self.context.live_config)),
             }),
         });
         let candidate = scope_session_key(Some(self.session_key.durable_id()), async {
@@ -922,15 +923,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let messages = vec![
-            ChatMessage::system(
-                "Return only strict JSON. Schema: {\\\"decision\\\":\\\"complete|continue|blocked\\\",\\\"reason\\\":\\\"nonempty bounded explanation\\\",\\\"blockers\\\":[{\\\"kind\\\":\\\"needs_user_input|human_escalation|external_dependency\\\",\\\"message\\\":\\\"nonempty bounded explanation\\\",\\\"payload\\\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Do not emit any other keys or blocker kinds.",
-            ),
-            ChatMessage::user(format!(
-                "Objective:\n{}\n\nCandidate:\n{}",
-                turn.objective, turn.candidate
-            )),
-        ];
+        let messages = turn.to_chat_messages();
         let mut settled_attempts = Vec::new();
         let response = resolved_channel_execution(
             self.context.as_ref(),
