@@ -4241,11 +4241,11 @@ impl RpcDispatcher {
             .as_ref()
             .and_then(|record| record.live_generation)
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let expected_queue_generation = self
+        let (expected_queue_generation, _session_lifecycle_lease) = self
             .ctx
             .sessions
             .session_queue
-            .lifecycle_generation(&req.session_id)
+            .capture_generation(&req.session_id)
             .await;
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
@@ -4368,11 +4368,11 @@ impl RpcDispatcher {
             .as_ref()
             .and_then(|record| record.live_generation)
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let expected_queue_generation = self
+        let (expected_queue_generation, _session_lifecycle_lease) = self
             .ctx
             .sessions
             .session_queue
-            .lifecycle_generation(sid)
+            .capture_generation(sid)
             .await;
 
         // Kill is an explicit administrative interruption for either session
@@ -5094,11 +5094,11 @@ impl RpcDispatcher {
             .get_generation(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let expected_queue_generation = self
+        let (expected_queue_generation, _session_lifecycle_lease) = self
             .ctx
             .sessions
             .session_queue
-            .lifecycle_generation(sid)
+            .capture_generation(sid)
             .await;
 
         // Admit before reading mutable session metadata. Session replacement
@@ -6448,11 +6448,11 @@ impl RpcDispatcher {
         // turn. Capture its incarnation before waiting so deletion never
         // applies to a successor created with the same ID.
         let expected_generation = self.ctx.sessions.get_generation(&req.session_id).await;
-        let expected_queue_generation = self
+        let (expected_queue_generation, _session_lifecycle_lease) = self
             .ctx
             .sessions
             .session_queue
-            .lifecycle_generation(&req.session_id)
+            .capture_generation(&req.session_id)
             .await;
         // Reject a mismatched explicit domain before any lifecycle effect.
         // The domain is otherwise selected after admission, from the live

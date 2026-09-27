@@ -1875,7 +1875,7 @@ pub async fn handle_api_session_message_post(
     // before waiting. DELETE publishes invalidation through this same queue
     // authority only after durable removal, so a queued request cannot adopt a
     // successor generation after it observed the predecessor.
-    let Some(expected_generation) = state
+    let Some((expected_generation, _session_lifecycle_lease)) = state
         .session_queue
         .capture_generation_if(&session_key, || backend.session_exists(&session_key))
         .await
@@ -1972,7 +1972,7 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    let Some(expected_generation) = state
+    let Some((expected_generation, _session_lifecycle_lease)) = state
         .session_queue
         .capture_generation_if(&session_key, || backend.session_exists(&session_key))
         .await

@@ -139,16 +139,76 @@ impl SessionActorQueue {
     }
 
     /// Capture a session incarnation only if a caller's synchronous durable
-    /// predicate still holds. The predicate runs while the generation mutex is
-    /// held, serializing its observation with [`Self::invalidate`]. This is
-    /// intended for admission paths that must bind a durable existence check to
-    /// the exact queue incarnation before they await the actor permit.
-    pub async fn capture_generation_if<F>(&self, session_id: &str, predicate: F) -> Option<u64>
+    /// predicate still holds. The returned lease keeps idle eviction from
+    /// reclaiming the queue slot and generation tombstone before the caller
+    /// registers its queued operation with [`Self::acquire`]. The predicate
+    /// runs while the generation mutex is held, serializing its observation
+    /// with [`Self::invalidate`].
+    pub async fn capture_generation_if<F>(
+        &self,
+        session_id: &str,
+        predicate: F,
+    ) -> Option<(u64, SessionLease)>
     where
         F: FnOnce() -> bool,
     {
+        // Keep the lock order slots -> generations aligned with evict_idle.
+        // Holding the slot-map lock while the synchronous predicate runs is
+        // intentional: it closes the observation-to-lease gap without
+        // introducing a generations -> slots deadlock.
+        let mut slots = self.slots.lock().await;
         let generations = self.generations.lock().await;
-        predicate().then(|| generations.get(session_id).copied().unwrap_or(0))
+        if !predicate() {
+            return None;
+        }
+
+        let slot = slots
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionSlot {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    last_active: Mutex::new(Instant::now()),
+                    pending: AtomicUsize::new(0),
+                    leases: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+        slot.leases.fetch_add(1, Ordering::Relaxed);
+        let generation = generations.get(session_id).copied().unwrap_or(0);
+        Some((
+            generation,
+            SessionLease {
+                _registration: LeaseRegistration { slot },
+            },
+        ))
+    }
+
+    /// Capture the current lifecycle incarnation and retain its queue slot
+    /// until the returned lease is dropped. This is for admission paths whose
+    /// durable existence was checked separately before queue admission.
+    pub async fn capture_generation(&self, session_id: &str) -> (u64, SessionLease) {
+        // Keep the lock order slots -> generations aligned with evict_idle.
+        let mut slots = self.slots.lock().await;
+        let generations = self.generations.lock().await;
+        let slot = slots
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionSlot {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    last_active: Mutex::new(Instant::now()),
+                    pending: AtomicUsize::new(0),
+                    leases: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+        slot.leases.fetch_add(1, Ordering::Relaxed);
+        let generation = generations.get(session_id).copied().unwrap_or(0);
+        (
+            generation,
+            SessionLease {
+                _registration: LeaseRegistration { slot },
+            },
+        )
     }
 
     /// Invalidate all holders of the current incarnation. Must be called
@@ -407,9 +467,31 @@ mod tests {
         tokio::task::spawn_blocking(move || predicate_release.wait())
             .await
             .unwrap();
-        assert_eq!(snapshot.await.unwrap(), Some(1));
+        let (generation, _lease) = snapshot.await.unwrap().unwrap();
+        assert_eq!(generation, 1);
         assert_eq!(invalidation.await.unwrap(), 2);
         assert_eq!(queue.lifecycle_generation("s1").await, 2);
+    }
+
+    #[tokio::test]
+    async fn captured_generation_lease_blocks_idle_reclamation_until_admission() {
+        let queue = SessionActorQueue::new(8, 5, 0);
+        let guard = queue.acquire("reused-session").await.unwrap();
+        queue.invalidate("reused-session").await;
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let (generation, lease) = queue
+            .capture_generation_if("reused-session", || true)
+            .await
+            .unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(queue.evict_idle().await, 0);
+        assert_eq!(queue.lifecycle_generation("reused-session").await, 1);
+
+        drop(lease);
+        assert_eq!(queue.evict_idle().await, 1);
+        assert_eq!(queue.lifecycle_generation("reused-session").await, 0);
     }
 
     #[tokio::test]
