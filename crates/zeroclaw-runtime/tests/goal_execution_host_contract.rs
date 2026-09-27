@@ -11,9 +11,9 @@ use zeroclaw_config::{
 };
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalVerifierTurn,
+    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
+    GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
@@ -216,7 +216,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_parent_turn(
         &mut self,
-        _operation: &GoalOperationScope,
+        _operation: &GoalExecutionScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<String> {
         anyhow::bail!("lease execution test does not run parent turns")
@@ -224,7 +224,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_verifier(
         &mut self,
-        _operation: &GoalOperationScope,
+        _operation: &GoalExecutionScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
         anyhow::bail!("lease execution test does not run verifier turns")

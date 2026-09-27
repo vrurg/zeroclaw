@@ -24,6 +24,7 @@ use zeroclaw_commands::goal::{
 };
 use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
 
+use crate::accounting::GoalOperationAccountingFactory;
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult,
@@ -678,11 +679,9 @@ impl GoalRuntime {
     /// control plane and running/accounting it through another.
     pub fn execution_engine(
         &self,
-        tracker: Arc<zeroclaw_config::cost::CostTracker>,
-        agent_alias: impl Into<String>,
-        pricing: Arc<crate::agent::cost::ModelProviderPricing>,
-    ) -> Result<GoalExecutionEngine> {
-        GoalExecutionEngine::new(self.clone(), tracker, agent_alias, pricing)
+        accounting_factory: Arc<dyn GoalOperationAccountingFactory>,
+    ) -> GoalExecutionEngine {
+        GoalExecutionEngine::new(self.clone(), accounting_factory)
     }
 
     pub async fn submit(
