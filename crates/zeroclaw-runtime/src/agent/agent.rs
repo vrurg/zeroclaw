@@ -1930,7 +1930,7 @@ impl Agent {
         let isolated_turn = Box::pin(isolated_turn);
         let (result, fallback, safeguard) = zeroclaw_providers::scope_safeguard_fallback(async {
             let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
-                let result = zeroclaw_goal::control::scope_goal_parent_turn(isolated_turn).await;
+                let result = isolated_turn.await;
                 (
                     result,
                     zeroclaw_providers::reliable::take_last_provider_fallback(),
