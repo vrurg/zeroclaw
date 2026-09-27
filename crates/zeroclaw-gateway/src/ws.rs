@@ -1350,6 +1350,7 @@ fn refresh_history_if_advanced(
 fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
     let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
         dropped_messages,
+        dropped_turns,
         kept_turns,
         reason,
         token_budget,
@@ -1364,6 +1365,7 @@ fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<se
     };
     Some(history_trimmed_ws_frame(
         dropped_messages,
+        dropped_turns,
         kept_turns,
         &reason,
         token_budget,
@@ -1427,6 +1429,7 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
 
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: &str,
     token_budget: Option<u64>,
@@ -1439,6 +1442,7 @@ fn history_trimmed_ws_frame(
     let mut frame = serde_json::json!({
         "type": "history_trimmed",
         "dropped_messages": dropped_messages,
+        "dropped_turns": dropped_turns,
         "kept_turns": kept_turns,
         "reason": reason,
     });
@@ -2192,6 +2196,7 @@ async fn process_chat_message(
                                     }
                                     TurnEvent::HistoryTrimmed {
                                         dropped_messages,
+                                        dropped_turns,
                                         kept_turns,
                                         reason,
                                         token_budget,
@@ -2202,6 +2207,7 @@ async fn process_chat_message(
                                         unsatisfiable_floor,
                                     } => history_trimmed_ws_frame(
                                         dropped_messages,
+                                        dropped_turns,
                                         kept_turns,
                                         &reason,
                                         token_budget,
@@ -4318,14 +4324,26 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame =
-            history_trimmed_ws_frame(12, 3, "message limit", None, None, None, None, None, None);
+        let frame = history_trimmed_frame_for(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            dropped_turns: 4,
+            kept_turns: 3,
+            reason: "message limit".into(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        })
+        .expect("history trim event should produce a frame");
 
         assert_eq!(
             frame,
             serde_json::json!({
                 "type": "history_trimmed",
                 "dropped_messages": 12,
+                "dropped_turns": 4,
                 "kept_turns": 3,
                 "reason": "message limit",
             })
@@ -4438,6 +4456,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     fn history_trimmed_frame_carries_token_accounting_when_present() {
         let frame = history_trimmed_ws_frame(
             12,
+            4,
             3,
             "context token budget exceeded",
             Some(500_000),
@@ -4449,6 +4468,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
 
         assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(frame["dropped_turns"], 4);
         assert_eq!(frame["token_budget"], 500_000);
         assert_eq!(frame["tokens_before"], 612_000);
         assert_eq!(frame["tokens_after"], 117_000);

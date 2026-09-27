@@ -274,6 +274,7 @@ export interface WsMessage {
   /** Daemon-owned permission to offer the persistent approval action. */
   allow_always?: boolean;
   dropped_messages?: number;
+  dropped_turns?: number;
   kept_turns?: number;
   reason?: string;
   // Safety-safeguard fallback notice (server → client), present only on
