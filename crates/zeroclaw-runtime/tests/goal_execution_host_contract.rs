@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -70,7 +70,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         })
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -118,7 +118,7 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         Ok(r#"{"decision":"complete","reason":"done"}"#.to_owned())
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -150,6 +150,76 @@ impl GoalSessionDriver for PausingExecutionDriver {
             parent_started: Arc::clone(&self.parent_started),
             release_parent: Arc::clone(&self.release_parent),
             verifier_calls: Arc::clone(&self.verifier_calls),
+        }))
+    }
+}
+
+struct UserInputExecutionDriver {
+    binding: GoalSessionBinding,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    candidates: Arc<Mutex<Vec<String>>>,
+}
+
+struct UserInputExecutionLease {
+    session_key: GoalSessionKey,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    candidates: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for UserInputExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _scope: &GoalExecutionScope,
+        _turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
+        self.events.lock().unwrap().push("parent");
+        Ok("Which option should I use?".to_owned())
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _scope: &GoalExecutionScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        self.events.lock().unwrap().push("verifier");
+        Ok(r#"{"decision":"blocked","reason":"A user choice is required","blockers":[{"kind":"needs_user_input","message":"Which option should I use?"}]}"#.to_owned())
+    }
+
+    async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        self.events.lock().unwrap().push("candidate");
+        self.candidates.lock().unwrap().push(candidate);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GoalSessionDriver for UserInputExecutionDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(UserInputExecutionLease {
+            session_key: self.binding.session_key().clone(),
+            events: Arc::clone(&self.events),
+            candidates: Arc::clone(&self.candidates),
         }))
     }
 }
@@ -315,7 +385,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
         anyhow::bail!("lease execution test does not run verifier turns")
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         anyhow::bail!("lease execution test does not deliver candidates")
     }
 }
@@ -828,7 +898,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         "verifier:candidate"
     );
     lease
-        .append_verified_candidate("candidate".into())
+        .append_parent_candidate("candidate".into())
         .await
         .unwrap();
 
@@ -2175,6 +2245,83 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
         verifier_calls.load(Ordering::SeqCst),
         0,
         "a pause may drain an admitted parent operation but cannot admit a verifier"
+    );
+}
+
+#[tokio::test]
+async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let candidates = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(UserInputExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        events: Arc::clone(&events),
+        candidates: Arc::clone(&candidates),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let engine = Arc::new(runtime.execution_engine(accounting_factory));
+    let supervisor = GoalExecutionSupervisor::new(engine);
+
+    let started = supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "choose the appropriate option".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+
+    let paused = timeout(Duration::from_secs(1), async {
+        loop {
+            let current = store
+                .current_goal_for_session(&ingress.session_key().durable_id())
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status == TaskStatus::Paused {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a validated user-input blocker must pause the Goal");
+
+    assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(
+        candidates.lock().unwrap().as_slice(),
+        &["Which option should I use?".to_owned()]
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["parent", "candidate", "verifier"]
     );
 }
 

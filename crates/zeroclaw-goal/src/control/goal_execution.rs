@@ -885,14 +885,21 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(candidate) => {
-                    self.require_complete_accounting(scope, accountant.as_ref())
-                        .await?;
-                    if !candidate.trim().is_empty() {
-                        candidate
-                    } else {
+                    if candidate.trim().is_empty() {
                         self.fail(scope, "candidate_empty").await?;
                         bail!("Goal parent returned an empty candidate");
                     }
+
+                    // Parent output is ordinary agent output, not verifier
+                    // metadata. Persist and deliver it before any verifier
+                    // decision can pause or terminate this execution.
+                    lease
+                        .append_parent_candidate(candidate.clone())
+                        .await
+                        .context("publish Goal parent candidate before verification")?;
+                    self.require_complete_accounting(scope, accountant.as_ref())
+                        .await?;
+                    candidate
                 }
                 Err(error) => {
                     self.fail(scope, "parent_operation_failed").await?;
@@ -928,7 +935,7 @@ impl GoalExecutionEngine {
 
             match parse_verifier_response(&verifier.response) {
                 Ok(VerifierDecision::Complete) => {
-                    self.complete(scope, lease, candidate).await?;
+                    self.complete(scope).await?;
                     return Ok(GoalExecutionOutcome::Completed);
                 }
                 Ok(VerifierDecision::Continue { reason }) => {
@@ -989,12 +996,7 @@ impl GoalExecutionEngine {
         Ok(task)
     }
 
-    async fn complete(
-        &self,
-        scope: &GoalExecutionScope,
-        lease: &mut dyn GoalSessionExecutionLease,
-        candidate: String,
-    ) -> Result<()> {
+    async fn complete(&self, scope: &GoalExecutionScope) -> Result<()> {
         self.exact_running_task(scope).await?;
         match self
             .registry
@@ -1012,8 +1014,7 @@ impl GoalExecutionEngine {
                 bail!("Goal completion lost its execution fence")
             }
         }
-        // Delivery failure is observable but does not rewrite verified state.
-        lease.append_verified_candidate(candidate).await
+        Ok(())
     }
 
     async fn pause_verifier_blocked(
