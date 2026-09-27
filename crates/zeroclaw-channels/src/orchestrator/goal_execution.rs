@@ -11,27 +11,34 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
-    channel::ChannelMessage,
+    channel::{Channel, ChannelMessage, SendMessage},
     model_provider::{ChatMessage, ChatRequest},
 };
-use zeroclaw_goal::control::goal_parent_turn_input;
+use zeroclaw_goal::{
+    GoalDiagnosticTextGuard, GoalExecutionNotice, GoalExecutionScope, GoalExecutionSupervisor,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
+    GoalVerifierTurn, control::goal_parent_turn_input,
+};
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
     agent::execution_tree_budget::ExecutionTreeBudget,
-    agent::loop_::{LoopKnobs, ToolLoop, run_tool_call_loop, scope_session_key, scope_thread_id},
+    agent::loop_::{
+        LoopKnobs, ProgressEvent, StreamDelta, ToolLoop, run_tool_call_loop, scope_session_key,
+        scope_thread_id,
+    },
     control_plane::control_plane,
     cost::CostTracker,
-    goal_mode::{
-        GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
-        GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
-        GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn,
+    goal_accounting::{
+        ModelProviderGoalUsagePricer, RuntimeGoalDiagnosticTextGuard,
+        RuntimeGoalOperationAccountingFactory,
     },
 };
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
-    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
+    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn_durably,
     build_channel_system_prompt_for_message_with_signal,
     callable_protocol_exposed_for_channel_turn, channel_ingress_context, find_channel_for_message,
     get_or_create_provider, get_route_selection, model_provider_entry_for_ref,
@@ -97,7 +104,7 @@ impl MatrixGoalSessionDriver {
         );
         ensure!(ingress.route() == self.route, "Goal ingress route is stale");
         match ingress.principal() {
-            zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix { raw_mxid }
+            GoalIngressPrincipal::Matrix { raw_mxid }
                 if raw_mxid.as_str() == self.raw_mxid.as_str() =>
             {
                 Ok(())
@@ -113,7 +120,7 @@ pub(super) async fn submit_matrix_goal(
     history_key: String,
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
-) -> Result<zeroclaw_runtime::goal_mode::GoalResponse> {
+) -> Result<GoalResponse> {
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
     // serialized lifecycle operation before another command can install a
@@ -137,7 +144,7 @@ pub(super) async fn submit_matrix_goal(
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
     let defaults = runtime_defaults_snapshot(context.as_ref());
-    let settings = zeroclaw_runtime::goal_mode::GoalHostSettings::from_config(
+    let settings = GoalHostSettings::from_config(
         &defaults.config.goal,
         std::process::id(),
         control_plane.boot_id.clone(),
@@ -169,18 +176,25 @@ pub(super) async fn submit_matrix_goal(
         if let Some(supervisor) = slot.as_ref() {
             Arc::clone(supervisor)
         } else {
-            let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::new(Arc::clone(&registry));
+            let runtime = GoalRuntime::new(Arc::clone(&registry));
             let tracker = CostTracker::get_or_init_global_required(
                 defaults.config.cost.clone(),
                 &defaults.config.data_dir,
             )?;
-            let engine = Arc::new(runtime.execution_engine(
+            let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
+                build_type_level_model_provider_pricing(defaults.config.as_ref()),
+            )));
+            let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
+                Arc::clone(&registry),
                 tracker,
                 context.agent_alias.to_string(),
-                Arc::new(build_type_level_model_provider_pricing(
-                    defaults.config.as_ref(),
-                )),
+                pricer,
             )?);
+            let engine = Arc::new(
+                runtime
+                    .execution_engine(accounting)
+                    .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
+            );
             let supervisor = restart_coordinator.new_supervisor(engine).await;
             *slot = Some(Arc::clone(&supervisor));
             supervisor
@@ -190,7 +204,7 @@ pub(super) async fn submit_matrix_goal(
         GoalSessionKey::matrix(history_key)?,
         context.agent_alias.to_string(),
         route,
-        zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix {
+        GoalIngressPrincipal::Matrix {
             raw_mxid: driver.raw_mxid.clone(),
         },
     )?;
@@ -199,11 +213,11 @@ pub(super) async fn submit_matrix_goal(
         .await?;
     if matches!(
         submission.response(),
-        zeroclaw_runtime::goal_mode::GoalResponse::Paused(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::AlreadyPaused(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::Cancelled(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::AlreadyCancelled(_)
-            | zeroclaw_runtime::goal_mode::GoalResponse::Terminal(_)
+        GoalResponse::Paused(_)
+            | GoalResponse::AlreadyPaused(_)
+            | GoalResponse::Cancelled(_)
+            | GoalResponse::AlreadyCancelled(_)
+            | GoalResponse::Terminal(_)
     ) {
         // Pause and cancellation drain the old worker before the supervisor
         // returns. Rebuilding on an explicit resume picks up live policy and
@@ -278,6 +292,212 @@ pub(super) async fn dispose_matrix_goal(
     Ok(())
 }
 
+struct MatrixGoalParentDelivery {
+    channel: Arc<dyn Channel>,
+    draft_id: Option<String>,
+    streamed_text: Arc<Mutex<String>>,
+}
+
+struct MatrixGoalDraftStream {
+    channel: Arc<dyn Channel>,
+    delta_tx: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
+    draft_id: Option<String>,
+    updater: Option<tokio::task::JoinHandle<()>>,
+    streamed_text: Arc<Mutex<String>>,
+    single_message: bool,
+    is_partial_draft: bool,
+}
+
+async fn start_matrix_goal_draft_stream(
+    context: &ChannelRuntimeContext,
+    message: &ChannelMessage,
+    channel: Arc<dyn Channel>,
+) -> MatrixGoalDraftStream {
+    let single_message = super::matrix_single_message_streaming_enabled(context, message);
+    let use_draft_streaming = channel.supports_draft_updates();
+    let is_partial_draft =
+        (use_draft_streaming && !channel.supports_multi_message_streaming()) || single_message;
+    let mut typing_scope = if single_message && use_draft_streaming {
+        Some(super::start_matrix_single_message_typing_scope(
+            Arc::clone(&channel),
+            message.reply_target.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let (delta_tx, delta_rx) = if use_draft_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamDelta>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let draft_id = if use_draft_streaming {
+        if let Some(scope) = typing_scope.take() {
+            super::stop_matrix_single_message_typing_scope(scope).await;
+        }
+        match channel
+            .send_draft(&SendMessage::reply_to(
+                message,
+                zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+            ))
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error}")))})),
+                    &format!("Failed to start Matrix Goal draft on {}", channel.name())
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let streamed_text = Arc::new(Mutex::new(String::new()));
+    let updater = match (delta_rx, draft_id.as_deref()) {
+        (Some(rx), Some(draft_id)) if single_message => {
+            let channel = Arc::clone(&channel);
+            let reply_target = message.reply_target.clone();
+            let draft_id = draft_id.to_owned();
+            let interval_ms = super::matrix_draft_update_interval_ms(context, message);
+            let stream_draft_lines = super::matrix_stream_draft_lines(context, message);
+            let matrix_config = Arc::clone(&context.prompt_config);
+            let matrix_alias = message.channel_alias.clone().unwrap_or_default();
+            Some(zeroclaw_spawn::spawn!(async move {
+                super::run_matrix_single_message_draft_updater(
+                    rx,
+                    channel,
+                    reply_target,
+                    draft_id,
+                    interval_ms,
+                    stream_draft_lines,
+                    matrix_config,
+                    matrix_alias,
+                )
+                .await;
+            }))
+        }
+        (Some(rx), Some(draft_id)) => {
+            let known_tool_names = context
+                .tools_registry
+                .iter()
+                .map(|tool| tool.name().to_ascii_lowercase())
+                .collect();
+            let reply_target = message.reply_target.clone();
+            let draft_id = draft_id.to_owned();
+            let channel = Arc::clone(&channel);
+            let streamed_text = Arc::clone(&streamed_text);
+            let leak_detection = context.prompt_config.security.leak_detection.clone();
+            let content_format = super::outbound_content_format_for_channel(&message.channel);
+            let turn_flush_narration = channel.supports_turn_flush_narration();
+            let outbound_hooks = context.hooks.clone();
+            let outbound_channel = message.channel.clone();
+            Some(zeroclaw_spawn::spawn!(async move {
+                super::run_draft_updater_with_leak_detection(
+                    channel,
+                    reply_target,
+                    draft_id,
+                    known_tool_names,
+                    streamed_text,
+                    leak_detection,
+                    content_format,
+                    turn_flush_narration,
+                    outbound_hooks,
+                    outbound_channel,
+                    rx,
+                )
+                .await;
+            }))
+        }
+        (Some(_), None) | (None, _) => None,
+    };
+
+    if let Some(tx) = delta_tx.as_ref() {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
+            .await;
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Planning))
+            .await;
+    }
+
+    MatrixGoalDraftStream {
+        channel,
+        delta_tx,
+        draft_id,
+        updater,
+        streamed_text,
+        single_message,
+        is_partial_draft,
+    }
+}
+
+async fn finish_matrix_goal_draft_stream(
+    mut stream: MatrixGoalDraftStream,
+    message: &ChannelMessage,
+    completed: bool,
+) -> MatrixGoalParentDelivery {
+    if completed && let Some(tx) = stream.delta_tx.as_ref() {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::FinalizingResponse))
+            .await;
+    }
+    drop(stream.delta_tx.take());
+    if let Some(updater) = stream.updater.take() {
+        let _ = updater.await;
+    }
+    if !completed
+        && let Some(draft_id) = stream.draft_id.as_deref()
+        && let Err(error) = stream
+            .channel
+            .cancel_draft(&message.reply_target, draft_id)
+            .await
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(serde_json::json!({"error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error}")))})),
+            &format!(
+                "Failed to cancel Matrix Goal draft on {}",
+                stream.channel.name()
+            )
+        );
+    }
+    MatrixGoalParentDelivery {
+        channel: stream.channel,
+        draft_id: stream.draft_id,
+        streamed_text: stream.streamed_text,
+    }
+}
+
+fn matrix_goal_core_error_text(error: &anyhow::Error) -> Option<String> {
+    if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(error) {
+        return None;
+    }
+    let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+    Some(super::channel_user_error_message(error, &safe_error))
+}
+
+async fn publish_matrix_goal_core_error(
+    channel: &dyn Channel,
+    message: &ChannelMessage,
+    error: &anyhow::Error,
+) {
+    let Some(error_text) = matrix_goal_core_error_text(error) else {
+        return;
+    };
+    // Match the ordinary channel-turn error path: render the safe core error
+    // as a plain, non-voice reply rather than hiding it in Goal status.
+    let _ = channel
+        .send(&SendMessage::reply_to(message, &error_text).suppress_voice())
+        .await;
+}
+
 /// Clear a session's resident supervisor only if it is still the one that
 /// performed the lifecycle transition.
 ///
@@ -286,10 +506,8 @@ pub(super) async fn dispose_matrix_goal(
 /// retiring. Pointer comparison additionally protects disposal and other
 /// lifecycle paths that do not own that command lease.
 async fn clear_supervisor_slot_if_current(
-    slot: &Arc<
-        tokio::sync::Mutex<Option<Arc<zeroclaw_runtime::goal_mode::GoalExecutionSupervisor>>>,
-    >,
-    supervisor: &Arc<zeroclaw_runtime::goal_mode::GoalExecutionSupervisor>,
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
+    supervisor: &Arc<GoalExecutionSupervisor>,
 ) {
     let mut slot = slot.lock().await;
     if slot
@@ -339,6 +557,11 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
             message: self.message.clone(),
+            pending_delivery: None,
+            pending_receipts: None,
+            pending_route: None,
+            pending_fallback: None,
+            history_has_trim_breadcrumb: false,
         }))
     }
 }
@@ -348,6 +571,15 @@ struct MatrixGoalExecutionLease {
     context: Arc<ChannelRuntimeContext>,
     session_key: GoalSessionKey,
     message: ChannelMessage,
+    pending_delivery: Option<MatrixGoalParentDelivery>,
+    pending_receipts: Option<String>,
+    /// The ordinary routing handle, reduced to its final instruction after the loop.
+    pending_route: Option<zeroclaw_runtime::tools::TurnRoutingHandle>,
+    pending_fallback: Option<(
+        Option<super::ProviderFallbackInfo>,
+        Option<super::SafeguardFallbackNotice>,
+    )>,
+    history_has_trim_breadcrumb: bool,
 }
 
 impl MatrixGoalExecutionLease {
@@ -395,15 +627,19 @@ impl MatrixGoalExecutionLease {
             self.context.agent_cfg.resolved.strict_tool_parsing,
             self.context.system_prompt.as_str(),
         );
+        let target_channel =
+            find_channel_for_message(&self.context.channels_by_name, &self.message);
+        let room_purpose = target_channel
+            .and_then(|channel| channel.room_context(&self.message.reply_target))
+            .and_then(|room| room.purpose);
         let base_system_prompt = system_prompt_for_channel_turn(
             self.context.as_ref(),
             self.context.system_prompt.as_str(),
             true,
             callable_protocol_exposed,
             excluded_tools,
+            room_purpose.as_deref(),
         );
-        let target_channel =
-            find_channel_for_message(&self.context.channels_by_name, &self.message);
         let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
             &base_system_prompt,
             &self.message,
@@ -446,7 +682,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         // the ordinary Matrix canonical-history append path so the exact
         // multiline response survives a daemon restart and reaches the next
         // resumed parent turn just like any other user message.
-        let appended = append_sender_turn(
+        let appended = append_sender_turn_durably(
             self.context.as_ref(),
             &self.session_key.durable_id(),
             ChatMessage::user(&response),
@@ -503,8 +739,103 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 history
             }
         };
+        ensure!(
+            self.pending_delivery.is_none()
+                && self.pending_receipts.is_none()
+                && self.pending_route.is_none()
+                && self.pending_fallback.is_none(),
+            "Matrix Goal parent delivery was not settled before the next turn"
+        );
+        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
+            .context("Matrix Goal channel is no longer available")?;
+        let draft_stream = start_matrix_goal_draft_stream(
+            self.context.as_ref(),
+            &self.message,
+            Arc::clone(channel),
+        )
+        .await;
+        let (notify_tx, notify_task) = if draft_stream.single_message {
+            (None, None)
+        } else {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
+            let notify_channel = Arc::clone(channel);
+            let reply_target = self.message.reply_target.clone();
+            let thread = super::followup_thread_id(&self.message);
+            let notify_task = if !self.context.show_tool_calls || draft_stream.is_partial_draft {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    while rx.recv().await.is_some() {}
+                }))
+            } else {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    while let Some(text) = rx.recv().await {
+                        let _ = notify_channel
+                            .send(
+                                &SendMessage::new(&text, &reply_target)
+                                    .in_thread(thread.clone())
+                                    .suppress_voice(),
+                            )
+                            .await;
+                    }
+                }))
+            };
+            (Some(tx), notify_task)
+        };
+        let notify_observer = Arc::new(super::ChannelNotifyObserver {
+            inner: Arc::clone(&self.context.observer),
+            tx: notify_tx,
+            tools_used: std::sync::atomic::AtomicBool::new(false),
+        });
+        let typing_controller = if draft_stream.is_partial_draft {
+            None
+        } else {
+            Some(Arc::new(super::ScopedTypingController::new(
+                Arc::clone(channel),
+                self.message.reply_target.clone(),
+            )))
+        };
+        if let Some(typing) = typing_controller.as_ref() {
+            typing.resume().await;
+        }
+        let approval_channel: Option<Arc<dyn Channel>> = match typing_controller.as_ref() {
+            Some(typing) => Some(Arc::new(super::ApprovalTypingChannel::new(
+                Arc::clone(channel),
+                Arc::clone(typing),
+            ))),
+            None => Some(Arc::clone(channel)),
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let loop_knobs = LoopKnobs::default();
+        let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start(
+            self.context.observer.as_ref(),
+            route.model_provider.clone(),
+            route.model.clone(),
+            Some(self.message.channel.clone()),
+            Some(self.context.agent_alias.to_string()),
+            Some(turn_id.clone()),
+        );
+        let mut loop_knobs = LoopKnobs::default();
+        if draft_stream.single_message {
+            loop_knobs.draft_reasoning =
+                super::matrix_stream_reasoning(self.context.as_ref(), &self.message);
+        }
+        let history_key = self.session_key.durable_id();
+        let mut memory_sessions: Vec<Option<String>> =
+            super::sender_memory_session_ids(&self.message, &history_key)
+                .into_iter()
+                .map(Some)
+                .collect();
+        if super::is_group_reply_target(&self.message.reply_target) {
+            memory_sessions.push(Some(history_key.clone()));
+        }
+        let receipt_collector: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let receipt_scope = self.context.receipt_generator.as_ref().map(|generator| {
+            zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
+                generator: generator.clone(),
+                collector: Arc::clone(&receipt_collector),
+            }
+        });
+        let mut injected_memory_preamble = None;
+        let turn_routing: zeroclaw_runtime::tools::TurnRoutingHandle =
+            Arc::new(Mutex::new(Vec::new()));
         let execution_tree_budget = ExecutionTreeBudget::from_limit(
             self.context
                 .prompt_config
@@ -515,47 +846,129 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 self.context.as_ref(),
                 provider.as_ref(),
                 &route,
-                self.context.observer.as_ref(),
+                notify_observer.as_ref(),
                 &loop_knobs,
                 Self::excluded_tools(self.context.as_ref(), &self.message),
                 thinking.effective_temperature,
             ),
             history: &mut history,
+            history_has_trim_breadcrumb: &mut self.history_has_trim_breadcrumb,
+            injected_memory_preamble: &mut injected_memory_preamble,
             channel_name: self.message.channel.as_str(),
             channel_reply_target: Some(self.message.reply_target.as_str()),
             cancellation_token: None,
-            on_delta: None,
+            on_delta: draft_stream.delta_tx.clone(),
             shared_budget: execution_tree_budget,
-            channel: None,
-            collected_receipts: None,
+            channel: approval_channel.as_deref(),
+            collected_receipts: self
+                .context
+                .receipt_generator
+                .as_ref()
+                .map(|_| receipt_collector.as_ref()),
             event_tx: None,
             steering: None,
             new_messages_out: None,
             image_cache: None,
             ingress: channel_ingress_context(&self.message),
-            memory: None,
+            memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                handle: self.context.memory.as_ref(),
+                query: self.message.content.clone(),
+                sessions: memory_sessions,
+                suppress: false,
+                cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: self.context.min_relevance_score,
+                    ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                        &self.context.prompt_config.memory,
+                        zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    )
+                },
+            }),
             agent_alias: Some(self.context.agent_alias.as_str()),
             parent_agent_alias: None,
             turn_id: &turn_id,
-            sop_reassembly: None,
+            served_route_sink: None,
+            sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                config: self.context.prompt_config.as_ref(),
+            }),
         });
-        let candidate = scope_session_key(Some(self.session_key.durable_id()), async {
-            let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .scope(thinking.params.native_thinking, tool_loop);
-            let thread_scope_id = self
-                .message
-                .interruption_scope_id
-                .clone()
-                .or_else(|| self.message.thread_ts.clone())
-                .or_else(|| Some(self.message.id.clone()));
-            scope_thread_id(thread_scope_id, tool_loop).await
-        })
-        .await?;
+        let scoped_turn =
+            super::scope_provider_fallback(scope_session_key(Some(history_key), async {
+                let tool_loop = zeroclaw_runtime::tools::TURN_ROUTING
+                    .scope(Some(Arc::clone(&turn_routing)), tool_loop);
+                let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(thinking.params.native_thinking, tool_loop);
+                let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                    .scope(receipt_scope, tool_loop);
+                let thread_scope_id = self
+                    .message
+                    .interruption_scope_id
+                    .clone()
+                    .or_else(|| self.message.thread_ts.clone())
+                    .or_else(|| Some(self.message.id.clone()));
+                let result = scope_thread_id(thread_scope_id, tool_loop).await;
+                let fallback = super::take_last_provider_fallback();
+                let safeguard = super::take_last_safeguard_fallback();
+                (result, fallback, safeguard)
+            }));
+        let (candidate, fallback, safeguard) = super::scope_safeguard_fallback(scoped_turn).await;
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                turn_guard.finish();
+                if let Some(typing) = typing_controller.as_ref() {
+                    typing.pause().await;
+                }
+                let _ = finish_matrix_goal_draft_stream(draft_stream, &self.message, false).await;
+                drop(notify_observer);
+                if let Some(task) = notify_task {
+                    let _ = task.await;
+                }
+                publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+                return Err(error);
+            }
+        };
+        turn_guard.finish();
+        if let Some(typing) = typing_controller.as_ref() {
+            typing.pause().await;
+        }
+        let candidate_is_nonempty = !candidate.trim().is_empty();
+        if candidate_is_nonempty {
+            let has_route = {
+                let mut entries = turn_routing
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let final_entry = entries.pop();
+                entries.clear();
+                if let Some(final_entry) = final_entry {
+                    entries.push(final_entry);
+                }
+                !entries.is_empty()
+            };
+            if has_route {
+                self.pending_route = Some(turn_routing);
+            }
+            self.pending_fallback = Some((fallback, safeguard));
+        }
+        self.pending_receipts = if candidate_is_nonempty && self.context.show_receipts_in_response {
+            let receipts = receipt_collector
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            zeroclaw_runtime::agent::tool_receipts::render_receipts_block(&receipts)
+        } else {
+            None
+        };
+        let delivery =
+            finish_matrix_goal_draft_stream(draft_stream, &self.message, candidate_is_nonempty)
+                .await;
+        drop(notify_observer);
+        if let Some(task) = notify_task {
+            let _ = task.await;
+        }
+        if candidate_is_nonempty {
+            self.pending_delivery = Some(delivery);
+        }
         let _ = operation;
-        Ok(GoalParentTurnResult {
-            candidate,
-            working_history: history,
-        })
+        GoalParentTurnResult::from_completed_agent_turn(candidate, history)
     }
 
     async fn run_verifier(
@@ -591,6 +1004,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 turn.objective, turn.candidate
             )),
         ];
+        let mut settled_attempts = Vec::new();
         let response = resolved_channel_execution(
             self.context.as_ref(),
             provider.as_ref(),
@@ -605,36 +1019,307 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             verifier_defaults.temperature,
         )
         .model_access
-        .run_model_query(ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        })
-        .await?;
+        .run_model_query(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            &mut settled_attempts,
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(channel) =
+                    find_channel_for_message(&self.context.channels_by_name, &self.message)
+                {
+                    publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+                }
+                return Err(error);
+            }
+        };
         response.text.context("Goal verifier returned no text")
     }
 
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
+    async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
+        let delivery = self
+            .pending_delivery
+            .take()
+            .context("Matrix Goal parent output has no matching delivery session")?;
+        let channel = delivery.channel;
+        let mut outbound_response = candidate;
+        if let Some(hooks) = self.context.hooks.as_ref() {
+            match hooks
+                .run_on_message_sending(
+                    self.message.channel.clone(),
+                    self.message.reply_target.clone(),
+                    outbound_response.clone(),
+                )
+                .await
+            {
+                zeroclaw_runtime::hooks::HookResult::Cancel(reason) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_attrs(serde_json::json!({"reason": reason.to_string()})),
+                        "Matrix Goal parent output suppressed by hook"
+                    );
+                    if let Some(draft_id) = delivery.draft_id.as_deref() {
+                        let _ = channel
+                            .cancel_draft(&self.message.reply_target, draft_id)
+                            .await;
+                    }
+                    self.pending_receipts.take();
+                    self.pending_route.take();
+                    self.pending_fallback.take();
+                    return Ok(());
+                }
+                zeroclaw_runtime::hooks::HookResult::Continue((
+                    hook_channel,
+                    hook_recipient,
+                    mut modified_content,
+                )) => {
+                    if hook_channel != self.message.channel
+                        || hook_recipient != self.message.reply_target
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(serde_json::json!({
+                                "from_channel": self.message.channel,
+                                "from_recipient": self.message.reply_target,
+                                "to_channel": hook_channel,
+                                "to_recipient": hook_recipient,
+                            })),
+                            "on_message_sending attempted to rewrite Goal routing; only content mutation is applied"
+                        );
+                    }
+                    let modified_len = modified_content.chars().count();
+                    if modified_len > super::CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                        modified_content = super::truncate_with_ellipsis(
+                            &modified_content,
+                            super::CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                        );
+                    }
+                    outbound_response = modified_content;
+                }
+            }
+        }
         let delivered = sanitize_channel_response_for_format_with_leak_detection(
-            &candidate,
+            &outbound_response,
             self.context.tools_registry.as_ref(),
             &self.context.prompt_config.security.leak_detection,
             outbound_content_format_for_channel(&self.message.channel),
         );
-        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
-            .context("Matrix Goal channel is no longer available")?;
-        channel
-            .send(&zeroclaw_api::channel::SendMessage::reply_to(
-                &self.message,
-                &delivered,
-            ))
-            .await
-            .context("deliver verified Matrix Goal candidate")?;
-        append_sender_turn(
+        let delivered = if delivered.is_empty() && !outbound_response.trim().is_empty() {
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-malformed-tool-output")
+        } else {
+            delivered
+        };
+        let delivered = super::ensure_nonempty_channel_reply(
+            delivered,
+            &outbound_response,
+            &self.message.channel,
+            &self.message.reply_target,
+        );
+        let transcript_appended = append_sender_turn_durably(
             self.context.as_ref(),
             &self.session_key.durable_id(),
             ChatMessage::assistant(&delivered),
         );
+
+        let (fallback, safeguard) = self.pending_fallback.take().unwrap_or_default();
+        let delivered_response = super::append_provider_fallback_footer(
+            delivered.clone(),
+            fallback.as_ref(),
+            safeguard.as_ref(),
+        );
+
+        let turn_route = self.pending_route.take().and_then(|handle| {
+            handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .last()
+                .cloned()
+        });
+        let (routed_channel, recipient, suppress_voice, force_voice) =
+            if let Some(route) = turn_route.as_ref() {
+                let routed_channel = match route.channel.as_deref() {
+                    None | Some("") => Some(Arc::clone(&channel)),
+                    Some(key) => self.context.channels_by_name.get(key).map(Arc::clone),
+                };
+                let suppress_voice = match route.modality {
+                    zeroclaw_config::multi_agent::OutputModality::Text => Some(true),
+                    zeroclaw_config::multi_agent::OutputModality::Voice => Some(false),
+                    zeroclaw_config::multi_agent::OutputModality::Mirror => None,
+                };
+                (
+                    routed_channel,
+                    route
+                        .recipient
+                        .clone()
+                        .unwrap_or_else(|| self.message.reply_target.clone()),
+                    suppress_voice,
+                    matches!(
+                        route.modality,
+                        zeroclaw_config::multi_agent::OutputModality::Voice
+                    ),
+                )
+            } else {
+                let (suppress_voice, force_voice) = super::voice_override_from_sender_verdict(
+                    super::sender_prefers_voice(self.context.as_ref(), &self.message),
+                );
+                (
+                    Some(Arc::clone(&channel)),
+                    self.message.reply_target.clone(),
+                    suppress_voice,
+                    force_voice,
+                )
+            };
+        let is_redirect = turn_route
+            .as_ref()
+            .and_then(|route| route.channel.as_deref())
+            .is_some();
+        let reply_delivered = if let Some(routed_channel) = routed_channel.as_ref() {
+            if is_redirect {
+                if let Some(draft_id) = delivery.draft_id.as_deref() {
+                    let _ = channel
+                        .cancel_draft(&self.message.reply_target, draft_id)
+                        .await;
+                }
+                let mut reply = SendMessage::new(&delivered_response, &recipient)
+                    .in_thread(self.message.thread_ts.clone());
+                if suppress_voice == Some(true) {
+                    reply = reply.suppress_voice();
+                } else if force_voice {
+                    reply = reply.force_voice();
+                }
+                routed_channel.send_final(&reply).await.is_ok()
+            } else if let Some(draft_id) = delivery.draft_id.as_deref() {
+                if force_voice {
+                    let _ = routed_channel.cancel_draft(&recipient, draft_id).await;
+                    routed_channel
+                        .send_final(
+                            &SendMessage::new(&delivered_response, &recipient)
+                                .force_voice()
+                                .in_thread(self.message.thread_ts.clone()),
+                        )
+                        .await
+                        .is_ok()
+                } else {
+                    let final_text = if channel.supports_multi_message_streaming() {
+                        let confirmed_offset = channel
+                            .multi_message_confirmed_offset(&recipient, draft_id)
+                            .await;
+                        let streamed_text = delivery
+                            .streamed_text
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        super::cumulative_multi_message_final_text(
+                            &streamed_text,
+                            &delivered_response,
+                            confirmed_offset,
+                        )
+                    } else {
+                        delivered_response.clone()
+                    };
+                    match channel
+                        .finalize_draft(
+                            &recipient,
+                            draft_id,
+                            &final_text,
+                            suppress_voice.unwrap_or(false),
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error)
+                            if error
+                                .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                                .is_some() =>
+                        {
+                            true
+                        }
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(serde_json::json!({"error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error}")))})),
+                                "Failed to finalize Matrix Goal draft; sending final candidate separately"
+                            );
+                            let mut fallback =
+                                SendMessage::reply_to(&self.message, &delivered_response);
+                            if suppress_voice == Some(true) {
+                                fallback = fallback.suppress_voice();
+                            } else if force_voice {
+                                fallback = fallback.force_voice();
+                            }
+                            routed_channel.send_final(&fallback).await.is_ok()
+                        }
+                    }
+                }
+            } else {
+                let mut reply = SendMessage::reply_to(&self.message, &delivered_response);
+                if suppress_voice == Some(true) {
+                    reply = reply.suppress_voice();
+                } else if force_voice {
+                    reply = reply.force_voice();
+                }
+                routed_channel.send_final(&reply).await.is_ok()
+            }
+        } else {
+            false
+        };
+        if reply_delivered && let Some(hooks) = self.context.hooks.as_ref() {
+            hooks
+                .fire_message_sent(
+                    &self.message.channel,
+                    &self.message.reply_target,
+                    &delivered_response,
+                )
+                .await;
+        }
+        let receipts_block = self.pending_receipts.take();
+        if reply_delivered
+            && let Some(block) = receipts_block.as_deref()
+            && let Some(routed_channel) = routed_channel.as_ref()
+            && let Err(error) = routed_channel
+                .send(
+                    &SendMessage::new(block, &recipient)
+                        .in_thread(self.message.thread_ts.clone())
+                        .suppress_voice(),
+                )
+                .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(serde_json::json!({"error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error}")))})),
+                "failed to send Matrix Goal tool receipts block"
+            );
+        }
+        if !reply_delivered {
+            let error = anyhow::Error::msg("Matrix Goal parent candidate could not be delivered");
+            publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+            return Err(error);
+        }
+        if transcript_appended.is_none() {
+            let error = anyhow::Error::msg(
+                "Matrix Goal parent candidate could not be durably appended to the session transcript",
+            );
+            publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -658,6 +1343,210 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct MatrixGoalErrorRecordingChannel {
+        messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for MatrixGoalErrorRecordingChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-error-test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for MatrixGoalErrorRecordingChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.messages.lock().await.push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingAppendSessionBackend;
+
+    struct MatrixGoalDraftFailureChannel {
+        error: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for MatrixGoalDraftFailureChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-draft-log-fixture"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for MatrixGoalDraftFailureChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _: &SendMessage) -> Result<Option<String>> {
+            Err(anyhow::Error::msg(self.error.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_draft_failure_log_guards_credentials_and_preserves_clean_text() {
+        zeroclaw_log::try_install_capture_subscriber();
+        drop(zeroclaw_log::subscribe_or_install());
+        let context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        let message = ChannelMessage::new(
+            "fixture-event",
+            "fixture-user",
+            "fixture-room",
+            "work",
+            "matrix",
+            1,
+        );
+        let token = ["sk", "_live_", "0123456789abcdefghijklmnopqrstuv"].concat();
+        for credential in [false, true] {
+            let nonce = format!(
+                "goal-draft-log.{}",
+                uuid::Uuid::new_v4().to_string().replace('-', ".")
+            );
+            let mut error = format!("{nonce}: the api_key field is documented.");
+            if credential {
+                write!(&mut error, " {token}").expect("append synthetic credential");
+            }
+            let mut logs = zeroclaw_log::subscribe().expect("subscribe to draft failure logs");
+            let draft = start_matrix_goal_draft_stream(
+                &context,
+                &message,
+                Arc::new(MatrixGoalDraftFailureChannel {
+                    error: error.clone(),
+                }),
+            )
+            .await;
+            assert!(draft.draft_id.is_none());
+            assert!(draft.updater.is_none());
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame = logs.recv().await.expect("receive draft failure log");
+                    if frame["message"] == "Failed to start Matrix Goal draft on matrix"
+                        && frame["attributes"]["error"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&nonce))
+                    {
+                        break frame;
+                    }
+                }
+            })
+            .await
+            .expect("production draft failure frame must arrive");
+            assert_eq!(frame["severity_text"], "DEBUG");
+            assert_eq!(frame["event"]["action"], "note");
+            let emitted = frame["attributes"]["error"]
+                .as_str()
+                .expect("draft log carries error text");
+            if credential {
+                assert!(
+                    !emitted.contains("sk_live_")
+                        && !emitted.contains("0123456789abcdefghijklmnopqrstuv"),
+                    "credential reached the Matrix Goal draft log"
+                );
+                assert!(emitted.contains("REDACTED"));
+            } else {
+                assert_eq!(emitted, zeroclaw_providers::sanitize_api_error(&error));
+            }
+        }
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingAppendSessionBackend {
+        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+
+        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated append failure"))
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn matrix_goal_does_not_advance_canonical_cache_when_durable_append_fails() {
+        let context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        let key = "goal-session";
+
+        assert!(
+            append_sender_turn_durably(&context, key, ChatMessage::user("resume answer"),)
+                .is_none()
+        );
+        assert!(
+            context
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .peek(key)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_surfaces_core_error_through_channel_error_renderer() {
+        let channel = MatrixGoalErrorRecordingChannel::default();
+        let message = ChannelMessage::new("event", "alice", "!room", "/goal start", "matrix", 1);
+        let error = anyhow::Error::msg("provider rejected the request");
+        let expected = super::super::channel_user_error_message(
+            &error,
+            &zeroclaw_providers::sanitize_api_error(&error.to_string()),
+        );
+
+        publish_matrix_goal_core_error(&channel, &message, &error).await;
+
+        assert_eq!(channel.messages.lock().await.as_slice(), [expected]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_does_not_surface_controlled_tool_loop_cancellation_as_error() {
+        let channel = MatrixGoalErrorRecordingChannel::default();
+        let message = ChannelMessage::new("event", "alice", "!room", "/goal start", "matrix", 1);
+        let error = anyhow::Error::new(zeroclaw_runtime::agent::loop_::ToolLoopCancelled);
+
+        publish_matrix_goal_core_error(&channel, &message, &error).await;
+
+        assert!(channel.messages.lock().await.is_empty());
+    }
 
     #[test]
     fn goal_parent_input_keeps_lifecycle_phase_out_of_user_control() {
@@ -700,5 +1589,139 @@ mod tests {
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "earlier user message");
         assert_eq!(history[2].content, "Goal objective");
+    }
+
+    #[derive(Default)]
+    struct RecoveryRecordingProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecoveryRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "goal-recovery-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for RecoveryRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires the history boundary")
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(messages.to_vec());
+            if requests.len() % 2 == 1 {
+                bail!("maximum context length exceeded")
+            }
+            Ok("candidate after recovery".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_keeps_one_breadcrumb_across_two_continuation_recoveries() {
+        let provider = Arc::new(RecoveryRecordingProvider::default());
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            Arc::new(FailingAppendSessionBackend),
+            channel,
+            provider.clone(),
+            0,
+        );
+        let session_key = GoalSessionKey::matrix("matrix_goal_recovery_fixture").unwrap();
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("goal-recovery-fixture", session_key.durable_id(), 1).unwrap(),
+        );
+        let mut lease = MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context,
+            session_key,
+            message: ChannelMessage::new("event", "user", "room", "work", "matrix", 1),
+            pending_delivery: None,
+            pending_receipts: None,
+            pending_route: None,
+            pending_fallback: None,
+            history_has_trim_breadcrumb: false,
+        };
+        let mut history = vec![
+            ChatMessage::system("previous Goal prompt"),
+            ChatMessage::user("old ".repeat(20_000)),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent response"),
+            ChatMessage::user("continue the repair"),
+        ];
+        let breadcrumb = zeroclaw_runtime::agent::history_trim::breadcrumb();
+        for turn in 0..2 {
+            if turn == 1 {
+                assert!(lease.history_has_trim_breadcrumb);
+                // Make another whole old turn reclaimable without replacing
+                // the lease-owned breadcrumb or recognizing it by content.
+                history.splice(
+                    2..2,
+                    [
+                        ChatMessage::user("older ".repeat(20_000)),
+                        ChatMessage::assistant("older response"),
+                    ],
+                );
+                history.push(ChatMessage::user("continue with the remaining criterion"));
+            }
+            let result = lease
+                .run_parent_turn(
+                    &operation,
+                    GoalParentTurn {
+                        kind: GoalParentTurnKind::Continue,
+                        objective: "bounded repair".to_owned(),
+                        working_history: history,
+                    },
+                )
+                .await
+                .expect("ordinary context recovery must finish the parent turn");
+            history = result.working_history().to_vec();
+            assert!(lease.history_has_trim_breadcrumb);
+            assert_eq!(history[1].content, breadcrumb.content);
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|row| row.content == breadcrumb.content)
+                    .count(),
+                1,
+                "each recovery must retain exactly one owner-tracked breadcrumb"
+            );
+            // This fixture probes assembly and recovery, not final delivery.
+            lease.pending_delivery.take();
+            lease.pending_receipts.take();
+        }
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in [&requests[1], &requests[3]] {
+            assert_eq!(request[1].content, breadcrumb.content);
+            assert_eq!(
+                request
+                    .iter()
+                    .filter(|row| row.content == breadcrumb.content)
+                    .count(),
+                1
+            );
+        }
     }
 }
