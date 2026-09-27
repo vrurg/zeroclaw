@@ -16,13 +16,13 @@ tokio::task_local! {
 }
 
 #[derive(Debug)]
-pub(crate) struct GoalChildFence {
+struct GoalChildFence {
     permits: Arc<Semaphore>,
     accepts_children: bool,
 }
 
 impl GoalChildFence {
-    pub(crate) fn open() -> Arc<Self> {
+    fn open() -> Arc<Self> {
         Arc::new(Self {
             permits: Arc::new(Semaphore::new(1)),
             accepts_children: true,
@@ -48,13 +48,13 @@ impl GoalChildFence {
 }
 
 /// Held from Goal-child admission through inline child execution.
-pub(crate) struct GoalChildGuard {
+pub struct GoalChildGuard {
     _permit: OwnedSemaphorePermit,
 }
 
 /// Returns a guard only inside a Goal parent or child turn. Ordinary turns
 /// retain their existing child-concurrency behavior.
-pub(crate) async fn admit_goal_child() -> Result<Option<GoalChildGuard>> {
+pub async fn admit_goal_child() -> Result<Option<GoalChildGuard>> {
     let Some(fence) = GOAL_CHILD_FENCE.try_with(Clone::clone).ok().flatten() else {
         return Ok(None);
     };
@@ -62,14 +62,14 @@ pub(crate) async fn admit_goal_child() -> Result<Option<GoalChildGuard>> {
 }
 
 /// Whether the current task is inside any isolated Goal turn.
-pub(crate) fn is_goal_scoped() -> bool {
+pub fn is_goal_scoped() -> bool {
     GOAL_CHILD_FENCE
         .try_with(|fence| fence.is_some())
         .unwrap_or(false)
 }
 
 /// Installs an open child-admission scope for one isolated Goal parent turn.
-pub(crate) async fn scope_goal_parent<F: Future>(future: F) -> F::Output {
+pub async fn scope_goal_parent<F: Future>(future: F) -> F::Output {
     GOAL_CHILD_FENCE
         .scope(Some(GoalChildFence::open()), future)
         .await
@@ -78,9 +78,7 @@ pub(crate) async fn scope_goal_parent<F: Future>(future: F) -> F::Output {
 /// Re-scopes an inline child so it cannot recursively create Goal-owned work.
 /// The child still has no global tool fence: its ordinary tool batch remains
 /// independently parallel according to normal agent configuration.
-pub(crate) async fn scope_goal_child<'a, T>(
-    future: Pin<Box<dyn Future<Output = T> + Send + 'a>>,
-) -> T {
+pub async fn scope_goal_child<'a, T>(future: Pin<Box<dyn Future<Output = T> + Send + 'a>>) -> T {
     if is_goal_scoped() {
         GOAL_CHILD_FENCE
             .scope(Some(GoalChildFence::closed()), future)
