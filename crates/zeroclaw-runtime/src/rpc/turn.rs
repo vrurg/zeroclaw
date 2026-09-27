@@ -1188,6 +1188,7 @@ mod tests {
             .agent_alias("rpc-agent".into())
             .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
                 config: Some(Arc::new(full_config)),
+                live_config: None,
                 live: None,
             })
             .build()

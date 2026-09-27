@@ -29522,6 +29522,7 @@ mod tests {
             .agent_alias("test-agent".to_string())
             .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
                 config: Some(Arc::new(agent_config)),
+                live_config: None,
                 live: None,
             })
             .build()
