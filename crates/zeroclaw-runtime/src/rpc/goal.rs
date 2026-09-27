@@ -21,18 +21,17 @@ use crate::{
     control_plane::control_plane,
     cost::CostTracker,
     goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
-    goal_mode::{
-        GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-        GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
-        GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
-        GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
-        dispose_unowned_session_goal,
-    },
     rpc::context::RpcContext,
 };
 
-use crate::goal_mode::GoalExecutionSupervisor;
 use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_goal::control::{
+    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings,
+    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
+    GoalVerifierTurn, dispose_unowned_session_goal,
+};
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
 

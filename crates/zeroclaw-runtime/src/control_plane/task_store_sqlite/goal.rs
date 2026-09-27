@@ -1297,8 +1297,8 @@ mod tests {
     use super::*;
     use crate::control_plane::goal_task::{GoalBlockerKind, GoalTaskRegistry};
     use crate::control_plane::task_registry::{TaskKind, TaskRegistry, TaskStatus};
-    use crate::goal_mode::dispose_unowned_session_goal;
     use rusqlite::params;
+    use zeroclaw_goal::control::dispose_unowned_session_goal;
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
         TaskRecord {
