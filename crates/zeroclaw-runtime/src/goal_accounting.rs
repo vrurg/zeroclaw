@@ -1,4 +1,4 @@
-//! Runtime persistence adapter for Goal-owned provider accounting contracts.
+//! Runtime adapters for Goal-owned accounting and diagnostic contracts.
 
 use std::sync::Arc;
 
@@ -9,7 +9,8 @@ use uuid::Uuid;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 use zeroclaw_goal::{
-    GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
+    GoalAccountingState, GoalDiagnosticTextGuard, GoalExecutionScope, GoalTaskRegistry,
+    GoalTransitionResult,
     accounting::{
         GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationFenced,
         GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice,
@@ -19,6 +20,17 @@ use zeroclaw_goal::{
 };
 
 use crate::agent::cost::{ModelProviderPricing, cost_usage_with_pricing};
+use crate::agent::turn::redact::scrub_credentials;
+
+/// Applies the canonical log leak scrub followed by key/value credential
+/// redaction, in the ordinary progress-display order.
+pub struct RuntimeGoalDiagnosticTextGuard;
+
+impl GoalDiagnosticTextGuard for RuntimeGoalDiagnosticTextGuard {
+    fn guard_diagnostic_text(&self, text: &str) -> String {
+        scrub_credentials(&crate::security::scrub(text))
+    }
+}
 
 /// Runtime pricing adapter delegating to the existing configured/live/catalog
 /// resolver used by ordinary turns.
@@ -407,6 +419,48 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use zeroclaw_goal::GoalTaskRecord;
+
+    #[test]
+    fn diagnostic_guard_uses_canonical_scrub_then_key_value_redaction() {
+        let stripe = ["sk", "_live_", "0123456789abcdefghijklmnopqrstuv"].concat();
+        let jwt = [
+            "eyJ",
+            "fixtureHeader.eyJ",
+            "fixturePayload.fixtureSignature",
+        ]
+        .concat();
+        let password = ["fixture", "Password", "0123456789ABCDEF"].concat();
+        let quoted = ["test", "Password", "Value"].concat();
+        for (text, credential) in [
+            (format!("criterion met {stripe} safely"), stripe),
+            (format!("criterion met {jwt} safely"), jwt),
+            (
+                format!(
+                    "{}postgres://fixture:{password}@example.invalid/db",
+                    "word ".repeat(45)
+                ),
+                password,
+            ),
+            (
+                format!("criterion met {{\"password\":\"{quoted}\"}}"),
+                quoted,
+            ),
+        ] {
+            let output = RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&text);
+            assert_eq!(output, scrub_credentials(&crate::security::scrub(&text)));
+            assert!(!output.contains(&credential));
+            assert!(output.contains("REDACTED"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_guard_preserves_valid_reason_verbatim() {
+        let reason = "The task-level criterion is met: Slovakia locale tests pass and the api_key field is documented; bearer-token auth is unchanged.";
+        assert_eq!(
+            RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(reason),
+            reason
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum AdmissionFault {
