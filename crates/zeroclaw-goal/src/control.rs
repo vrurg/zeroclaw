@@ -34,8 +34,7 @@ mod parent_input;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
-    GoalExecutionSubmission, GoalExecutionSupervisor,
-    dispose_unowned_session_goal,
+    GoalExecutionSubmission, GoalExecutionSupervisor, dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 
