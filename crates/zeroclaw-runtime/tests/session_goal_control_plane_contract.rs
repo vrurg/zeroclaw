@@ -437,6 +437,108 @@ async fn a_fenced_goal_tool_batch_can_settle_after_the_pause_epoch() {
 }
 
 #[tokio::test]
+async fn goal_tool_batch_marker_clears_only_after_parent_turn_finalization() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store =
+        Arc::new(SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema"));
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("paired-tool-batch", "paired-tool-batch-session"),
+                session_goal_extension("paired-tool-batch"),
+            )
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+    let registry: Arc<dyn GoalTaskRegistry> = store.clone();
+    let scope =
+        zeroclaw_goal::GoalExecutionScope::new("paired-tool-batch", "paired-tool-batch-session", 1)
+            .expect("build exact execution scope");
+
+    zeroclaw_goal::tool_pairing::scope_goal_tool_pairing(registry, scope, async {
+        zeroclaw_goal::tool_pairing::admit_goal_tool_batch(1)
+            .await
+            .expect("admit durable tool batch")
+            .expect("Goal scope installs tool-pairing marker")
+            .settle()
+            .expect("settle assistant/tool history pair");
+
+        let before_finalize = store
+            .get_goal_task("paired-tool-batch")
+            .await
+            .expect("read Goal before parent-turn finalization")
+            .expect("Goal extension exists");
+        assert!(before_finalize.pending_tool_batch_id.is_some());
+        assert_eq!(before_finalize.pending_tool_epoch, Some(1));
+
+        zeroclaw_goal::tool_pairing::finalize_goal_tool_pairing()
+            .await
+            .expect("finalize paired marker at parent-turn boundary");
+
+        let after_finalize = store
+            .get_goal_task("paired-tool-batch")
+            .await
+            .expect("read Goal after parent-turn finalization")
+            .expect("Goal extension exists");
+        assert!(after_finalize.pending_tool_batch_id.is_none());
+        assert!(after_finalize.pending_tool_epoch.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropped_nested_batch_fails_outer_settlement_closed() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store =
+        Arc::new(SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema"));
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("nested-tool-batch", "nested-tool-batch-session"),
+                session_goal_extension("nested-tool-batch"),
+            )
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+    let registry: Arc<dyn GoalTaskRegistry> = store.clone();
+    let scope =
+        zeroclaw_goal::GoalExecutionScope::new("nested-tool-batch", "nested-tool-batch-session", 1)
+            .expect("build exact execution scope");
+
+    zeroclaw_goal::tool_pairing::scope_goal_tool_pairing(registry, scope, async {
+        let outer = zeroclaw_goal::tool_pairing::admit_goal_tool_batch(1)
+            .await
+            .expect("admit outer tool batch")
+            .expect("Goal scope installs outer marker");
+        let nested = zeroclaw_goal::tool_pairing::admit_goal_tool_batch(1)
+            .await
+            .expect("admit nested foreground tool batch")
+            .expect("nested Goal scope shares marker");
+        drop(nested);
+
+        let settlement = outer
+            .settle()
+            .expect_err("outer settlement must reject dropped nested batch");
+        assert!(settlement.to_string().contains("nested tool loop"));
+        let finalization = zeroclaw_goal::tool_pairing::finalize_goal_tool_pairing()
+            .await
+            .expect_err("parent finalization must remain fail-closed");
+        assert!(finalization.to_string().contains("unpaired tool batch"));
+
+        let goal = store
+            .get_goal_task("nested-tool-batch")
+            .await
+            .expect("read Goal after rejected pairing")
+            .expect("Goal extension exists");
+        assert!(goal.pending_tool_batch_id.is_some());
+        assert_eq!(goal.pending_tool_epoch, Some(1));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn restart_fails_an_unpaired_goal_tool_batch_without_replaying_it() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
