@@ -3,7 +3,7 @@
 use super::*;
 
 pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
-    mut command: MatrixGoalCommandSubmission,
+    command: MatrixGoalCommandSubmission,
     channel: Option<Arc<dyn Channel>>,
     message: ChannelMessage,
 ) {
@@ -20,8 +20,18 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
 
     // An idle/immediate command already committed. A queued acknowledgement
     // must be visible before waiting, and that wait must retain no bind lease.
-    let admission = command.submission;
-    command.submission = match admission {
+    let MatrixGoalCommandSubmission::Deferred {
+        supervisor,
+        supervisor_slot,
+        mut settings,
+        context,
+        submission,
+        history_key,
+    } = command
+    else {
+        return;
+    };
+    let submission = match submission {
         GoalControlAdmission::Direct(submission) => GoalControlAdmission::Direct(submission),
         GoalControlAdmission::Queued { deferred, .. } => {
             let ready = match deferred.wait().await {
@@ -44,17 +54,16 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
                     return;
                 }
             };
-            command.settings =
-                match matrix_goal_settings(command.context.as_ref(), &command.history_key) {
-                    Ok(settings) => settings,
-                    Err(error) => {
-                        drop(ready);
-                        log_delivery_error("Goal deferred settings could not be resolved", &error);
-                        send_command_failed(channel.as_ref(), &message).await;
-                        return;
-                    }
-                };
-            let commit = match ready.commit(command.settings.clone()).await {
+            settings = match matrix_goal_settings(context.as_ref(), &history_key) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    drop(ready);
+                    log_delivery_error("Goal deferred settings could not be resolved", &error);
+                    send_command_failed(channel.as_ref(), &message).await;
+                    return;
+                }
+            };
+            let commit = match ready.commit(settings.clone()).await {
                 Ok(commit) => commit,
                 Err(error) => {
                     log_delivery_error("Goal deferred command could not commit", &error);
@@ -68,31 +77,42 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
                 commit.response(),
                 GoalResponse::Started(_) | GoalResponse::Resumed(_)
             );
-            if before_release {
-                let delivery = send_response(channel.as_ref(), &message, commit.response()).await;
-                command.submission = GoalControlAdmission::Direct(commit.release());
-                if let Err(error) = delivery {
-                    log_delivery_error(
-                        "Goal deferred launch response could not be delivered",
-                        &error,
-                    );
-                    if let Err(error) = command.response_delivery_failed().await {
-                        log_delivery_error(
-                            "Goal deferred launch failure could not be settled",
-                            &error,
-                        );
-                    }
-                    return;
-                }
-                finish_after_response(command, channel.as_ref(), &message, false).await;
-                return;
-            }
+            let delivery = if before_release {
+                send_response(channel.as_ref(), &message, commit.response()).await
+            } else {
+                Ok(())
+            };
             // Release checkpoint and command ownership before draining a
             // predecessor. Budget and refused/stale outcomes publish afterwards.
-            command.submission = GoalControlAdmission::Direct(commit.release());
-            finish_after_response(command, channel.as_ref(), &message, true).await;
+            let command = MatrixGoalCommandSubmission::Deferred {
+                supervisor,
+                supervisor_slot,
+                settings,
+                context,
+                submission: GoalControlAdmission::Direct(commit.release()),
+                history_key,
+            };
+            if let Err(error) = delivery {
+                log_delivery_error(
+                    "Goal deferred launch response could not be delivered",
+                    &error,
+                );
+                if let Err(error) = command.response_delivery_failed().await {
+                    log_delivery_error("Goal deferred launch failure could not be settled", &error);
+                }
+                return;
+            }
+            finish_after_response(command, channel.as_ref(), &message, !before_release).await;
             return;
         }
+    };
+    let command = MatrixGoalCommandSubmission::Deferred {
+        supervisor,
+        supervisor_slot,
+        settings,
+        context,
+        submission,
+        history_key,
     };
     finish_after_response(command, channel.as_ref(), &message, false).await;
 }

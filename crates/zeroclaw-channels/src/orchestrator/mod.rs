@@ -21892,6 +21892,61 @@ temperature = 0.3
         assert_eq!(snapshot.references, message.references);
     }
 
+    #[tokio::test]
+    async fn matrix_goal_help_requires_the_goal_control_plane() {
+        let Err(error) = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-help".to_owned(),
+            channel_message("matrix", Some("primary")),
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        else {
+            panic!("Help must not bypass the Goal control plane");
+        };
+        assert_eq!(error.to_string(), "Goal control plane is unavailable");
+    }
+
+    async fn matrix_help_under_policy(enabled: bool) -> zeroclaw_goal::control::GoalResponse {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = enabled;
+        let mut context = router_test_ctx();
+        Arc::get_mut(&mut context).unwrap().live_config =
+            zeroclaw_config::live::LiveConfig::new(config).handle();
+        crate::orchestrator::foreground::install_goal_test_control_plane(
+            &context.persist_locks,
+            "matrix_goal-help",
+            zeroclaw_runtime::control_plane::ControlPlaneHandle::open(directory.path()).unwrap(),
+        );
+        // A non-Matrix sender would fail driver construction, so any response
+        // proves that Help built no driver.
+        let mut message = channel_message("not-matrix", Some("primary"));
+        message.sender = "different-sender".to_owned();
+        submit_matrix_goal(
+            context,
+            "matrix_goal-help".to_owned(),
+            message,
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        .unwrap()
+        .response()
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_help_follows_the_live_policy_without_a_driver() {
+        assert!(matches!(
+            matrix_help_under_policy(false).await,
+            zeroclaw_goal::control::GoalResponse::Disabled
+        ));
+        assert!(matches!(
+            matrix_help_under_policy(true).await,
+            zeroclaw_goal::control::GoalResponse::Help
+        ));
+    }
+
     #[test]
     fn composite_channel_key_aliased_uses_dotted_form() {
         assert_eq!(

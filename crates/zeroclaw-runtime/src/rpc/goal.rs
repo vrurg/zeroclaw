@@ -1249,6 +1249,12 @@ impl RpcGoalRuntime {
                 post_response: None,
             });
         }
+        if matches!(command, GoalCommand::Help) {
+            return Ok(RpcGoalCommandSubmission {
+                response: GoalResponse::Help,
+                post_response: None,
+            });
+        }
         let registry = control_plane.goal_store()?;
         let settings =
             Self::settings_from_config(&config, control_plane.boot_id, policy_generation)?;
@@ -1384,6 +1390,129 @@ impl RpcGoalRuntime {
             .is_some_and(|current| Arc::ptr_eq(current, supervisor))
         {
             supervisors.remove(session_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_config::schema::Config;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    use super::*;
+    use crate::rpc::session::SessionStore;
+
+    #[tokio::test]
+    async fn help_without_a_goal_control_plane_is_unavailable() {
+        // The daemon control plane is process-global, and in-process daemon
+        // tests install it. Prove its absence in a dedicated test process.
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::goal::tests::help_without_a_goal_control_plane_is_unavailable",
+        )
+        .await
+        {
+            return;
+        }
+        assert!(
+            crate::control_plane::control_plane().is_none(),
+            "test requires a process without a Goal control plane"
+        );
+        let config = Config::default();
+        assert!(
+            !config.goal.enabled,
+            "test requires Goal Mode to be disabled"
+        );
+        let sessions = Arc::new(SessionStore::new(
+            1,
+            Arc::new(SessionActorQueue::new(1, 1, 1)),
+        ));
+        let context = RpcContext::minimal(config, sessions);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let driver = Arc::new(ZeroCodeGoalSessionDriver {
+            context: Arc::clone(&context),
+            authorization: super::super::dispatch::GoalSessionAuthorization::new(
+                Arc::clone(&context),
+                None,
+                "disabled-goal-help".to_owned(),
+                None,
+            ),
+            outbound: Arc::new(RpcOutbound::new(outbound_tx)),
+            connection_activity: None,
+            session_key: GoalSessionKey::zero_code("disabled-goal-help").unwrap(),
+            agent_alias: "test-agent".to_owned(),
+            session_generation: 0,
+            tui_id: "test-tui".to_owned(),
+            command_lock: Arc::new(Mutex::new(())),
+        });
+
+        let response = Arc::new(RpcGoalRuntime::default())
+            .submit(context, driver, GoalCommand::Help)
+            .await;
+
+        let Err(error) = response else {
+            panic!("Help must not bypass the Goal control plane");
+        };
+        assert_eq!(error.to_string(), "Goal control plane is unavailable");
+    }
+
+    fn policy_help_driver(context: &Arc<RpcContext>) -> Arc<ZeroCodeGoalSessionDriver> {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let dispatcher = super::super::dispatch::RpcDispatcher::new(
+            Arc::clone(context),
+            outbound_tx.clone(),
+            "goal-help-policy-test".to_owned(),
+        );
+        Arc::new(ZeroCodeGoalSessionDriver {
+            context: Arc::clone(context),
+            authorization: Arc::new(super::super::dispatch::GoalSessionAuthorization::new(
+                dispatcher,
+                super::super::dispatch::GoalCommandPurpose::Control,
+                "goal-help-policy".to_owned(),
+                None,
+            )),
+            outbound: Arc::new(RpcOutbound::new(outbound_tx)),
+            connection_activity: None,
+            session_key: GoalSessionKey::zero_code("goal-help-policy").unwrap(),
+            agent_alias: "test-agent".to_owned(),
+            session_generation: 0,
+            tui_id: "test-tui".to_owned(),
+            command_lock: Arc::new(Mutex::new(())),
+            recall_query: "/goal help".to_owned(),
+        })
+    }
+
+    #[tokio::test]
+    async fn help_follows_the_live_goal_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(RpcGoalRuntime::default());
+        runtime.install_test_control_plane(
+            crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap(),
+        );
+        for enabled in [false, true] {
+            let mut config = Config::default();
+            config.goal.enabled = enabled;
+            let sessions = Arc::new(SessionStore::new(
+                1,
+                Arc::new(SessionActorQueue::new(1, 1, 1)),
+            ));
+            let context = RpcContext::minimal(config, sessions);
+            let driver = policy_help_driver(&context);
+
+            let response = runtime
+                .submit(context, driver, GoalCommand::Help)
+                .await
+                .unwrap();
+
+            if enabled {
+                assert!(matches!(response.response(), GoalResponse::Help));
+            } else {
+                assert!(matches!(response.response(), GoalResponse::Disabled));
+            }
+            assert!(response.post_response.is_none());
         }
     }
 }
