@@ -1574,7 +1574,7 @@ fn settle_exit_against_channel_retirement(
     exit: Result<DaemonExit>,
     channels_retired: bool,
 ) -> Result<DaemonExit> {
-    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload)) {
+    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload(_))) {
         return exit;
     }
     ::zeroclaw_log::record!(
@@ -3047,10 +3047,27 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the timed-out supervisor must be aborted and joined"
         );
-        assert_eq!(
-            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload), retired).unwrap(),
-            DaemonExit::Shutdown,
+        assert!(
+            matches!(
+                settle_exit_against_channel_retirement(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    retired
+                )
+                .unwrap(),
+                DaemonExit::Shutdown
+            ),
             "reload must be refused when channel retirement is unproven"
+        );
+        assert!(
+            matches!(
+                settle_exit_against_channel_retirement(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    true
+                )
+                .unwrap(),
+                DaemonExit::Reload(_)
+            ),
+            "a reload must be preserved after channel retirement is proven"
         );
     }
 
