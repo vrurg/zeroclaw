@@ -2129,6 +2129,8 @@ pub(crate) fn signal_gateway_deletion_at_generation<'a>(
     };
     // A different active generation is a successor. A stale DELETE may retain
     // a latch only for its expected generation, never for that successor.
+    // Replace an older unconsumed latch when a later generation arrives so a
+    // successor DELETE cannot inherit a predecessor's cancellation boundary.
     let pending = match cancellations
         .pending_deletions
         .entry(session_key.to_string())
@@ -2137,7 +2139,14 @@ pub(crate) fn signal_gateway_deletion_at_generation<'a>(
             entry.insert(expected_generation);
             true
         }
-        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if *entry.get() == expected_generation {
+                false
+            } else {
+                entry.insert(expected_generation);
+                true
+            }
+        }
     };
     GatewayDeletionCancellation {
         state,
@@ -3969,6 +3978,61 @@ pub(crate) mod tests {
             signal_gateway_deletion_at_generation(&state, session_key, successor_generation);
         assert!(active.cancelled_active_turn);
         assert!(successor_token.is_cancelled());
+    }
+
+    #[test]
+    fn successor_session_delete_replaces_a_stale_pending_latch() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1";
+        let predecessor_generation = 4;
+        let successor_generation = predecessor_generation + 1;
+
+        let predecessor =
+            signal_gateway_deletion_at_generation(&state, session_key, predecessor_generation);
+        assert_eq!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions
+                .get(session_key),
+            Some(&predecessor_generation)
+        );
+
+        let successor =
+            signal_gateway_deletion_at_generation(&state, session_key, successor_generation);
+        assert_eq!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions
+                .get(session_key),
+            Some(&successor_generation),
+            "a successor DELETE must replace a stale predecessor latch"
+        );
+
+        drop(predecessor);
+        assert_eq!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions
+                .get(session_key),
+            Some(&successor_generation),
+            "the predecessor guard must not clear the successor latch"
+        );
+
+        drop(successor);
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions
+                .contains_key(session_key)
+        );
     }
 
     #[test]
