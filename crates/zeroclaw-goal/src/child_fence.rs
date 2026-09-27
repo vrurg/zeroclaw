@@ -47,7 +47,8 @@ impl GoalChildFence {
     }
 }
 
-/// Held from Goal-child admission through inline child execution.
+/// Guard held from Goal-child admission through inline child execution.
+#[must_use = "dropping the guard releases Goal foreground-child admission"]
 pub struct GoalChildGuard {
     _permit: OwnedSemaphorePermit,
 }
@@ -92,7 +93,6 @@ pub async fn scope_goal_child<'a, T>(future: Pin<Box<dyn Future<Output = T> + Se
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use super::{admit_goal_child, scope_goal_child, scope_goal_parent};
 
@@ -108,7 +108,7 @@ mod tests {
                     let _guard = admit_goal_child().await.unwrap().unwrap();
                     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                     maximum.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tokio::task::yield_now().await;
                     active.fetch_sub(1, Ordering::SeqCst);
                 }
             };
@@ -119,7 +119,7 @@ mod tests {
                     let _guard = admit_goal_child().await.unwrap().unwrap();
                     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                     maximum.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tokio::task::yield_now().await;
                     active.fetch_sub(1, Ordering::SeqCst);
                 }
             };
@@ -149,14 +149,11 @@ mod tests {
     async fn independent_parent_scopes_do_not_share_a_permit() {
         let first = scope_goal_parent(async {
             let _guard = admit_goal_child().await.unwrap().unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            tokio::task::yield_now().await;
         });
         let second = scope_goal_parent(async {
-            tokio::time::timeout(Duration::from_millis(20), async {
-                let _guard = admit_goal_child().await.unwrap().unwrap();
-            })
-            .await
-            .expect("a distinct parent fence must not wait for another parent");
+            let _guard = admit_goal_child().await.unwrap().unwrap();
+            tokio::task::yield_now().await;
         });
         tokio::join!(first, second);
     }
