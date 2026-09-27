@@ -1921,7 +1921,7 @@ impl Agent {
                 break result;
             }
         };
-        let response = crate::goal_mode::scope_goal_parent_turn(Box::pin(isolated_turn))
+        let response = zeroclaw_goal::control::scope_goal_parent_turn(Box::pin(isolated_turn))
             .await?;
 
         if let Some(preamble) = injected_memory_preamble.take() {
