@@ -3246,11 +3246,27 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the timed-out supervisor must be aborted and joined"
         );
-        assert_eq!(
-            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload(Box::default())), retired)
+        assert!(
+            matches!(
+                settle_exit_against_channel_retirement(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    retired
+                )
                 .unwrap(),
-            DaemonExit::Shutdown,
+                DaemonExit::Shutdown
+            ),
             "reload must be refused when channel retirement is unproven"
+        );
+        assert!(
+            matches!(
+                settle_exit_against_channel_retirement(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    true
+                )
+                .unwrap(),
+                DaemonExit::Reload(_)
+            ),
+            "a reload must be preserved after channel retirement is proven"
         );
     }
 
