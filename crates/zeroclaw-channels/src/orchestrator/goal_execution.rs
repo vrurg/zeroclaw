@@ -123,55 +123,91 @@ async fn acquire_goal_foreground_lease(
     }
 }
 
-/// Holds a Matrix Goal response together with the worker that must not start
-/// until that response has been delivered.
-pub(super) struct MatrixGoalCommandSubmission {
-    supervisor: Arc<GoalExecutionSupervisor>,
-    supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
-    settings: GoalHostSettings,
-    submission: GoalExecutionSubmission,
+/// Represents a Matrix Goal response and any lifecycle work that must wait
+/// until the response has been delivered.
+pub(super) enum MatrixGoalCommandSubmission {
+    /// A grammar-only response that requires no control-plane access.
+    Immediate(GoalResponse),
+    /// A lifecycle response whose admitted worker is gated on delivery.
+    Deferred {
+        supervisor: Arc<GoalExecutionSupervisor>,
+        supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
+        settings: GoalHostSettings,
+        submission: GoalExecutionSubmission,
+    },
 }
 
 impl MatrixGoalCommandSubmission {
     pub(super) fn response(&self) -> &GoalResponse {
-        self.submission.response()
+        match self {
+            Self::Immediate(response) => response,
+            Self::Deferred { submission, .. } => submission.response(),
+        }
     }
 
     /// Release the admitted worker after Matrix confirms lifecycle delivery.
     pub(super) async fn after_response(&mut self) -> Result<Option<GoalResponse>> {
-        self.supervisor
-            .launch_after_response(self.settings.clone(), &mut self.submission)
-            .await
+        match self {
+            Self::Immediate(_) => Ok(None),
+            Self::Deferred {
+                supervisor,
+                settings,
+                submission,
+                ..
+            } => {
+                supervisor
+                    .launch_after_response(settings.clone(), submission)
+                    .await
+            }
+        }
     }
 
     /// Retire a supervisor only after the corresponding final lifecycle
     /// response has been delivered by Matrix.
     pub(super) async fn final_response_delivered(&self, late_response: Option<&GoalResponse>) {
+        let Self::Deferred {
+            supervisor,
+            supervisor_slot,
+            submission,
+            ..
+        } = self
+        else {
+            return;
+        };
         let initial_is_final = matches!(
-            self.submission.response(),
+            submission.response(),
             GoalResponse::Paused(_)
                 | GoalResponse::AlreadyPaused(_)
                 | GoalResponse::Cancelled(_)
                 | GoalResponse::AlreadyCancelled(_)
                 | GoalResponse::Terminal(_)
         );
-        let pending_was_finalized = matches!(
-            self.submission.response(),
-            GoalResponse::TransitionPending(_)
-        ) && late_response.is_some();
+        let pending_was_finalized =
+            matches!(submission.response(), GoalResponse::TransitionPending(_))
+                && late_response.is_some();
         if initial_is_final || pending_was_finalized {
-            clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+            clear_supervisor_slot_if_current(supervisor_slot, supervisor).await;
         }
     }
 
     /// Keep an unseen Goal from starting when Matrix cannot deliver its
     /// lifecycle acknowledgement.
-    pub(super) async fn response_delivery_failed(mut self) -> Result<()> {
-        self.supervisor
-            .pause_before_launch(&mut self.submission, GoalPauseReason::ExternalDependency)
-            .await?;
-        clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
-        Ok(())
+    pub(super) async fn response_delivery_failed(self) -> Result<()> {
+        match self {
+            Self::Immediate(_) => Ok(()),
+            Self::Deferred {
+                supervisor,
+                supervisor_slot,
+                mut submission,
+                ..
+            } => {
+                supervisor
+                    .pause_before_launch(&mut submission, GoalPauseReason::ExternalDependency)
+                    .await?;
+                clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -271,6 +307,11 @@ pub(super) async fn submit_matrix_goal(
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
 ) -> Result<MatrixGoalCommandSubmission> {
+    // Help is local grammar and must remain available when Goal execution is
+    // disabled or its control plane is unavailable.
+    if matches!(&command, zeroclaw_commands::goal::GoalCommand::Help) {
+        return Ok(MatrixGoalCommandSubmission::Immediate(GoalResponse::Help));
+    }
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
     // serialized lifecycle operation before another command can install a
@@ -378,7 +419,7 @@ async fn submit_matrix_goal_with_command_lease(
     let submission = supervisor
         .submit(settings.clone(), ingress, driver, command)
         .await?;
-    Ok(MatrixGoalCommandSubmission {
+    Ok(MatrixGoalCommandSubmission::Deferred {
         supervisor,
         supervisor_slot,
         settings,
