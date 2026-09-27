@@ -537,7 +537,7 @@ type RpcResult = Result<Value, JsonRpcError>;
 /// Optional `TurnComplete` payload beyond the outcome and text. Refusals
 /// and missing-session completions carry neither.
 #[derive(Default)]
-struct TurnCompleteExtras {
+pub(super) struct TurnCompleteExtras {
     safeguard_fallback: Option<crate::rpc::types::SafeguardFallbackWire>,
     usage: Option<crate::rpc::types::TurnUsageTotals>,
 }
@@ -7646,21 +7646,16 @@ impl RpcDispatcher {
         message_count: Option<usize>,
         extras: TurnCompleteExtras,
     ) {
-        let update = SessionUpdateEvent::TurnComplete {
-            session_id: session_id.to_string(),
+        forward_turn_completion(
+            &self.rpc,
+            session_id,
             outcome,
             content,
             client_turn_generation,
             message_count,
-            safeguard_fallback: extras.safeguard_fallback,
-            usage: extras.usage.map(Box::new),
-        };
-        if let Ok(params) = serde_json::to_value(update) {
-            let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
-            if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
-            }
-        }
+            extras,
+        )
+        .await;
     }
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
@@ -13840,6 +13835,53 @@ pub(super) async fn forward_turn_event(
         Some(n) => rpc.send_raw(n).await,
         None => false,
     }
+}
+
+/// Forward the standard terminal turn event through the same `session/update`
+/// stream used by ordinary RPC turns. Goal-managed isolated turns use this for
+/// core failures so their original error remains visible independently of the
+/// Goal lifecycle transition.
+pub(super) async fn forward_turn_completion(
+    rpc: &RpcOutbound,
+    session_id: &str,
+    outcome: crate::rpc::types::TurnCompletionOutcome,
+    content: String,
+    client_turn_generation: Option<u64>,
+    message_count: Option<usize>,
+    extras: TurnCompleteExtras,
+) {
+    if let Some(json) = turn_completion_notification(
+        session_id,
+        outcome,
+        content,
+        client_turn_generation,
+        message_count,
+        extras,
+    ) {
+        let _ = rpc.send_raw(json).await;
+    }
+}
+
+fn turn_completion_notification(
+    session_id: &str,
+    outcome: crate::rpc::types::TurnCompletionOutcome,
+    content: String,
+    client_turn_generation: Option<u64>,
+    message_count: Option<usize>,
+    extras: TurnCompleteExtras,
+) -> Option<String> {
+    let update = SessionUpdateEvent::TurnComplete {
+        session_id: session_id.to_string(),
+        outcome,
+        content,
+        client_turn_generation,
+        message_count,
+        safeguard_fallback: extras.safeguard_fallback,
+        usage: extras.usage.map(Box::new),
+    };
+    let params = serde_json::to_value(update).ok()?;
+    let notification = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&notification).ok()
 }
 
 /// Replace the RPC chat session's durable transcript and breadcrumb flag
@@ -27266,6 +27308,63 @@ mod tests {
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["type"], "agent_message_chunk");
         assert_eq!(v["params"]["text"], "hello");
+    }
+
+    #[test]
+    fn failed_turn_completion_preserves_the_core_error_on_session_update() {
+        let json = turn_completion_notification(
+            "goal-session",
+            crate::rpc::types::TurnCompletionOutcome::Failed,
+            "turn failed: Agent turn failed: provider returned 429".to_string(),
+            None,
+            None,
+            TurnCompleteExtras::default(),
+        )
+        .expect("turn completion must serialize");
+        let value = parse(&json);
+
+        assert_eq!(value["method"], notification::SESSION_UPDATE);
+        assert_eq!(value["params"]["session_id"], "goal-session");
+        assert_eq!(value["params"]["type"], "turn_complete");
+        assert_eq!(value["params"]["outcome"], "failed");
+        assert_eq!(
+            value["params"]["content"],
+            "turn failed: Agent turn failed: provider returned 429"
+        );
+    }
+
+    #[test]
+    fn ordinary_turn_completion_keeps_safeguard_and_usage_extras() {
+        let json = turn_completion_notification(
+            "ordinary-session",
+            crate::rpc::types::TurnCompletionOutcome::Completed,
+            "answer".to_string(),
+            Some(3),
+            Some(2),
+            TurnCompleteExtras {
+                safeguard_fallback: Some(crate::rpc::types::SafeguardFallbackWire {
+                    fallback_kind: crate::rpc::types::SafeguardFallbackKindWire::Client,
+                    requested_model: "big".into(),
+                    served_model: "small".into(),
+                }),
+                usage: Some(crate::rpc::types::TurnUsageTotals {
+                    tokens_used: Some(15),
+                    ..Default::default()
+                }),
+            },
+        )
+        .expect("turn completion must serialize");
+        let value = parse(&json);
+
+        assert_eq!(value["params"]["type"], "turn_complete");
+        assert_eq!(value["params"]["outcome"], "completed");
+        assert_eq!(value["params"]["client_turn_generation"], json!(3));
+        assert_eq!(value["params"]["message_count"], json!(2));
+        assert_eq!(
+            value["params"]["safeguard_fallback"],
+            json!({"fallback_kind": "client", "requested_model": "big", "served_model": "small"})
+        );
+        assert_eq!(value["params"]["usage"]["tokens_used"], json!(15));
     }
 
     #[test]

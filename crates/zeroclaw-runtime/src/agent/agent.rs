@@ -1691,10 +1691,12 @@ impl Agent {
     /// Runs one Goal-owned model turn against a process-local transcript.
     ///
     /// This intentionally bypasses the ordinary user-turn conveniences:
-    /// user-message insertion, memory persistence, request hooks,
-    /// response caching, turn events, and canonical-history replay. The only
-    /// canonical mutation permitted here is refreshing the Agent-owned system
-    /// prompt for the active tool dispatcher.
+    /// user-message insertion, memory persistence, request hooks, response
+    /// caching, and canonical-history replay. It preserves the ordinary
+    /// lifecycle bracket and the Agent's cost-tracking context, so `AgentEnd`
+    /// usage matches an ordinary turn while Goal accounting remains the only
+    /// ledger writer. The only canonical mutation permitted here is refreshing
+    /// the Agent-owned system prompt for the active tool dispatcher.
     /// Read-only recall uses the raw admitting command as `recall_query` and
     /// the Agent's ordinary memory configuration and session scope. Recalled
     /// context is removed from the returned transcript before it carries forward.
@@ -1703,6 +1705,28 @@ impl Agent {
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
         recall_query: &str,
+    ) -> Result<IsolatedTurnOutcome> {
+        self.run_isolated_turn_inner(source, input, None).await
+    }
+
+    /// Runs one isolated Goal turn while forwarding ordinary turn events to
+    /// its host. The host owns delivery and must drain the bounded channel
+    /// concurrently with this future, just like an ordinary RPC turn.
+    pub(crate) async fn run_isolated_turn_with_events(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        input: &zeroclaw_goal::control::GoalParentTurnInput,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<IsolatedTurnOutcome> {
+        self.run_isolated_turn_inner(source, input, Some(event_tx))
+            .await
+    }
+
+    async fn run_isolated_turn_inner(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        input: &zeroclaw_goal::control::GoalParentTurnInput,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
             self.history
@@ -1759,6 +1783,16 @@ impl Agent {
                 )) as Box<dyn zeroclaw_api::channel::Channel>
             });
         let agent_alias = self.observer_agent_alias();
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            selected_route.provider_name.clone(),
+            selected_route.model.clone(),
+            Some(self.channel_name.clone()),
+            agent_alias.clone(),
+            Some(turn_id.clone()),
+        );
+        let cost_context = self.tool_loop_cost_tracking_context();
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
@@ -1853,7 +1887,7 @@ impl Agent {
                         collected_receipts: receipt_scope
                             .as_ref()
                             .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: None,
+                        event_tx: event_tx.clone(),
                         steering: None,
                         new_messages_out: None,
                         image_cache: Some(crate::agent::turn::ToolLoopImageState {
@@ -1921,8 +1955,73 @@ impl Agent {
                 break result;
             }
         };
-        let response = zeroclaw_goal::control::scope_goal_parent_turn(Box::pin(isolated_turn))
-            .await?;
+        let isolated_turn = Box::pin(
+            crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(cost_context.clone()), isolated_turn),
+        );
+        let (result, fallback, safeguard) = zeroclaw_providers::scope_safeguard_fallback(async {
+            let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = zeroclaw_goal::control::scope_goal_parent_turn(isolated_turn).await;
+                (
+                    result,
+                    zeroclaw_providers::reliable::take_last_provider_fallback(),
+                )
+            })
+            .await;
+            (
+                result,
+                fallback,
+                zeroclaw_providers::take_last_safeguard_fallback(),
+            )
+        })
+        .await;
+
+        let usage = cost_context.snapshot_turn_usage();
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            guard.set_usage(
+                Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                }),
+                None,
+            );
+        }
+        let response = result?;
+
+        // Receipt presentation is separate from the candidate and transcript.
+        if let Some(event_tx) = event_tx.as_ref() {
+            let block = self.append_receipts_block(String::new(), receipt_scope.as_ref());
+            if !block.is_empty() {
+                let delta = if response.is_empty() {
+                    block
+                } else {
+                    format!("\n\n{block}")
+                };
+                let _ = event_tx.send(TurnEvent::Chunk { delta }).await;
+            }
+            // Recovery notices use the ordinary event renderer, never the
+            // verified candidate or its carried transcript.
+            let _ = Self::append_model_fallback_notice(
+                response.clone(),
+                fallback.as_ref(),
+                safeguard.as_ref(),
+                event_tx,
+            )
+            .await;
+            let displayed = crate::agent::append_safeguard_fallback_notice(
+                response.clone(),
+                safeguard.as_ref(),
+            );
+            if let Some(delta) = displayed.strip_prefix(&response)
+                && !delta.is_empty()
+            {
+                let _ = event_tx
+                    .send(TurnEvent::Chunk {
+                        delta: delta.to_owned(),
+                    })
+                    .await;
+            }
+        }
 
         if let Some(preamble) = injected_memory_preamble.take() {
             preamble.strip_from_history(&mut working_history);
@@ -11471,6 +11570,296 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IsolatedLifecycleUsageScript {
+        Success,
+        ErrorAfterTool,
+    }
+
+    struct IsolatedLifecycleUsageProvider {
+        script: IsolatedLifecycleUsageScript,
+        calls: AtomicUsize,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for IsolatedLifecycleUsageProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "isolated-lifecycle-usage-provider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for IsolatedLifecycleUsageProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("isolated lifecycle fixture requires structured requests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("use the fixture tool".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "isolated-lifecycle-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(2),
+                        ..Default::default()
+                    }),
+                    reasoning_content: None,
+                }),
+                1 if self.script == IsolatedLifecycleUsageScript::Success => {
+                    Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("fixture complete".into()),
+                        tool_calls: Vec::new(),
+                        usage: Some(zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(20),
+                            output_tokens: Some(3),
+                            ..Default::default()
+                        }),
+                        reasoning_content: None,
+                    })
+                }
+                1 => anyhow::bail!("provider failed after billed tool leaf"),
+                call => anyhow::bail!("unexpected isolated lifecycle fixture call {call}"),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct IsolatedLifecycleAccountingProbe {
+        admissions: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationRequest>>,
+        settlements: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for IsolatedLifecycleAccountingProbe {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> Result<()> {
+            self.admissions.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> Result<()> {
+            self.settlements.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct IsolatedLifecycleUsageRun {
+        result: Result<String>,
+        events: Vec<ObserverEvent>,
+        admissions: Vec<zeroclaw_goal::accounting::GoalOperationRequest>,
+        settlements: Vec<zeroclaw_goal::accounting::GoalOperationSettlement>,
+        cost_ledger_exists: bool,
+    }
+
+    async fn run_isolated_lifecycle_usage_script(
+        script: IsolatedLifecycleUsageScript,
+        goal_scoped: bool,
+    ) -> IsolatedLifecycleUsageRun {
+        let workspace = tempfile::TempDir::new().expect("isolated lifecycle workspace");
+        let observer = Arc::new(CapturingObserver::default());
+        let observer_handle: Arc<dyn Observer> = observer.clone();
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(IsolatedLifecycleUsageProvider {
+                script,
+                calls: AtomicUsize::new(0),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(memory)
+            .observer(observer_handle)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_provider_name("isolated-lifecycle-usage-provider".into())
+            .model_name("isolated-lifecycle-model".into())
+            .agent_alias("isolated-lifecycle-agent".into())
+            .channel_name("zerocode-goal".into())
+            .build()
+            .expect("isolated lifecycle Agent should build");
+        let accounting = Arc::new(IsolatedLifecycleAccountingProbe::default());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+
+        let result = if goal_scoped {
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                    objective: "exercise lifecycle usage".into(),
+                    working_history: Vec::new(),
+                });
+            let scoped_accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                accounting.clone();
+            // Deliberately scope only the Goal accountant. The production
+            // isolated entry owns its lifecycle guard and usage context.
+            zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(scoped_accounting),
+                    agent.run_isolated_turn_with_events(
+                        IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                        &input,
+                        "exercise lifecycle usage",
+                        event_tx,
+                    ),
+                )
+                .await
+                .map(|outcome| outcome.response)
+        } else {
+            match agent
+                .turn_streamed_with_steering_state("exercise lifecycle usage", event_tx, None, None)
+                .await
+            {
+                Ok(outcome) => Ok(outcome.response),
+                Err(error) => Err(error.error),
+            }
+        };
+
+        drop(agent);
+        while event_rx.recv().await.is_some() {}
+        let events = observer.events.lock().clone();
+        let admissions = accounting.admissions.lock().clone();
+        let settlements = accounting.settlements.lock().clone();
+        let cost_ledger_exists = workspace.path().join("state/costs.jsonl").exists();
+
+        IsolatedLifecycleUsageRun {
+            result,
+            events,
+            admissions,
+            settlements,
+            cost_ledger_exists,
+        }
+    }
+
+    fn isolated_lifecycle_tokens(
+        events: &[ObserverEvent],
+    ) -> zeroclaw_api::observability_traits::TurnTokenUsage {
+        let (start, end) = assert_single_agent_lifecycle(events);
+        assert_all_events_share_turn_id(
+            events,
+            Some("isolated-lifecycle-agent"),
+            Some("zerocode-goal"),
+        );
+        let turn_id = observer_event_turn_id(&events[start])
+            .expect("isolated lifecycle start should carry turn_id");
+        let request_ids: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::LlmRequest { .. }))
+            .map(observer_event_turn_id)
+            .collect();
+        assert_eq!(request_ids.len(), 2, "fixture should make two LLM requests");
+        assert!(
+            request_ids.iter().all(|id| *id == Some(turn_id)),
+            "every LlmRequest must share the lifecycle turn_id"
+        );
+        agent_end_tokens(&events[end]).expect("AgentEnd should report billed usage")
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_isolated_turn_reports_agent_end_usage_like_ordinary() {
+        for (script, expected_tokens) in [
+            (IsolatedLifecycleUsageScript::Success, (30, 5)),
+            (IsolatedLifecycleUsageScript::ErrorAfterTool, (10, 2)),
+        ] {
+            let ordinary = run_isolated_lifecycle_usage_script(script, false).await;
+            let goal = run_isolated_lifecycle_usage_script(script, true).await;
+
+            match script {
+                IsolatedLifecycleUsageScript::Success => {
+                    assert_eq!(ordinary.result.unwrap(), "fixture complete");
+                    assert_eq!(goal.result.unwrap(), "fixture complete");
+                }
+                IsolatedLifecycleUsageScript::ErrorAfterTool => {
+                    assert!(ordinary.result.is_err(), "ordinary script should fail");
+                    assert!(goal.result.is_err(), "Goal script should fail");
+                }
+            }
+
+            let ordinary_tokens = isolated_lifecycle_tokens(&ordinary.events);
+            let goal_tokens = isolated_lifecycle_tokens(&goal.events);
+            assert_eq!(
+                (ordinary_tokens.input_tokens, ordinary_tokens.output_tokens),
+                expected_tokens,
+                "ordinary control should expose the scripted billed leaves"
+            );
+            assert_eq!(
+                (goal_tokens.input_tokens, goal_tokens.output_tokens),
+                (ordinary_tokens.input_tokens, ordinary_tokens.output_tokens),
+                "isolated Goal AgentEnd usage must match the ordinary turn"
+            );
+
+            let goal_request_count = goal
+                .events
+                .iter()
+                .filter(|event| matches!(event, ObserverEvent::LlmRequest { .. }))
+                .count();
+            assert_eq!(goal.admissions.len(), goal_request_count);
+            assert_eq!(goal.settlements.len(), goal_request_count);
+            assert_eq!(goal_request_count, 2, "each scripted attempt must run once");
+            assert!(ordinary.admissions.is_empty());
+            assert!(ordinary.settlements.is_empty());
+            assert!(
+                !ordinary.cost_ledger_exists && !goal.cost_ledger_exists,
+                "tracker-less ordinary and Goal contexts must not create a cost ledger"
+            );
+
+            let first_settlement = &goal.settlements[0];
+            assert_eq!(first_settlement.events.len(), 1);
+            assert_eq!(first_settlement.events[0].usage.input_tokens, Some(10));
+            assert_eq!(first_settlement.events[0].usage.output_tokens, Some(2));
+            let second_settlement = &goal.settlements[1];
+            match script {
+                IsolatedLifecycleUsageScript::Success => {
+                    assert_eq!(second_settlement.events.len(), 1);
+                    assert_eq!(second_settlement.events[0].usage.input_tokens, Some(20));
+                    assert_eq!(second_settlement.events[0].usage.output_tokens, Some(3));
+                }
+                IsolatedLifecycleUsageScript::ErrorAfterTool => {
+                    assert!(second_settlement.events.is_empty());
+                }
+            }
+        }
+    }
+
     async fn isolated_sop_reassembly_status(
         goal: bool,
         with_config: bool,
@@ -11744,6 +12133,58 @@ mod tests {
         assert_eq!(
             isolated_sop_reassembly_status(true, false).await,
             SopRunStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_can_forward_ordinary_turn_events() {
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".to_owned(),
+                working_history: Vec::new(),
+            });
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical {
+                    prefix: vec![ChatMessage::user("user request")],
+                },
+                &input,
+                event_tx,
+            )
+            .await
+            .expect("isolated Goal turn should succeed");
+
+        assert_eq!(outcome.response, "done");
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, TurnEvent::Chunk { delta } if delta == "done")),
+            "the isolated Goal turn must expose the normal response chunk"
         );
     }
 
