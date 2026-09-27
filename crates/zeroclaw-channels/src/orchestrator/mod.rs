@@ -11259,7 +11259,7 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
     } else {
         "goal-mode-no"
     });
-    let mut message = channel_runtime_cli_string_with_args(
+    let message = channel_runtime_cli_string_with_args(
         "goal-mode-details",
         &[
             ("status", status),
@@ -11271,20 +11271,6 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
             ("pause_reason", &pause_reason),
         ],
     );
-    if let Some(description) = projection.pause_description.as_deref() {
-        message.push('\n');
-        message.push_str(&channel_runtime_cli_string_with_args(
-            "goal-mode-pause-description",
-            &[("description", description)],
-        ));
-    }
-    for blocker in &projection.blocker_messages {
-        message.push('\n');
-        message.push_str(&channel_runtime_cli_string_with_args(
-            "goal-mode-blocker",
-            &[("blocker", blocker)],
-        ));
-    }
     message
 }
 
@@ -11304,8 +11290,6 @@ mod goal_response_render_tests {
             cost_limit_usd: None,
             accounting_state: GoalAccountingState::Complete,
             pause_reason: Some(GoalPauseReason::NeedsUserInput),
-            pause_description: Some("Select a target.".to_owned()),
-            blocker_messages: vec!["Which target should receive the change?".to_owned()],
             resumable: true,
         });
 
@@ -11316,8 +11300,7 @@ mod goal_response_render_tests {
         assert!(rendered.contains("token limit: 12000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
         assert!(rendered.contains("pause reason: needs_user_input"));
-        assert!(rendered.contains("Details: Select a target."));
-        assert!(rendered.contains("Blocker: Which target should receive the change?"));
+        assert!(!rendered.contains("Which target should receive the change?"));
     }
 }
 
