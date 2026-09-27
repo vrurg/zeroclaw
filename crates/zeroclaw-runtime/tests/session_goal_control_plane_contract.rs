@@ -10,6 +10,28 @@ use zeroclaw_runtime::control_plane::{
     GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 
+#[test]
+fn runtime_task_paths_reexport_the_canonical_api_types() {
+    fn accepts_api_kind(_: zeroclaw_api::task::TaskKind) {}
+    fn accepts_runtime_kind(_: TaskKind) {}
+    fn accepts_api_status(_: zeroclaw_api::task::TaskStatus) {}
+    fn accepts_runtime_status(_: TaskStatus) {}
+    fn accepts_api_record(_: &zeroclaw_api::task::TaskRecord) {}
+    fn accepts_runtime_record(_: &TaskRecord) {}
+
+    let kind = TaskKind::Goal;
+    accepts_api_kind(kind);
+    accepts_runtime_kind(kind);
+
+    let status = TaskStatus::Paused;
+    accepts_api_status(status);
+    accepts_runtime_status(status);
+
+    let record = session_goal_task("goal-1", "session-1");
+    accepts_api_record(&record);
+    accepts_runtime_record(&record);
+}
+
 fn insert_current_goal(
     connection: &Connection,
     task_id: &str,
