@@ -1500,10 +1500,10 @@ async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
         .expect("open replacement fixture database")
         .execute(
             "INSERT INTO tasks (
-                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
-                 execution_epoch, started_at
+                 id, kind, agent, status, owner_pid, owner_boot_id, principal_id,
+                 session_id, execution_epoch, started_at
              ) VALUES ('corrupt-replace', 'goal', 'main', 'running', 999999, 'boot-old',
-                       'session-replace', 1, 'now')",
+                       'matrix:@operator:example.test', 'session-replace', 1, 'now')",
             [],
         )
         .expect("insert corrupt replacement fixture");
