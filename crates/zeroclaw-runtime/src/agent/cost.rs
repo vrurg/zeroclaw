@@ -343,7 +343,7 @@ fn lower_bound_usage_event(
 
 /// Resolve the configured rate map for an immutable actual provider/model
 /// attribution. Goal execution consumes this same resolver when it persists
-/// #10144 attempt reports, so configured model aliases cannot drift between
+/// actual-attempt usage, so configured model aliases cannot drift between
 /// ordinary and Goal-scoped accounting.
 pub(crate) fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> ModelRates {
