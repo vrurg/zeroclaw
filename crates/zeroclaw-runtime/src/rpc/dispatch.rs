@@ -373,7 +373,7 @@ impl Method {
             M::DoctorRun => (Resource::System, Verb::Execute),
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
-            M::SessionPrompt => (Resource::Sessions, Verb::Execute),
+            M::SessionPrompt | M::SessionGoal => (Resource::Sessions, Verb::Execute),
             M::SessionConfigure | M::SessionApprove => (Resource::Sessions, Verb::Update),
             M::SessionList
             | M::SessionListAcp
@@ -1208,17 +1208,232 @@ fn current_authority(
     auth: &crate::rpc::auth::ConnectionAuth,
     method: Method,
 ) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
+    current_principal_authority(inbound, auth, method).map(|resolved| resolved.grants)
+}
+
+/// Re-resolve both principal identity and grants at a post-wait admission
+/// boundary. Returning the full resolution lets session operations apply the
+/// current scoped-owner rule instead of trusting the connection's stamped
+/// principal after policy changes.
+fn current_principal_authority(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    auth: &crate::rpc::auth::ConnectionAuth,
+    method: Method,
+) -> Result<crate::security::principal_resolver::ResolvedPrincipal, crate::rpc::auth::AuthDenied> {
     use crate::rpc::auth::AuthDenied;
-    let grants = inbound.current_grants(auth)?;
+    credential_is_live(inbound, auth)?;
+    let resolved = inbound
+        .resolve_current(auth)
+        .map_err(AuthDenied::from_deny_reason)?;
+    if resolved.generation != inbound.generation() {
+        // The accepted state moved between the resolution and this read.
+        // Fail closed rather than act under a policy nobody observed.
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
     if let MethodAuthz::Requires(resource, verb) = method.authz()
-        && !grants.permits(resource, verb)
+        && !resolved.grants.permits(resource, verb)
     {
         return Err(AuthDenied::forbidden(format!(
             "Principal is not granted {resource}:{verb} (required by {})",
             method.wire_name()
         )));
     }
-    Ok(grants)
+    Ok(resolved)
+}
+
+/// The ZeroCode Goal binding retains the authority proof checked before it
+/// waits on the session's Goal command lock. It re-resolves the existing
+/// dispatcher authority and canonical session record after that wait, before
+/// the Goal controller can mutate lifecycle state.
+pub(super) struct GoalSessionAuthorization {
+    context: Arc<RpcContext>,
+    auth: Option<crate::rpc::auth::ConnectionAuth>,
+    session_id: String,
+    authorized: Option<super::session::SessionRecord>,
+}
+
+impl GoalSessionAuthorization {
+    pub(super) fn new(
+        context: Arc<RpcContext>,
+        auth: Option<crate::rpc::auth::ConnectionAuth>,
+        session_id: String,
+        authorized: Option<super::session::SessionRecord>,
+    ) -> Self {
+        Self {
+            context,
+            auth,
+            session_id,
+            authorized,
+        }
+    }
+
+    pub(super) async fn revalidate(&self) -> anyhow::Result<()> {
+        let resolved = match self.auth.as_ref() {
+            Some(auth) => {
+                match current_principal_authority(&self.context.auth, auth, Method::SessionGoal) {
+                    Ok(resolved) => Some(resolved),
+                    Err(denied) => {
+                        audit_denial(Some(auth), Method::SessionGoal, &denied);
+                        anyhow::bail!(denied.message);
+                    }
+                }
+            }
+            None => None,
+        };
+        let scope = resolved.as_ref().and_then(|resolved| {
+            (!resolved.grants.admin && resolved.principal.is_authenticated())
+                .then(|| resolved.principal.id.as_str().to_owned())
+        });
+        let selected_mode = self.authorized.as_ref().and_then(|record| {
+            record.durable.as_ref().map(|durable| match durable {
+                super::session::DurableSession::Acp => crate::rpc::types::ChatMode::Acp,
+                super::session::DurableSession::Chat { .. } => crate::rpc::types::ChatMode::Chat,
+            })
+        });
+        let current = resolve_session_record_in_context(
+            &self.context,
+            &self.session_id,
+            selected_mode.as_ref(),
+            scope.as_deref(),
+        )
+        .await
+        .map_err(|denied| anyhow::anyhow!(denied.message))?;
+
+        if let Some(mine) = scope.as_deref()
+            && current
+                .as_ref()
+                .is_none_or(|record| record.owner.as_deref() != Some(mine))
+        {
+            anyhow::bail!("Session not found or not owned by this principal");
+        }
+
+        let expected_generation = self
+            .authorized
+            .as_ref()
+            .and_then(|record| record.live_generation);
+        let current_generation = current.as_ref().and_then(|record| record.live_generation);
+        if expected_generation.is_some() && current_generation != expected_generation {
+            if scope.is_some() {
+                anyhow::bail!("Session not found or not owned by this principal");
+            }
+            anyhow::bail!("Session was replaced while this Goal command waited for admission");
+        }
+        if scope.is_some() && current.is_none() && self.authorized.is_some() {
+            anyhow::bail!("Session not found or not owned by this principal");
+        }
+        Ok(())
+    }
+}
+
+async fn resolve_session_record_in_context(
+    context: &RpcContext,
+    session_id: &str,
+    selected_mode: Option<&crate::rpc::types::ChatMode>,
+    scoped_principal_id: Option<&str>,
+) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+    use super::session::{DurableSession, SessionRecord};
+    let mut owners: Vec<Option<String>> = Vec::new();
+    let live = context
+        .sessions
+        .owner_generation_and_mode(session_id)
+        .await;
+    if let Some((owner, _, _)) = &live {
+        owners.push(owner.clone());
+    }
+    let mut chat_durable: Option<DurableSession> = None;
+    let mut has_acp = false;
+    if let Some(backend) = context.session_backend.as_ref() {
+        for key in [
+            format!("rpc_{session_id}"),
+            format!("gw_{session_id}"),
+            session_id.to_string(),
+        ] {
+            if let Some(meta) = backend.get_session_metadata(&key) {
+                owners.push(meta.principal_id);
+                if chat_durable.is_none() {
+                    chat_durable = Some(DurableSession::Chat { key });
+                }
+            }
+        }
+    }
+    if let Some(store) = context.acp_session_store.as_ref() {
+        let store = store.clone();
+        let sid = session_id.to_string();
+        match tokio::task::spawn_blocking(move || store.session_principal(&sid)).await {
+            Ok(Ok(Some(owner))) => {
+                owners.push(owner);
+                has_acp = true;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to resolve the session owner: {error}"),
+                ));
+            }
+            Err(join) => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to resolve the session owner: {join}"),
+                ));
+            }
+        }
+    }
+    let Some(first) = owners.first().cloned() else {
+        return Ok(None);
+    };
+    if owners.iter().any(|owner| *owner != first) {
+        if scoped_principal_id.is_some() {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "records": owners.len(),
+                })),
+            "session records under one id disagree about their owner; refusing the ambiguous id"
+        );
+        return Err(rpc_err(
+            INTERNAL_ERROR,
+            "Session records disagree about their owner; refusing to act on an ambiguous session id",
+        ));
+    }
+    let durable = match (
+        live.as_ref().map(|(_, _, mode)| mode).or(selected_mode),
+        has_acp,
+        chat_durable,
+    ) {
+        (Some(crate::rpc::types::ChatMode::Acp), true, _)
+        | (None, true, None) => Some(DurableSession::Acp),
+        (Some(crate::rpc::types::ChatMode::Acp), false, _) => None,
+        (Some(crate::rpc::types::ChatMode::Chat), _, chat) | (None, false, chat) => chat,
+        (None, true, Some(_)) => {
+            if scoped_principal_id.is_some_and(|mine| first.as_deref() != Some(mine)) {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                ));
+            }
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Session ID matches both ACP and Chat durable history; reconnect the intended session before mutating it",
+            ));
+        }
+    };
+    Ok(Some(SessionRecord {
+        live_generation: live.map(|(_, generation, _)| generation),
+        durable,
+        owner: first,
+    }))
 }
 
 impl RpcDispatcher {
@@ -2094,113 +2309,14 @@ impl RpcDispatcher {
         session_id: &str,
         selected_mode: Option<&ChatMode>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        use super::session::{DurableSession, SessionRecord};
-        let mut owners: Vec<Option<String>> = Vec::new();
-        let live = self
-            .ctx
-            .sessions
-            .owner_generation_and_mode(session_id)
-            .await;
-        if let Some((owner, _, _)) = &live {
-            owners.push(owner.clone());
-        }
-        let mut chat_durable: Option<DurableSession> = None;
-        let mut has_acp = false;
-        if let Some(backend) = self.ctx.session_backend.as_ref() {
-            for key in [
-                format!("rpc_{session_id}"),
-                format!("gw_{session_id}"),
-                session_id.to_string(),
-            ] {
-                if let Some(meta) = backend.get_session_metadata(&key) {
-                    owners.push(meta.principal_id);
-                    if chat_durable.is_none() {
-                        chat_durable = Some(DurableSession::Chat { key });
-                    }
-                }
-            }
-        }
-        if let Some(store) = self.ctx.acp_session_store.as_ref() {
-            let store = store.clone();
-            let sid = session_id.to_string();
-            match tokio::task::spawn_blocking(move || store.session_principal(&sid)).await {
-                Ok(Ok(Some(owner))) => {
-                    owners.push(owner);
-                    has_acp = true;
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to resolve the session owner: {e}"),
-                    ));
-                }
-                Err(join) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to resolve the session owner: {join}"),
-                    ));
-                }
-            }
-        }
-        let Some(first) = owners.first().cloned() else {
-            return Ok(None);
-        };
-        if owners.iter().any(|owner| *owner != first) {
-            if self.scoped_principal_id().is_some() {
-                return Err(rpc_err(
-                    FORBIDDEN,
-                    "Session not found or not owned by this principal",
-                ));
-            }
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::System)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session_id,
-                        "records": owners.len(),
-                    })),
-                "session records under one id disagree about their owner; refusing the ambiguous id"
-            );
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "Session records disagree about their owner; refusing to act on an ambiguous session id",
-            ));
-        }
-        // A live incarnation chooses its own durable domain. A reaped id
-        // present in both stores has no canonical mode and must be reopened
-        // explicitly rather than letting either store win by lookup order.
-        let durable = match (
-            live.as_ref().map(|(_, _, mode)| mode).or(selected_mode),
-            has_acp,
-            chat_durable,
-        ) {
-            (Some(ChatMode::Acp), true, _) | (None, true, None) => Some(DurableSession::Acp),
-            (Some(ChatMode::Acp), false, _) => None,
-            (Some(ChatMode::Chat), _, chat) | (None, false, chat) => chat,
-            (None, true, Some(_)) => {
-                if self
-                    .scoped_principal_id()
-                    .is_some_and(|mine| first.as_deref() != Some(mine.as_str()))
-                {
-                    return Err(rpc_err(
-                        FORBIDDEN,
-                        "Session not found or not owned by this principal",
-                    ));
-                }
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    "Session ID matches both ACP and Chat durable history; reconnect the intended session before mutating it",
-                ));
-            }
-        };
-        Ok(Some(SessionRecord {
-            live_generation: live.map(|(_, generation, _)| generation),
-            durable,
-            owner: first,
-        }))
+        let scoped_principal_id = self.scoped_principal_id();
+        resolve_session_record_in_context(
+            &self.ctx,
+            session_id,
+            selected_mode,
+            scoped_principal_id.as_deref(),
+        )
+        .await
     }
 
     /// Enforce principal ownership for one session-targeting operation and
@@ -6373,6 +6489,9 @@ impl RpcDispatcher {
 
     async fn handle_session_goal(&self, params: &Value) -> RpcResult {
         let req: SessionGoalParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionGoal)
+            .await?;
         let tui_id = self
             .tui_id
             .clone()
@@ -6396,6 +6515,12 @@ impl RpcDispatcher {
                 "That is not a valid Goal command. Use /goal help to see the supported commands.",
             )
         })?;
+        let authorization = GoalSessionAuthorization::new(
+            Arc::clone(&self.ctx),
+            self.auth.clone(),
+            req.session_id.clone(),
+            authorized,
+        );
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
@@ -6403,6 +6528,7 @@ impl RpcDispatcher {
                 self.connection_activity.clone(),
                 req.session_id.clone(),
                 tui_id,
+                authorization,
             )
             .await
             .map_err(|error| {
@@ -19260,6 +19386,7 @@ mod tests {
             ("config/set", Resource::Config, Verb::Update),
             ("config/reload", Resource::Config, Verb::Update),
             ("session/prompt", Resource::Sessions, Verb::Execute),
+            ("session/goal", Resource::Sessions, Verb::Execute),
             ("session/new", Resource::Sessions, Verb::Create),
             ("memory/delete", Resource::Memory, Verb::Delete),
             ("sops/run", Resource::Sops, Verb::Execute),
@@ -22601,6 +22728,135 @@ mod tests {
     fn session_goal_method_is_registered() {
         assert_eq!(Method::from_wire("session/goal"), Some(Method::SessionGoal));
         assert_eq!(Method::SessionGoal.wire_name(), "session/goal");
+        assert!(matches!(
+            Method::SessionGoal.authz(),
+            MethodAuthz::Requires(
+                zeroclaw_api::grants::Resource::Sessions,
+                zeroclaw_api::grants::Verb::Execute
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_goal_rejects_a_different_scoped_principal_even_with_matching_tui_id() {
+        use zeroclaw_config::schema::UserConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config.data_dir = tmp.path().join("data");
+        config.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4343),
+                permission_profiles: vec!["session-scoped".into()],
+            },
+        );
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let sessions = Arc::clone(&ctx.sessions);
+        install_state_test_session_owned_at(
+            &sessions,
+            &chat_backend,
+            "goal-owner-isolation",
+            DummyModelProvider,
+            Some("tui-alice"),
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+
+        let (mut bob, _rx) = roster_peer(&ctx, 4343).await;
+        // Exercise the principal boundary independently of the existing TUI
+        // connection/session binding: even possession of the same TUI id does
+        // not confer session ownership on a different scoped principal.
+        bob.set_tui_id_for_test(Some("tui-alice".into()));
+        let error = bob
+            .handle_session_goal(&json!({
+                "session_id": "goal-owner-isolation",
+                "command": "/goal status",
+            }))
+            .await
+            .expect_err("a scoped principal must not control another principal's Goal");
+
+        assert_eq!(error.code, FORBIDDEN, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn session_goal_rechecks_permission_after_waiting_for_command_lock() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config.data_dir = tmp.path().join("data");
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let sessions = Arc::clone(&ctx.sessions);
+        let session_id = "goal-permission-revoked-after-wait";
+        install_state_test_session_owned_at(
+            &sessions,
+            &chat_backend,
+            session_id,
+            DummyModelProvider,
+            Some("tui-alice"),
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+        let authorized = alice
+            .authorize_session_owner(session_id, Method::SessionGoal)
+            .await
+            .expect("the owner is authorized before admission");
+        let authorization = GoalSessionAuthorization::new(
+            Arc::clone(&ctx),
+            alice.auth.clone(),
+            session_id.into(),
+            authorized,
+        );
+        let snapshot = sessions
+            .goal_session_snapshot(session_id)
+            .await
+            .expect("the Goal session remains live");
+        let command_lock = Arc::clone(&snapshot.goal_command);
+        let held = command_lock.clone().lock_owned().await;
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let pending = zeroclaw_spawn::spawn!(async move {
+            let _queued = queued_tx.send(());
+            let _guard = command_lock.lock_owned().await;
+            authorization.revalidate().await
+        });
+        queued_rx
+            .await
+            .expect("the revalidation task was scheduled");
+
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Sessions, vec![Verb::Read]);
+        *ctx.config.write() = revoked.clone();
+        ctx.auth
+            .refresh_from_config(&revoked)
+            .expect("the narrowed session permission is a valid policy");
+        drop(held);
+
+        let error = pending
+            .await
+            .expect("the post-wait authorization task completes")
+            .expect_err("a revoked session execute grant must be refused");
+        assert!(
+            format!("{error:#}").contains("Principal is not granted sessions:execute"),
+            "the post-wait check must use the current policy: {error:#}"
+        );
     }
 
     #[tokio::test]
