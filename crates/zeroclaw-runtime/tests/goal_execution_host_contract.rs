@@ -16,10 +16,11 @@ use zeroclaw_config::{
     providers::ModelProviderRef,
 };
 use zeroclaw_goal::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalParentTurn, GoalResponse,
-    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalVerifierResult, GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
+    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
+    GoalParentTurn, GoalPauseReason, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
+    GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::goal_accounting::{
     ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
@@ -118,7 +119,7 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
     }
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        anyhow::bail!("a paused Goal must not deliver a candidate")
+        Ok(())
     }
 }
 
@@ -2150,7 +2151,7 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
     let pause_driver = driver.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(
                 pause_settings,
@@ -2175,4 +2176,148 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
         0,
         "a pause may drain an admitted parent operation but cannot admit a verifier"
     );
+}
+
+#[tokio::test]
+async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::default()));
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            pricer,
+        )
+        .unwrap(),
+    );
+    let engine = Arc::new(runtime.execution_engine(accounting_factory));
+    let coordinator = Arc::new(GoalExecutionRestartCoordinator::new());
+    let supervisor = coordinator.new_supervisor(engine).await;
+
+    let started = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let task_id = match started.response() {
+        GoalResponse::Started(projection) => projection.task_id.clone(),
+        response => panic!("expected start response, got {response:?}"),
+    };
+    parent_started.notified().await;
+
+    let restarting = Arc::clone(&coordinator);
+    let mut quiesce = zeroclaw_spawn::spawn!(async move { restarting.quiesce_for_restart().await });
+    let paused_task = timeout(Duration::from_secs(1), async {
+        loop {
+            let current = store
+                .current_goal_for_session(&ingress.session_key().durable_id())
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status == TaskStatus::Paused {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restart must durably fence the active Goal");
+    assert_eq!(paused_task.id, task_id);
+    let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        timeout(Duration::from_millis(20), &mut quiesce)
+            .await
+            .is_err(),
+        "restart must drain the already-admitted parent operation"
+    );
+
+    release_parent.notify_one();
+    quiesce.await.unwrap().unwrap();
+    assert_eq!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Paused,
+        "restart quiescence must not auto-resume the Goal"
+    );
+
+    let rejected_resume = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Resume { response: None },
+        )
+        .await;
+    assert!(
+        rejected_resume.is_err(),
+        "the retiring generation must not admit a Goal resume"
+    );
+
+    coordinator.reopen_for_generation().await;
+    let resumed = supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Resume { response: None },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(resumed.response(), GoalResponse::Resumed(_)));
+    parent_started.notified().await;
+    release_parent.notify_one();
+    let completed = timeout(Duration::from_secs(1), async {
+        loop {
+            let current = store
+                .current_goal_for_session(&ingress.session_key().durable_id())
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status.is_terminal() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit resume must execute in the next generation");
+    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
 }
