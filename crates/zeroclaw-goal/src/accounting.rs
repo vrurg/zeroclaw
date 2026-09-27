@@ -43,6 +43,12 @@ impl GoalOperationFenced {
         message: "Goal operation admission lost its execution fence",
     };
 
+    /// Durable tool-batch admission rejected the exact execution fence before
+    /// any tool in the batch started.
+    pub const TOOL_BATCH_FENCE_LOST: Self = Self {
+        message: "Goal tool batch lost its execution fence",
+    };
+
     /// The accountant committed a budget-exhaustion pause before refusing work.
     pub const BUDGET_EXHAUSTED: Self = Self {
         message: "Goal budget is exhausted",

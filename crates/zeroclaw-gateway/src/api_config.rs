@@ -4007,6 +4007,33 @@ mod tests {
             .await
             .expect("immediate cancel must publish its final command response after settlement");
         }
+
+        /// Reads frames until the session's final Goal command response arrives.
+        async fn wait_final_goal_response(&mut self, session_id: &str) -> serde_json::Value {
+            use tokio::io::AsyncBufReadExt;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(self.reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame["id"].is_null(),
+                        "unexpected response during control drain: {frame}"
+                    );
+                    let lifecycle = &frame["params"]["lifecycle"];
+                    let response = (frame["method"] == "session/goal_update"
+                        && lifecycle["session_id"] == session_id
+                        && lifecycle["response"]["kind"] != "transition_pending")
+                        .then(|| lifecycle["response"].clone());
+                    self.notifications.push(frame);
+                    if let Some(response) = response {
+                        return response;
+                    }
+                }
+            })
+            .await
+            .expect("an immediate control must publish its final command response after settlement")
+        }
     }
 
     #[cfg(unix)]
@@ -4162,8 +4189,8 @@ mod tests {
                     .cancel_provider
                     .tool_runs
                     .load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "the held operation must execute its tool step before the next admission is fenced"
+                0,
+                "the fenced epoch must refuse the held operation's tool batch"
             );
             assert!(
                 fixture
@@ -4317,8 +4344,8 @@ mod tests {
                     .goal_provider
                     .tool_runs
                     .load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "the held operation must execute its tool step before the next admission is fenced"
+                0,
+                "the fenced epoch must refuse the held operation's tool batch"
             );
             assert!(
                 fixture
@@ -4377,6 +4404,136 @@ mod tests {
         })
         .await
         .expect("gateway cutover must not wait for an admitted parent operation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_pause_now_keeps_resumable_pause_after_refused_tool_batch() {
+        if !live_goal_policy_gateway_child("api_config::tests::live_goal_policy_gateway_pause_now_keeps_resumable_pause_after_refused_tool_batch").await { return; }
+        // An immediate pause commits while the admitted model call is held. The
+        // batch that call returns is a new executable admission, so the fenced
+        // epoch refuses it and the operator pause stays resumable.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut fixture = GatewayPolicyFixture::new().await;
+            fixture
+                .send(
+                    8,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-cancel",
+                "command": "/goal start --unlimited finish the bounded repair"}),
+                )
+                .await;
+            assert_eq!(fixture.result(8).await["response"]["kind"], "started");
+            fixture.cancel_provider.wait_entered().await;
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let registry = plane.goal_store().unwrap();
+            let before = registry
+                .current_goal_for_session("rpc_gateway-cancel")
+                .await
+                .unwrap()
+                .unwrap();
+            let supervisor = fixture
+                .context
+                .goal_runtime
+                .supervisor("gateway-cancel")
+                .await
+                .unwrap();
+            fixture
+                .send(
+                    9,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-cancel",
+                "command": "/goal pause now"}),
+                )
+                .await;
+            assert_eq!(
+                fixture.result(9).await["response"]["kind"],
+                "transition_pending"
+            );
+            assert!(
+                !fixture
+                    .cancel_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            fixture.cancel_provider.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !supervisor.try_retire().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("immediate pause must drain its held parent operation");
+            let response = fixture.wait_final_goal_response("gateway-cancel").await;
+            assert_eq!(
+                response["kind"], "paused",
+                "a settled immediate pause must stay resumable: {response}"
+            );
+            let after = registry
+                .current_goal_for_session("rpc_gateway-cancel")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.id, before.id);
+            assert_eq!(
+                after.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Paused
+            );
+            assert_eq!(after.execution_epoch, before.execution_epoch + 1);
+            let goal = registry.get_goal_task(&after.id).await.unwrap().unwrap();
+            assert_eq!(
+                goal.pause_reason,
+                Some(zeroclaw_runtime::control_plane::GoalPauseReason::OperatorPaused)
+            );
+            assert_eq!(
+                goal.accounting_state,
+                zeroclaw_runtime::control_plane::GoalAccountingState::Complete
+            );
+            assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
+            assert!(goal.pending_tool_batch_id.is_none() && goal.pending_tool_epoch.is_none());
+            assert_eq!(
+                fixture
+                    .cancel_provider
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                fixture
+                    .cancel_provider
+                    .tool_runs
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the fenced epoch must refuse the held operation's tool batch"
+            );
+            assert!(
+                fixture
+                    .cancel_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            let refusal = fixture.parent_failure_text("gateway-cancel");
+            assert!(
+                refusal.contains("Goal tool batch lost its execution fence"),
+                "the ordinary failed parent turn must carry the refusal once: {refusal}"
+            );
+            let updates = fixture
+                .notifications
+                .iter()
+                .filter(|frame| frame["method"] == "session/goal_update")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                updates.len(),
+                1,
+                "only the final pause response may follow, with no failure notice: {updates:?}"
+            );
+            assert_eq!(
+                updates[0]["params"]["lifecycle"]["response"]["kind"],
+                "paused"
+            );
+        })
+        .await
+        .expect("an immediate pause must not wait for a refused tool batch");
     }
 
     #[cfg(unix)]

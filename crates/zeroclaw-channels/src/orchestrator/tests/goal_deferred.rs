@@ -989,6 +989,500 @@ async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: boo
     supervisor.dispose_session(&key).await.unwrap();
 }
 
+/// Holds the first Goal parent model call, then returns one executable native
+/// tool call. A control committed while the call is held therefore meets the
+/// durable tool-batch admission rather than a later model-call admission.
+#[derive(Default)]
+struct GoalHeldToolBatchProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    first_entered: tokio::sync::Notify,
+    first_release: tokio::sync::Notify,
+    successor_release: tokio::sync::Notify,
+}
+
+impl zeroclaw_api::attribution::Attributable for GoalHeldToolBatchProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Custom,
+        ))
+    }
+
+    fn alias(&self) -> &str {
+        "held-tool-batch-fixture"
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for GoalHeldToolBatchProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+        _: Option<f64>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("fixture requires the structured model boundary")
+    }
+
+    async fn chat(
+        &self,
+        _: zeroclaw_api::model_provider::ChatRequest<'_>,
+        _: &str,
+        _: Option<f64>,
+    ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+        let usage = Some(zeroclaw_api::model_provider::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
+        });
+        match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => {
+                self.first_entered.notify_one();
+                self.first_release.notified().await;
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                        id: "held-tool-batch".into(),
+                        name: "fixture_held_batch_tool".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage,
+                    reasoning_content: None,
+                })
+            }
+            1 => {
+                self.successor_release.notified().await;
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some("unfenced successor candidate".into()),
+                    tool_calls: Vec::new(),
+                    usage,
+                    reasoning_content: None,
+                })
+            }
+            _ => anyhow::bail!("fixture must admit no extra parent call"),
+        }
+    }
+}
+
+/// Counts executions, so zero proves that no tool in a refused batch started.
+struct GoalHeldBatchTool(Arc<std::sync::atomic::AtomicUsize>);
+
+zeroclaw_api::tool_attribution!(
+    GoalHeldBatchTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+
+#[async_trait::async_trait]
+impl zeroclaw_api::tool::Tool for GoalHeldBatchTool {
+    fn name(&self) -> &str {
+        "fixture_held_batch_tool"
+    }
+
+    fn description(&self) -> &str {
+        "fixture_held_batch_tool"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+    ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(zeroclaw_api::tool::ToolResult::ok("held batch ran"))
+    }
+}
+
+/// The control committed while the held parent call is in flight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldToolBatchControl {
+    PauseNow,
+    Stop,
+    Restart,
+    Unfenced,
+}
+
+// `pause now` during a held parent call whose returned batch is refused stays
+// a resumable operator pause, and an explicit resume continues the same Goal.
+#[tokio::test]
+async fn matrix_goal_pause_now_keeps_resumable_pause_after_refused_tool_batch() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_pause_now_keeps_resumable_pause_after_refused_tool_batch
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_held_tool_batch(HeldToolBatchControl::PauseNow).await;
+}
+
+// Matrix `/stop` is the Goal-aware immediate pause and keeps the same outcome.
+#[tokio::test]
+async fn matrix_goal_stop_keeps_resumable_pause_after_refused_tool_batch() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_keeps_resumable_pause_after_refused_tool_batch
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_held_tool_batch(HeldToolBatchControl::Stop).await;
+}
+
+// A daemon-restart pause that meets the refused batch stays `daemon_restarted`.
+#[tokio::test]
+async fn matrix_goal_restart_keeps_resumable_pause_after_refused_tool_batch() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_restart_keeps_resumable_pause_after_refused_tool_batch
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_held_tool_batch(HeldToolBatchControl::Restart).await;
+}
+
+// Positive control: without a fence, the same returned batch is admitted and
+// its permitted tool runs once before the next model call is admitted.
+#[tokio::test]
+async fn matrix_goal_running_goal_executes_permitted_native_tool_batch() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_running_goal_executes_permitted_native_tool_batch
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_held_tool_batch(HeldToolBatchControl::Unfenced).await;
+}
+
+async fn assert_matrix_held_tool_batch(control: HeldToolBatchControl) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+    use zeroclaw_goal::{GoalAccountingState, GoalPauseReason, GoalResponse, GoalRuntime};
+    use zeroclaw_runtime::{
+        control_plane::{ControlPlaneHandle, TaskStatus},
+        cost::CostTracker,
+        goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let handle = ControlPlaneHandle::open(directory.path()).unwrap();
+    let registry = handle.goal_store().unwrap();
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(GoalHeldToolBatchProvider::default());
+    let tool_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = matrix_control_test_config();
+    config.data_dir = directory.path().to_owned();
+    config.goal.enabled = true;
+    config.goal.verifier.model_provider = "custom.fixture".into();
+    config.reliability.provider_retries = 0;
+    let mut context = test_runtime_ctx_with_observer_and_tools(
+        channel.clone(),
+        provider.clone(),
+        config,
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+        Arc::new(zeroclaw_runtime::observability::NoopObserver),
+        vec![Box::new(GoalHeldBatchTool(tool_runs.clone()))],
+    );
+    Arc::get_mut(&mut context).unwrap().session_store = Some(Arc::new(
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
+    ));
+    let mut message = matrix_msg("@fixture:example.test");
+    let key = runtime_conversation_history_key(&context, &message);
+    foreground::install_goal_test_control_plane(&context.persist_locks, &key, handle.clone());
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            registry.clone(),
+            tracker.clone(),
+            context.agent_alias.to_string(),
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor = handle
+        .goal_execution_restart()
+        .new_supervisor(Arc::new(
+            GoalRuntime::new(registry.clone()).execution_engine(accounting),
+        ))
+        .await;
+    *foreground::goal_supervisor_slot(&context.persist_locks, &key)
+        .lock()
+        .await = Some(supervisor.clone());
+    let started = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Start {
+            budget: GoalBudgetSelection::Unlimited,
+            objective: "bounded held tool-batch repair".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    goal_execution::deliver_matrix_goal_command(started, Some(channel.clone()), message.clone())
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), provider.first_entered.notified())
+        .await
+        .expect("the actual Matrix parent provider call must be held");
+    let before = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.status, TaskStatus::Running);
+    let pending = channel_runtime_cli_string("goal-mode-pause-pending");
+    match control {
+        HeldToolBatchControl::Unfenced => {
+            provider.first_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while provider.calls.load(SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the paired tool round must admit the next parent model call");
+            assert_eq!(tool_runs.load(SeqCst), 1);
+            let running = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(running.status, TaskStatus::Running);
+            assert_eq!(running.execution_epoch, before.execution_epoch);
+            // The isolated child process ends here with the next call held.
+            return;
+        }
+        HeldToolBatchControl::Restart => {
+            let restarting = supervisor.clone();
+            let mut restart =
+                zeroclaw_spawn::spawn!(async move { restarting.pause_for_restart().await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    != TaskStatus::Paused
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("restart must fence before waiting for admitted settlement");
+            provider.first_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), &mut restart)
+                .await
+                .expect("restart must drain after provider release")
+                .unwrap()
+                .unwrap();
+        }
+        HeldToolBatchControl::PauseNow | HeldToolBatchControl::Stop => {
+            let stop = control == HeldToolBatchControl::Stop;
+            message.content = if stop { "/stop" } else { "/goal pause now" }.into();
+            let paused = goal_execution::submit_matrix_goal(
+                context.clone(),
+                key.clone(),
+                message.clone(),
+                GoalCommand::Pause { immediate: true },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                paused.response(),
+                GoalResponse::TransitionPending(_)
+            ));
+            let delivery_channel = channel.clone();
+            let delivery_message = message.clone();
+            let mut delivery = zeroclaw_spawn::spawn!(async move {
+                if stop {
+                    goal_execution::deliver_matrix_goal_stop(
+                        paused,
+                        Some(delivery_channel),
+                        delivery_message,
+                    )
+                    .await;
+                } else {
+                    goal_execution::deliver_matrix_goal_command(
+                        paused,
+                        Some(delivery_channel),
+                        delivery_message,
+                    )
+                    .await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !channel
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|row| row.content == pending)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("pause acknowledgement must precede provider settlement");
+            assert_eq!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskStatus::Paused
+            );
+            provider.first_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), &mut delivery)
+                .await
+                .expect("pause delivery must settle after provider release")
+                .unwrap();
+        }
+    }
+    let replies = channel
+        .sent_messages
+        .lock()
+        .await
+        .iter()
+        .map(|row| row.content.clone())
+        .collect::<Vec<_>>();
+    let paused = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        paused.status,
+        TaskStatus::Paused,
+        "a settled immediate or restart pause must stay resumable: {replies:?}"
+    );
+    assert_eq!(paused.id, before.id);
+    assert_eq!(paused.execution_epoch, before.execution_epoch + 1);
+    let goal = registry.get_goal_task(&paused.id).await.unwrap().unwrap();
+    assert_eq!(
+        goal.pause_reason,
+        Some(if control == HeldToolBatchControl::Restart {
+            GoalPauseReason::DaemonRestart
+        } else {
+            GoalPauseReason::OperatorPaused
+        })
+    );
+    assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
+    assert!(goal.pending_tool_batch_id.is_none() && goal.pending_tool_epoch.is_none());
+    assert_eq!(
+        registry
+            .terminal_reason_for_session_goal(&paused.id, &key)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(provider.calls.load(SeqCst), 1);
+    assert_eq!(
+        tool_runs.load(SeqCst),
+        0,
+        "the fenced epoch must refuse the held operation's tool batch"
+    );
+    assert_eq!(tracker.get_usage_totals_for_task(&paused.id).unwrap().0, 12);
+    let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+    assert_eq!(
+        ledger
+            .lines()
+            .map(|line| serde_json::from_str::<zeroclaw_config::cost::CostRecord>(line).unwrap())
+            .filter(|row| row.task_id.as_deref() == Some(paused.id.as_str()))
+            .count(),
+        1,
+        "the settled physical attempt must be recorded exactly once"
+    );
+    let refusal_text = "Goal tool batch lost its execution fence";
+    let refusal_reply = channel_user_error_message(
+        &anyhow::Error::msg(refusal_text),
+        &zeroclaw_providers::sanitize_api_error(refusal_text),
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|reply| **reply == refusal_reply)
+            .count(),
+        1,
+        "the ordinary core error must be shown exactly once: {replies:?}"
+    );
+    let failure = channel_runtime_cli_string("goal-mode-failure-executor");
+    let terminal = channel_runtime_cli_string("goal-mode-terminal");
+    let command_failed = channel_runtime_cli_string("goal-mode-command-failed");
+    assert!(
+        replies.iter().all(|reply| *reply != failure
+            && !reply.starts_with(&terminal)
+            && *reply != command_failed),
+        "no failure notice or terminal response may follow a resumable pause: {replies:?}"
+    );
+    if control == HeldToolBatchControl::Restart {
+        return;
+    }
+    let paused_headline = channel_runtime_cli_string("goal-mode-paused");
+    let ack = replies.iter().position(|reply| *reply == pending).unwrap();
+    let original = replies
+        .iter()
+        .position(|reply| *reply == refusal_reply)
+        .unwrap();
+    let late = replies
+        .iter()
+        .position(|reply| reply.starts_with(&paused_headline))
+        .expect("the late response must report the resumable pause");
+    assert!(ack < original && original < late, "{replies:?}");
+    if control == HeldToolBatchControl::Stop {
+        supervisor.dispose_session(&key).await.unwrap();
+        return;
+    }
+    // Continuation: the same Goal resumes through the ordinary resume path.
+    message.content = "/goal resume".into();
+    let resumed = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Resume { response: None },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resumed.response(), GoalResponse::Resumed(_)));
+    goal_execution::deliver_matrix_goal_command(resumed, Some(channel.clone()), message.clone())
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while provider.calls.load(SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the resumed epoch must admit its next parent call");
+    let running = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.id, before.id);
+    assert_eq!(running.status, TaskStatus::Running);
+    assert_eq!(running.execution_epoch, before.execution_epoch + 2);
+}
+
 #[tokio::test]
 async fn matrix_goal_failure_delivery_waits_for_ordinary_lane_without_blocking_other_conversation()
 {

@@ -28,7 +28,7 @@ use zeroclaw_api::{
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
 use zeroclaw_config::schema::Config;
-use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
+use zeroclaw_goal::control::dispose_unowned_session_goal;
 use zeroclaw_goal::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDiagnosticTextGuard, GoalExecutionNotice,
     GoalExecutionScope, GoalExecutionSupervisor, GoalFailureReason, GoalHostSettings,
@@ -924,6 +924,22 @@ struct MatrixGoalExecutionLease {
 }
 
 impl MatrixGoalExecutionLease {
+    /// Reuse the ordinary Matrix pre-call daily and monthly cost check and
+    /// pricing for Goal calls. Goal-scoped settlement remains projection-only,
+    /// so the Goal accountant stays the sole ledger writer.
+    fn ordinary_cost_tracking_context(
+        &self,
+    ) -> Option<zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext> {
+        self.context.cost_tracking.clone().map(|state| {
+            let agent_alias = state.agent_alias;
+            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+                state.tracker,
+                state.model_provider_pricing,
+            )
+            .with_agent_alias(agent_alias.as_str())
+        })
+    }
+
     fn excluded_tools<'a>(
         context: &'a ChannelRuntimeContext,
         message: &ChannelMessage,
@@ -1231,10 +1247,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             Some(self.context.agent_alias.to_string()),
             Some(turn_id.clone()),
         );
-        let cost_tracking_context = self.context.cost_tracking.as_ref().map(|_| {
-            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
-                .with_agent_alias(self.context.agent_alias.as_str())
-        });
+        let cost_tracking_context = self.ordinary_cost_tracking_context();
         let mut loop_knobs = LoopKnobs::default();
         if draft_stream.single_message {
             loop_knobs.draft_reasoning =
@@ -1443,8 +1456,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 (result, fallback, safeguard)
             },
         ));
-        let (candidate, fallback, safeguard) =
-            scope_goal_parent_turn(super::scope_safeguard_fallback(scoped_turn)).await;
+        let (candidate, fallback, safeguard) = super::scope_safeguard_fallback(scoped_turn).await;
         enum AttemptFailure {
             Core(anyhow::Error),
             TimedOut,
@@ -1580,48 +1592,51 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult> {
-        let result: Result<GoalVerifierResult> = async {
-            let defaults = runtime_defaults_snapshot(self.context.as_ref());
-            let (provider, route, temperature) =
-                matrix_goal_verifier_provider(defaults.config).await?;
-            let messages = turn.to_chat_messages();
-            let mut settled_attempts = Vec::new();
-            let approval_manager = self.context.approval_manager.for_new_turn();
-            let response = resolved_channel_execution(
-                self.context.as_ref(),
-                provider.as_ref(),
-                &route,
-                self.context.observer.as_ref(),
-                &approval_manager,
-                &LoopKnobs::default(),
-                &[],
-                temperature,
-            )
-            .model_access
-            .run_model_query(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                &mut settled_attempts,
-            )
-            .await?;
-            let response = response.text.context("Goal verifier returned no text")?;
-            let attribution =
-                verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
-                    (
-                        attempt.accepted,
-                        attempt.provider_ref.as_str(),
-                        attempt.model.as_str(),
+        let result: Result<GoalVerifierResult> =
+            zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(self.ordinary_cost_tracking_context(), async {
+                    let defaults = runtime_defaults_snapshot(self.context.as_ref());
+                    let (provider, route, temperature) =
+                        matrix_goal_verifier_provider(defaults.config).await?;
+                    let messages = turn.to_chat_messages();
+                    let mut settled_attempts = Vec::new();
+                    let approval_manager = self.context.approval_manager.for_new_turn();
+                    let response = resolved_channel_execution(
+                        self.context.as_ref(),
+                        provider.as_ref(),
+                        &route,
+                        self.context.observer.as_ref(),
+                        &approval_manager,
+                        &LoopKnobs::default(),
+                        &[],
+                        temperature,
                     )
-                }));
-            Ok(GoalVerifierResult {
-                response,
-                attribution,
-            })
-        }
-        .await;
+                    .model_access
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut settled_attempts,
+                    )
+                    .await?;
+                    let response = response.text.context("Goal verifier returned no text")?;
+                    let attribution = verifier_attribution_from_attempts(
+                        settled_attempts.iter().map(|attempt| {
+                            (
+                                attempt.accepted,
+                                attempt.provider_ref.as_str(),
+                                attempt.model.as_str(),
+                            )
+                        }),
+                    );
+                    Ok(GoalVerifierResult {
+                        response,
+                        attribution,
+                    })
+                })
+                .await;
         if let Err(error) = &result
             && let Some(channel) =
                 find_channel_for_message(&self.context.channels_by_name, &self.message)
@@ -8183,9 +8198,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_goal_policy_loop_break_commits_parent_failure_after_core_error() {
+    async fn matrix_goal_policy_loop_break_commits_pairing_failure_after_core_error() {
         use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
-        use zeroclaw_goal::GoalTaskRegistry;
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
         use zeroclaw_runtime::control_plane::{SqliteTaskStore, TaskStatus};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -8291,6 +8306,9 @@ mod tests {
                 .unwrap()
                 .unwrap_err();
         assert!(format!("{error:#}").contains("Circuit breaker"));
+        assert!(
+            format!("{error:#}").contains("Goal parent turn returned with an unpaired tool batch")
+        );
         let task = store.current_goal_for_session(key).await.unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(
@@ -8299,8 +8317,14 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("parent_operation_failed")
+            Some("goal_tool_pairing_incomplete")
         );
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(goal.pending_tool_batch_id, None);
+        assert_eq!(goal.pending_tool_epoch, None);
+        assert_eq!(goal.pending_call_id, None);
+        assert_eq!(goal.pending_call_epoch, None);
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
         let messages = channel.messages.lock().await;
         assert_eq!(
             messages
@@ -8314,7 +8338,7 @@ mod tests {
             .position(|text| text.contains("Circuit breaker"))
             .unwrap();
         let failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
-            matrix_goal_failure_key(GoalFailureReason::AgentOperationFailed),
+            matrix_goal_failure_key(GoalFailureReason::ToolResultsUnpaired),
         );
         let failure = messages
             .iter()
@@ -8330,6 +8354,16 @@ mod tests {
                 .filter(|text| *text == &failure_text)
                 .count(),
             1
+        );
+        let parent_failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
+            matrix_goal_failure_key(GoalFailureReason::AgentOperationFailed),
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| *text == &parent_failure_text)
+                .count(),
+            0
         );
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert!(provider.requests.lock().unwrap().len() < 8);

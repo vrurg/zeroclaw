@@ -3012,8 +3012,28 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // there is real work to dispatch, but before any tool can begin an
         // external effect. Ordinary tool batches receive `None` and retain
         // their current parallel execution behavior.
-        let pending_goal_tool_batch =
-            crate::agent::goal_tool_pairing::admit_goal_tool_batch(executable_calls.len()).await?;
+        let pending_goal_tool_batch = match zeroclaw_goal::tool_pairing::admit_goal_tool_batch(
+            executable_calls.len(),
+        )
+        .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                // Admission refused the batch before any tool started, so
+                // every prepared executable context is abandoned once, as
+                // when the batch fails outright, and the error is returned
+                // unchanged.
+                call_prep::abandon_unexecuted_prepared_contexts(
+                    &ctx,
+                    iteration,
+                    &executable_indices,
+                    &executable_calls,
+                    &[],
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
@@ -8655,10 +8675,18 @@ mod tool_lifecycle_abandonment_tests {
     //! after.
 
     use super::*;
+    use crate::control_plane::task_store_sqlite::SqliteTaskStore;
     use crate::observability::NoopObserver;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use zeroclaw_api::hook::ToolCallHookContext;
+    use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
+    use zeroclaw_goal::task::TaskContinuationContext;
+    use zeroclaw_goal::{
+        GoalAccountingState, GoalExecutionScope, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
+        GoalTransitionResult,
+    };
     use zeroclaw_providers::{ChatResponse, ToolCall};
 
     struct LifecycleRecorder {
@@ -9004,10 +9032,906 @@ mod tool_lifecycle_abandonment_tests {
         .await
     }
 
+    async fn run_scripted_loop_with_events(
+        provider: &dyn ModelProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &NoopObserver,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+        history: &mut Vec<ChatMessage>,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> anyhow::Result<String> {
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget: 0,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: "goal-usage-test",
+            served_route_sink: None,
+        })
+        .await
+    }
+
     fn registry_with(
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    struct CountingGoalTool {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    zeroclaw_api::tool_attribution!(
+        CountingGoalTool,
+        zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CountingGoalTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "counts fixture executions"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult::ok("counted"))
+        }
+    }
+
+    struct GoalToolBatchFixture {
+        provider: ScriptedProvider,
+        registry: crate::tools::scoped::ScopedToolRegistry,
+        events: Arc<Mutex<Vec<String>>>,
+        hooks: crate::hooks::HookRunner,
+        calls: [Arc<AtomicUsize>; 2],
+    }
+
+    fn goal_tool_batch_fixture() -> GoalToolBatchFixture {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        GoalToolBatchFixture {
+            provider: ScriptedProvider {
+                responses: Mutex::new(vec![ChatResponse {
+                    text: None,
+                    tool_calls: vec![
+                        tool_call("call-a", "a", serde_json::json!({"n": 1})),
+                        tool_call("call-b", "b", serde_json::json!({"n": 2})),
+                    ],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            },
+            registry: registry_with(vec![
+                Box::new(CountingGoalTool {
+                    name: "a",
+                    calls: Arc::clone(&calls[0]),
+                }),
+                Box::new(CountingGoalTool {
+                    name: "b",
+                    calls: Arc::clone(&calls[1]),
+                }),
+            ]),
+            hooks: lifecycle_runner(Arc::clone(&events), Vec::new()),
+            events,
+            calls,
+        }
+    }
+
+    struct CapturedToolLoopSettlement(
+        Arc<Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>>,
+    );
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedToolLoopSettlement {
+        async fn admit(
+            &self,
+            _request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .expect("settlement capture lock")
+                .push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn tool_loop_usage_context(
+        root: &std::path::Path,
+    ) -> crate::agent::cost::ToolLoopCostTrackingContext {
+        use std::collections::HashMap;
+
+        let pricing = Arc::new(HashMap::from([
+            (
+                "scripted".to_string(),
+                HashMap::from([
+                    ("scripted-model.input".to_string(), 1.0),
+                    ("scripted-model.output".to_string(), 2.0),
+                ]),
+            ),
+            (
+                "ScriptedProvider".to_string(),
+                HashMap::from([
+                    ("scripted-model.input".to_string(), 1.0),
+                    ("scripted-model.output".to_string(), 2.0),
+                ]),
+            ),
+        ]));
+        crate::agent::cost::ToolLoopCostTrackingContext::new(
+            Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    root,
+                )
+                .expect("usage tracker"),
+            ),
+            pricing,
+        )
+    }
+
+    // Compare the complete usage projection, including fields rejected attempts
+    // must not contribute to accepted context-window telemetry.
+    type ToolLoopUsageProjection = (
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<f64>,
+        Option<u64>,
+        Option<u64>,
+        String,
+        String,
+        bool,
+    );
+
+    struct ToolLoopUsageRun {
+        result: anyhow::Result<String>,
+        events: Vec<ToolLoopUsageProjection>,
+        usage: crate::agent::cost::TurnUsage,
+        settlements: Vec<zeroclaw_goal::accounting::GoalOperationSettlement>,
+        tool_calls: usize,
+        history: Vec<ChatMessage>,
+    }
+
+    async fn run_tool_loop_usage_script(
+        responses: Vec<ChatResponse>,
+        retries: u32,
+        goal_scoped: bool,
+    ) -> ToolLoopUsageRun {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "scripted",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedProvider {
+                    responses: Mutex::new(responses),
+                }) as Box<dyn ModelProvider>,
+            )],
+            retries,
+            1,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with(vec![Box::new(CountingGoalTool {
+            name: "a",
+            calls: Arc::clone(&calls),
+        })]);
+        let mut history = vec![ChatMessage::user("perform one action")];
+        let workspace = tempfile::TempDir::new().expect("usage tracker directory");
+        let usage = tool_loop_usage_context(workspace.path());
+        let usage_snapshot = Arc::clone(&usage.turn_usage);
+        let settlements = Arc::new(Mutex::new(Vec::new()));
+        let accountant: Option<Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>> =
+            goal_scoped.then(|| {
+                Arc::new(CapturedToolLoopSettlement(Arc::clone(&settlements)))
+                    as Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>
+            });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(accountant, async {
+                crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(usage), async {
+                        run_scripted_loop_with_events(
+                            &reliable,
+                            &registry,
+                            &NoopObserver,
+                            &zeroclaw_config::schema::PacingConfig::default(),
+                            &mut history,
+                            event_tx,
+                        )
+                        .await
+                    })
+                    .await
+            })
+            .await;
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Usage {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    context_token_budget,
+                    model_context_window,
+                    provider_ref,
+                    model,
+                    accepted,
+                } => Some((
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    context_token_budget,
+                    model_context_window,
+                    provider_ref,
+                    model,
+                    accepted,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            workspace.path().join("state/costs.jsonl").exists(),
+            !goal_scoped,
+            "only the ordinary run may use the ordinary ledger writer"
+        );
+        let usage = *usage_snapshot.lock();
+        let settlements = settlements.lock().expect("settlement capture lock").clone();
+        ToolLoopUsageRun {
+            result,
+            events,
+            usage,
+            settlements,
+            tool_calls: calls.load(Ordering::SeqCst),
+            history,
+        }
+    }
+
+    fn assert_tool_loop_usage_parity(
+        ordinary: &ToolLoopUsageRun,
+        goal: &ToolLoopUsageRun,
+        expected: &[(u64, u64, bool)],
+        expected_operations: usize,
+    ) {
+        assert_eq!(goal.events, ordinary.events);
+        assert_eq!(goal.events.len(), expected.len());
+        assert_eq!(goal.usage.input_tokens, ordinary.usage.input_tokens);
+        assert_eq!(goal.usage.output_tokens, ordinary.usage.output_tokens);
+        assert_eq!(goal.usage.cost_usd, ordinary.usage.cost_usd);
+        assert_eq!(
+            goal.usage.last_input_tokens,
+            ordinary.usage.last_input_tokens
+        );
+        assert_eq!(
+            goal.usage.input_tokens,
+            expected.iter().map(|e| e.0).sum::<u64>()
+        );
+        assert_eq!(
+            goal.usage.output_tokens,
+            expected.iter().map(|e| e.1).sum::<u64>()
+        );
+        assert_eq!(
+            goal.usage.last_input_tokens,
+            expected.iter().rev().find(|e| e.2).map_or(0, |e| e.0)
+        );
+        let expected_cost = expected
+            .iter()
+            .map(|e| (e.0 as f64 + 2.0 * e.1 as f64) / 1_000_000.0)
+            .sum::<f64>();
+        assert!((goal.usage.cost_usd - expected_cost).abs() < 1e-12);
+        assert!(ordinary.settlements.is_empty());
+        assert_eq!(goal.settlements.len(), expected_operations);
+        assert!(goal.settlements.iter().all(|settlement| {
+            settlement.accounting_state == zeroclaw_goal::task::GoalAccountingState::Complete
+        }));
+        let canonical_events: Vec<_> = goal
+            .settlements
+            .iter()
+            .flat_map(|settlement| &settlement.events)
+            .collect();
+        assert_eq!(canonical_events.len(), expected.len());
+        for ((event, canonical), &(input, output, accepted)) in
+            goal.events.iter().zip(canonical_events).zip(expected)
+        {
+            assert_eq!(event.0, Some(input));
+            assert_eq!(event.1, None);
+            assert_eq!(event.2, Some(output));
+            let expected_cost = (input as f64 + 2.0 * output as f64) / 1_000_000.0;
+            assert!((event.3.expect("priced event") - expected_cost).abs() < 1e-12);
+            assert_eq!(event.4, accepted.then_some(0));
+            assert_eq!(event.5, None);
+            assert_eq!(event.6, "scripted");
+            assert_eq!(event.7, "scripted-model");
+            assert_eq!(event.8, accepted);
+            assert_eq!(canonical.provider_ref, event.6);
+            assert_eq!(canonical.model, event.7);
+            assert_eq!(canonical.usage.input_tokens, event.0);
+            // The event keeps the provider's absent cache count (checked above);
+            // the canonical Goal event records a valid absent partition as zeros.
+            assert_eq!(canonical.usage.cached_input_tokens, Some(0));
+            assert_eq!(canonical.usage.output_tokens, event.2);
+            assert_eq!(canonical.usage.cache_creation_input_tokens, Some(0));
+            assert!(canonical.priceable);
+        }
+    }
+
+    fn tool_loop_usage_response(input: u64, output: u64) -> ChatResponse {
+        ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_tool_loop_success_projects_rejected_and_accepted_usage_like_ordinary() {
+        let mut rejected = tool_loop_usage_response(160, 5);
+        rejected.text = None;
+        let mut tool_response = tool_loop_usage_response(80, 7);
+        tool_response.text = None;
+        tool_response.tool_calls = vec![tool_call(
+            "goal-usage-call",
+            "a",
+            serde_json::json!({"n": 1}),
+        )];
+        // Script the final completion too: ScriptedProvider's implicit fallback
+        // has no usage and would test incomplete accounting instead.
+        let script = vec![rejected, tool_response, tool_loop_usage_response(40, 3)];
+        let ordinary = run_tool_loop_usage_script(script.clone(), 1, false).await;
+        let goal = run_tool_loop_usage_script(script, 1, true).await;
+
+        assert_eq!(
+            ordinary.result.as_ref().expect("ordinary completion"),
+            "done"
+        );
+        assert_eq!(goal.result.as_ref().expect("Goal completion"), "done");
+        assert_eq!(ordinary.tool_calls, 1);
+        assert_eq!(goal.tool_calls, 1);
+        assert_tool_loop_usage_parity(
+            &ordinary,
+            &goal,
+            &[(160, 5, false), (80, 7, true), (40, 3, true)],
+            2,
+        );
+        assert_eq!(goal.settlements[0].events.len(), 2);
+        assert_eq!(goal.settlements[1].events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_tool_loop_provider_error_projects_billed_attempt_once() {
+        // Reliable records this complete physical response before rejecting it
+        // as semantic-empty. With no retries its error reaches the tool loop.
+        let mut rejected = tool_loop_usage_response(160, 5);
+        rejected.text = None;
+        assert!(rejected.is_semantically_empty_terminal());
+        let ordinary = run_tool_loop_usage_script(vec![rejected.clone()], 0, false).await;
+        let goal = run_tool_loop_usage_script(vec![rejected], 0, true).await;
+
+        for run in [&ordinary, &goal] {
+            let error = run.result.as_ref().expect_err("semantic-empty exhaustion");
+            assert!(error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }));
+            assert_eq!(run.tool_calls, 0);
+        }
+        assert_tool_loop_usage_parity(&ordinary, &goal, &[(160, 5, false)], 1);
+        assert_eq!(goal.settlements[0].events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_tool_loop_parse_retry_projects_each_attempt_once() {
+        let malformed = "<tool_call>{\"name\":\"a\",\"arguments\":{\"n\":1}</tool_call>";
+        let (_, parsed_calls) = zeroclaw_tool_call_parser::parse_tool_calls(malformed);
+        assert!(parsed_calls.is_empty());
+        let known_tools = std::collections::HashSet::from(["a".to_string()]);
+        assert!(
+            super::protocol_detect::detect_tool_call_parse_issue_for_known_tools(
+                malformed,
+                &parsed_calls,
+                &known_tools,
+            )
+            .is_some()
+        );
+        let mut rejected = tool_loop_usage_response(160, 5);
+        rejected.text = Some(malformed.to_string());
+        let script = vec![rejected, tool_loop_usage_response(80, 7)];
+        let ordinary = run_tool_loop_usage_script(script.clone(), 0, false).await;
+        let goal = run_tool_loop_usage_script(script, 0, true).await;
+
+        for run in [&ordinary, &goal] {
+            assert_eq!(
+                run.result.as_ref().expect("completion after parse retry"),
+                "done"
+            );
+            assert_eq!(run.tool_calls, 0);
+            assert_eq!(
+                run.history
+                    .iter()
+                    .filter(|message| message.content.starts_with("[Tool call parse error]"))
+                    .count(),
+                1,
+                "the real tool-loop parser retry must run exactly once"
+            );
+        }
+        assert_tool_loop_usage_parity(&ordinary, &goal, &[(160, 5, false), (80, 7, true)], 2);
+        assert!(
+            goal.settlements
+                .iter()
+                .all(|settlement| settlement.events.len() == 1)
+        );
+    }
+
+    async fn running_tool_batch_goal() -> (Arc<SqliteTaskStore>, GoalExecutionScope) {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task = TaskRecord {
+            id: "tool-batch-goal".into(),
+            kind: TaskKind::Goal,
+            agent: "fixture-agent".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "fixture-boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("rpc_tool-batch".into()),
+            execution_epoch: 1,
+            started_at: "2026-06-18T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "run the prepared batch".into(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let scope = GoalExecutionScope::new("tool-batch-goal", "rpc_tool-batch", 1).unwrap();
+        (store, scope)
+    }
+
+    struct CancelAtToolBatchAdmission {
+        store: Arc<SqliteTaskStore>,
+        events: Arc<Mutex<Vec<String>>>,
+        turn_id: &'static str,
+        admissions: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalTaskRegistry for CancelAtToolBatchAdmission {
+        async fn latest_active_goal_for_agent(
+            &self,
+            agent: &str,
+        ) -> anyhow::Result<Option<TaskRecord>> {
+            self.store.latest_active_goal_for_agent(agent).await
+        }
+
+        async fn latest_active_goal_for_context(
+            &self,
+            agent: &str,
+            route: Option<&str>,
+            principal: Option<&str>,
+        ) -> anyhow::Result<Option<TaskRecord>> {
+            self.store
+                .latest_active_goal_for_context(agent, route, principal)
+                .await
+        }
+
+        async fn latest_active_goal_id_for_context(
+            &self,
+            agent: &str,
+            route: Option<&str>,
+            principal: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
+            self.store
+                .latest_active_goal_id_for_context(agent, route, principal)
+                .await
+        }
+
+        async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>> {
+            self.store.get_goal_task(task_id).await
+        }
+
+        async fn update_goal_limits(
+            &self,
+            task_id: &str,
+            tokens: Option<u64>,
+            cost: Option<f64>,
+        ) -> anyhow::Result<()> {
+            self.store.update_goal_limits(task_id, tokens, cost).await
+        }
+
+        async fn update_goal_pause(
+            &self,
+            task_id: &str,
+            pause: Option<GoalPauseState>,
+        ) -> anyhow::Result<()> {
+            self.store.update_goal_pause(task_id, pause).await
+        }
+
+        async fn set_continuation_context(
+            &self,
+            task_id: &str,
+            context: Option<TaskContinuationContext>,
+        ) -> anyhow::Result<()> {
+            self.store.set_continuation_context(task_id, context).await
+        }
+
+        async fn get_continuation_context(
+            &self,
+            task_id: &str,
+        ) -> anyhow::Result<Option<TaskContinuationContext>> {
+            self.store.get_continuation_context(task_id).await
+        }
+
+        async fn current_goal_for_session(
+            &self,
+            session_id: &str,
+        ) -> anyhow::Result<Option<TaskRecord>> {
+            self.store.current_goal_for_session(session_id).await
+        }
+
+        async fn terminal_reason_for_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.store
+                .terminal_reason_for_session_goal(task_id, session_id)
+                .await
+        }
+
+        async fn create_or_replace_session_goal(
+            &self,
+            task: TaskRecord,
+            goal: GoalTaskRecord,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store.create_or_replace_session_goal(task, goal).await
+        }
+
+        async fn pause_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            pause: GoalPauseState,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .pause_session_goal(task_id, session_id, epoch, pause)
+                .await
+        }
+
+        async fn resume_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            owner_pid: u32,
+            boot: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .resume_session_goal(task_id, session_id, epoch, owner_pid, boot)
+                .await
+        }
+
+        async fn finish_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            status: TaskStatus,
+            error: Option<String>,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .finish_session_goal(task_id, session_id, epoch, status, error)
+                .await
+        }
+
+        async fn admit_pending_operation(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            call_id: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .admit_pending_operation(task_id, session_id, epoch, call_id)
+                .await
+        }
+
+        async fn settle_pending_operation(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            call_id: &str,
+            state: GoalAccountingState,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .settle_pending_operation(task_id, session_id, epoch, call_id, state)
+                .await
+        }
+
+        async fn update_session_goal_limits(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            tokens: Option<u64>,
+            cost: Option<f64>,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .update_session_goal_limits(task_id, session_id, epoch, tokens, cost)
+                .await
+        }
+
+        async fn delete_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.store
+                .delete_session_goal(task_id, session_id, epoch)
+                .await
+        }
+
+        async fn admit_pending_tool_batch(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            epoch: i64,
+            batch_id: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            // This callback is reached only after prepare_tool_calls returns.
+            // Both continued hook contexts are therefore execution's duty.
+            assert_eq!(self.admissions.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(
+                *self.events.lock().unwrap(),
+                vec![
+                    format!("before:a:{}:0:0", self.turn_id),
+                    format!("before:b:{}:0:1", self.turn_id),
+                ]
+            );
+            assert_eq!(
+                self.store
+                    .finish_session_goal(task_id, session_id, epoch, TaskStatus::Cancelled, None)
+                    .await?,
+                GoalTransitionResult::Applied
+            );
+            let result = self
+                .store
+                .admit_pending_tool_batch(task_id, session_id, epoch, batch_id)
+                .await?;
+            assert_eq!(result, GoalTransitionResult::Stale);
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_tool_batch_admission_failure_abandons_prepared_calls() {
+        let fixture = goal_tool_batch_fixture();
+        let (store, scope) = running_tool_batch_goal().await;
+        let registry = Arc::new(CancelAtToolBatchAdmission {
+            store: Arc::clone(&store),
+            events: Arc::clone(&fixture.events),
+            turn_id: "turn-goal-fenced",
+            admissions: AtomicUsize::new(0),
+        });
+        let mut history = vec![ChatMessage::user("run the tools".to_string())];
+        let error = zeroclaw_goal::tool_pairing::scope_goal_tool_pairing(
+            registry.clone(),
+            scope,
+            run_scripted_loop(
+                &fixture.provider,
+                &fixture.registry,
+                &NoopObserver,
+                Some(&fixture.hooks),
+                &zeroclaw_config::schema::PacingConfig::default(),
+                "turn-goal-fenced",
+                false,
+                None,
+                &mut history,
+            ),
+        )
+        .await
+        .expect_err("the cancelled Goal must lose admission");
+
+        assert_eq!(
+            error.to_string(),
+            "Goal tool batch lost its execution fence"
+        );
+        assert_eq!(registry.admissions.load(Ordering::SeqCst), 1);
+        let task = store
+            .current_goal_for_session("rpc_tool-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.execution_epoch, 2);
+        assert_eq!(fixture.calls[0].load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls[1].load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *fixture.events.lock().unwrap(),
+            vec![
+                "before:a:turn-goal-fenced:0:0",
+                "before:b:turn-goal-fenced:0:1",
+                "abandoned:a:turn-goal-fenced:0:0",
+                "abandoned:b:turn-goal-fenced:0:1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_tool_batch_admission_preserves_ordinary_lifecycle() {
+        let fixture = goal_tool_batch_fixture();
+        let mut history = vec![ChatMessage::user("run the tools".to_string())];
+        let result = run_scripted_loop(
+            &fixture.provider,
+            &fixture.registry,
+            &NoopObserver,
+            Some(&fixture.hooks),
+            &zeroclaw_config::schema::PacingConfig::default(),
+            "turn-ordinary-batch",
+            false,
+            None,
+            &mut history,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(fixture.calls[0].load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls[1].load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *fixture.events.lock().unwrap(),
+            vec![
+                "before:a:turn-ordinary-batch:0:0",
+                "before:b:turn-ordinary-batch:0:1",
+                "after:a:turn-ordinary-batch:0:0",
+                "after:b:turn-ordinary-batch:0:1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_tool_batch_admission_preserves_running_goal_lifecycle() {
+        let fixture = goal_tool_batch_fixture();
+        let (store, scope) = running_tool_batch_goal().await;
+        let mut history = vec![ChatMessage::user("run the tools".to_string())];
+        let result =
+            zeroclaw_goal::tool_pairing::scope_goal_tool_pairing(store.clone(), scope, async {
+                let result = run_scripted_loop(
+                    &fixture.provider,
+                    &fixture.registry,
+                    &NoopObserver,
+                    Some(&fixture.hooks),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    "turn-running-batch",
+                    false,
+                    None,
+                    &mut history,
+                )
+                .await?;
+                zeroclaw_goal::tool_pairing::finalize_goal_tool_pairing().await?;
+                anyhow::Ok(result)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(fixture.calls[0].load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls[1].load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *fixture.events.lock().unwrap(),
+            vec![
+                "before:a:turn-running-batch:0:0",
+                "before:b:turn-running-batch:0:1",
+                "after:a:turn-running-batch:0:0",
+                "after:b:turn-running-batch:0:1",
+            ]
+        );
+        let task = store
+            .current_goal_for_session("rpc_tool-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.execution_epoch, 1);
+        let goal = store
+            .get_goal_task("tool-batch-goal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pending_tool_batch_id, None);
+        assert_eq!(goal.pending_tool_epoch, None);
     }
 
     struct ImageRecoveryProvider {

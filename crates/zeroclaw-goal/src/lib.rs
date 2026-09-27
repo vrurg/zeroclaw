@@ -14,8 +14,10 @@ mod test_support;
 
 pub mod accounting;
 pub mod checkpoint;
+pub mod child_fence;
 pub mod control;
 pub mod task;
+pub mod tool_pairing;
 
 pub use checkpoint::{
     GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint,

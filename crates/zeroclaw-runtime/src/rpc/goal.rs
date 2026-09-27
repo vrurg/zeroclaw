@@ -536,6 +536,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         Ok(Box::new(ZeroCodeGoalExecutionLease {
             _queue_guard: queue_guard,
             agent,
+            agent_alias: self.agent_alias.clone(),
             canonical_history,
             history_has_trim_breadcrumb: false,
             outbound: Arc::clone(&self.outbound),
@@ -551,6 +552,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
 struct ZeroCodeGoalExecutionLease {
     _queue_guard: zeroclaw_infra::session_queue::SessionGuard,
     agent: Arc<Mutex<Agent>>,
+    agent_alias: String,
     // Acquisition proves identity; projection failures belong to the engine's
     // fenced publication path, not to the acquisition boundary.
     canonical_history: Result<Vec<ChatMessage>>,
@@ -569,6 +571,22 @@ enum GoalEpochAdmission {
 }
 
 impl ZeroCodeGoalExecutionLease {
+    /// Reuse the ordinary pre-call daily and monthly cost check and its live
+    /// pricing for Goal calls. Goal-scoped settlement only projects usage, so
+    /// the Goal accountant remains the sole ledger writer.
+    fn ordinary_cost_tracking_context(
+        &self,
+    ) -> Option<crate::agent::cost::ToolLoopCostTrackingContext> {
+        self.context.cost_tracker.as_ref().map(|tracker| {
+            let pricing = {
+                let config = self.context.config.read();
+                Arc::new(build_model_provider_pricing(&config))
+            };
+            crate::agent::cost::ToolLoopCostTrackingContext::new(Arc::clone(tracker), pricing)
+                .with_agent_alias(&self.agent_alias)
+        })
+    }
+
     fn raw_session_id(&self) -> Result<&str> {
         match &self.session_key {
             GoalSessionKey::ZeroCode { raw_session_id } => Ok(raw_session_id),
@@ -740,11 +758,13 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let session_id = self.raw_session_id()?.to_owned();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let recall_query = self.recall_query.clone();
-        let run = async move {
-            agent
-                .run_isolated_turn_with_events(source, &input, &recall_query, event_tx)
-                .await
-        };
+        let cost_context = self.ordinary_cost_tracking_context();
+        let run =
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(cost_context, async move {
+                agent
+                    .run_isolated_turn_with_events(source, &input, &recall_query, event_tx)
+                    .await
+            });
         tokio::pin!(run);
 
         let mut event_rx_open = true;
@@ -787,51 +807,55 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult> {
-        let result: Result<GoalVerifierResult> = async {
-            let (provider, model_selector, route_resolver) = {
-                let config = self.context.config.read();
-                let (provider, _provider_ref, model_selector, route_resolver) =
-                    build_session_model_provider(
-                        &config,
-                        &config.goal.verifier.model_provider,
-                        config.goal.verifier.model.as_deref(),
-                    )?;
-                (provider, model_selector, route_resolver)
-            };
-            let route = route_resolver.resolve(&model_selector);
-            let messages = turn.to_chat_messages();
-            let mut settled_attempts = Vec::new();
-            let response = crate::agent::loop_::ResolvedModelAccess {
-                model_provider: provider.as_ref(),
-                provider_name: &route.provider_name,
-                model: &route.model,
-                dispatch_model: &model_selector,
-                temperature: None,
-            }
-            .run_model_query(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                &mut settled_attempts,
-            )
-            .await?;
-            let response = response.text.context("Goal verifier returned no text")?;
-            let attribution =
-                verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
-                    (
-                        attempt.accepted,
-                        attempt.provider_ref.as_str(),
-                        attempt.model.as_str(),
+        let cost_context = self.ordinary_cost_tracking_context();
+        let result: Result<GoalVerifierResult> =
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(cost_context, async {
+                    let (provider, model_selector, route_resolver) = {
+                        let config = self.context.config.read();
+                        let (provider, _provider_ref, model_selector, route_resolver) =
+                            build_session_model_provider(
+                                &config,
+                                &config.goal.verifier.model_provider,
+                                config.goal.verifier.model.as_deref(),
+                            )?;
+                        (provider, model_selector, route_resolver)
+                    };
+                    let route = route_resolver.resolve(&model_selector);
+                    let messages = turn.to_chat_messages();
+                    let mut settled_attempts = Vec::new();
+                    let response = crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: provider.as_ref(),
+                        provider_name: &route.provider_name,
+                        model: &route.model,
+                        dispatch_model: &model_selector,
+                        temperature: None,
+                    }
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut settled_attempts,
                     )
-                }));
-            Ok(GoalVerifierResult {
-                response,
-                attribution,
-            })
-        }
-        .await;
+                    .await?;
+                    let response = response.text.context("Goal verifier returned no text")?;
+                    let attribution = verifier_attribution_from_attempts(
+                        settled_attempts.iter().map(|attempt| {
+                            (
+                                attempt.accepted,
+                                attempt.provider_ref.as_str(),
+                                attempt.model.as_str(),
+                            )
+                        }),
+                    );
+                    Ok(GoalVerifierResult {
+                        response,
+                        attribution,
+                    })
+                })
+                .await;
         if let Err(error) = &result {
             self.publish_parent_turn_failure(error).await;
         }

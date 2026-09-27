@@ -30,14 +30,12 @@ use zeroclaw_commands::goal::{
 };
 
 mod deferred;
-pub mod goal_child_fence;
 mod goal_execution;
 mod parent_input;
 mod policy;
 
 pub use deferred::{GoalControlClass, GoalQueuedControl, GoalTurnBoundary, classify_goal_control};
 
-pub use goal_child_fence::scope_goal_parent as scope_goal_parent_turn;
 pub use goal_execution::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
     GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
@@ -2365,16 +2363,5 @@ mod tests {
         goal.pending_tool_epoch = None;
         task.execution_epoch = i64::MAX;
         assert!(!goal_is_resumable(&task, &goal));
-    }
-
-    #[tokio::test]
-    async fn shared_parent_turn_scope_marks_goal_owned_child_admission() {
-        scope_goal_parent_turn(async {
-            let _guard = goal_child_fence::admit_goal_child()
-                .await
-                .expect("Goal parent scope should allow a foreground child")
-                .expect("Goal parent scope should install a child fence");
-        })
-        .await;
     }
 }
