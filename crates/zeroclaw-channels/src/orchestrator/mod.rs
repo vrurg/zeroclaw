@@ -3756,6 +3756,30 @@ fn append_sender_turn(
     sender_key: &str,
     turn: ChatMessage,
 ) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_inner(ctx, sender_key, turn, false)
+}
+
+/// Append a Goal-owned turn only when its canonical session transcript is
+/// durably available and the write succeeds. Goal continuation and resume
+/// must never proceed from memory-only history.
+fn append_sender_turn_durably(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_inner(ctx, sender_key, turn, true)
+}
+
+fn append_sender_turn_inner(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    require_durable_store: bool,
+) -> Option<Vec<ChatMessage>> {
+    if require_durable_store && ctx.session_store.is_none() {
+        return None;
+    }
+
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -3896,6 +3920,9 @@ fn append_sender_turn(
                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
             "Failed to persist session turn"
         );
+        if require_durable_store {
+            return None;
+        }
     }
 
     // Use the user-configured max_history_messages (fall back to
@@ -9016,7 +9043,13 @@ async fn process_channel_message_body(
             }
             return;
         }
-        let _ = handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await;
+        let _ = handle_runtime_command_for_delivery(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            &delivery_message_id,
+        )
+        .await;
         return;
     }
 
@@ -11030,6 +11063,7 @@ fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
     ChannelMessage {
         id: message.id.clone(),
         sender: message.sender.clone(),
+        platform_sender_id: message.platform_sender_id.clone(),
         reply_target: message.reply_target.clone(),
         content: message.content.clone(),
         channel: message.channel.clone(),
@@ -11044,11 +11078,12 @@ fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
         explicitly_addressed: message.explicitly_addressed,
         conversation_scope: message.conversation_scope,
         references: message.references.clone(),
+        voice_origin: message.voice_origin,
     }
 }
 
-fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
-    use zeroclaw_runtime::goal_mode::GoalResponse;
+fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
+    use zeroclaw_goal::GoalResponse;
     let key = match response {
         GoalResponse::Help => "goal-mode-help",
         GoalResponse::Disabled => "goal-mode-disabled",
