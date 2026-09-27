@@ -28,7 +28,7 @@ use zeroclaw_api::{
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
 use zeroclaw_config::schema::Config;
-use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
+use zeroclaw_goal::control::dispose_unowned_session_goal;
 use zeroclaw_goal::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDiagnosticTextGuard, GoalExecutionNotice,
     GoalExecutionScope, GoalExecutionSupervisor, GoalFailureReason, GoalHostSettings,
@@ -1436,8 +1436,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 (result, fallback, safeguard)
             },
         ));
-        let (candidate, fallback, safeguard) =
-            scope_goal_parent_turn(super::scope_safeguard_fallback(scoped_turn)).await;
+        let (candidate, fallback, safeguard) = super::scope_safeguard_fallback(scoped_turn).await;
         enum AttemptFailure {
             Core(anyhow::Error),
             TimedOut,
@@ -8086,9 +8085,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_goal_policy_loop_break_commits_parent_failure_after_core_error() {
+    async fn matrix_goal_policy_loop_break_commits_pairing_failure_after_core_error() {
         use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
-        use zeroclaw_goal::GoalTaskRegistry;
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
         use zeroclaw_runtime::control_plane::{SqliteTaskStore, TaskStatus};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -8194,6 +8193,9 @@ mod tests {
                 .unwrap()
                 .unwrap_err();
         assert!(format!("{error:#}").contains("Circuit breaker"));
+        assert!(
+            format!("{error:#}").contains("Goal parent turn returned with an unpaired tool batch")
+        );
         let task = store.current_goal_for_session(key).await.unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(
@@ -8202,8 +8204,14 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("parent_operation_failed")
+            Some("goal_tool_pairing_incomplete")
         );
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(goal.pending_tool_batch_id, None);
+        assert_eq!(goal.pending_tool_epoch, None);
+        assert_eq!(goal.pending_call_id, None);
+        assert_eq!(goal.pending_call_epoch, None);
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
         let messages = channel.messages.lock().await;
         assert_eq!(
             messages
@@ -8217,7 +8225,7 @@ mod tests {
             .position(|text| text.contains("Circuit breaker"))
             .unwrap();
         let failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
-            matrix_goal_failure_key(GoalFailureReason::AgentOperationFailed),
+            matrix_goal_failure_key(GoalFailureReason::ToolResultsUnpaired),
         );
         let failure = messages
             .iter()
@@ -8233,6 +8241,16 @@ mod tests {
                 .filter(|text| *text == &failure_text)
                 .count(),
             1
+        );
+        let parent_failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
+            matrix_goal_failure_key(GoalFailureReason::AgentOperationFailed),
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| *text == &parent_failure_text)
+                .count(),
+            0
         );
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert!(provider.requests.lock().unwrap().len() < 8);
