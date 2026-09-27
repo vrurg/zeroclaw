@@ -4058,6 +4058,7 @@ impl RpcDispatcher {
                                             &session_key,
                                             &durable,
                                             agent.history_has_trim_breadcrumb(),
+                                            self.ctx.config.read().channels.session_prompts_enabled,
                                         ) {
                                             return Err(rpc_err(
                                                 INTERNAL_ERROR,
@@ -5742,6 +5743,7 @@ impl RpcDispatcher {
                         &key,
                         &durable,
                         agent.history_has_trim_breadcrumb(),
+                        self.ctx.config.read().channels.session_prompts_enabled,
                     );
                 }
             }
@@ -10257,12 +10259,18 @@ fn replace_rpc_chat_conversation_state(
     session_key: &str,
     durable: &[zeroclaw_providers::ChatMessage],
     breadcrumb_present: bool,
+    session_prompts_enabled: bool,
 ) -> bool {
     // RPC Chat is also a non-provider export boundary: its durable transcript
     // is exposed through session-history APIs and searchable SQLite storage.
     // Keep opaque session-prompt bodies out of that durable copy while the
-    // provider-facing history remains unchanged for the active turn.
-    let export = crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable);
+    // provider-facing history remains unchanged for the active turn, but do
+    // not apply the feature-specific heuristic when the feature is disabled.
+    let export = if session_prompts_enabled {
+        crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable)
+    } else {
+        durable.to_vec()
+    };
 
     // Guarded replacement, not check-then-act: a delete committing between a
     // separate existence probe and the write would be silently undone by the
@@ -10820,7 +10828,14 @@ mod tests {
         let backend = FailingReplaceBackend;
         let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
 
-        replace_rpc_chat_conversation_state(&backend, "sess-1", "rpc_sess-1", &durable, false);
+        replace_rpc_chat_conversation_state(
+            &backend,
+            "sess-1",
+            "rpc_sess-1",
+            &durable,
+            false,
+            false,
+        );
     }
 
     #[test]
@@ -10870,6 +10885,7 @@ mod tests {
             "sess-gone",
             "rpc_sess-gone",
             &durable,
+            false,
             false,
         );
 

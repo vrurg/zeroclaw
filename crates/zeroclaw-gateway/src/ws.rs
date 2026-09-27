@@ -707,11 +707,13 @@ async fn handle_socket(
     // Read the generation before seeding so a write landing in between shows
     // up as a changed generation on the next turn, which is the safe direction.
     let connect_generation = state.session_queue.transcript_generation(&session_key);
+    let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
     let restored = match restore_agent_history(
         state.session_backend.as_deref(),
         &mut agent,
         &session_key,
         &stored_messages,
+        session_prompts_enabled,
     ) {
         Ok(restored) => restored,
         Err(()) => {
@@ -1158,11 +1160,17 @@ fn replace_conversation_state_unless_deleted(
     session_key: &str,
     durable: &[zeroclaw_providers::ChatMessage],
     breadcrumb_present: bool,
+    session_prompts_enabled: bool,
 ) -> bool {
     // The canonical in-memory history remains provider-visible, but durable
-    // transcripts are an export boundary and must not retain attachment text.
-    let redacted =
-        zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable);
+    // transcripts are an export boundary and must not retain attachment text
+    // while the feature is enabled. With the feature disabled, preserve
+    // ordinary conversation content instead of applying its heuristic.
+    let redacted = if session_prompts_enabled {
+        zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable)
+    } else {
+        durable.to_vec()
+    };
     match backend.replace_conversation_state_if_exists(session_key, &redacted, breadcrumb_present) {
         Ok(_) => true,
         Err(e) => {
@@ -1191,6 +1199,7 @@ fn persist_agent_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
+    session_prompts_enabled: bool,
 ) -> bool {
     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
     replace_conversation_state_unless_deleted(
@@ -1198,6 +1207,7 @@ fn persist_agent_conversation_state(
         session_key,
         &durable,
         agent.history_has_trim_breadcrumb(),
+        session_prompts_enabled,
     )
 }
 
@@ -1238,6 +1248,7 @@ fn restore_agent_history(
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     messages: &[zeroclaw_providers::ChatMessage],
+    session_prompts_enabled: bool,
 ) -> Result<RestoredHistory, ()> {
     if messages.is_empty() {
         return Ok(RestoredHistory {
@@ -1289,7 +1300,7 @@ fn restore_agent_history(
         && let Some(backend) = backend
         && backend.session_exists(session_key)
     {
-        if !persist_agent_conversation_state(backend, session_key, agent) {
+        if !persist_agent_conversation_state(backend, session_key, agent, session_prompts_enabled) {
             return Err(());
         }
         persisted = true;
@@ -1313,6 +1324,7 @@ fn refresh_history_if_advanced(
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     persisted_watermark: &mut PersistedWatermark,
+    session_prompts_enabled: bool,
 ) -> Result<Option<zeroclaw_api::agent::TurnEvent>, ()> {
     let generation = queue.transcript_generation(session_key);
     let persisted = backend.load(session_key);
@@ -1337,7 +1349,13 @@ fn refresh_history_if_advanced(
         "session transcript moved since this connection synced; rebuilding execution history"
     );
     agent.clear_history();
-    let restored = restore_agent_history(Some(backend), agent, session_key, &persisted)?;
+    let restored = restore_agent_history(
+        Some(backend),
+        agent,
+        session_key,
+        &persisted,
+        session_prompts_enabled,
+    )?;
     *persisted_watermark = if restored.persisted {
         note_own_transcript_write(queue, session_key, agent)
     } else {
@@ -1810,12 +1828,14 @@ async fn process_chat_message(
     // history from a transcript that has since moved; rebuild from the
     // persisted transcript before running on the stale snapshot.
     if let Some(ref backend) = state.session_backend {
+        let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
         match refresh_history_if_advanced(
             backend.as_ref(),
             &state.session_queue,
             agent,
             session_key,
             persisted_watermark,
+            session_prompts_enabled,
         ) {
             Ok(trim_event) => {
                 if let Some(frame) = trim_event.and_then(history_trimmed_frame_for) {
@@ -2279,6 +2299,7 @@ async fn process_chat_message(
                 session_key,
                 &durable,
                 crumb,
+                session_prompts_enabled,
             );
             *persisted_watermark = PersistedWatermark {
                 generation: state.session_queue.advance_generation(session_key),
@@ -2333,7 +2354,12 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+                persist_agent_conversation_state(
+                    backend.as_ref(),
+                    session_key,
+                    agent,
+                    session_prompts_enabled,
+                );
                 *persisted_watermark =
                     note_own_transcript_write(&state.session_queue, session_key, agent);
             }
@@ -2508,7 +2534,12 @@ async fn process_chat_message(
         }
         Err(e) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+                persist_agent_conversation_state(
+                    backend.as_ref(),
+                    session_key,
+                    agent,
+                    session_prompts_enabled,
+                );
                 *persisted_watermark =
                     note_own_transcript_write(&state.session_queue, session_key, agent);
             }
@@ -5099,7 +5130,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         ];
 
-        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
+        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false, false);
 
         assert!(
             backend.rewrite_calls.lock().unwrap().is_empty(),
@@ -5154,7 +5185,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             zeroclaw_providers::ChatMessage::assistant("final reply"),
         ];
 
-        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
+        replace_conversation_state_unless_deleted(
+            &backend,
+            "gw_append_only",
+            &authoritative,
+            true,
+            false,
+        );
 
         let persisted = backend.messages.lock().unwrap().clone();
         assert_eq!(
@@ -5218,7 +5255,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
 
         assert!(
-            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
+            !replace_conversation_state_unless_deleted(
+                &backend,
+                "gw_failing",
+                &durable,
+                false,
+                false,
+            ),
             "a failed durable replacement must be reported to the caller, not swallowed"
         );
     }
@@ -5282,6 +5325,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "gw_prompt",
             &messages,
             false,
+            true,
         ));
 
         let appended = backend.appended.lock().unwrap();
@@ -5301,6 +5345,34 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .all(|message| !message.content.contains(marker)),
             "retained transcripts must not include opaque session-prompt bodies"
         );
+    }
+
+    #[test]
+    fn persist_conversation_state_preserves_session_prompt_like_content_when_disabled() {
+        use zeroclaw_providers::ChatMessage;
+
+        let marker = "session-prompt-disabled-marker";
+        let backend = RecordingSessionBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+        };
+        let messages = vec![ChatMessage::assistant(format!(
+            "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"
+        ))];
+
+        assert!(replace_conversation_state_unless_deleted(
+            &backend,
+            "gw_prompt_disabled",
+            &messages,
+            false,
+            false,
+        ));
+
+        let appended = backend.appended.lock().unwrap();
+        assert_eq!(appended.len(), messages.len());
+        for (actual, expected) in appended.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
