@@ -1566,38 +1566,78 @@ impl GoalExecutionEngine {
             if self.exact_running_task_or_fenced(scope).await?.is_none() {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
-            let parent = match lease
-                .run_parent_turn(
-                    &super::GoalOperationScope::new(scope.clone()),
-                    GoalParentTurn {
-                        kind: parent_turn_kind,
-                        objective: objective.to_owned(),
-                        working_history: working_history.clone(),
+            let (parent_result, pairing_result) = crate::child_fence::scope_goal_parent(
+                crate::tool_pairing::scope_goal_tool_pairing(
+                    Arc::clone(&self.registry),
+                    scope.clone(),
+                    async {
+                        let parent_result = lease
+                            .run_parent_turn(
+                                &super::GoalOperationScope::new(scope.clone()),
+                                GoalParentTurn {
+                                    kind: parent_turn_kind,
+                                    objective: objective.to_owned(),
+                                    working_history: working_history.clone(),
+                                },
+                            )
+                            .await;
+                        let pairing_result =
+                            crate::tool_pairing::finalize_goal_tool_pairing().await;
+                        (parent_result, pairing_result)
                     },
-                )
-                .await
-            {
-                Ok(parent) => {
-                    if parent.candidate.trim().is_empty() {
-                        self.fail(scope, "candidate_empty").await?;
-                        bail!("Goal parent returned an empty candidate");
+                ),
+            )
+            .await;
+            let parent = match (parent_result, pairing_result) {
+                (Ok(parent), Ok(())) => parent,
+                (Ok(_), Err(pairing_error)) => {
+                    if let Err(transition_error) =
+                        self.fail(scope, "goal_tool_pairing_incomplete").await
+                    {
+                        return Err(pairing_error).context(format!(
+                            "Goal tool pairing failed and terminal transition also failed: {transition_error:#}"
+                        ));
                     }
+                    return Err(pairing_error).context("Goal tool batch could not be paired");
+                }
+                (Err(parent_error), Ok(())) => {
+                    if let Err(transition_error) = self.fail(scope, "parent_operation_failed").await
+                    {
+                        return Err(parent_error).context(format!(
+                            "Goal parent operation failed and terminal transition also failed: {transition_error:#}"
+                        ));
+                    }
+                    return Err(parent_error).context("Goal parent operation failed");
+                }
+                (Err(parent_error), Err(pairing_error)) => {
+                    if let Err(transition_error) =
+                        self.fail(scope, "goal_tool_pairing_incomplete").await
+                    {
+                        return Err(parent_error).context(format!(
+                            "Goal parent operation failed; tool pairing also failed ({pairing_error:#}); terminal transition also failed ({transition_error:#})"
+                        ));
+                    }
+                    return Err(parent_error).context(format!(
+                        "Goal parent operation failed; tool pairing also failed ({pairing_error:#})"
+                    ));
+                }
+            };
+            let parent = {
+                if parent.candidate.trim().is_empty() {
+                    self.fail(scope, "candidate_empty").await?;
+                    bail!("Goal parent returned an empty candidate");
+                }
 
-                    // Parent output is ordinary agent output, not verifier
-                    // metadata. Persist and deliver it before any verifier
-                    // decision can pause or terminate this execution.
-                    lease
-                        .append_parent_candidate(parent.candidate.clone())
-                        .await
-                        .context("publish Goal parent candidate before verification")?;
-                    self.require_complete_accounting(scope, accountant.as_ref())
-                        .await?;
-                    parent
-                }
-                Err(error) => {
-                    self.fail(scope, "parent_operation_failed").await?;
-                    return Err(error).context("Goal parent operation failed");
-                }
+                // Parent output is ordinary agent output, not verifier
+                // metadata. Persist and deliver it before any verifier
+                // decision can pause or terminate this execution.
+                lease
+                    .append_parent_candidate(parent.candidate.clone())
+                    .await
+                    .context("publish Goal parent candidate before verification")?;
+                self.require_complete_accounting(scope, accountant.as_ref())
+                    .await?;
+                parent
             };
             let candidate = parent.candidate;
             working_history = parent.working_history;

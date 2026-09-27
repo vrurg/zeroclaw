@@ -87,6 +87,80 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
     }
 }
 
+struct UnpairedParentErrorExecutionDriver {
+    binding: GoalSessionBinding,
+}
+
+struct UnpairedParentErrorExecutionLease {
+    session_key: GoalSessionKey,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for UnpairedParentErrorExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _scope: &GoalOperationScope,
+        _turn: GoalParentTurn,
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        assert!(zeroclaw_goal::child_fence::is_goal_scoped());
+        let _child_guard = zeroclaw_goal::child_fence::admit_goal_child()
+            .await?
+            .expect("the shared Goal executor must admit a foreground child");
+        let _batch = zeroclaw_goal::tool_pairing::admit_goal_tool_batch(1)
+            .await?
+            .expect("the shared Goal executor must install a durable tool marker");
+        anyhow::bail!("synthetic provider failure: quota exhausted")
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _scope: &GoalOperationScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("verifier must not run after the parent error")
+    }
+
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GoalSessionDriver for UnpairedParentErrorExecutionDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(UnpairedParentErrorExecutionLease {
+            session_key: self.binding.session_key().clone(),
+        }))
+    }
+}
+
 struct ExecutionDriver {
     binding: GoalSessionBinding,
     execution_acquires: AtomicUsize,
@@ -2440,7 +2514,218 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
 }
 
 #[tokio::test]
+async fn parent_core_error_remains_visible_when_tool_pairing_also_fails() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let session_id = ingress.session_key().durable_id();
+    let driver = Arc::new(UnpairedParentErrorExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime.execution_engine(Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    ));
+
+    let error = engine
+        .run(
+            &settings,
+            request,
+            zeroclaw_goal::GoalParentTurnCheckpoint::new(),
+        )
+        .await
+        .expect_err("the failed parent/tool pairing must fail the Goal");
+    let details = format!("{error:#}");
+    assert!(
+        details.contains("synthetic provider failure: quota exhausted"),
+        "the original parent/core error must remain in the surfaced chain: {details}"
+    );
+    assert!(
+        details.contains("tool pairing"),
+        "the unsafe pairing failure must remain diagnosable: {details}"
+    );
+
+    let task = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(&task.id, &session_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("goal_tool_pairing_incomplete")
+    );
+}
+
+#[tokio::test]
 async fn supervisor_immediate_pause_acknowledges_before_draining_parent() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::default()));
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            pricer,
+        )
+        .unwrap(),
+    );
+    let engine = Arc::new(runtime.execution_engine(accounting_factory));
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(engine));
+
+    let mut started = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    assert!(
+        timeout(Duration::from_millis(20), parent_started.notified())
+            .await
+            .is_err(),
+        "the admitted worker must wait until its surface delivers the start acknowledgement"
+    );
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    parent_started.notified().await;
+
+    let mut pause = timeout(
+        Duration::from_millis(20),
+        supervisor.submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        ),
+    )
+    .await
+    .expect("immediate pause must return before the admitted parent settles")
+    .unwrap();
+    assert!(matches!(
+        pause.response(),
+        GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Pause)
+    ));
+
+    let drain_supervisor = Arc::clone(&supervisor);
+    let drain_settings = settings.clone();
+    let mut draining = zeroclaw_spawn::spawn!(async move {
+        drain_supervisor
+            .launch_after_response(drain_settings, &mut pause)
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(20), &mut draining)
+            .await
+            .is_err(),
+        "post-response drain must wait for the admitted parent operation"
+    );
+
+    let mut status = timeout(
+        Duration::from_millis(20),
+        supervisor.submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Status,
+        ),
+    )
+    .await
+    .expect("draining a fenced parent must not hold the Goal command lease")
+    .unwrap();
+    assert!(matches!(status.response(), GoalResponse::Status(_)));
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut status)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    release_parent.notify_one();
+    assert!(matches!(
+        draining.await.unwrap().unwrap(),
+        Some(GoalResponse::Paused(_))
+    ));
+    assert_eq!(
+        verifier_calls.load(Ordering::SeqCst),
+        0,
+        "a pause may drain an admitted parent operation but cannot admit a verifier"
+    );
+}
+
+#[tokio::test]
+async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
