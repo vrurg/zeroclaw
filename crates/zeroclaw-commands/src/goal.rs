@@ -33,12 +33,16 @@ pub enum GoalCommand {
     Status,
     Budget,
     SetBudget(GoalBudgetSelection),
-    Pause { immediate: bool },
+    Pause {
+        immediate: bool,
+    },
     /// An optional, verbatim response to a previous Goal-owned request.
     ///
     /// The parser deliberately preserves embedded newlines so transports can
     /// append the response to the same durable session before resuming work.
-    Resume { response: Option<String> },
+    Resume {
+        response: Option<String>,
+    },
     Cancel,
     Help,
 }
