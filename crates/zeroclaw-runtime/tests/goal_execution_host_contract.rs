@@ -1615,8 +1615,9 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
     async fn run_verifier(
         &mut self,
         _operation: &GoalOperationScope,
-        _turn: GoalVerifierTurn,
+        turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
+        assert_eq!(turn.objective, "finish the task");
         if self.continue_once {
             self.continue_once = false;
             Ok(GoalVerifierResult {
