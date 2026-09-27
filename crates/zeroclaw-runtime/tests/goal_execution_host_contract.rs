@@ -9,14 +9,14 @@ use zeroclaw_config::{
     goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig, GoalVerifierConfig},
     providers::ModelProviderRef,
 };
-use zeroclaw_runtime::control_plane::{
-    GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
-    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
-};
-use zeroclaw_runtime::goal_mode::{
+use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
     GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
     GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalVerifierTurn,
+};
+use zeroclaw_runtime::control_plane::{
+    GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
+    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 
 struct RecordingDriver {
@@ -160,8 +160,8 @@ impl GoalSessionDriver for RecordingDriver {
     async fn acquire_execution(
         &self,
         _ingress: &GoalIngressContext,
-        _scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
-    ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionExecutionLease>> {
+        _scope: &zeroclaw_goal::GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn zeroclaw_goal::GoalSessionExecutionLease>> {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("recording driver has no execution lease")
     }
@@ -250,8 +250,8 @@ impl GoalSessionDriver for LeaseDriver {
     async fn acquire_execution(
         &self,
         _ingress: &GoalIngressContext,
-        _scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
-    ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionExecutionLease>> {
+        _scope: &zeroclaw_goal::GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn zeroclaw_goal::GoalSessionExecutionLease>> {
         Ok(Box::new(self.acquire_reconnect_lease()?))
     }
 }
@@ -553,8 +553,8 @@ fn enabled_host_settings_reject_unproven_unlimited_defaults() {
 fn explicitly_unlimited_enabled_config_retains_its_declaration_provenance() {
     let config = GoalConfig {
         enabled: true,
-        default_token_limit: Some(0),
-        default_cost_limit_usd: Some(0.0),
+        default_token_limit: 0,
+        default_cost_limit_usd: 0.0,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
@@ -603,9 +603,7 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
-    let scope =
-        zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
-            .unwrap();
+    let scope = zeroclaw_goal::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1).unwrap();
     let settings = host_settings(true);
     let host = GoalExecutionHost::new();
     let submission = host
@@ -989,8 +987,8 @@ fn host_settings_rejects_a_blank_boot_id() {
 
     let config = GoalConfig {
         enabled: true,
-        default_token_limit: Some(0),
-        default_cost_limit_usd: Some(0.0),
+        default_token_limit: 0,
+        default_cost_limit_usd: 0.0,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
