@@ -16,12 +16,12 @@ use zeroclaw_config::{
     providers::ModelProviderRef,
 };
 use zeroclaw_goal::{
-    GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
-    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalParentTurn, GoalParentTurnCheckpoint, GoalParentTurnKind, GoalParentTurnResult,
-    GoalPauseReason, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalVerifierResult,
-    GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
+    GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnCheckpoint,
+    GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
@@ -57,10 +57,10 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         _scope: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
-        Ok(GoalParentTurnResult {
-            candidate: format!("parent:{}", turn.objective),
-            working_history: turn.working_history,
-        })
+        Ok(GoalParentTurnResult::from_continuation_prefix(
+            format!("parent:{}", turn.objective),
+            turn.working_history,
+        ))
     }
 
     async fn run_verifier(
@@ -113,7 +113,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
 
     async fn run_parent_turn(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         self.parent_histories
@@ -121,15 +121,17 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             .unwrap()
             .push(turn.working_history.clone());
         self.parent_turn_kinds.lock().unwrap().push(turn.kind);
-        Ok(GoalParentTurnResult {
-            candidate: format!("parent:{}", turn.objective),
-            working_history: turn.working_history,
-        })
+        let candidate = format!("parent:{}", turn.objective);
+        let mut completed_history = turn.working_history;
+        completed_history.push(zeroclaw_api::model_provider::ChatMessage::assistant(
+            candidate.clone(),
+        ));
+        GoalParentTurnResult::from_completed_agent_turn(candidate, completed_history)
     }
 
     async fn run_verifier(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
         if self.continue_once {
@@ -143,7 +145,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         }
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -207,20 +209,20 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
 
     async fn run_parent_turn(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         self.parent_started.notify_one();
         self.release_parent.notified().await;
-        Ok(GoalParentTurnResult {
-            candidate: "candidate that settled before pause".to_owned(),
-            working_history: Vec::new(),
-        })
+        Ok(GoalParentTurnResult::from_continuation_prefix(
+            "candidate that settled before pause".to_owned(),
+            Vec::new(),
+        ))
     }
 
     async fn run_verifier(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
         self.verifier_calls.fetch_add(1, Ordering::SeqCst);
@@ -298,19 +300,19 @@ impl GoalSessionExecutionLease for UserInputExecutionLease {
 
     async fn run_parent_turn(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         self.events.lock().unwrap().push("parent");
-        Ok(GoalParentTurnResult {
-            candidate: "Which option should I use?".to_owned(),
-            working_history: Vec::new(),
-        })
+        Ok(GoalParentTurnResult::from_continuation_prefix(
+            "Which option should I use?".to_owned(),
+            Vec::new(),
+        ))
     }
 
     async fn run_verifier(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
         self.events.lock().unwrap().push("verifier");
@@ -512,7 +514,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_parent_turn(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
         anyhow::bail!("lease execution test does not run parent turns")
@@ -520,7 +522,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn run_verifier(
         &mut self,
-        _operation: &GoalExecutionScope,
+        _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
         anyhow::bail!("lease execution test does not run verifier turns")
@@ -1037,7 +1039,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
             )
             .await
             .unwrap()
-            .candidate,
+            .candidate(),
         "parent:finish the task"
     );
     assert_eq!(
@@ -2374,25 +2376,44 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         )
         .unwrap(),
     );
-    let engine = runtime
-        .execution_engine(tracker, "main", Arc::default())
-        .unwrap();
+    let engine = runtime.execution_engine(Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    ));
 
     assert_eq!(
         engine.run(&settings, request).await.unwrap(),
-        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+        GoalExecutionOutcome::Completed
     );
-    assert_eq!(delivered.load(Ordering::SeqCst), 1);
-    let histories = parent_histories.lock().unwrap();
-    assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
-    assert!(histories[1].iter().any(|message| {
-        message.role == "assistant" && message.content == "parent:finish the task"
-    }));
-    assert!(
-        histories[1]
-            .iter()
-            .any(|message| message.content.contains("add the missing detail"))
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        2,
+        "each parent candidate is delivered before its verifier decision"
     );
+    {
+        let histories = parent_histories.lock().unwrap();
+        assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
+        assert_eq!(
+            histories[1]
+                .iter()
+                .filter(|message| {
+                    message.role == "assistant" && message.content == "parent:finish the task"
+                })
+                .count(),
+            1,
+            "the prior candidate must occur once despite the Agent transcript containing its final reply"
+        );
+        assert!(
+            histories[1]
+                .iter()
+                .any(|message| message.content.contains("add the missing detail"))
+        );
+    }
     assert_eq!(
         parent_turn_kinds.lock().unwrap().as_slice(),
         &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue]

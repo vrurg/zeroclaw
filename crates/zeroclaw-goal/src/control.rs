@@ -415,13 +415,69 @@ pub enum GoalParentTurnKind {
 
 /// Process-local result of one Goal parent turn.
 ///
-/// The transcript is returned to the controller rather than persisted in
-/// canonical session history. It survives verifier `Continue` within this
-/// process only; pause and restart deliberately discard it.
+/// `working_history` is the completed transcript prefix before this turn's
+/// final assistant response. The response is carried separately as
+/// `candidate`, so adapters must remove exactly that terminal assistant
+/// message before returning the result. This prevents a verifier `Continue`
+/// from adding the candidate twice to the next parent turn. The transcript is
+/// not persisted in canonical session history; pause and restart deliberately
+/// discard it.
 #[derive(Clone)]
 pub struct GoalParentTurnResult {
-    pub candidate: String,
-    pub working_history: Vec<ChatMessage>,
+    candidate: String,
+    working_history: Vec<ChatMessage>,
+}
+
+impl GoalParentTurnResult {
+    /// Build a result from a complete ordinary Agent transcript.
+    ///
+    /// Ordinary isolated Agent turns return a history containing their final
+    /// assistant response. The Goal controller carries that response
+    /// separately as the candidate and appends it itself only after a valid
+    /// verifier `Continue`, so this constructor removes the terminal assistant
+    /// entry while retaining all preceding assistant tool calls and tool
+    /// results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the completed transcript ends in an assistant
+    /// message, as required for a successful isolated Agent turn.
+    pub fn from_completed_agent_turn(
+        candidate: String,
+        mut completed_history: Vec<ChatMessage>,
+    ) -> Result<Self> {
+        if !completed_history
+            .last()
+            .is_some_and(|message| message.role == "assistant")
+        {
+            bail!("completed Goal parent transcript has no final assistant response");
+        }
+        completed_history.pop();
+        Ok(Self {
+            candidate,
+            working_history: completed_history,
+        })
+    }
+
+    /// Build a result when the caller already has the transcript prefix with
+    /// this turn's candidate omitted.
+    ///
+    /// Agent adapters should prefer [`Self::from_completed_agent_turn`] when
+    /// they receive the ordinary Agent's complete transcript.
+    pub fn from_continuation_prefix(candidate: String, working_history: Vec<ChatMessage>) -> Self {
+        Self {
+            candidate,
+            working_history,
+        }
+    }
+
+    pub fn candidate(&self) -> &str {
+        &self.candidate
+    }
+
+    pub fn working_history(&self) -> &[ChatMessage] {
+        &self.working_history
+    }
 }
 
 impl fmt::Debug for GoalParentTurnResult {
@@ -1685,6 +1741,45 @@ mod tests {
             "revalidation must retain the original request"
         );
         drop(rebound);
+    }
+
+    #[test]
+    fn completed_parent_turn_result_removes_only_the_final_assistant_reply() {
+        let completed_history = vec![
+            ChatMessage::assistant("tool call request"),
+            ChatMessage::tool("found evidence"),
+            ChatMessage::assistant("final answer"),
+        ];
+
+        let result = GoalParentTurnResult::from_completed_agent_turn(
+            "candidate".to_owned(),
+            completed_history,
+        )
+        .expect("successful Agent transcript has a final assistant response");
+
+        assert_eq!(result.candidate(), "candidate");
+        assert_eq!(result.working_history().len(), 2);
+        assert_eq!(result.working_history()[0].role, "assistant");
+        assert_eq!(result.working_history()[0].content, "tool call request");
+        assert_eq!(result.working_history()[1].role, "tool");
+        assert_eq!(result.working_history()[1].content, "found evidence");
+        assert!(
+            result
+                .working_history()
+                .iter()
+                .all(|message| message.content != "final answer")
+        );
+    }
+
+    #[test]
+    fn completed_parent_turn_result_rejects_a_transcript_without_final_assistant() {
+        assert!(
+            GoalParentTurnResult::from_completed_agent_turn(
+                "candidate".to_owned(),
+                vec![ChatMessage::user("not a completed Agent reply")],
+            )
+            .is_err()
+        );
     }
 
     #[test]
