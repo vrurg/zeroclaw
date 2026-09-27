@@ -7,7 +7,6 @@ pub mod cost;
 pub mod dispatcher;
 pub mod eval;
 pub mod execution_tree_budget;
-pub(crate) mod goal_child_fence;
 pub mod history;
 pub mod history_pruner;
 pub mod history_trim;
