@@ -14953,6 +14953,12 @@ mod tests {
 
     async fn environment_principal_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
         let mut config = principal_test_config(tmp, &["*"], &["*"]);
+        // `master` binds existing RPC session workspaces to their canonical
+        // path. Create the configured workspace before the admin session is
+        // built so this fixture reaches the environment-demotion assertion
+        // instead of failing on a platform-specific `/var` alias.
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent"))
+            .expect("the test agent workspace is creatable");
         config
             .permission_profiles
             .get_mut("principal-test")
