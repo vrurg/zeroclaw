@@ -4,14 +4,17 @@
 //! provider routing, agent execution, and transport presentation remain with
 //! their existing owners.
 
+pub mod accounting;
 pub mod control;
 pub mod task;
 
 pub use control::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
-    GoalSubmission, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionOutcome,
+    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalRuntime, GoalRuntimeSubmission,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSurface,
+    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,

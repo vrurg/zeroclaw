@@ -8,7 +8,7 @@ use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
-use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
+use crate::agent::cost::admit_goal_operation_if_scoped;
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
