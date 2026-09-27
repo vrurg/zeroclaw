@@ -1194,7 +1194,7 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared after fenced-tool classification")?;
-        let projection = super::GoalStatusProjection::from_parts(&current, &goal);
+        let projection = super::GoalStatusProjection::from_parts(&current, goal);
         Ok(Some(match current.status {
             TaskStatus::Paused => GoalResponse::Paused(projection),
             TaskStatus::Cancelled => GoalResponse::Cancelled(projection),

@@ -1224,7 +1224,7 @@ pub enum GoalPendingAction {
     Cancel,
 }
 
-/// Durable state visible to the future Matrix and ZeroCode renderers.
+/// Controller-derived status visible to Matrix and ZeroCode renderers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GoalStatusProjection {
@@ -1235,17 +1235,12 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
-    /// Controller-authored explanation for a paused Goal. This is display data
-    /// derived from the canonical Goal extension, not a second lifecycle fact.
-    pub pause_description: Option<String>,
-    /// Human-readable blocker summaries. Durable blocker kind and payload stay
-    /// in the control plane; transport renderers receive only this projection.
-    pub blocker_messages: Vec<String>,
     pub resumable: bool,
 }
 
 impl GoalStatusProjection {
-    fn from_parts(task: &TaskRecord, goal: &GoalTaskRecord) -> Self {
+    fn from_parts(task: &TaskRecord, goal: GoalTaskRecord) -> Self {
+        let resumable = goal_is_resumable(task, &goal);
         Self {
             task_id: task.id.clone(),
             status: task.status,
@@ -1254,13 +1249,7 @@ impl GoalStatusProjection {
             cost_limit_usd: goal.effective_cost_limit_usd,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
-            pause_description: goal.pause_description.clone(),
-            blocker_messages: goal
-                .blockers
-                .iter()
-                .map(|blocker| blocker.message.clone())
-                .collect(),
-            resumable: goal_is_resumable(task, goal),
+            resumable,
         }
     }
 }
@@ -1669,7 +1658,7 @@ impl GoalController {
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, &goal))),
+            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, goal))),
             None => {
                 // A terminal predecessor can be atomically replaced between
                 // the current-task read and extension read. Recheck only on
@@ -1881,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_status_projection_keeps_actionable_pause_details() {
+    fn goal_status_projection_keeps_only_typed_pause_authority() {
         let task = TaskRecord {
             id: "goal-status".to_owned(),
             kind: TaskKind::Goal,
@@ -1913,16 +1902,56 @@ mod tests {
             ..GoalTaskRecord::default()
         };
 
-        let projection = GoalStatusProjection::from_parts(&task, &goal);
+        let projection = GoalStatusProjection::from_parts(&task, goal);
 
         assert_eq!(
-            projection.pause_description.as_deref(),
-            Some("Choose the target environment.")
+            projection.pause_reason,
+            Some(GoalPauseReason::NeedsUserInput)
         );
-        assert_eq!(
-            projection.blocker_messages,
-            vec!["Which environment should receive the change?".to_owned()]
+    }
+
+    #[test]
+    fn goal_status_projection_never_serializes_raw_pause_text() {
+        let task = TaskRecord {
+            id: "goal-status".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let projection = GoalStatusProjection::from_parts(
+            &task,
+            GoalTaskRecord {
+                task_id: task.id.clone(),
+                pause_description: Some("private pause detail".to_owned()),
+                blockers: vec![crate::task::GoalBlocker {
+                    kind: crate::task::GoalBlockerKind::NeedsUserInput,
+                    message: "private blocker request".to_owned(),
+                    payload: None,
+                }],
+                ..GoalTaskRecord::default()
+            },
         );
+
+        let raw = serde_json::to_value(projection).expect("serialize Goal status projection");
+
+        assert!(raw.get("pause_description").is_none());
+        assert!(raw.get("blocker_messages").is_none());
+        let serialized = raw.to_string();
+        assert!(!serialized.contains("private pause detail"));
+        assert!(!serialized.contains("private blocker request"));
     }
 
     #[test]
