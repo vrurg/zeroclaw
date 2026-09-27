@@ -2638,9 +2638,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // A Goal operation settles the complete immutable report before
-        // response handling. Ordinary sessions retain their established split
-        // path, where the accepted leaf updates context-window telemetry.
+        // Both paths settle before response handling. A Goal operation gives
+        // the complete immutable report to its accounting owner; ordinary
+        // sessions retain the split settlement writer. Their non-ledger usage
+        // projections stay identical.
         if crate::agent::cost::goal_operation_accounting_is_scoped() {
             crate::agent::cost::settle_provider_attempts(
                 &attempts,
@@ -2653,15 +2654,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 None,
             )
             .await?;
-            // Earlier physical leaves are rejected routing/retry work. The final
-            // accepted response remains settled by `record_accepted_chat_response`
-            // so only it updates context-window telemetry.
-            emit_rejected_attempt_usage(
-                ctx.event_tx,
-                &attempts[..attempts.len().saturating_sub(1)],
-            )
-            .await;
         }
+        // Earlier physical leaves are rejected routing/retry work. The final
+        // accepted response is projected by `record_accepted_chat_response`,
+        // so only it carries accepted context-window fields.
+        emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
+            .await;
         record_accepted_chat_response(
             &ctx,
             &served_provider,
