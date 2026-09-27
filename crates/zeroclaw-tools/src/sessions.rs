@@ -1551,10 +1551,7 @@ mod tests {
     async fn list_empty_sessions() {
         let (_tmp, backend) = test_backend();
         let tool = SessionsListTool::new(backend);
-        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-            .scope(Some("acp-session".to_string()), tool.execute(json!({})))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No active sessions"));
     }
