@@ -1681,6 +1681,28 @@ impl Agent {
         source: IsolatedTranscriptSource,
         directive: ChatMessage,
     ) -> Result<IsolatedTurnOutcome> {
+        self.run_isolated_turn_inner(source, directive, None).await
+    }
+
+    /// Runs one isolated Goal turn while forwarding ordinary turn events to
+    /// its host. The host owns delivery and must drain the bounded channel
+    /// concurrently with this future, just like an ordinary RPC turn.
+    pub(crate) async fn run_isolated_turn_with_events(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        directive: ChatMessage,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<IsolatedTurnOutcome> {
+        self.run_isolated_turn_inner(source, directive, Some(event_tx))
+            .await
+    }
+
+    async fn run_isolated_turn_inner(
+        &mut self,
+        source: IsolatedTranscriptSource,
+        directive: ChatMessage,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    ) -> Result<IsolatedTurnOutcome> {
         ensure!(
             directive.role == "system",
             "isolated Goal directive must be a system message"
@@ -1837,7 +1859,7 @@ impl Agent {
                 shared_budget: None,
                 channel: approval_bridge.as_deref(),
                 collected_receipts: None,
-                event_tx: None,
+                event_tx,
                 steering: None,
                 new_messages_out: None,
                 image_cache: Some(&mut self.image_cache),
@@ -10137,6 +10159,52 @@ mod tests {
                 .any(|message| message.role == "assistant" && message.content == "done")
         );
         assert_eq!(format!("{:?}", agent.history()), canonical_before);
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_can_forward_ordinary_turn_events() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical {
+                    prefix: vec![ChatMessage::user("user request")],
+                },
+                ChatMessage::system("Goal success criterion (trusted runtime directive): finish"),
+                event_tx,
+            )
+            .await
+            .expect("isolated Goal turn should succeed");
+
+        assert_eq!(outcome.response, "done");
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, TurnEvent::Chunk { delta } if delta == "done")),
+            "the isolated Goal turn must expose the normal response chunk"
+        );
     }
 
     #[test]
