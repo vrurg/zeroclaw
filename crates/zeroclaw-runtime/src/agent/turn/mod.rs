@@ -2413,7 +2413,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // external effect. Ordinary tool batches receive `None` and retain
         // their current parallel execution behavior.
         let pending_goal_tool_batch =
-            crate::agent::goal_tool_pairing::admit_goal_tool_batch(executable_calls.len()).await?;
+            zeroclaw_goal::tool_pairing::admit_goal_tool_batch(executable_calls.len()).await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
