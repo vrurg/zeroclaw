@@ -1174,7 +1174,7 @@ impl GoalExecutionEngine {
             }
             let parent = match lease
                 .run_parent_turn(
-                    scope,
+                    &super::GoalOperationScope::new(scope.clone()),
                     GoalParentTurn {
                         kind: parent_turn_kind,
                         objective: objective.to_owned(),
@@ -1226,7 +1226,7 @@ impl GoalExecutionEngine {
             let candidate_fingerprint = verifier_candidate_fingerprint(&candidate);
             let verifier = match lease
                 .run_verifier(
-                    scope,
+                    &super::GoalOperationScope::new(scope.clone()),
                     GoalVerifierTurn {
                         objective: objective.to_owned(),
                         candidate: candidate.clone(),
