@@ -744,6 +744,12 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<RpcGoalCommandSubmission> {
+        if matches!(command, GoalCommand::Help) {
+            return Ok(RpcGoalCommandSubmission {
+                response: GoalResponse::Help,
+                post_response: None,
+            });
+        }
         let config = context.config.read().clone();
         if !config.goal.enabled {
             return Ok(RpcGoalCommandSubmission {
@@ -857,5 +863,57 @@ impl RpcGoalRuntime {
         {
             supervisors.remove(session_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_config::schema::Config;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    use super::*;
+    use crate::rpc::session::SessionStore;
+
+    #[tokio::test]
+    async fn help_is_available_while_goal_mode_is_disabled() {
+        let config = Config::default();
+        assert!(
+            !config.goal.enabled,
+            "test requires Goal Mode to be disabled"
+        );
+        let sessions = Arc::new(SessionStore::new(
+            1,
+            Arc::new(SessionActorQueue::new(1, 1, 1)),
+        ));
+        let context = RpcContext::minimal(config, sessions);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let driver = Arc::new(ZeroCodeGoalSessionDriver {
+            context: Arc::clone(&context),
+            authorization: super::super::dispatch::GoalSessionAuthorization::new(
+                Arc::clone(&context),
+                None,
+                "disabled-goal-help".to_owned(),
+                None,
+            ),
+            outbound: Arc::new(RpcOutbound::new(outbound_tx)),
+            connection_activity: None,
+            session_key: GoalSessionKey::zero_code("disabled-goal-help").unwrap(),
+            agent_alias: "test-agent".to_owned(),
+            session_generation: 0,
+            tui_id: "test-tui".to_owned(),
+            command_lock: Arc::new(Mutex::new(())),
+        });
+
+        let response = Arc::new(RpcGoalRuntime::default())
+            .submit(context, driver, GoalCommand::Help)
+            .await
+            .unwrap();
+
+        assert!(matches!(response.response(), GoalResponse::Help));
+        assert!(response.post_response.is_none());
     }
 }
