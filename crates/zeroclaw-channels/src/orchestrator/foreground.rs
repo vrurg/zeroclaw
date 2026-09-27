@@ -10,7 +10,7 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
-use zeroclaw_runtime::goal_mode::GoalExecutionSupervisor;
+use zeroclaw_goal::GoalExecutionSupervisor;
 
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
