@@ -4052,13 +4052,19 @@ impl RpcDispatcher {
                                         let durable = zeroclaw_providers::durable_chat_messages(
                                             agent.history(),
                                         );
+                                        let session_prompts_enabled = self
+                                            .ctx
+                                            .config
+                                            .read()
+                                            .channels
+                                            .session_prompts_enabled;
                                         if !replace_rpc_chat_conversation_state(
                                             backend.as_ref(),
                                             &session_id,
                                             &session_key,
                                             &durable,
                                             agent.history_has_trim_breadcrumb(),
-                                            self.ctx.config.read().channels.session_prompts_enabled,
+                                            session_prompts_enabled,
                                         ) {
                                             return Err(rpc_err(
                                                 INTERNAL_ERROR,
@@ -5743,7 +5749,7 @@ impl RpcDispatcher {
                         &key,
                         &durable,
                         agent.history_has_trim_breadcrumb(),
-                        self.ctx.config.read().channels.session_prompts_enabled,
+                        session_prompts_enabled,
                     );
                 }
             }
@@ -10836,6 +10842,67 @@ mod tests {
             false,
             false,
         );
+    }
+
+    struct RecordingReplaceBackend {
+        rewritten: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for RecordingReplaceBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            *self.rewritten.lock().unwrap() = messages.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn replace_rpc_chat_conversation_state_preserves_prompt_like_content_when_disabled() {
+        use zeroclaw_providers::ChatMessage;
+
+        let marker = "rpc-session-prompt-disabled-marker";
+        let backend = RecordingReplaceBackend {
+            rewritten: std::sync::Mutex::new(Vec::new()),
+        };
+        let durable = vec![ChatMessage::assistant(format!(
+            "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"
+        ))];
+
+        assert!(replace_rpc_chat_conversation_state(
+            &backend,
+            "sess-disabled",
+            "rpc_sess-disabled",
+            &durable,
+            false,
+            false,
+        ));
+
+        let rewritten = backend.rewritten.lock().unwrap();
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].role, durable[0].role);
+        assert_eq!(rewritten[0].content, durable[0].content);
     }
 
     #[test]
