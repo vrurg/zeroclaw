@@ -5121,21 +5121,25 @@ impl RpcDispatcher {
             ));
         }
 
-        // The queue wait was unbounded: the incarnation authorized before it
-        // may have been replaced under the same id. Bind this prompt to the
-        // exact record present now, under the permit, or refuse it.
-        self.revalidate_admitted_session(sid, authorized.as_ref())
-            .await?;
-
         // Registration is the first operation after admission and the RAII
-        // handle removes this exact generation on every exit path. Removal
-        // handlers signal before waiting on the same queue, so they cannot
-        // lose cancellation while setup awaits attachments or persistence.
+        // handle removes this exact generation on every exit path. Establish
+        // the marker before the final revalidation: lifecycle handlers signal
+        // before waiting on this same queue, so they must not lose
+        // cancellation while this validation awaits the live session state.
         let pre_registration_admission = self
             .ctx
             .sessions
             .begin_pre_registration_admission(sid, expected_session_generation);
         self.ctx.sessions.wait_test_prompt_pre_marker_pause().await;
+
+        // The queue wait was unbounded: the incarnation authorized before it
+        // may have been replaced under the same id. Bind this prompt to the
+        // exact record present now, under the permit, or refuse it. The
+        // pre-registration marker above covers this await for lifecycle
+        // cancellation, and its RAII drop clears the marker on failure.
+        self.revalidate_admitted_session(sid, authorized.as_ref())
+            .await?;
+
         let session_generation = self
             .ctx
             .sessions
@@ -30681,7 +30685,7 @@ mod tests {
             .expect("prompt must publish admission before its final generation validation");
             assert!(
                 !sessions.has_inflight_turn(&sid),
-                "the test must hold the exact pre-registration cancellation window"
+                "the test must hold the exact pre-registration cancellation window, including final validation"
             );
 
             let removal_handle = dispatcher.spawn_handle();
