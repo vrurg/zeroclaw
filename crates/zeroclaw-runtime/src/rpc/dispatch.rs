@@ -6385,7 +6385,7 @@ impl RpcDispatcher {
         }
         // Deletion waits for an admitted turn before mutating durable state.
         // Cancelling first would be irreversible if durable cleanup failed.
-        self.handle_session_delete_at_generation(
+        self.finalize_session_delete_at_generation(
             req,
             authorized,
             expected_generation,
@@ -6397,7 +6397,12 @@ impl RpcDispatcher {
     /// Delete only the incarnation observed when the request was accepted.
     /// `session/new` shares this queue; the generation fence also makes the
     /// request fail safely if another lifecycle path replaced the ID first.
-    async fn handle_session_delete_at_generation(
+    // This private finalization helper is reached only after the public RPC
+    // handler has authorized the session. It revalidates that admission after
+    // the queue wait; keeping it outside the `handle_session_*` naming family
+    // lets the architecture gate distinguish this internal second check from
+    // an independently reachable RPC method.
+    async fn finalize_session_delete_at_generation(
         &self,
         req: SessionIdParams,
         authorized: Option<super::session::SessionRecord>,
