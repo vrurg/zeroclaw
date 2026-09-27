@@ -2688,10 +2688,9 @@ impl Chat {
                     };
                     match update {
                         GoalUpdate::VerifiedCandidate { candidate, .. } => {
-                            state
-                                .entries
-                                .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
-                            state.mark_dirty_append();
+                            // Ordinary session/update chunks are authoritative when present;
+                            // the full candidate is a fallback for clients that missed them.
+                            state.commit_turn(candidate.to_owned(), true);
                         }
                         GoalUpdate::Completed { .. } => {
                             state
@@ -11577,10 +11576,12 @@ impl ChatState {
                         if outcome == TurnEndOutcome::Failed {
                             self.last_error = Some(classify_turn_failure(&content));
                         }
+                        // Settle streamed text/thinking before displaying the terminal error.
+                        // Otherwise commit_turn flushes the partial response after its error row.
+                        self.commit_turn(String::new(), false);
                         self.entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
                         self.mark_dirty_append();
-                        self.commit_turn(String::new(), false);
                     }
                 }
             }
@@ -26547,6 +26548,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_turn_displays_streamed_response_before_error() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "partial agent response".to_string(),
+        });
+
+        s.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            client_turn_generation: None,
+            message_count: None,
+            outcome: TurnEndOutcome::Failed,
+            content: "turn failed: provider returned 429".to_string(),
+        });
+
+        assert_eq!(s.entries().len(), 2);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::AgentMessage(text) if text.as_ref() == "partial agent response")
+        );
+        assert!(
+            matches!(&s.entries()[1], ChatEntry::SystemMessage(text) if text.as_ref() == "turn failed: provider returned 429")
+        );
+    }
+
     /// When tool calls were made during a turn but no text was streamed and
     /// final text is empty, commit_turn must NOT add a diagnostic — the tool
     /// entries are the visible record of work.
@@ -29127,12 +29153,18 @@ mod tests {
                 .unwrap();
         }
 
+        active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "accepted result".to_string(),
+        });
+
         chat.drain_notifications();
 
         let entries = active_state(&mut chat).entries();
         assert_eq!(entries.len(), 2);
         assert!(
-            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result"),
+            "the candidate must settle streamed output without duplicating it"
         );
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
