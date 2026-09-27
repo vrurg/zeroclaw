@@ -112,13 +112,13 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     let pause_reason = projection
         .pause_reason
         .clone()
-        .unwrap_or_else(|| crate::i18n::t("zc-goal-none"));
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-value-none"));
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
     } else {
         "zc-goal-no"
     });
-    let mut message = crate::i18n::t_args(
+    let message = crate::i18n::t_args(
         "zc-goal-details",
         &[
             ("status", &projection.status),
@@ -130,20 +130,6 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             ("pause_reason", &pause_reason),
         ],
     );
-    if let Some(description) = projection.pause_description.as_deref() {
-        message.push('\n');
-        message.push_str(&crate::i18n::t_args(
-            "zc-goal-pause-description",
-            &[("description", description)],
-        ));
-    }
-    for blocker in &projection.blocker_messages {
-        message.push('\n');
-        message.push_str(&crate::i18n::t_args(
-            "zc-goal-blocker",
-            &[("blocker", blocker)],
-        ));
-    }
     message
 }
 
@@ -13593,8 +13579,6 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: Some("needs_user_input".to_owned()),
-            pause_description: Some("Select a target.".to_owned()),
-            blocker_messages: vec!["Which target should receive the change?".to_owned()],
             resumable: true,
         });
 
@@ -13605,8 +13589,7 @@ mod tests {
         assert!(rendered.contains("token limit: 12000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
         assert!(rendered.contains("pause reason: needs_user_input"));
-        assert!(rendered.contains("Details: Select a target."));
-        assert!(rendered.contains("Blocker: Which target should receive the change?"));
+        assert!(!rendered.contains("Which target should receive the change?"));
     }
 
     #[test]
@@ -13619,8 +13602,6 @@ mod tests {
             cost_limit_usd: None,
             accounting_state: "complete".to_owned(),
             pause_reason: None,
-            pause_description: None,
-            blocker_messages: Vec::new(),
             resumable: true,
         });
 
