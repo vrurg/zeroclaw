@@ -3000,10 +3000,17 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
         )
         .unwrap(),
     );
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
     let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
-        runtime
-            .execution_engine(tracker, "main", Arc::default())
-            .unwrap(),
+        runtime.execution_engine(accounting_factory),
     )));
     supervisor
         .submit(
