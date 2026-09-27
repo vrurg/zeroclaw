@@ -14313,6 +14313,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-goal"
+version = "0.8.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+ "zeroclaw-api",
+ "zeroclaw-commands",
+ "zeroclaw-config",
+]
+
+[[package]]
 name = "zeroclaw-hardware"
 version = "0.8.5"
 dependencies = [
@@ -14609,6 +14624,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-goal",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
