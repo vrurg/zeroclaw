@@ -306,7 +306,7 @@ rpc_type! {
 rpc_type! {
     /// Typed Goal lifecycle result for both local IPC and WSS clients.
     pub struct SessionGoalResult {
-        pub response: crate::goal_mode::GoalResponse,
+        pub response: zeroclaw_goal::control::GoalResponse,
     }
 }
 
