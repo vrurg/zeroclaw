@@ -179,6 +179,8 @@ impl TaskGoal {
 /// Typed policy input for why a goal is paused.
 /// A pause reason is goal-specific explanation layered on top of
 /// [`TaskStatus::Paused`]. It must not be used as a second lifecycle enum.
+/// Values remain deserializable as durable Goal audit data even where the V1
+/// controller no longer creates that particular pause path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPauseReason {
@@ -519,26 +521,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_restart_pause_reason_uses_rfc_name_with_legacy_alias() {
-        // Restart recovery is an RFC-visible persisted reason; old local rows
-        // that used the draft spelling must continue to deserialize.
-        let serialized = serde_json::to_string(&GoalPauseReason::DaemonRestart).unwrap();
-        assert_eq!(serialized, "\"daemon_restarted\"");
-
+    fn daemon_restart_pause_reason_accepts_legacy_alias() {
+        // Restart recovery's current spelling is covered with every other
+        // pause reason below. Old local rows used this draft spelling.
         let legacy: GoalPauseReason = serde_json::from_str("\"daemon_restart\"").unwrap();
         assert_eq!(legacy, GoalPauseReason::DaemonRestart);
     }
 
     #[test]
-    fn operator_pause_reason_roundtrips_with_control_plane_name() {
-        // `/goal pause` is a controller request, not a human escalation. Its
-        // persisted reason must stay distinguishable for status and resume
-        // policy.
-        let serialized = serde_json::to_string(&GoalPauseReason::OperatorPaused).unwrap();
-        assert_eq!(serialized, "\"operator_paused\"");
-
-        let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed, GoalPauseReason::OperatorPaused);
+    fn every_goal_pause_reason_remains_readable_from_persisted_control_state() {
+        let reasons = [
+            GoalPauseReason::OperatorPaused,
+            GoalPauseReason::NeedsUserInput,
+            GoalPauseReason::HumanEscalation,
+            GoalPauseReason::ExternalDependency,
+            GoalPauseReason::ProviderUnavailable,
+            GoalPauseReason::VerifierBlocked,
+            GoalPauseReason::BudgetExhausted,
+            GoalPauseReason::BudgetUnavailable,
+            GoalPauseReason::DaemonRestart,
+        ];
+        for reason in reasons {
+            let wire_name = match reason {
+                GoalPauseReason::OperatorPaused => "operator_paused",
+                GoalPauseReason::NeedsUserInput => "needs_user_input",
+                GoalPauseReason::HumanEscalation => "human_escalation",
+                GoalPauseReason::ExternalDependency => "external_dependency",
+                GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+                GoalPauseReason::VerifierBlocked => "verifier_blocked",
+                GoalPauseReason::BudgetExhausted => "budget_exhausted",
+                GoalPauseReason::BudgetUnavailable => "budget_unavailable",
+                GoalPauseReason::DaemonRestart => "daemon_restarted",
+            };
+            let serialized = serde_json::to_string(&reason).unwrap();
+            assert_eq!(serialized, format!("\"{wire_name}\""));
+            let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed, reason);
+        }
     }
 
     #[test]
