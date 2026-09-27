@@ -84,7 +84,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
@@ -782,9 +782,10 @@ pub struct AppState {
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
     /// Per-session cancellation registry for in-flight agent responses.
     ///
-    /// A DELETE may arrive in the short interval after queue admission but
-    /// before a WebSocket turn has registered its token. The registry latches
-    /// that generation-bound request so registration consumes it atomically.
+    /// DELETE requests may arrive in the short interval after queue admission
+    /// but before WebSocket turns have registered their tokens. The registry
+    /// retains each generation-bound latch so an out-of-order stale request
+    /// cannot overwrite a successor's cancellation boundary.
     pub cancel_tokens: Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
@@ -807,7 +808,7 @@ pub struct AppState {
 #[derive(Default)]
 pub struct GatewayCancellationRegistry {
     tokens: HashMap<String, (u64, Arc<tokio_util::sync::CancellationToken>)>,
-    pub(crate) pending_deletions: HashMap<String, u64>,
+    pub(crate) pending_deletions: HashMap<String, HashSet<u64>>,
 }
 
 impl Deref for GatewayCancellationRegistry {
@@ -3676,7 +3677,7 @@ pub(crate) fn register_cancel_token(
         let pending_delete = registry
             .pending_deletions
             .get(session_key)
-            .is_some_and(|generation| *generation == session_generation);
+            .is_some_and(|generations| generations.contains(&session_generation));
         let previous = registry.insert(
             cancel_key.to_owned(),
             (session_generation, Arc::clone(&cancel_token)),
