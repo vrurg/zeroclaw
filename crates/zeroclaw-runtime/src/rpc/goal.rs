@@ -30,7 +30,7 @@ use zeroclaw_goal::control::{
     GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierTurn, dispose_unowned_session_goal,
+    GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_turn_input,
 };
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
@@ -226,6 +226,21 @@ impl ZeroCodeGoalExecutionLease {
             GoalSessionKey::Matrix { .. } => bail!("ZeroCode Goal lease has a Matrix session key"),
         }
     }
+
+    async fn publish_parent_turn_failure(&self, error: String) {
+        let Ok(session_id) = self.raw_session_id() else {
+            return;
+        };
+        super::dispatch::forward_turn_completion(
+            &self.outbound,
+            session_id,
+            crate::rpc::types::TurnCompletionOutcome::Failed,
+            format!("turn failed: Agent turn failed: {error}"),
+            None,
+            None,
+        )
+        .await;
+    }
 }
 
 #[async_trait]
@@ -267,7 +282,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
-        let directive = goal_parent_directive(&turn);
+        let input = goal_parent_turn_input(&turn);
         let source = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 IsolatedTranscriptSource::Canonical {
@@ -279,12 +294,44 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 history_has_trim_breadcrumb: self.history_has_trim_breadcrumb,
             },
         };
-        let outcome = self
-            .agent
-            .lock()
-            .await
-            .run_isolated_turn(source, directive)
-            .await?;
+        let session_id = self.raw_session_id()?.to_owned();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let agent = Arc::clone(&self.agent);
+        let run = async move {
+            agent
+                .lock()
+                .await
+                .run_isolated_turn_with_events(source, &input, event_tx)
+                .await
+        };
+        tokio::pin!(run);
+
+        let mut event_rx_open = true;
+        let result = loop {
+            tokio::select! {
+                outcome = &mut run => {
+                    while let Some(event) = event_rx.recv().await {
+                        super::dispatch::forward_turn_event(&self.outbound, &session_id, &event).await;
+                    }
+                    break outcome;
+                }
+                event = event_rx.recv(), if event_rx_open => {
+                    match event {
+                        Some(event) => {
+                            super::dispatch::forward_turn_event(&self.outbound, &session_id, &event).await;
+                        }
+                        None => event_rx_open = false,
+                    }
+                }
+            }
+        };
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.publish_parent_turn_failure(error.to_string()).await;
+                return Err(error);
+            }
+        };
         self.history_has_trim_breadcrumb = outcome.history_has_trim_breadcrumb;
         GoalParentTurnResult::from_completed_agent_turn(outcome.response, outcome.working_history)
     }
@@ -332,9 +379,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let backend = self.context.session_backend.as_ref().context(
             "cannot publish Goal parent response: ZeroCode session persistence is disabled",
         )?;
-        backend
-            .append(&session_key, &message)
-            .context("persist ZeroCode Goal parent response")?;
+        if let Err(error) = backend.append(&session_key, &message) {
+            self.publish_parent_turn_failure(error.to_string()).await;
+            return Err(error).context("persist ZeroCode Goal parent response");
+        }
         self.agent.lock().await.seed_history(&[message]);
         self.outbound
             .notify(

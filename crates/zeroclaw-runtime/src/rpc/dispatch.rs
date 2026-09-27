@@ -6583,19 +6583,15 @@ impl RpcDispatcher {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     ) {
-        let update = SessionUpdateEvent::TurnComplete {
-            session_id: session_id.to_string(),
+        forward_turn_completion(
+            &self.rpc,
+            session_id,
             outcome,
             content,
             client_turn_generation,
             message_count,
-        };
-        if let Ok(params) = serde_json::to_value(update) {
-            let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
-            if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
-            }
-        }
+        )
+        .await;
     }
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
@@ -11518,6 +11514,48 @@ pub(super) async fn forward_turn_event(
         Some(n) => rpc.send_raw(n).await,
         None => false,
     }
+}
+
+/// Forward the standard terminal turn event through the same `session/update`
+/// stream used by ordinary RPC turns. Goal-managed isolated turns use this for
+/// core failures so their original error remains visible independently of the
+/// Goal lifecycle transition.
+pub(super) async fn forward_turn_completion(
+    rpc: &RpcOutbound,
+    session_id: &str,
+    outcome: crate::rpc::types::TurnCompletionOutcome,
+    content: String,
+    client_turn_generation: Option<u64>,
+    message_count: Option<usize>,
+) {
+    if let Some(json) = turn_completion_notification(
+        session_id,
+        outcome,
+        content,
+        client_turn_generation,
+        message_count,
+    ) {
+        let _ = rpc.send_raw(json).await;
+    }
+}
+
+fn turn_completion_notification(
+    session_id: &str,
+    outcome: crate::rpc::types::TurnCompletionOutcome,
+    content: String,
+    client_turn_generation: Option<u64>,
+    message_count: Option<usize>,
+) -> Option<String> {
+    let update = SessionUpdateEvent::TurnComplete {
+        session_id: session_id.to_string(),
+        outcome,
+        content,
+        client_turn_generation,
+        message_count,
+    };
+    let params = serde_json::to_value(update).ok()?;
+    let notification = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&notification).ok()
 }
 
 /// Replace the RPC chat session's durable transcript and breadcrumb flag
@@ -23182,6 +23220,28 @@ mod tests {
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["type"], "agent_message_chunk");
         assert_eq!(v["params"]["text"], "hello");
+    }
+
+    #[test]
+    fn failed_turn_completion_preserves_the_core_error_on_session_update() {
+        let json = turn_completion_notification(
+            "goal-session",
+            crate::rpc::types::TurnCompletionOutcome::Failed,
+            "turn failed: Agent turn failed: provider returned 429".to_string(),
+            None,
+            None,
+        )
+        .expect("turn completion must serialize");
+        let value = parse(&json);
+
+        assert_eq!(value["method"], notification::SESSION_UPDATE);
+        assert_eq!(value["params"]["session_id"], "goal-session");
+        assert_eq!(value["params"]["type"], "turn_complete");
+        assert_eq!(value["params"]["outcome"], "failed");
+        assert_eq!(
+            value["params"]["content"],
+            "turn failed: Agent turn failed: provider returned 429"
+        );
     }
 
     #[test]
