@@ -20,6 +20,7 @@ use crate::{
     agent::cost::build_type_level_model_provider_pricing,
     control_plane::control_plane,
     cost::CostTracker,
+    goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
         GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
@@ -38,6 +39,7 @@ const GOAL_UPDATE_METHOD: &str = "session/goal_update";
 /// The immutable, trusted ZeroCode binding for one Goal admission.
 pub struct ZeroCodeGoalSessionDriver {
     context: Arc<RpcContext>,
+    authorization: super::dispatch::GoalSessionAuthorization,
     outbound: Arc<RpcOutbound>,
     // Held by the worker-owned driver so the RPC generation cannot finish
     // draining while a Goal it admitted is still unwinding.
@@ -51,12 +53,13 @@ pub struct ZeroCodeGoalSessionDriver {
 
 impl ZeroCodeGoalSessionDriver {
     /// Capture the live session facts that command text cannot control.
-    pub async fn new(
+    pub(super) async fn new(
         context: Arc<RpcContext>,
         outbound: Arc<RpcOutbound>,
         connection_activity: Option<crate::rpc::ConnectionActivity>,
         session_id: String,
         tui_id: String,
+        authorization: super::dispatch::GoalSessionAuthorization,
     ) -> Result<Self> {
         let session_key = GoalSessionKey::zero_code(session_id)?;
         let raw_session_id = match &session_key {
@@ -78,6 +81,7 @@ impl ZeroCodeGoalSessionDriver {
         );
         Ok(Self {
             context,
+            authorization,
             outbound,
             connection_activity,
             session_key,
@@ -168,6 +172,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         self.revalidate_session().await?;
         let guard = self.command_lock.clone().lock_owned().await;
         self.revalidate_session().await?;
+        self.authorization.revalidate().await?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
@@ -197,6 +202,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             _queue_guard: queue_guard,
             agent,
             canonical_history,
+            history_has_trim_breadcrumb: false,
             outbound: Arc::clone(&self.outbound),
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
@@ -208,6 +214,7 @@ struct ZeroCodeGoalExecutionLease {
     _queue_guard: zeroclaw_infra::session_queue::SessionGuard,
     agent: Arc<Mutex<Agent>>,
     canonical_history: Vec<ChatMessage>,
+    history_has_trim_breadcrumb: bool,
     outbound: Arc<RpcOutbound>,
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
@@ -262,9 +269,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     prefix: turn.working_history,
                 }
             }
-            GoalParentTurnKind::Continue => {
-                IsolatedTranscriptSource::Continuation(turn.working_history)
-            }
+            GoalParentTurnKind::Continue => IsolatedTranscriptSource::Continuation {
+                history: turn.working_history,
+                history_has_trim_breadcrumb: self.history_has_trim_breadcrumb,
+            },
         };
         let outcome = self
             .agent
@@ -272,10 +280,8 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .await
             .run_isolated_turn(source, directive)
             .await?;
-        Ok(GoalParentTurnResult {
-            candidate: outcome.response,
-            working_history: outcome.working_history,
-        })
+        self.history_has_trim_breadcrumb = outcome.history_has_trim_breadcrumb;
+        GoalParentTurnResult::from_completed_agent_turn(outcome.response, outcome.working_history)
     }
 
     async fn run_verifier(
@@ -283,43 +289,48 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<String> {
-        let (provider, provider_name, model) = {
+        let (provider, model_selector, route_resolver) = {
             let config = self.context.config.read();
-            build_session_model_provider(
-                &config,
-                &config.goal.verifier.model_provider,
-                config.goal.verifier.model.as_deref(),
-            )?
+            let (provider, _provider_ref, model_selector, route_resolver) =
+                build_session_model_provider(
+                    &config,
+                    &config.goal.verifier.model_provider,
+                    config.goal.verifier.model.as_deref(),
+                )?;
+            (provider, model_selector, route_resolver)
         };
-        let messages = vec![
-            ChatMessage::system(
-                "Return only strict JSON: {\"decision\":\"complete|continue|blocked\",\"reason\":\"...\",\"blockers\":[...]}.",
-            ),
-            ChatMessage::user(format!(
-                "Objective:\n{}\n\nCandidate:\n{}",
-                turn.objective, turn.candidate
-            )),
-        ];
+        let route = route_resolver.resolve(&model_selector);
+        let messages = turn.to_chat_messages();
+        let mut settled_attempts = Vec::new();
         let response = crate::agent::loop_::ResolvedModelAccess {
             model_provider: provider.as_ref(),
-            provider_name: &provider_name,
-            model: &model,
+            provider_name: &route.provider_name,
+            model: &route.model,
+            dispatch_model: &model_selector,
             temperature: None,
         }
-        .run_model_query(ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        })
+        .run_model_query(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            &mut settled_attempts,
+        )
         .await?;
         response.text.context("Goal verifier returned no text")
     }
 
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
-        self.agent
-            .lock()
-            .await
-            .seed_history(&[ChatMessage::assistant(&candidate)]);
+    async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
+        let session_key = format!("rpc_{}", self.raw_session_id()?);
+        let message = ChatMessage::assistant(&candidate);
+        let backend = self.context.session_backend.as_ref().context(
+            "cannot publish Goal parent response: ZeroCode session persistence is disabled",
+        )?;
+        backend
+            .append(&session_key, &message)
+            .context("persist ZeroCode Goal parent response")?;
+        self.agent.lock().await.seed_history(&[message]);
         self.outbound
             .notify(
                 GOAL_UPDATE_METHOD,
@@ -404,11 +415,16 @@ impl RpcGoalRuntime {
                     config.cost.clone(),
                     &config.data_dir,
                 )?;
-                let engine = Arc::new(runtime.execution_engine(
+                let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
+                    build_type_level_model_provider_pricing(&config),
+                )));
+                let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
+                    Arc::clone(&registry),
                     tracker,
                     driver.agent_alias().to_owned(),
-                    Arc::new(build_type_level_model_provider_pricing(&config)),
+                    pricer,
                 )?);
+                let engine = Arc::new(runtime.execution_engine(accounting));
                 let candidate = restart_coordinator.new_supervisor(engine).await;
                 self.install_supervisor_if_absent(session_id.clone(), candidate)
                     .await
