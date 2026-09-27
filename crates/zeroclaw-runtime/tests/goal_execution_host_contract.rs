@@ -207,8 +207,9 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
     async fn run_verifier(
         &mut self,
         _operation: &GoalOperationScope,
-        _turn: GoalVerifierTurn,
+        turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
+        assert_eq!(turn.objective, "finish the task");
         if self.continue_once {
             self.continue_once = false;
             Ok(GoalVerifierResult {
@@ -3236,7 +3237,7 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
 
     let session_id = ingress.session_key().durable_id();
     let cancelling = Arc::clone(&supervisor);
-    let mut cancel = tokio::spawn(async move {
+    let mut cancel = zeroclaw_spawn::spawn!(async move {
         cancelling
             .pause_for_external_cancellation(&session_id)
             .await
@@ -3351,7 +3352,7 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
     );
 
     let cancelling = Arc::clone(&supervisor);
-    let mut cancel = tokio::spawn(async move {
+    let mut cancel = zeroclaw_spawn::spawn!(async move {
         cancelling
             .pause_for_external_cancellation(&session_id)
             .await

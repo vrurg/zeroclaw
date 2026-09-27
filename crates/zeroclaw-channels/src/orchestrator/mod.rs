@@ -21090,6 +21090,44 @@ temperature = 0.3
         assert_eq!(snapshot.references, message.references);
     }
 
+    #[tokio::test]
+    async fn matrix_goal_help_is_available_without_a_control_plane() {
+        let response = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-help".to_owned(),
+            channel_message("matrix", Some("primary")),
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response.response(),
+            zeroclaw_goal::control::GoalResponse::Help
+        ));
+        response.after_response().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_help_does_not_construct_a_matrix_driver() {
+        let mut message = channel_message("not-matrix", Some("primary"));
+        message.sender = "different-sender".to_owned();
+
+        let response = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-help".to_owned(),
+            message,
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response.response(),
+            zeroclaw_goal::control::GoalResponse::Help
+        ));
+    }
+
     #[test]
     fn composite_channel_key_aliased_uses_dotted_form() {
         assert_eq!(
