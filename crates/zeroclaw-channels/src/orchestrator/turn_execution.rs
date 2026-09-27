@@ -15,7 +15,7 @@ use zeroclaw_runtime::{
     observability::Observer,
 };
 
-use super::{ChannelRouteSelection, ChannelRuntimeContext};
+use super::{ChannelRouteSelection, ChannelRuntimeContext, resolve_channel_context_limits};
 
 pub(super) fn resolved_channel_execution<'a>(
     context: &'a ChannelRuntimeContext,
@@ -32,6 +32,7 @@ pub(super) fn resolved_channel_execution<'a>(
             model_provider,
             provider_name: route.model_provider.as_str(),
             model: route.model.as_str(),
+            dispatch_model: route.model.as_str(),
             temperature,
         },
         ResolvedIo {
@@ -58,7 +59,13 @@ pub(super) fn resolved_channel_execution<'a>(
             strict_tool_parsing: context.agent_cfg.resolved.strict_tool_parsing,
             parallel_tools: context.agent_cfg.resolved.parallel_tools,
             max_tool_result_chars: context.max_tool_result_chars,
-            context_token_budget: context.context_token_budget,
+            context_limits: resolve_channel_context_limits(
+                context.prompt_config.as_ref(),
+                context.agent_alias.as_str(),
+                route,
+                context.context_token_budget,
+            ),
+            context_limits_resolver: None,
             knobs: loop_knobs,
         },
     )

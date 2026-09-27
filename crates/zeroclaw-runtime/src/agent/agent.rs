@@ -651,8 +651,13 @@ pub type ConfigGeneration =
 /// transcript returned by the previous isolated turn.
 #[derive(Debug)]
 pub enum IsolatedTranscriptSource {
-    Canonical { prefix: Vec<ChatMessage> },
-    Continuation(Vec<ChatMessage>),
+    Canonical {
+        prefix: Vec<ChatMessage>,
+    },
+    Continuation {
+        history: Vec<ChatMessage>,
+        history_has_trim_breadcrumb: bool,
+    },
 }
 
 /// The model response and process-local transcript produced by an isolated
@@ -661,6 +666,7 @@ pub enum IsolatedTranscriptSource {
 pub struct IsolatedTurnOutcome {
     pub response: String,
     pub working_history: Vec<ChatMessage>,
+    pub history_has_trim_breadcrumb: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1636,17 +1642,20 @@ impl Agent {
     /// isolated turn starts.
     pub fn isolated_canonical_prefix(&self) -> Result<Vec<ChatMessage>> {
         let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let dispatch_model = self.model_name.clone();
+        let selected_route = self.model_route_resolver.resolve(&dispatch_model);
         let (vision_provider_box, _) = crate::agent::turn::resolve_vision_provider(
             self.full_config(),
             self.model_provider.as_ref(),
             &base_provider_messages,
             &self.multimodal_config,
-            &self.model_provider_name,
-            &self.model_name,
+            &selected_route.provider_name,
+            &selected_route.model,
+            &dispatch_model,
         )?;
         let (active_provider, active_model): (&dyn ModelProvider, &str) =
             vision_provider_box.as_ref().map_or(
-                (self.model_provider.as_ref(), self.model_name.as_str()),
+                (self.model_provider.as_ref(), selected_route.model.as_str()),
                 |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
             );
         let dispatcher = tool_dispatcher_for_provider(&self.config, active_provider, active_model);
@@ -1682,10 +1691,12 @@ impl Agent {
                 )));
         }
 
+        let dispatch_model = self.model_name.clone();
+        let selected_route = self.model_route_resolver.resolve(&dispatch_model);
         let base_dispatcher = tool_dispatcher_for_provider(
             &self.config,
             self.model_provider.as_ref(),
-            &self.model_name,
+            &selected_route.model,
         );
         self.rebuild_system_prompt_for_dispatcher(base_dispatcher.as_ref())?;
         let system = match self.history.first() {
@@ -1695,7 +1706,7 @@ impl Agent {
             ),
         };
 
-        let mut working_history = match source {
+        let (mut working_history, mut history_has_trim_breadcrumb) = match source {
             IsolatedTranscriptSource::Canonical { prefix } => {
                 ensure!(
                     prefix.iter().all(|message| message.role != "system"),
@@ -1705,9 +1716,12 @@ impl Agent {
                 history.push(system);
                 history.push(directive);
                 history.extend(prefix);
-                history
+                (history, self.history_has_trim_breadcrumb)
             }
-            IsolatedTranscriptSource::Continuation(mut history) => {
+            IsolatedTranscriptSource::Continuation {
+                mut history,
+                history_has_trim_breadcrumb,
+            } => {
                 ensure!(
                     history
                         .first()
@@ -1716,23 +1730,25 @@ impl Agent {
                 );
                 history[0] = system;
                 history.push(directive);
-                history
+                (history, history_has_trim_breadcrumb)
             }
         };
+        let mut injected_memory_preamble = None;
         let (vision_provider_box, _) = crate::agent::turn::resolve_vision_provider(
             self.full_config(),
             self.model_provider.as_ref(),
             &working_history,
             &self.multimodal_config,
-            &self.model_provider_name,
-            &self.model_name,
+            &selected_route.provider_name,
+            &selected_route.model,
+            &dispatch_model,
         )?;
         let (active_provider, active_provider_name, active_model) =
             vision_provider_box.as_ref().map_or(
                 (
                     self.model_provider.as_ref(),
-                    self.model_provider_name.as_str(),
-                    self.model_name.as_str(),
+                    selected_route.provider_name.as_str(),
+                    selected_route.model.as_str(),
                 ),
                 |resolved| {
                     (
@@ -1774,6 +1790,7 @@ impl Agent {
                         model_provider: active_provider,
                         provider_name: active_provider_name,
                         model: active_model,
+                        dispatch_model: &dispatch_model,
                         temperature: self.temperature,
                     },
                     crate::agent::loop_::ResolvedIo {
@@ -1799,11 +1816,15 @@ impl Agent {
                         strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                         parallel_tools: self.config.resolved.parallel_tools,
                         max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                        context_token_budget: self.config.resolved.effective_context_budget(),
+                        context_limits: self
+                            .context_limits_for_route(active_provider_name, active_model),
+                        context_limits_resolver: self.context_limits_resolver.clone(),
                         knobs: &knobs,
                     },
                 ),
                 history: &mut working_history,
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
                 channel_name: &self.channel_name,
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -1820,6 +1841,7 @@ impl Agent {
                 agent_alias: agent_alias.as_deref(),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
+                served_route_sink: None,
                 sop_reassembly: None,
             });
         let response = crate::agent::turn::scope_tool_protocol_prompts(
@@ -1831,6 +1853,7 @@ impl Agent {
         Ok(IsolatedTurnOutcome {
             response,
             working_history,
+            history_has_trim_breadcrumb,
         })
     }
 
