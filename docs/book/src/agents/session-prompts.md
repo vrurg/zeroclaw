@@ -106,4 +106,9 @@ including when an operator has selected `session_prompt_approval = "disabled"`
 and ordinary auto-approval permits the call; this keeps the opaque content out
 of generic sinks at the cost of less detailed completion visibility. The
 explicit list result and the provider request remain the only content-bearing
-surfaces.
+surfaces. Durable session transcripts and retained/export copies also replace
+the prompt-mutation tool exchange with a redaction marker rather than storing
+the opaque arguments or results. This redaction is the restart boundary: after
+loading a retained transcript, the model does not recover the hidden tool
+exchange from history, but the attached prompt collection itself remains
+available through the session metadata and the next injected system prompt.
