@@ -154,6 +154,8 @@ pub trait GoalOperationAccountingFactory: Send + Sync {
 
 tokio::task_local! {
     /// Provider-call admission and settlement scope for one Goal epoch.
+    /// Foreground child futures run inline within this scope; re-scoping them
+    /// would detach their usage from the parent's durable task and operation fence.
     pub static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
