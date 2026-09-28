@@ -25,9 +25,10 @@ use crate::{
 };
 
 use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_goal::GoalPauseReason;
 use zeroclaw_goal::control::{
-    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
     GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, dispose_unowned_session_goal,
@@ -35,6 +36,71 @@ use zeroclaw_goal::control::{
 };
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
+
+/// Retains a ZeroCode Goal admission until its JSON-RPC response has been
+/// queued ahead of any ordinary parent-turn events.
+pub(super) struct RpcGoalCommandSubmission {
+    response: GoalResponse,
+    post_response: Option<RpcGoalPostResponse>,
+}
+
+impl std::fmt::Debug for RpcGoalCommandSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RpcGoalCommandSubmission")
+            .field("has_post_response_action", &self.post_response.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+struct RpcGoalPostResponse {
+    runtime: Arc<RpcGoalRuntime>,
+    session_id: String,
+    supervisor: Arc<GoalExecutionSupervisor>,
+    settings: GoalHostSettings,
+    submission: GoalExecutionSubmission,
+    starts_execution: bool,
+}
+
+impl RpcGoalCommandSubmission {
+    pub(super) fn response(&self) -> &GoalResponse {
+        &self.response
+    }
+
+    /// Launch only after the response is in the shared outbound queue. The
+    /// same queue preserves response-before-agent-event ordering for both
+    /// local IPC and WSS.
+    pub(super) async fn after_response(self) -> Result<()> {
+        let Some(mut post_response) = self.post_response else {
+            return Ok(());
+        };
+        post_response
+            .supervisor
+            .launch_after_response(post_response.settings, &mut post_response.submission)
+            .await
+    }
+
+    /// If a start/resume acknowledgement cannot be queued, pause before any
+    /// parent model call so an unseen Goal cannot begin running.
+    pub(super) async fn response_delivery_failed(self) -> Result<()> {
+        if let Some(mut post_response) = self.post_response
+            && post_response.starts_execution
+        {
+            post_response
+                .supervisor
+                .pause_before_launch(
+                    &mut post_response.submission,
+                    GoalPauseReason::ExternalDependency,
+                )
+                .await?;
+            post_response
+                .runtime
+                .remove_supervisor_if_current(&post_response.session_id, &post_response.supervisor)
+                .await;
+        }
+        Ok(())
+    }
+}
 
 /// The immutable, trusted ZeroCode binding for one Goal admission.
 pub struct ZeroCodeGoalSessionDriver {
@@ -505,15 +571,18 @@ impl RpcGoalRuntime {
     }
 
     /// Submit one parsed Goal command through the current ZeroCode session.
-    pub async fn submit(
-        &self,
+    pub(super) async fn submit(
+        self: &Arc<Self>,
         context: Arc<RpcContext>,
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
-    ) -> Result<GoalResponse> {
+    ) -> Result<RpcGoalCommandSubmission> {
         let config = context.config.read().clone();
         if !config.goal.enabled {
-            return Ok(GoalResponse::Disabled);
+            return Ok(RpcGoalCommandSubmission {
+                response: GoalResponse::Disabled,
+                post_response: None,
+            });
         }
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
@@ -556,7 +625,7 @@ impl RpcGoalRuntime {
             },
         )?;
         let submission = supervisor
-            .submit(settings, ingress, driver, command)
+            .submit(settings.clone(), ingress, driver, command)
             .await?;
         if matches!(
             submission.response(),
@@ -569,7 +638,21 @@ impl RpcGoalRuntime {
             self.remove_supervisor_if_current(&session_id, &supervisor)
                 .await;
         }
-        Ok(submission.into_response())
+        let starts_execution = matches!(
+            submission.response(),
+            GoalResponse::Started(_) | GoalResponse::Resumed(_)
+        );
+        Ok(RpcGoalCommandSubmission {
+            response: submission.response().clone(),
+            post_response: Some(RpcGoalPostResponse {
+                runtime: Arc::clone(self),
+                session_id,
+                supervisor,
+                settings,
+                submission,
+                starts_execution,
+            }),
+        })
     }
     /// Return a resident supervisor for this session, if it has one.
     pub async fn supervisor(&self, session_id: &str) -> Option<Arc<GoalExecutionSupervisor>> {
