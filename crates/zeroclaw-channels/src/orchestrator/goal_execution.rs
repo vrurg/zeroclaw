@@ -160,6 +160,95 @@ impl MatrixGoalCommandSubmission {
     }
 }
 
+/// Deliver `/stop`'s Goal-pause lifecycle response before draining the
+/// already-admitted parent operation. This mirrors the ordinary Matrix Goal
+/// command ordering so the user sees the pause acknowledgement promptly.
+pub(super) async fn deliver_matrix_goal_stop(
+    mut submission: MatrixGoalCommandSubmission,
+    channel: Option<Arc<dyn Channel>>,
+    message: ChannelMessage,
+) {
+    let Some(channel) = channel else {
+        if let Err(error) = submission.response_delivery_failed().await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                    })),
+                "Goal stop acknowledgement could not be delivered or settled"
+            );
+        }
+        return;
+    };
+
+    let response = super::render_goal_response(submission.response());
+    if let Err(error) = channel
+        .send(&SendMessage::reply_to(&message, response))
+        .await
+    {
+        if let Err(pause_error) = submission.response_delivery_failed().await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "error": zeroclaw_providers::sanitize_api_error(&pause_error.to_string()),
+                    })),
+                "Goal could not be safely settled after /stop acknowledgement failure"
+            );
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                })),
+            "Goal /stop acknowledgement could not be delivered"
+        );
+        return;
+    }
+
+    let late_response = match submission.after_response().await {
+        Ok(response) => response,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                    })),
+                "Goal /stop pause could not be finalized after acknowledgement"
+            );
+            return;
+        }
+    };
+    if let Some(response) = late_response.as_ref()
+        && let Err(error) = channel
+            .send(&SendMessage::reply_to(
+                &message,
+                super::render_goal_response(response),
+            ))
+            .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                })),
+            "Final Goal pause response after /stop could not be delivered"
+        );
+    }
+    submission
+        .final_response_delivered(late_response.as_ref())
+        .await;
+}
+
 /// Submit an already parsed Goal command using immutable Matrix ingress facts.
 pub(super) async fn submit_matrix_goal(
     context: Arc<ChannelRuntimeContext>,
@@ -173,6 +262,17 @@ pub(super) async fn submit_matrix_goal(
     // successor supervisor for this session.
     let command_lock = goal_command_lock(&context.persist_locks, &history_key);
     let command_lease = command_lock.lock_owned().await;
+    submit_matrix_goal_with_command_lease(context, history_key, original, command, command_lease)
+        .await
+}
+
+async fn submit_matrix_goal_with_command_lease(
+    context: Arc<ChannelRuntimeContext>,
+    history_key: String,
+    original: ChannelMessage,
+    command: zeroclaw_commands::goal::GoalCommand,
+    command_lease: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<MatrixGoalCommandSubmission> {
     let route = format!(
         "matrix:{}:{}",
         original.channel_alias.as_deref().unwrap_or_default(),
@@ -259,6 +359,53 @@ pub(super) async fn submit_matrix_goal(
         settings,
         submission,
     })
+}
+
+/// Route Matrix `/stop` through the ordinary immediate Goal-pause command
+/// when the sender's canonical session currently owns a running Goal.
+///
+/// The durable task row is the authority for whether a Goal is running. The
+/// process-local supervisor slot alone is not sufficient: it may be absent
+/// after recovery or retained briefly while a terminal transition is being
+/// delivered.
+pub(super) async fn submit_matrix_goal_stop(
+    context: Arc<ChannelRuntimeContext>,
+    message: ChannelMessage,
+) -> Result<Option<MatrixGoalCommandSubmission>> {
+    if !message.channel.eq_ignore_ascii_case("matrix") {
+        return Ok(None);
+    }
+
+    let history_key = super::runtime_conversation_history_key(context.as_ref(), &message);
+    // Serialize the durable Running check with starts and other lifecycle
+    // commands. Otherwise a concurrent start could commit after the read and
+    // leave this `/stop` following the ordinary no-task path.
+    let command_lease = goal_command_lock(&context.persist_locks, &history_key)
+        .lock_owned()
+        .await;
+    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
+        // Goal admission itself requires this control plane, so no live Goal
+        // can be running when it is unavailable.
+        return Ok(None);
+    };
+    let registry = control_plane.goal_store()?;
+    let Some(task) = registry.current_goal_for_session(&history_key).await? else {
+        return Ok(None);
+    };
+    let Some(command) = goal_stop_command_for_status(task.status) else {
+        return Ok(None);
+    };
+
+    submit_matrix_goal_with_command_lease(context, history_key, message, command, command_lease)
+        .await
+        .map(Some)
+}
+
+fn goal_stop_command_for_status(
+    status: zeroclaw_runtime::control_plane::TaskStatus,
+) -> Option<zeroclaw_commands::goal::GoalCommand> {
+    (status == zeroclaw_runtime::control_plane::TaskStatus::Running)
+        .then_some(zeroclaw_commands::goal::GoalCommand::Pause { immediate: true })
 }
 
 /// Dispose a Matrix session's Goal before the channel resets its history.
@@ -1218,6 +1365,24 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_stop_only_maps_a_running_goal_to_immediate_pause() {
+        assert_eq!(
+            goal_stop_command_for_status(zeroclaw_runtime::control_plane::TaskStatus::Running),
+            Some(zeroclaw_commands::goal::GoalCommand::Pause { immediate: true })
+        );
+        for status in [
+            zeroclaw_runtime::control_plane::TaskStatus::Paused,
+            zeroclaw_runtime::control_plane::TaskStatus::Completed,
+            zeroclaw_runtime::control_plane::TaskStatus::Failed,
+            zeroclaw_runtime::control_plane::TaskStatus::Cancelled,
+            zeroclaw_runtime::control_plane::TaskStatus::Lost,
+            zeroclaw_runtime::control_plane::TaskStatus::TimedOut,
+        ] {
+            assert_eq!(goal_stop_command_for_status(status), None);
+        }
+    }
 
     #[derive(Default)]
     struct MatrixGoalErrorRecordingChannel {
