@@ -170,7 +170,8 @@ struct ExecutionDriver {
 
 struct TranscriptExecutionLease {
     session_key: GoalSessionKey,
-    delivered: Arc<AtomicUsize>,
+    delivered_candidates: Arc<Mutex<Vec<String>>>,
+    verifier_calls: Arc<AtomicUsize>,
     continue_once: bool,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
@@ -209,6 +210,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<GoalVerifierResult> {
+        self.verifier_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(turn.objective, "finish the task");
         if self.continue_once {
             self.continue_once = false;
@@ -227,8 +229,8 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         }
     }
 
-    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        self.delivered.fetch_add(1, Ordering::SeqCst);
+    async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        self.delivered_candidates.lock().unwrap().push(candidate);
         Ok(())
     }
 
@@ -242,7 +244,8 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
 
 struct TranscriptExecutionDriver {
     binding: GoalSessionBinding,
-    delivered: Arc<AtomicUsize>,
+    delivered_candidates: Arc<Mutex<Vec<String>>>,
+    verifier_calls: Arc<AtomicUsize>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
     parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
@@ -265,7 +268,8 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(TranscriptExecutionLease {
             session_key: self.binding.session_key().clone(),
-            delivered: Arc::clone(&self.delivered),
+            delivered_candidates: Arc::clone(&self.delivered_candidates),
+            verifier_calls: Arc::clone(&self.verifier_calls),
             continue_once: true,
             parent_histories: Arc::clone(&self.parent_histories),
             parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
@@ -2418,17 +2422,19 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
 }
 
 #[tokio::test]
-async fn verifier_continue_preserves_the_process_local_parent_transcript() {
+async fn verifier_continue_preserves_repeated_parent_output_and_stops_after_complete() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
     let ingress = matrix_ingress();
-    let delivered = Arc::new(AtomicUsize::new(0));
+    let delivered_candidates = Arc::new(Mutex::new(Vec::new()));
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
-        delivered: Arc::clone(&delivered),
+        delivered_candidates: Arc::clone(&delivered_candidates),
+        verifier_calls: Arc::clone(&verifier_calls),
         parent_histories: Arc::clone(&parent_histories),
         parent_turn_kinds: Arc::clone(&parent_turn_kinds),
     });
@@ -2477,9 +2483,17 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
         GoalExecutionOutcome::Completed
     );
     assert_eq!(
-        delivered.load(Ordering::SeqCst),
+        delivered_candidates.lock().unwrap().as_slice(),
+        [
+            "parent:finish the task".to_owned(),
+            "parent:finish the task".to_owned(),
+        ],
+        "identical parent replies remain separate delivered events"
+    );
+    assert_eq!(
+        verifier_calls.load(Ordering::SeqCst),
         2,
-        "each parent candidate is delivered before its verifier decision"
+        "completion after a continuation must not admit another verifier call"
     );
     {
         let histories = parent_histories.lock().unwrap();
