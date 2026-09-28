@@ -4340,9 +4340,9 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
     let engine = Arc::new(runtime.execution_engine(accounting_factory));
     let coordinator = Arc::new(GoalExecutionRestartCoordinator::new());
     let supervisor = coordinator.new_supervisor(engine).await;
-    supervisor
+    let mut started = supervisor
         .submit(
-            settings,
+            settings.clone(),
             ingress.clone(),
             driver,
             GoalCommand::Start {
@@ -4350,6 +4350,11 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
                 objective: "finish the task".into(),
             },
         )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    supervisor
+        .launch_after_response(settings.clone(), &mut started)
         .await
         .unwrap();
     parent_started.notified().await;
@@ -4421,9 +4426,9 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
     let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
         runtime.execution_engine(accounting_factory),
     )));
-    supervisor
+    let mut started = supervisor
         .submit(
-            settings,
+            settings.clone(),
             ingress.clone(),
             driver,
             GoalCommand::Start {
@@ -4431,6 +4436,11 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
                 objective: "finish the task".into(),
             },
         )
+        .await
+        .unwrap();
+    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    supervisor
+        .launch_after_response(settings, &mut started)
         .await
         .unwrap();
     parent_started.notified().await;
