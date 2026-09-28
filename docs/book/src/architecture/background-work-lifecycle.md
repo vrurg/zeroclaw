@@ -61,6 +61,82 @@ Legacy delegate result files that contain status remain readable when no task ro
 
 A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
 
+The following describes the RFC V1 candidate boundary; it does not change the
+implementation-status statement above. That statement remains until the
+production integration and cross-surface validation gates pass.
+
+### Ownership and accounting
+
+`zeroclaw-goal` owns Goal-specific control, execution, verifier, recovery, and
+operation-accounting policy. Canonical task records remain in
+`zeroclaw-api`; the runtime's existing SQLite task store persists Goal task
+state and its session binding. The runtime adapts the existing session and
+provider-pricing owners, while ordinary provider routing, fallback, tool
+dispatch, agent-loop execution, and canonical session history remain with
+their existing owners. Goal mode adds no parallel task store, session store,
+provider router, or usage ledger.
+
+Every Goal-owned model operation must settle actual-attempt usage through the
+canonical ledger before another Goal-owned model call is admitted. Known usage
+is retained before completeness is classified. Genuinely missing, invalid, or
+outcome-unknown accounting is terminal under V1; an unlimited budget does not
+make uncertain usage safe to retry.
+
+### Turn, session, and recovery boundaries
+
+When a parent turn is active, ordinary start, resume, pause, and budget changes
+are acknowledged promptly and applied at its next shared checkpoint. That
+checkpoint follows ordinary event delivery and session persistence, tool
+result pairing, and usage settlement. Status and other read-only commands do
+not interrupt the turn. Cancel, `pause now`, and `/stop` fence Goal execution
+immediately; they do not roll back an already-admitted external side effect.
+
+Resume continues the same durable session and history. An optional, including
+multiline, response is appended once as a user message before the next Goal
+turn; plain resume adds no synthetic answer. On daemon restart, a running Goal
+is fenced and recorded as a resumable `daemon_restarted` pause. Restart never
+automatically launches it again; a later authorized resume is required, and
+the restart does not make unsettled accounting or tool work safe to retry.
+
+### Verification, events, and presentation
+
+The verifier is the sole normal authority for Goal completion, continuation,
+or an input-related pause. Its strict structured result is `Complete`,
+`Continue`, or `Blocked`: completion checks the declared Goal's success
+criteria (not broader work), continuation requires concrete unmet work within
+that Goal, and a blocker requires user input, human escalation, or an external
+dependency. A valid `Blocked` result pauses execution; ordinary progress prose
+does not. Invalid or inconsistent verifier output follows V1's terminal
+protocol-failure path and is never rewritten into a successful decision.
+Provider and verifier-operation failures and genuinely incomplete accounting
+are also terminal under V1, not user-input pauses. Explicit operator pauses
+and daemon-restart recovery remain resumable; restart never auto-launches work.
+
+The agent's full response and ordinary visible events, including thinking,
+tool calls/results, drafts, text, and core errors, remain on their normal
+representation path.
+The original core error remains visible there; a Goal failure notice separately
+explains the lifecycle transition.
+Goal lifecycle notices supplement that output: start/resume precedes execution,
+and a blocker pause follows the agent's complete request. The pause rationale
+describes why execution stopped rather than replacing or paraphrasing the
+request. Matrix and ZeroCode share Goal decisions and transitions while using
+their native streaming, rendering, localization, and egress protections; the
+surfaces must not classify blockers or completion independently.
+Fluent catalogs and native rendering may differ, but status and transition
+semantics do not. Known accounting totals remain visible before a qualification
+that usage may be incomplete, and the status icon reflects the reported status.
+
+Verifier diagnostics correlate the task and execution epoch, candidate
+fingerprint, actual verifier provider/model when available, validation result,
+validated decision, bounded sanitized reason, and controller action. They
+distinguish a model verdict from the transition actually committed, without
+logging unrestricted prompts, candidate text, or hidden reasoning. These logs
+support diagnosis; they do not make verifier judgments deterministic. Repeated
+agent text remains visible and is not suppressed or treated as an automatic
+stagnation pause. A validated completion ends the loop; `Continue` is reserved
+for concrete unmet work within the declared Goal.
+
 ## Change checklist
 
 For background-work changes, answer these before reviewer sign-off:
@@ -80,4 +156,13 @@ For background-work changes, answer these before reviewer sign-off:
 - Delegation and subagent behavior: [Delegation & SubAgents](../agents/delegation.md), `crates/zeroclaw-runtime/src/tools/delegate.rs`, `crates/zeroclaw-runtime/src/tools/spawn_subagent.rs`, `crates/zeroclaw-runtime/src/subagent/mod.rs`
 - Durable task control plane and recovery: `crates/zeroclaw-runtime/src/control_plane/`
 - Goal-mode decision: [ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
+- Goal policy, verifier, and execution supervision: `crates/zeroclaw-goal/src/control/`
+- Goal task contracts: `crates/zeroclaw-goal/src/task.rs`,
+  `crates/zeroclaw-api/src/task.rs`
+- Goal SQLite, ZeroCode session, and pricing adapters:
+  `crates/zeroclaw-runtime/src/control_plane/task_store_sqlite/goal.rs`,
+  `crates/zeroclaw-runtime/src/rpc/goal.rs`,
+  `crates/zeroclaw-runtime/src/goal_accounting.rs`
+- Matrix Goal adapter: `crates/zeroclaw-channels/src/orchestrator/goal_execution.rs`
+- Goal command grammar: `crates/zeroclaw-commands/src/goal.rs`
 - SOP operator guide: [How SOPs run](../sop/how-it-works.md)
