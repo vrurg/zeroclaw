@@ -311,7 +311,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             .await
             .context("ZeroCode Goal session is busy")?;
         let agent = self.revalidate_session().await?;
-        let canonical_history = agent.lock().await.isolated_canonical_prefix()?;
+        let canonical_history = agent.lock().await.isolated_canonical_prefix().await?;
         Ok(Box::new(ZeroCodeGoalExecutionLease {
             _queue_guard: queue_guard,
             agent,
