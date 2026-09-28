@@ -12,11 +12,11 @@ use zeroclaw_api::{
     model_provider::{ChatMessage, ChatRequest},
 };
 use zeroclaw_goal::{
-    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
@@ -107,13 +107,45 @@ impl MatrixGoalSessionDriver {
     }
 }
 
+/// Holds a Matrix Goal response together with the worker that must not start
+/// until that response has been delivered.
+pub(super) struct MatrixGoalCommandSubmission {
+    supervisor: Arc<GoalExecutionSupervisor>,
+    supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
+    settings: GoalHostSettings,
+    submission: GoalExecutionSubmission,
+}
+
+impl MatrixGoalCommandSubmission {
+    pub(super) fn response(&self) -> &GoalResponse {
+        self.submission.response()
+    }
+
+    /// Release the admitted worker after Matrix confirms lifecycle delivery.
+    pub(super) async fn after_response(mut self) -> Result<()> {
+        self.supervisor
+            .launch_after_response(self.settings, &mut self.submission)
+            .await
+    }
+
+    /// Keep an unseen Goal from starting when Matrix cannot deliver its
+    /// lifecycle acknowledgement.
+    pub(super) async fn response_delivery_failed(mut self) -> Result<()> {
+        self.supervisor
+            .pause_before_launch(&mut self.submission, GoalPauseReason::ExternalDependency)
+            .await?;
+        clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+        Ok(())
+    }
+}
+
 /// Submit an already parsed Goal command using immutable Matrix ingress facts.
 pub(super) async fn submit_matrix_goal(
     context: Arc<ChannelRuntimeContext>,
     history_key: String,
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
-) -> Result<GoalResponse> {
+) -> Result<MatrixGoalCommandSubmission> {
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
     // serialized lifecycle operation before another command can install a
@@ -198,7 +230,7 @@ pub(super) async fn submit_matrix_goal(
         },
     )?;
     let submission = supervisor
-        .submit(settings, ingress, driver, command)
+        .submit(settings.clone(), ingress, driver, command)
         .await?;
     if matches!(
         submission.response(),
@@ -213,7 +245,12 @@ pub(super) async fn submit_matrix_goal(
         // pricing instead of keeping a stale configuration snapshot.
         clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
     }
-    Ok(submission.into_response())
+    Ok(MatrixGoalCommandSubmission {
+        supervisor,
+        supervisor_slot,
+        settings,
+        submission,
+    })
 }
 
 /// Dispose a Matrix session's Goal before the channel resets its history.
