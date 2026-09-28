@@ -54,7 +54,17 @@ pub enum GoalExecutionOutcome {
 /// command cannot enter the same session until it is dropped.
 pub struct GoalExecutionSubmission {
     response: GoalResponse,
+    /// A newly admitted epoch is held until its representation surface has
+    /// delivered the started/resumed acknowledgement. This prevents ordinary
+    /// agent events from overtaking the lifecycle event in the same surface.
+    execution: Option<GoalExecutionRequest>,
+    /// A replaced predecessor has been fenced durably, but must settle before
+    /// the admitted successor can launch.
+    predecessor: Option<GoalExecutionScope>,
     _lease: Option<GoalSessionLease>,
+    /// Keeps daemon-restart admission closed across the durable Running
+    /// transition and its acknowledgement-to-worker handoff.
+    _admission: Option<GoalExecutionAdmission>,
 }
 
 impl std::fmt::Debug for GoalExecutionSubmission {
@@ -72,6 +82,10 @@ impl GoalExecutionSubmission {
     }
 
     pub fn into_response(self) -> GoalResponse {
+        debug_assert!(
+            self.execution.is_none(),
+            "a Goal execution response must not be consumed before launch or pre-launch pause"
+        );
         self.response
     }
 }
@@ -323,12 +337,13 @@ impl GoalExecutionSupervisor {
         Ok(())
     }
 
-    /// Submit one typed Goal command and retain any execution it starts.
+    /// Admit one typed Goal command and retain any execution it starts.
     ///
-    /// This is the only runtime composition point that launches a Goal
-    /// worker. The controller keeps durable lifecycle authority; the
-    /// supervisor only retains the exact process-local handle needed to drain
-    /// a fenced epoch before a later execution can replace it.
+    /// A started/resumed worker is deliberately not launched here. The caller
+    /// must first make the returned lifecycle response observable, then call
+    /// [`Self::launch_after_response`]. The restart admission guard remains
+    /// held across that gap so restart cannot strand a durable Running row
+    /// without a worker to fence.
     pub async fn submit(
         &self,
         settings: GoalHostSettings,
@@ -336,7 +351,7 @@ impl GoalExecutionSupervisor {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalExecutionSubmission> {
-        let _admission = match &self.restart_gate {
+        let admission = match &self.restart_gate {
             Some(gate) => gate.admit(&command).await?,
             None => None,
         };
@@ -348,31 +363,110 @@ impl GoalExecutionSupervisor {
             .await?
             .into_parts_with_lease();
 
-        if let Some(request) = execution {
-            if let Some(scope) = previous.as_ref() {
-                self.drain_after_fence(scope).await?;
-            }
-            let scope = request.scope().clone();
-            if let Err(error) = self.launch(settings, request).await {
-                self.engine.fail(&scope, "executor_start_failed").await?;
-                return Err(error).context("Goal executor launch failed");
-            }
-        } else if matches!(
-            &response,
-            GoalResponse::Paused(_) | GoalResponse::Cancelled(_)
-        ) && let Some(scope) = previous.as_ref()
+        if execution.is_none()
+            && matches!(
+                &response,
+                GoalResponse::Paused(_) | GoalResponse::Cancelled(_)
+            )
+            && let Some(scope) = previous.as_ref()
             && let Some(response) = self.drain_lifecycle_fence(scope).await?
         {
             return Ok(GoalExecutionSubmission {
                 response,
+                execution: None,
+                predecessor: None,
                 _lease: lease,
+                _admission: admission,
             });
         }
 
         Ok(GoalExecutionSubmission {
             response,
+            execution,
+            predecessor: previous,
             _lease: lease,
+            _admission: admission,
         })
+    }
+
+    /// Start a newly admitted Goal only after its owning surface has delivered
+    /// the started/resumed response.
+    pub async fn launch_after_response(
+        &self,
+        settings: GoalHostSettings,
+        submission: &mut GoalExecutionSubmission,
+    ) -> Result<()> {
+        let result = async {
+            let Some(request) = submission.execution.take() else {
+                return Ok(());
+            };
+            let scope = request.scope().clone();
+            if let Some(predecessor) = submission.predecessor.take()
+                && let Err(error) = self.drain_after_fence(&predecessor).await
+            {
+                self.engine.fail(&scope, "executor_start_failed").await?;
+                return Err(
+                    error.context("Goal predecessor could not settle before executor launch")
+                );
+            }
+            if let Err(error) = self.launch(settings, request).await {
+                self.engine.fail(&scope, "executor_start_failed").await?;
+                return Err(error).context("Goal executor launch failed");
+            }
+            Ok(())
+        }
+        .await;
+        // Once launch/failure handling is settled, restart may close admission
+        // and fence the now-registered worker even if the surface keeps the
+        // submission around while finishing its request handler.
+        submission._admission.take();
+        result
+    }
+
+    /// Pause a newly admitted Goal without running its first model call when
+    /// its lifecycle acknowledgement could not reach the representation
+    /// surface. This is a resumable external dependency, not a provider,
+    /// verifier, protocol, or accounting failure.
+    pub async fn pause_before_launch(
+        &self,
+        submission: &mut GoalExecutionSubmission,
+        reason: GoalPauseReason,
+    ) -> Result<()> {
+        let result = async {
+            let Some(request) = submission.execution.take() else {
+                return Ok(());
+            };
+            let scope = request.scope();
+            match self
+                .engine
+                .registry
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                    bail!("Goal pre-launch pause lost its execution fence")
+                }
+            }
+            if let Some(predecessor) = submission.predecessor.take() {
+                self.drain_after_fence(&predecessor)
+                    .await
+                    .context("drain fenced Goal predecessor after acknowledgement failure")?;
+            }
+            Ok(())
+        }
+        .await;
+        submission._admission.take();
+        result
     }
 
     /// Hard-dispose one trusted session's current Goal control state.

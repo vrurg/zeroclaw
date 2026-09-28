@@ -113,9 +113,12 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         &mut self,
         _operation: &GoalExecutionScope,
         _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalVerifierResult> {
         self.verifier_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(r#"{"decision":"complete","reason":"done"}"#.to_owned())
+        Ok(GoalVerifierResult {
+            response: r#"{"decision":"complete","reason":"done"}"#.to_owned(),
+            attribution: None,
+        })
     }
 
     async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
@@ -189,9 +192,12 @@ impl GoalSessionExecutionLease for UserInputExecutionLease {
         &mut self,
         _scope: &GoalExecutionScope,
         _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalVerifierResult> {
         self.events.lock().unwrap().push("verifier");
-        Ok(r#"{"decision":"blocked","reason":"A user choice is required","blockers":[{"kind":"needs_user_input","message":"Which option should I use?"}]}"#.to_owned())
+        Ok(GoalVerifierResult {
+            response: r#"{"decision":"blocked","reason":"A user choice is required","blockers":[{"kind":"needs_user_input","message":"Which option should I use?"}]}"#.to_owned(),
+            attribution: None,
+        })
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
@@ -893,9 +899,11 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                 }
             )
             .await
-            .unwrap()
-            .response,
-        "verifier:candidate"
+            .unwrap(),
+        GoalVerifierResult {
+            response: "verifier:candidate".to_owned(),
+            attribution: None,
+        }
     );
     lease
         .append_parent_candidate("candidate".into())
@@ -2202,7 +2210,7 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
     let engine = Arc::new(runtime.execution_engine(accounting_factory));
     let supervisor = Arc::new(GoalExecutionSupervisor::new(engine));
 
-    let started = supervisor
+    let mut started = supervisor
         .submit(
             settings.clone(),
             ingress.clone(),
@@ -2215,6 +2223,16 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
         .await
         .unwrap();
     assert!(matches!(started.response(), GoalResponse::Started(_)));
+    assert!(
+        timeout(Duration::from_millis(20), parent_started.notified())
+            .await
+            .is_err(),
+        "the admitted worker must wait until its surface delivers the start acknowledgement"
+    );
+    supervisor
+        .launch_after_response(settings.clone(), &mut started)
+        .await
+        .unwrap();
     parent_started.notified().await;
 
     let pause_supervisor = Arc::clone(&supervisor);
@@ -2284,9 +2302,9 @@ async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
     let engine = Arc::new(runtime.execution_engine(accounting_factory));
     let supervisor = GoalExecutionSupervisor::new(engine);
 
-    let started = supervisor
+    let mut started = supervisor
         .submit(
-            settings,
+            settings.clone(),
             ingress.clone(),
             driver,
             GoalCommand::Start {
@@ -2297,6 +2315,10 @@ async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
         .await
         .unwrap();
     assert!(matches!(started.response(), GoalResponse::Started(_)));
+    supervisor
+        .launch_after_response(settings.clone(), &mut started)
+        .await
+        .unwrap();
 
     let paused = timeout(Duration::from_secs(1), async {
         loop {
@@ -2323,6 +2345,84 @@ async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
         events.lock().unwrap().as_slice(),
         &["parent", "candidate", "verifier"]
     );
+}
+
+#[tokio::test]
+async fn supervisor_pauses_without_starting_when_the_surface_cannot_acknowledge() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent,
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor =
+        GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting_factory)));
+
+    let mut started = supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let task_id = match started.response() {
+        GoalResponse::Started(projection) => projection.task_id.clone(),
+        response => panic!("expected start response, got {response:?}"),
+    };
+    supervisor
+        .pause_before_launch(&mut started, GoalPauseReason::ExternalDependency)
+        .await
+        .unwrap();
+
+    assert!(
+        timeout(Duration::from_millis(20), parent_started.notified())
+            .await
+            .is_err(),
+        "a Goal whose lifecycle acknowledgement was not delivered must not start"
+    );
+    let task = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::ExternalDependency));
+    assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    assert!(goal.pending_call_id.is_none());
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -2365,7 +2465,7 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
     let coordinator = Arc::new(GoalExecutionRestartCoordinator::new());
     let supervisor = coordinator.new_supervisor(engine).await;
 
-    let started = supervisor
+    let mut started = supervisor
         .submit(
             settings.clone(),
             ingress.clone(),
@@ -2381,6 +2481,10 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
         GoalResponse::Started(projection) => projection.task_id.clone(),
         response => panic!("expected start response, got {response:?}"),
     };
+    supervisor
+        .launch_after_response(settings.clone(), &mut started)
+        .await
+        .unwrap();
     parent_started.notified().await;
 
     let restarting = Arc::clone(&coordinator);
@@ -2438,9 +2542,9 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
     );
 
     coordinator.reopen_for_generation().await;
-    let resumed = supervisor
+    let mut resumed = supervisor
         .submit(
-            settings,
+            settings.clone(),
             ingress.clone(),
             driver,
             GoalCommand::Resume { response: None },
@@ -2448,6 +2552,10 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
         .await
         .unwrap();
     assert!(matches!(resumed.response(), GoalResponse::Resumed(_)));
+    supervisor
+        .launch_after_response(settings, &mut resumed)
+        .await
+        .unwrap();
     parent_started.notified().await;
     release_parent.notify_one();
     let completed = timeout(Duration::from_secs(1), async {
