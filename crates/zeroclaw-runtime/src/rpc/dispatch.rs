@@ -4678,6 +4678,13 @@ impl RpcDispatcher {
                 rpc_err(SESSION_NOT_FOUND, "Session was replaced before close")
             });
         }
+        // `session/close` operates on a live incarnation only. A durable
+        // record can outlive its in-process session, but it is not authority
+        // to dispose a Goal by raw session id: another incarnation may be
+        // restored under that id before this handler finishes admission.
+        if requested_generation.is_none() {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
         // complete. Removal then happens under the same incarnation fence.
@@ -29927,6 +29934,53 @@ mod tests {
             current.map(|task| task.id).as_deref(),
             Some("successor-goal")
         );
+    }
+
+    #[tokio::test]
+    async fn close_of_reaped_session_does_not_dispose_durable_goal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "reaped-session-close-preserves-goal";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "session_id": sid,
+            }))
+            .await
+            .expect("initial Chat session should succeed");
+        sessions.remove(sid).await;
+
+        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let durable_session_id = format!("rpc_{sid}");
+        insert_running_goal(&goal_store, &durable_session_id, "reaped-session-goal").await;
+        let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        goal_runtime
+            .install_supervisor_if_absent(
+                sid.to_owned(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher context is uniquely owned before spawning")
+            .goal_runtime = goal_runtime;
+
+        let error = dispatcher
+            .handle_session_close(&json!({ "session_id": sid }))
+            .await
+            .expect_err("closing a reaped session must report not found");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::GoalTaskRegistry;
+        let current = goal_store
+            .current_goal_for_session(&durable_session_id)
+            .await
+            .expect("read the durable Goal");
+        assert_eq!(current.map(|task| task.status), Some(TaskStatus::Running));
     }
 
     #[tokio::test]
