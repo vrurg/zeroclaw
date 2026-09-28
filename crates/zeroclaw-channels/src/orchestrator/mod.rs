@@ -684,6 +684,11 @@ struct ChannelRuntimeContext {
     /// `[risk_profiles]` config while preserving the initiating channel as a
     /// backchannel for supervised shell approval.
     approval_manager: Arc<ApprovalManager>,
+    /// The agent's filesystem policy, built once per agent at channel start
+    /// (the same `Arc` the agent's tools were assembled with) and threaded
+    /// into each turn's execution context so the no-vision image-marker
+    /// gate applies the identical read ledger the file tools apply.
+    security: Arc<SecurityPolicy>,
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
     cost_tracking: Option<ChannelCostTrackingState>,
@@ -9456,7 +9461,7 @@ async fn process_channel_message_body(
     // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
     // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
     // preamble too, so there is no separate byte-length to record here.
-    let mut channel_injected_memory_preamble: Option<String> = None;
+    let mut channel_injected_memory_preamble = None;
 
     // Kept so a post-loop trim resync can restore the current turn to this
     // clean content before persisting; the durable transcript must never
@@ -10038,6 +10043,9 @@ async fn process_channel_message_body(
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
                         approval: Some(&approval_manager),
+                        // The agent's own policy (built at channel start with
+                        // its tools) governs the no-vision marker gate.
+                        security: Some(ctx.security.as_ref()),
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
@@ -16954,6 +16962,7 @@ pub async fn start_channels_with_plugin_webhooks(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            security: Arc::clone(&security),
             sop_driver_sink: sop_driver_sink.clone(),
         });
 
@@ -17553,6 +17562,7 @@ fn concurrent_persist_lock_serialization() {
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     });
     ctx.conversation_histories
         .lock()
@@ -17652,6 +17662,7 @@ fn test_channel_ctx_with_backend(
 ) -> Arc<ChannelRuntimeContext> {
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(HashMap::new()),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -17772,6 +17783,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
 
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(channels_by_name),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider,
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -20998,6 +21010,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -21072,6 +21085,7 @@ temperature = 0.3
         let single_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&single_registry),
             session_store: Some(Arc::clone(&single_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -21141,12 +21155,14 @@ temperature = 0.3
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("alpha-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let beta_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("beta-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let mut config = Config::default();
@@ -21261,6 +21277,7 @@ temperature = 0.3
             memory: memory_for_ctx,
             auto_save_memory: true,
             ack_reactions: false,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -21354,6 +21371,7 @@ temperature = 0.3
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let ctx = ChannelRuntimeContext {
             session_store: Some(Arc::clone(&session_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         };
         let cases = [
@@ -21473,6 +21491,7 @@ temperature = 0.3
             sop_driver_sink: None,
             prompt_config: Arc::new(cfg.clone()),
             live_config: Arc::new(RwLock::new(cfg)),
+            security: Arc::new(SecurityPolicy::default()),
             ..base_ctx
         });
 
@@ -21968,6 +21987,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         }
     }
@@ -22448,6 +22468,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22553,6 +22574,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22676,6 +22698,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22803,6 +22826,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -24828,6 +24852,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -24936,6 +24961,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -26648,6 +26674,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
                 Arc::new(NoopMemory),
             ))),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base).clone()
         });
 
@@ -27785,6 +27812,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -27880,6 +27908,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -27973,6 +28002,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28179,6 +28209,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(LeakingNarratingToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28368,6 +28399,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28566,6 +28598,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -29138,6 +29171,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -29374,6 +29408,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29771,6 +29806,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29852,6 +29888,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
             show_receipts_in_response: true,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -30077,6 +30114,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30204,6 +30242,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -30353,6 +30392,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30491,6 +30531,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30614,6 +30655,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30755,6 +30797,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30920,6 +30963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31126,6 +31170,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31642,6 +31687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31763,6 +31809,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31891,6 +31938,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33367,6 +33415,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33520,6 +33569,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33936,6 +33986,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34105,6 +34156,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34267,6 +34319,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34476,6 +34529,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34714,6 +34768,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34856,6 +34911,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35536,6 +35592,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35671,6 +35728,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35810,6 +35868,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35941,6 +36000,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -36072,6 +36132,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -36490,6 +36551,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -38018,6 +38080,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -43922,6 +43985,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -44109,6 +44173,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -44635,6 +44700,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -45132,6 +45198,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -45303,6 +45370,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -48617,6 +48685,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -48790,6 +48859,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -48955,6 +49025,7 @@ This is an example JSON object for profile settings."#;
                     describe_images: true,
                     ..Default::default()
                 },
+                security: Arc::new(SecurityPolicy::default()),
                 ..(*base_ctx).clone()
             });
 
@@ -49048,6 +49119,13 @@ This is an example JSON object for profile settings."#;
         channels_by_name.insert(channel.name().to_string(), channel);
 
         // DummyModelProvider has default capabilities (vision: false).
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -49129,6 +49207,10 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             sop_driver_sink: None,
         });
 
@@ -49139,7 +49221,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -49171,6 +49253,13 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -49252,6 +49341,10 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             sop_driver_sink: None,
         });
 
@@ -49261,7 +49354,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -49423,6 +49516,7 @@ This is an example JSON object for profile settings."#;
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -49735,6 +49829,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -49896,6 +49991,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -50049,6 +50145,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -50222,6 +50319,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -51396,6 +51494,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 

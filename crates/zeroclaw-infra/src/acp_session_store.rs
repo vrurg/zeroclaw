@@ -3,11 +3,15 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::Path;
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+use zeroclaw_api::model_provider::{
+    ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, projected_entry_count,
+};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
+
+const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
@@ -25,6 +29,29 @@ impl ToolEventKind {
             Self::Out => "out",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "in" => Some(Self::In),
+            "out" => Some(Self::Out),
+            _ => None,
+        }
+    }
+}
+
+/// Open-call balance after replaying one tool-call id's rows in order. An
+/// `in` opens one call; an `out` folds into an open call while the balance
+/// is positive and otherwise is an orphan entry that leaves the balance
+/// untouched, so an orphan cannot consume a later call that reuses the id.
+fn open_calls_after(events: impl IntoIterator<Item = ToolEventKind>) -> usize {
+    let mut open = 0usize;
+    for event in events {
+        match event {
+            ToolEventKind::In => open += 1,
+            ToolEventKind::Out => open = open.saturating_sub(1),
+        }
+    }
+    open
 }
 
 /// Canonical breadcrumb text, duplicated from
@@ -33,6 +60,12 @@ impl ToolEventKind {
 /// cannot import it; used only for one-time legacy-row migration below.
 /// Keep in sync with the runtime constant.
 const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str = "[earlier turns omitted to fit the context window]";
+const SYNTHETIC_INTERRUPTION_ROLE: &str = "__zeroclaw_turn_stream_interrupted__";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RetainedContextRecord {
+    messages: Vec<ConversationMessage>,
+}
 
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
@@ -59,12 +92,22 @@ pub struct AcpSessionData {
     /// interactive-session JSONL migration contract (see
     /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`).
     pub trim_breadcrumb: bool,
+    /// Provider-facing retained context written by native RPC trims. `None`
+    /// preserves the legacy provider-safe replay path.
+    pub retained_context: Option<Vec<ConversationMessage>>,
 }
 
 pub enum AcpSessionRestore {
     Missing,
     Killed,
-    Restorable(AcpSessionData),
+    Restorable(Box<AcpSessionData>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionKillTransition {
+    Marked,
+    AlreadyKilled,
+    Missing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,10 +131,45 @@ pub struct AcpSessionSummary {
     pub message_count: usize,
 }
 
+/// The sessions one projected-count refresh pass may score: the scope of
+/// the listing about to run, or the one session a count read names. Scoring
+/// stays scoped to the rows that listing returns, before any caller-side
+/// principal filter, so an agent-scoped listing never rescores the sessions
+/// of other agents.
+enum ProjectedCountScope<'a> {
+    /// The live sessions of every agent (the unscoped picker listing).
+    Live,
+    /// Every session of one agent, live or killed (the export listing).
+    Agent(&'a str),
+    /// The live sessions of one agent (the live discovery listing).
+    LiveAgent(&'a str),
+    /// One session, by uuid (the persisted count getter).
+    Session(&'a str),
+}
+
+impl ProjectedCountScope<'_> {
+    /// The `acp_sessions` predicate that narrows a refresh pass to this
+    /// scope, as a `WHERE` tail plus the one value it binds.
+    fn session_filter(&self) -> (&'static str, Option<&str>) {
+        match *self {
+            Self::Live => (" AND s.killed_at IS NULL", None),
+            Self::Agent(agent) => (" AND s.agent_alias = ?1", Some(agent)),
+            Self::LiveAgent(agent) => (
+                " AND s.agent_alias = ?1 AND s.killed_at IS NULL",
+                Some(agent),
+            ),
+            Self::Session(session_uuid) => (" AND s.session_uuid = ?1", Some(session_uuid)),
+        }
+    }
+}
+
 /// A bounded, store-owned page of the typed ACP transcript. The cursor is
 /// deliberately opaque to RPC clients; callers must hand it back unchanged.
 #[derive(Debug)]
 pub struct AcpSessionPage {
+    /// Owner read in the same transaction as the page, for RPC authorization
+    /// revalidation without loading the complete transcript.
+    pub principal_id: Option<String>,
     pub messages: Vec<ConversationMessage>,
     pub next_cursor: Option<String>,
     pub has_older: bool,
@@ -138,6 +216,8 @@ impl AcpSessionStore {
                  interaction_surface TEXT,
                  token_count   INTEGER NOT NULL DEFAULT 0,
                  killed_at     TEXT,
+                 retained_context_json TEXT,
+                 retained_context_frontier INTEGER,
                  created_at    TEXT NOT NULL,
                  last_activity TEXT NOT NULL
              );
@@ -175,7 +255,20 @@ impl AcpSessionStore {
                  payload    TEXT,
                  created_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_acp_session_events_session ON acp_session_events(session_id, id);",
+             CREATE INDEX IF NOT EXISTS idx_acp_session_events_session ON acp_session_events(session_id, id);
+
+             CREATE TABLE IF NOT EXISTS acp_turn_checkpoints (
+                 session_id    INTEGER PRIMARY KEY REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 turn_id       TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS acp_turn_checkpoint_events (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES acp_turn_checkpoints(session_id) ON DELETE CASCADE,
+                 payload    TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_acp_turn_checkpoint_events_session
+                 ON acp_turn_checkpoint_events(session_id, id);",
         )
         .context("Failed to create ACP session schema")?;
 
@@ -188,10 +281,15 @@ impl AcpSessionStore {
         Self::ensure_interaction_surface_column(&conn)
             .context("Failed to migrate ACP session interaction surface")?;
 
+        Self::ensure_projected_message_count_columns(&conn)
+            .context("Failed to migrate ACP session projected message count")?;
         Self::ensure_trim_breadcrumb_column(&conn)
             .context("Failed to migrate ACP session trim breadcrumb column")?;
         Self::ensure_principal_id_column(&conn)
             .context("Failed to migrate ACP session principal owner")?;
+
+        Self::ensure_retained_context_columns(&conn)
+            .context("Failed to migrate ACP retained context columns")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -350,6 +448,78 @@ impl AcpSessionStore {
         }
     }
 
+    /// Idempotent migration adding the persisted projected conversation-entry
+    /// count the session picker reports, together with the message-id
+    /// watermark that says when that count is still valid. The message and
+    /// tool-call rows remain the single source of truth: the
+    /// (count, watermark) pair on `acp_sessions` is a cache of their
+    /// projection, and a cache entry is valid exactly when
+    /// `projected_count_through IS (SELECT MAX(id) FROM acp_messages WHERE
+    /// session_id = s.id)` (SQLite `IS` is null-safe: an empty session with
+    /// a NULL watermark is valid at count 0). Message ids are AUTOINCREMENT,
+    /// so every insert by any binary lands past any earlier watermark and
+    /// turns the cache stale instead of silently wrong. Stale sessions are
+    /// rescored lazily from their rows on the read paths, never at open, so
+    /// this migration is two plain idempotent column adds and the
+    /// constructor never scores a session. A database an earlier build of
+    /// this store already completed its one-pass scoring on needs nothing:
+    /// that build's schema stamp is simply unused, and its sessions carry a
+    /// NULL watermark and rescore lazily.
+    fn ensure_projected_message_count_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        let mut count_present = false;
+        let mut watermark_present = false;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "projected_message_count" {
+                count_present = true;
+            }
+            if column == "projected_count_through" {
+                watermark_present = true;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        if !count_present {
+            match conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN projected_message_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => {
+                    return Err(e).context("Failed to add ACP session projected message count");
+                }
+            }
+        }
+        if !watermark_present {
+            match conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN projected_count_through INTEGER",
+                [],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => {
+                    return Err(e).context("Failed to add ACP session projected count watermark");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Idempotent migration adding the `trim_breadcrumb` column: whether the
     /// persisted transcript's first non-system message is the synthetic
     /// history-trim marker. Stored as one canonical fact alongside the
@@ -394,6 +564,48 @@ impl AcpSessionStore {
             }
             Err(e) => Err(e).context("Failed to add ACP session trim breadcrumb column"),
         }
+    }
+
+    fn ensure_retained_context_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        let mut columns = std::collections::HashSet::new();
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            columns.insert(
+                row.get::<_, String>(1)
+                    .context("Failed to read ACP session column name")?,
+            );
+        }
+        drop(rows);
+        drop(stmt);
+        for (name, sql) in [
+            (
+                "retained_context_json",
+                "ALTER TABLE acp_sessions ADD COLUMN retained_context_json TEXT",
+            ),
+            (
+                "retained_context_frontier",
+                "ALTER TABLE acp_sessions ADD COLUMN retained_context_frontier INTEGER",
+            ),
+        ] {
+            if columns.contains(name) {
+                continue;
+            }
+            match conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e).with_context(|| format!("Failed to add {name}")),
+            }
+        }
+        Ok(())
     }
 
     /// One-time legacy migration for rows written before the
@@ -525,6 +737,22 @@ impl AcpSessionStore {
         }
     }
 
+    /// Read the owner and interaction surface needed before checkpoint
+    /// recovery without hydrating a potentially large transcript.
+    pub fn session_owner_and_surface(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT principal_id, interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("Failed to query ACP session owner and interaction surface")
+    }
+
     /// Bind an unlabelled legacy session to a validated surface exactly once.
     /// Returns the durable value after the update so the caller can reject a
     /// concurrent or pre-existing mismatch.
@@ -593,6 +821,7 @@ impl AcpSessionStore {
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
         let messages = Self::load_messages(&conn, session_id)?;
+        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -612,6 +841,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            retained_context,
             principal_id,
         }))
     }
@@ -631,11 +861,11 @@ impl AcpSessionStore {
         let conn = conn
             .transaction()
             .context("Failed to begin ACP session page read transaction")?;
-        let session_id: i64 = conn
+        let (session_id, principal_id): (i64, Option<String>) = conn
             .query_row(
-                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                "SELECT id, principal_id FROM acp_sessions WHERE session_uuid = ?1",
                 params![session_uuid],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| anyhow::Error::msg(format!("unknown ACP session: {session_uuid}")))?;
@@ -687,6 +917,7 @@ impl AcpSessionStore {
         }
         if state.next_message_id == 0 {
             return Ok(AcpSessionPage {
+                principal_id,
                 messages: Vec::new(),
                 next_cursor: None,
                 has_older: false,
@@ -784,6 +1015,7 @@ impl AcpSessionStore {
         let next_cursor = next.map(encode_cursor).transpose()?;
         let has_older = next_cursor.is_some();
         Ok(AcpSessionPage {
+            principal_id,
             messages,
             next_cursor,
             has_older,
@@ -843,6 +1075,7 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
+        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -862,6 +1095,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            retained_context,
             principal_id,
         }))
     }
@@ -968,6 +1202,7 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
+        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -977,7 +1212,7 @@ impl AcpSessionStore {
             }
         };
 
-        Ok(AcpSessionRestore::Restorable(AcpSessionData {
+        Ok(AcpSessionRestore::Restorable(Box::new(AcpSessionData {
             session_uuid: session_uuid.to_string(),
             principal_id,
             agent_alias,
@@ -988,15 +1223,19 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
-        }))
+            retained_context,
+        })))
     }
 
     /// List restorable sessions as lightweight summaries, ordered by most recent
     /// activity first. This is the picker-facing read: it avoids the full
     /// message-history hydration that `load_session` performs. Killed rows keep
     /// history/export data but are terminal and must not be offered for restore.
+    /// Stale projected counts are rescored from the rows first, so the listing
+    /// never reports a cache another writer left behind.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Live)?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -1005,7 +1244,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
@@ -1059,7 +1298,11 @@ impl AcpSessionStore {
     /// transcripts remain readable through `load_session_for_agent` and they
     /// remain available to export through `list_sessions_by_agent`.
     pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(
+            &mut conn,
+            ProjectedCountScope::LiveAgent(agent_alias),
+        )?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -1068,7 +1311,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
@@ -1208,22 +1451,31 @@ impl AcpSessionStore {
                 }
             }
 
-            if ins.is_empty() && outs.is_empty() {
-                // Pure chat message.
-                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+            let role = if role == SYNTHETIC_INTERRUPTION_ROLE {
+                "system".to_string()
             } else {
-                if !ins.is_empty() {
-                    // Assistant turn that issued tool calls. The text may be empty.
-                    out.push(ConversationMessage::AssistantToolCalls {
-                        text: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content)
-                        },
-                        tool_calls: ins,
-                        reasoning_content,
-                    });
+                role
+            };
+            // A row with no 'in' rows is a chat message, with any 'out' rows
+            // following it as their own entries: the persisted counter
+            // scores the parent row once for its text and each unmatched
+            // result once, so the reload must present the same entries.
+            if ins.is_empty() {
+                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+                if !outs.is_empty() {
+                    out.push(ConversationMessage::ToolResults(outs));
                 }
+            } else {
+                // Assistant turn that issued tool calls. The text may be empty.
+                out.push(ConversationMessage::AssistantToolCalls {
+                    text: if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
+                    tool_calls: ins,
+                    reasoning_content,
+                });
                 if !outs.is_empty() {
                     out.push(ConversationMessage::ToolResults(outs));
                 }
@@ -1233,148 +1485,137 @@ impl AcpSessionStore {
         Ok(out)
     }
 
-    /// Append all ConversationMessages from one completed turn, decomposing
-    /// AssistantToolCalls / ToolResults variants into the appropriate tables.
-    /// Single transaction.
-    pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
+    /// Refresh the persisted projected-entry counts whose watermark has gone
+    /// stale, so the listing or getter about to read one never trusts a
+    /// cache another writer left behind. Scoring is per session and
+    /// non-fatal: each stale session is reloaded and rescored in its own
+    /// short transaction from its rows through the shared counting rule. A
+    /// session whose rows cannot be reloaded (an unknown `event_kind`) is
+    /// logged at ERROR and left untouched: it still lists with its stored
+    /// count (0 for a session never scored), still fails closed on
+    /// `load_session`, and never blocks the store, the other sessions, or
+    /// the open. A genuine SQLite failure on the scoring UPDATE (busy, disk
+    /// full) propagates.
+    fn refresh_stale_projected_counts(
+        conn: &mut Connection,
+        scope: ProjectedCountScope<'_>,
+    ) -> Result<()> {
+        let (filter_sql, filter_value) = scope.session_filter();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT s.id, s.session_uuid
+                   FROM acp_sessions s
+                  WHERE NOT (s.projected_count_through IS
+                             (SELECT MAX(m.id) FROM acp_messages m
+                               WHERE m.session_id = s.id))
+                        {filter_sql}
+                  ORDER BY s.id"
+            ))
+            .context("Failed to prepare stale projected-count query")?;
+        let stale_sessions: Vec<(i64, String)> = match filter_value {
+            Some(value) => stmt
+                .query_map(params![value], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("Failed to read stale ACP sessions")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("Failed to read stale ACP sessions")?,
+            None => stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("Failed to read stale ACP sessions")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("Failed to read stale ACP sessions")?,
+        };
+        drop(stmt);
+
+        for (session_id, session_uuid) in stale_sessions {
+            let tx = conn
+                .transaction()
+                .context("Failed to begin projected-count refresh transaction")?;
+            let messages = match Self::load_messages(&tx, session_id) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_uuid": session_uuid,
+                                "error": error.to_string(),
+                            })),
+                        "Failed to reload ACP session for projected-count refresh; leaving its persisted count untouched"
+                    );
+                    continue;
+                }
+            };
+            let count = projected_entry_count(&messages) as i64;
+            let watermark: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .context("Failed to read ACP session watermark")?;
+            tx.execute(
+                "UPDATE acp_sessions
+                    SET projected_message_count = ?1,
+                        projected_count_through = ?2
+                  WHERE id = ?3",
+                params![count, watermark, session_id],
+            )
+            .context("Failed to refresh ACP session projected message count")?;
+            tx.commit()
+                .context("Failed to commit projected-count refresh")?;
         }
-
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
-
-        // Resolve the integer session_id once. Fail loudly if the UUID is
-        // unknown — we want an error here, not orphaned inserts.
-        let session_id: i64 = conn
-            .query_row(
-                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
-                params![session_uuid],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
-
-        let tx = conn
-            .transaction()
-            .context("Failed to begin append_turn transaction")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
-
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
-        )
-        .context("Failed to update last_activity")?;
-
-        tx.commit().context("Failed to commit append_turn")?;
         Ok(())
     }
 
-    /// Replace a session's entire durable message transcript with the
-    /// agent's own authoritative post-turn history, in one transaction.
-    /// Deleting `acp_messages` cascades to `acp_tool_calls` via their FK
-    /// (`foreign_keys = ON`). Used by callers that own a trimmed in-memory
-    /// history so the store never resurrects turns the live agent already
-    /// dropped by appending on top of a stale transcript.
-    pub fn replace_messages(
-        &self,
-        session_uuid: &str,
-        messages: &[ConversationMessage],
-    ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
-
-        let session_id: i64 = conn
+    fn load_retained_context(
+        conn: &Connection,
+        session_id: i64,
+    ) -> Result<Option<Vec<ConversationMessage>>> {
+        let payload: Option<String> = conn
             .query_row(
-                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
-                params![session_uuid],
+                "SELECT retained_context_json FROM acp_sessions WHERE id = ?1",
+                params![session_id],
                 |row| row.get(0),
             )
-            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
-
-        let tx = conn
-            .transaction()
-            .context("Failed to begin replace_messages transaction")?;
-        tx.execute(
-            "DELETE FROM acp_messages WHERE session_id = ?1",
-            params![session_id],
-        )
-        .context("Failed to clear prior messages")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
-
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
-        )
-        .context("Failed to update last_activity")?;
-
-        tx.commit().context("Failed to commit replace_messages")?;
-        Ok(())
+            .optional()
+            .context("Failed to read ACP retained context")?
+            .flatten();
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let record = serde_json::from_str::<RetainedContextRecord>(&payload)
+            .context("Failed to deserialize ACP retained context")?;
+        Ok(Some(Self::provider_safe_history(&record.messages)))
     }
 
-    /// Replace a session's message transcript and its breadcrumb provenance
-    /// together in one transaction. `replace_messages` and
-    /// `set_trim_breadcrumb` each commit on their own; calling them back to
-    /// back (as the ACP restore/turn-completion callers used to) leaves a
-    /// window where a crash between the two commits can desynchronize the
-    /// transcript and the flag. Callers that own both values at once should
-    /// use this instead.
-    pub fn replace_messages_and_breadcrumb(
-        &self,
-        session_uuid: &str,
-        messages: &[ConversationMessage],
-        breadcrumb_present: bool,
-    ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
-
-        let session_id: i64 = conn
-            .query_row(
-                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
-                params![session_uuid],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
-
-        let tx = conn
-            .transaction()
-            .context("Failed to begin replace_messages_and_breadcrumb transaction")?;
-        tx.execute(
-            "DELETE FROM acp_messages WHERE session_id = ?1",
-            params![session_id],
-        )
-        .context("Failed to clear prior messages")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1, trim_breadcrumb = ?2 WHERE id = ?3",
-            params![now, i64::from(breadcrumb_present), session_id],
-        )
-        .context("Failed to update last_activity and trim_breadcrumb")?;
-
-        tx.commit()
-            .context("Failed to commit replace_messages_and_breadcrumb")?;
-        Ok(())
-    }
-
-    /// Insert `messages` into `acp_messages`/`acp_tool_calls`, decomposing
-    /// `AssistantToolCalls`/`ToolResults` variants. Shared by `append_turn`
-    /// (adds to the existing transcript) and `replace_messages` (called
-    /// after clearing it) so both write the same row shapes.
+    /// Insert messages into the durable, user-visible transcript. This path
+    /// deliberately excludes runtime system prompts; interruption markers use
+    /// a provenance-known role and are added by recovery below.
     ///
-    /// A `Chat` message with `role == "system"` is never written: the system
-    /// prompt is runtime/operator-owned context, not a conversation turn, and
-    /// `session/messages` has no restore-side filter for it. Enforcing this
-    /// here (the one write path both callers share) means a caller that
-    /// persists an agent's full `history()` — which always starts with the
-    /// system prompt — can't leak it into durable ACP transcript rows.
+    /// Returns the projected conversation-entry count of the inserted batch,
+    /// folded against the tool-call rows already visible in this transaction:
+    /// `append_messages` adds it to the persisted counter, and
+    /// `replace_messages_inner` (whose prior rows the FK cascade already
+    /// removed) sets the counter to it, which is the counting rule over the
+    /// new transcript as a whole.
     fn insert_messages(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &Transaction<'_>,
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
+        // Persisted counter mirroring the runtime's projected conversation
+        // length: one entry per chat message, non-empty assistant text plus
+        // one per tool call, results folding into the call awaiting them.
+        let mut projected_increment: i64 = 0;
 
         for msg in messages {
             match msg {
@@ -1387,6 +1628,7 @@ impl AcpSessionStore {
                         params![session_id, chat.role, chat.content, now],
                     )
                     .context("Failed to insert chat message")?;
+                    projected_increment += 1;
                     if chat.role == "assistant" {
                         last_assistant_msg_id = Some(tx.last_insert_rowid());
                     }
@@ -1396,6 +1638,17 @@ impl AcpSessionStore {
                     tool_calls,
                     reasoning_content,
                 } => {
+                    if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                        projected_increment += 1;
+                    }
+                    projected_increment += tool_calls.len() as i64;
+                    // Zero-entry batch: nothing to persist, keeps the counter
+                    // and the reloaded projection equal.
+                    if tool_calls.is_empty()
+                        && !text.as_deref().is_some_and(|text| !text.is_empty())
+                    {
+                        continue;
+                    }
                     tx.execute(
                         "INSERT INTO acp_messages
                            (session_id, role, content, reasoning_content, created_at)
@@ -1450,6 +1703,17 @@ impl AcpSessionStore {
                             ));
                         }
                     };
+                    // This id's rows for the session, in write order; the
+                    // fold below replays them through the shared clamp rule.
+                    let mut history_stmt = tx
+                        .prepare(
+                            "SELECT tc.event_kind
+                               FROM acp_tool_calls tc
+                               JOIN acp_messages m ON m.id = tc.message_id
+                              WHERE m.session_id = ?1 AND tc.tool_call_id = ?2
+                              ORDER BY tc.id",
+                        )
+                        .context("Failed to prepare tool call history query")?;
                     for result in results {
                         let tool_name: String = tx
                             .query_row(
@@ -1460,6 +1724,25 @@ impl AcpSessionStore {
                                 |row| row.get(0),
                             )
                             .unwrap_or_else(|_| String::from("unknown"));
+                        let events: Vec<ToolEventKind> = history_stmt
+                            .query_map(params![session_id, result.tool_call_id], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .context("Failed to look up tool call history")?
+                            .collect::<Result<Vec<_>, _>>()
+                            .context("Failed to read tool call history rows")?
+                            .into_iter()
+                            .map(|kind| ToolEventKind::parse(&kind))
+                            .collect::<Option<Vec<_>>>()
+                            .context("Unknown event_kind in tool call history")?;
+                        // A result folds into its call (no entry) while an
+                        // 'in' row for this tool_call_id is still unconsumed;
+                        // beyond that it is an orphan entry. An orphan leaves
+                        // the open-call balance untouched, so a later call
+                        // reusing the id still opens fresh.
+                        if open_calls_after(events) == 0 {
+                            projected_increment += 1;
+                        }
                         tx.execute(
                             "INSERT INTO acp_tool_calls
                                (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
@@ -1480,7 +1763,954 @@ impl AcpSessionStore {
             }
         }
 
+        Ok(projected_increment)
+    }
+
+    /// Append `messages` to the visible transcript and keep the persisted
+    /// projected-entry count cache in step, in the caller's transaction.
+    /// Every append path (`append_turn`, checkpoint finalization and
+    /// recovery) goes through here. The batch's score is added only while
+    /// the session's watermark still matches its rows; a cache a writer
+    /// without the columns left behind is recomputed from the rows instead.
+    fn append_messages(
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+        session_id: i64,
+        messages: &[ConversationMessage],
+        now: &str,
+    ) -> Result<()> {
+        let messages = Self::bounded_transcript_messages(messages);
+        // The persisted pair is a cache of the rows' projection, valid only
+        // while the watermark matches the session's current MAX(id). Read
+        // both before inserting: a mismatch means a writer this store did
+        // not observe (a binary without the cache columns, or a raw insert
+        // such as the recovery interruption marker) left rows past the
+        // watermark, and the increment below would build on a stale base.
+        let (watermark, max_id): (Option<i64>, Option<i64>) = tx
+            .query_row(
+                "SELECT s.projected_count_through,
+                        (SELECT MAX(m.id) FROM acp_messages m
+                          WHERE m.session_id = s.id)
+                   FROM acp_sessions s
+                  WHERE s.id = ?1",
+                params![session_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .context("Failed to read ACP session projected count cache")?;
+        let projected_increment = Self::insert_messages(tx, session_id, &messages, now)?;
+        let watermark_now: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session watermark")?;
+        if watermark == max_id {
+            // A valid cache: keep the increment and move the watermark to
+            // the rows this transaction just wrote.
+            tx.execute(
+                "UPDATE acp_sessions
+                    SET last_activity = ?1,
+                        projected_message_count = projected_message_count + ?2,
+                        projected_count_through = ?3
+                  WHERE id = ?4",
+                params![now, projected_increment, watermark_now, session_id],
+            )
+            .with_context(|| format!("Failed to update last_activity for {session_uuid}"))?;
+            return Ok(());
+        }
+        // A stale cache: recompute the whole projection from the rows so the
+        // increment never builds on the stale base. A session whose rows
+        // cannot be reloaded keeps its stale pair untouched (the reload logs
+        // it) and stays stale for a later read to heal once the rows are
+        // repaired; the cache must not fail the append itself.
+        match Self::load_messages(tx, session_id) {
+            Ok(messages) => {
+                let projected_count = projected_entry_count(&messages) as i64;
+                tx.execute(
+                    "UPDATE acp_sessions
+                        SET last_activity = ?1,
+                            projected_message_count = ?2,
+                            projected_count_through = ?3
+                      WHERE id = ?4",
+                    params![now, projected_count, watermark_now, session_id],
+                )
+                .with_context(|| format!("Failed to update last_activity for {session_uuid}"))?;
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_uuid": session_uuid,
+                            "error": error.to_string(),
+                        })),
+                    "Failed to reload ACP session for projected-count resync; leaving its persisted count untouched"
+                );
+                tx.execute(
+                    "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
+                    params![now, session_id],
+                )
+                .with_context(|| format!("Failed to update last_activity for {session_uuid}"))?;
+            }
+        }
         Ok(())
+    }
+
+    fn append_checkpoint_visible_messages(
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+        session_id: i64,
+        messages: &[ConversationMessage],
+        now: &str,
+    ) -> Result<()> {
+        // The checkpoint projection is the one owner-produced path allowed to
+        // carry the synthetic interruption marker. Store it under an explicit
+        // role so actual provider system prompts remain excluded everywhere
+        // else and recovery can restore the marker without text heuristics.
+        let messages = messages
+            .iter()
+            .map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "system" => {
+                    ConversationMessage::Chat(ChatMessage {
+                        role: SYNTHETIC_INTERRUPTION_ROLE.to_string(),
+                        content: chat.content.clone(),
+                    })
+                }
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self::append_messages(tx, session_uuid, session_id, &messages, now)
+    }
+
+    fn session_id(conn: &Connection, session_uuid: &str) -> Result<i64> {
+        conn.query_row(
+            "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
+    }
+
+    pub fn contains_session(&self, session_uuid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM acp_sessions WHERE session_uuid = ?1)",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .context("Failed to check ACP session existence")
+    }
+
+    /// Append all ConversationMessages from one completed turn in one transaction.
+    pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin append_turn transaction")?;
+        Self::append_messages(&tx, session_uuid, session_id, messages, &now)?;
+
+        tx.commit().context("Failed to commit append_turn")?;
+        Ok(())
+    }
+
+    /// Replace a session's visible transcript while keeping message identity
+    /// local to the transcript. Native retained provider context uses a
+    /// separate projection and never calls this method for a trim.
+    pub fn replace_messages(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        self.replace_messages_inner(session_uuid, messages, None)
+    }
+
+    pub fn replace_messages_and_breadcrumb(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+        breadcrumb_present: bool,
+    ) -> Result<()> {
+        self.replace_messages_inner(session_uuid, messages, Some(breadcrumb_present))
+    }
+
+    fn replace_messages_inner(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+        breadcrumb_present: Option<bool>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin replace_messages_and_breadcrumb transaction")?;
+        tx.execute(
+            "DELETE FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to clear prior messages")?;
+        // The cascade above removed the prior tool-call rows, so the fold
+        // inside insert_messages starts from an empty open-call balance and
+        // its return value is the projected entry count of the new
+        // transcript as a whole: the counter is set to it, not incremented.
+        let projected_count = Self::insert_messages(&tx, session_id, messages, &now)?;
+        // The new transcript is authoritative, so the cache pair is set from
+        // it: the count to its projection and the watermark to the rows just
+        // written (NULL for an empty transcript, valid at 0).
+        let watermark: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session watermark")?;
+        // Legacy replacement intentionally changes the source transcript;
+        // invalidate its derived provider projection in the same transaction.
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1, trim_breadcrumb = COALESCE(?2, trim_breadcrumb),
+                retained_context_json = NULL, retained_context_frontier = NULL,
+                projected_message_count = ?3, projected_count_through = ?4 WHERE id = ?5",
+            params![
+                now,
+                breadcrumb_present.map(i64::from),
+                projected_count,
+                watermark,
+                session_id
+            ],
+        )
+        .context("Failed to update last_activity, trim_breadcrumb and projected_message_count")?;
+        tx.commit()
+            .context("Failed to commit replace_messages_and_breadcrumb")?;
+        Ok(())
+    }
+
+    pub fn begin_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn checkpoint transaction")?;
+        tx.execute(
+            "INSERT INTO acp_turn_checkpoints (session_id, turn_id) VALUES (?1, ?2)",
+            params![session_id, turn_id],
+        )
+        .context("Failed to begin ACP turn checkpoint")?;
+        Self::append_checkpoint_events(&tx, session_id, messages)?;
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint")?;
+        Ok(())
+    }
+
+    pub fn append_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn checkpoint append")?;
+        let active_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active_turn.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        let frontier = Self::append_checkpoint_events(&tx, session_id, messages)?;
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint append")?;
+        Ok(frontier)
+    }
+
+    fn append_checkpoint_events(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        messages: &[ConversationMessage],
+    ) -> Result<i64> {
+        let mut frontier = tx
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM acp_turn_checkpoint_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP checkpoint frontier")?;
+        for message in Self::bounded_transcript_messages(messages) {
+            let payload = serde_json::to_string(&message)
+                .context("Failed to serialize ACP turn checkpoint event")?;
+            tx.execute(
+                "INSERT INTO acp_turn_checkpoint_events (session_id, payload) VALUES (?1, ?2)",
+                params![session_id, payload],
+            )
+            .context("Failed to append ACP turn checkpoint event")?;
+            frontier = tx.last_insert_rowid();
+        }
+        Ok(frontier)
+    }
+
+    /// Atomically publish the provider-facing retained context and the exact
+    /// checkpoint journal frontier observed by the serial RPC event consumer.
+    /// The visible transcript remains untouched; its journal rows stay
+    /// durable for recovery and `session/messages`.
+    #[cfg(test)]
+    fn persist_retained_context(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+    ) -> Result<()> {
+        // Tests consume journal writes synchronously. Native RPC records the
+        // frontier at its ordered event boundary instead.
+        let frontier = self.checkpoint_frontier(session_uuid, turn_id)?;
+        self.persist_retained_context_at_frontier(
+            session_uuid,
+            turn_id,
+            retained_messages,
+            breadcrumb,
+            frontier,
+        )
+    }
+
+    /// Persist an owner-observed checkpoint frontier. The frontier is supplied
+    /// by the serial event consumer after its append transaction; it is never
+    /// inferred by content comparison or by a delayed global MAX in this path.
+    pub fn persist_retained_context_at_frontier(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+        frontier: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin retained context transaction")?;
+        Self::ensure_active_checkpoint(&tx, session_id, turn_id)?;
+        let retained = Self::bounded_transcript_messages(retained_messages);
+        // This is the complete owner-selected projection, including partial
+        // typed calls awaiting later results. Filtering belongs after recovery
+        // composes the snapshot with uncovered journal events.
+        let record = RetainedContextRecord {
+            messages: Self::without_hidden_reasoning(&retained),
+        };
+        let payload =
+            serde_json::to_string(&record).context("Failed to serialize retained ACP context")?;
+        tx.execute(
+            "UPDATE acp_sessions
+                SET retained_context_json = ?1,
+                    retained_context_frontier = ?2,
+                    trim_breadcrumb = ?3,
+                    last_activity = ?4
+              WHERE id = ?5",
+            params![
+                payload,
+                frontier,
+                i64::from(breadcrumb),
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )
+        .context("Failed to write retained ACP context")?;
+        tx.commit()
+            .context("Failed to commit retained ACP context")?;
+        Ok(())
+    }
+
+    /// Persist a seed-time trim projection. No turn checkpoint exists during
+    /// restore, so this path verifies only the session identity and commits the
+    /// owner-produced snapshot before its notification is forwarded.
+    pub fn persist_retained_context_seed(
+        &self,
+        session_uuid: &str,
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin retained seed context transaction")?;
+        let retained = Self::bounded_transcript_messages(retained_messages);
+        let record = RetainedContextRecord {
+            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+        };
+        let payload =
+            serde_json::to_string(&record).context("Failed to serialize retained seed context")?;
+        tx.execute(
+            "UPDATE acp_sessions
+                SET retained_context_json = ?1,
+                    retained_context_frontier = 0,
+                    trim_breadcrumb = ?2,
+                    last_activity = ?3
+              WHERE id = ?4",
+            params![
+                payload,
+                i64::from(breadcrumb),
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )
+        .context("Failed to write retained seed context")?;
+        tx.commit()
+            .context("Failed to commit retained seed context")?;
+        Ok(())
+    }
+
+    pub fn checkpoint_frontier(&self, session_uuid: &str, turn_id: &str) -> Result<i64> {
+        let conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let active: Option<String> = conn
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM acp_turn_checkpoint_events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .context("Failed to read ACP checkpoint frontier")
+    }
+
+    fn ensure_active_checkpoint(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        turn_id: &str,
+    ) -> Result<()> {
+        let active_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active_turn.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        Ok(())
+    }
+
+    fn without_hidden_reasoning(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+        messages
+            .iter()
+            .map(|message| match message {
+                ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content: _,
+                } => ConversationMessage::AssistantToolCalls {
+                    text: text.clone(),
+                    tool_calls: tool_calls.clone(),
+                    reasoning_content: None,
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+
+    /// Finalize a turn while atomically preserving visible journal fragments,
+    /// the final provider projection, breadcrumb provenance and checkpoint
+    /// deletion. Existing transcript rows are never replaced or re-identified.
+    pub fn finalize_turn_checkpoint_with_context(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        terminal_messages: &[ConversationMessage],
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+    ) -> Result<()> {
+        self.finalize_turn_checkpoint_with_context_for_owner(
+            session_uuid,
+            turn_id,
+            terminal_messages,
+            retained_messages,
+            breadcrumb,
+            None,
+        )
+    }
+
+    /// Finalize only the durable row owned by the expected principal. The
+    /// owner test and transcript, retained-context, and checkpoint changes
+    /// occur in the same immediate transaction.
+    pub fn finalize_turn_checkpoint_with_context_for_owner(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        terminal_messages: &[ConversationMessage],
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+        owner_principal_id: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin retained ACP turn finalization")?;
+        let session_id: i64 = tx
+            .query_row(
+                "SELECT id FROM acp_sessions
+                 WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
+                params![session_uuid, owner_principal_id],
+                |row| row.get(0),
+            )
+            .context("ACP turn finalization owner mismatch or missing session")?;
+        Self::ensure_active_checkpoint(&tx, session_id, turn_id)?;
+        let payloads = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT payload FROM acp_turn_checkpoint_events
+                     WHERE session_id = ?1 ORDER BY id ASC",
+                )
+                .context("Failed to read ACP turn checkpoint events")?;
+            stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
+                .context("Failed to query ACP turn checkpoint events")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("Failed to collect ACP turn checkpoint events")?
+        };
+        let fragments = payloads
+            .into_iter()
+            .map(|payload| {
+                serde_json::from_str::<ConversationMessage>(&payload)
+                    .context("Failed to deserialize ACP turn checkpoint event")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // A successful or cooperative-cancel terminal delta is the canonical
+        // current turn, including non-streamed output. The journal is its
+        // crash fallback, not an additional transcript to append beside it.
+        let visible = if terminal_messages.is_empty() {
+            Self::fold_checkpoint_fragments(fragments)
+        } else {
+            Self::bounded_transcript_messages(terminal_messages)
+        };
+        Self::append_checkpoint_visible_messages(&tx, session_uuid, session_id, &visible, &now)?;
+        let retained = Self::bounded_transcript_messages(retained_messages);
+        let record = RetainedContextRecord {
+            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+        };
+        let payload = serde_json::to_string(&record)
+            .context("Failed to serialize final retained ACP context")?;
+        tx.execute(
+            "UPDATE acp_sessions
+                SET retained_context_json = ?1,
+                    retained_context_frontier = 0,
+                    trim_breadcrumb = ?2,
+                    last_activity = ?3
+              WHERE id = ?4",
+            params![payload, i64::from(breadcrumb), now, session_id],
+        )
+        .context("Failed to write final retained ACP context")?;
+        tx.execute(
+            "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+            params![session_id, turn_id],
+        )
+        .context("Failed to delete finalized ACP turn checkpoint")?;
+        tx.commit()
+            .context("Failed to commit retained ACP turn finalization")?;
+        Ok(())
+    }
+
+    pub fn discard_turn_checkpoint(&self, session_uuid: &str, turn_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let changed = conn
+            .execute(
+                "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, turn_id],
+            )
+            .context("Failed to discard ACP turn checkpoint")?;
+        anyhow::ensure!(changed == 1, "ACP turn checkpoint identity mismatch");
+        Ok(())
+    }
+
+    pub fn finalize_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn finalization")?;
+        let active_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active_turn.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        let messages = Self::bounded_transcript_messages(messages);
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        tx.execute(
+            "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+            params![session_id, turn_id],
+        )
+        .context("Failed to delete finalized ACP turn checkpoint")?;
+        tx.commit()
+            .context("Failed to commit ACP turn finalization")?;
+        Ok(())
+    }
+
+    pub fn recover_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        interruption_marker: &str,
+    ) -> Result<bool> {
+        self.recover_turn_checkpoint_for_owner(session_uuid, interruption_marker, None)
+    }
+
+    /// Recover an interrupted turn only while the durable row still belongs
+    /// to `owner_principal_id`. The owner lookup and all checkpoint changes
+    /// share one immediate transaction, so a same-ID replacement cannot be
+    /// recovered under a stale principal authorization.
+    pub fn recover_turn_checkpoint_for_owner(
+        &self,
+        session_uuid: &str,
+        interruption_marker: &str,
+        owner_principal_id: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin ACP turn checkpoint recovery")?;
+        let session_id = tx
+            .query_row(
+                "SELECT id FROM acp_sessions
+                 WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
+                params![session_uuid, owner_principal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to find ACP session for checkpoint recovery")?;
+        let Some(session_id) = session_id else {
+            return Ok(false);
+        };
+        let killed_at: Option<String> = tx
+            .query_row(
+                "SELECT killed_at FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session killed marker")?;
+        if killed_at.is_some() {
+            return Ok(false);
+        }
+        let checkpoint_turn_id: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint")?;
+        let Some(checkpoint_turn_id) = checkpoint_turn_id else {
+            return Ok(false);
+        };
+        let mut statement = tx
+            .prepare(
+                "SELECT id, payload FROM acp_turn_checkpoint_events
+                 WHERE session_id = ?1 ORDER BY id ASC",
+            )
+            .context("Failed to prepare ACP turn checkpoint event read")?;
+        let payloads = statement
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("Failed to read ACP turn checkpoint events")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to collect ACP turn checkpoint events")?;
+        drop(statement);
+        let frontier: i64 = tx
+            .query_row(
+                "SELECT COALESCE(retained_context_frontier, 0) FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read retained context frontier")?;
+        let fragments = payloads
+            .into_iter()
+            .map(|(_, payload)| {
+                serde_json::from_str::<ConversationMessage>(&payload)
+                    .context("Failed to deserialize ACP turn checkpoint event")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let visible =
+            Self::bounded_transcript_messages(&Self::fold_checkpoint_fragments(fragments));
+        Self::append_messages(&tx, session_uuid, session_id, &visible, &now)?;
+        tx.execute(
+            "INSERT INTO acp_messages
+               (session_id, role, content, reasoning_content, created_at)
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![
+                session_id,
+                SYNTHETIC_INTERRUPTION_ROLE,
+                interruption_marker,
+                now
+            ],
+        )
+        .context("Failed to persist synthetic interruption marker")?;
+        if let Some(payload) = tx
+            .query_row(
+                "SELECT retained_context_json FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("Failed to read retained context during recovery")?
+            .flatten()
+        {
+            let mut record = serde_json::from_str::<RetainedContextRecord>(&payload)
+                .context("Failed to deserialize retained context during recovery")?;
+            let after_frontier = Self::payloads_after_frontier(&tx, session_id, frontier)?;
+            let mut projected = record.messages.clone();
+            projected.extend(after_frontier);
+            // The serial frontier makes this concatenation disjoint; do not
+            // use serialized-content overlap to repair a boundary because
+            // identical user text and differently typed tool fragments are
+            // both legitimate progress.
+            record.messages =
+                Self::provider_safe_history(&Self::fold_checkpoint_fragments(projected));
+            tx.execute(
+                "UPDATE acp_sessions SET retained_context_json = ?, retained_context_frontier = 0 WHERE id = ?",
+                params![serde_json::to_string(&record)?, session_id],
+            )
+            .context("Failed to update retained context after recovery")?;
+        }
+        let changed = tx
+            .execute(
+                "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, checkpoint_turn_id],
+            )
+            .context("Failed to delete recovered ACP turn checkpoint")?;
+        anyhow::ensure!(changed == 1, "ACP turn checkpoint identity mismatch");
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint recovery")?;
+        Ok(true)
+    }
+
+    fn payloads_after_frontier(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        frontier: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = tx
+            .prepare(
+                "SELECT payload FROM acp_turn_checkpoint_events
+                 WHERE session_id = ?1 AND id > ?2 ORDER BY id ASC",
+            )
+            .context("Failed to prepare retained context tail read")?;
+        stmt.query_map(params![session_id, frontier], |row| row.get::<_, String>(0))
+            .context("Failed to read retained context tail")?
+            .map(|row| {
+                row.context("Failed to read retained context tail row")
+                    .and_then(|payload| {
+                        serde_json::from_str::<ConversationMessage>(&payload)
+                            .context("Failed to deserialize retained context tail")
+                    })
+            })
+            .collect()
+    }
+
+    fn fold_checkpoint_fragments(fragments: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+        let mut messages = Vec::new();
+        for fragment in fragments {
+            match fragment {
+                ConversationMessage::Chat(chat) if chat.role == "assistant" => {
+                    if let Some(ConversationMessage::Chat(previous)) = messages.last_mut()
+                        && previous.role == "assistant"
+                    {
+                        previous.content.push_str(&chat.content);
+                    } else {
+                        messages.push(ConversationMessage::Chat(chat));
+                    }
+                }
+                ConversationMessage::AssistantToolCalls {
+                    mut text,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    if text.is_none()
+                        && let Some(ConversationMessage::Chat(previous)) = messages.last()
+                        && previous.role == "assistant"
+                    {
+                        text = messages.pop().and_then(|message| match message {
+                            ConversationMessage::Chat(chat) => {
+                                (!chat.content.is_empty()).then_some(chat.content)
+                            }
+                            _ => None,
+                        });
+                    }
+                    if let Some(ConversationMessage::AssistantToolCalls {
+                        tool_calls: previous_calls,
+                        ..
+                    }) = messages.last_mut()
+                    {
+                        previous_calls.extend(tool_calls);
+                    } else {
+                        messages.push(ConversationMessage::AssistantToolCalls {
+                            text,
+                            tool_calls,
+                            reasoning_content,
+                        });
+                    }
+                }
+                ConversationMessage::ToolResults(results) => {
+                    if let Some(ConversationMessage::ToolResults(previous)) = messages.last_mut() {
+                        previous.extend(results);
+                    } else {
+                        messages.push(ConversationMessage::ToolResults(results));
+                    }
+                }
+                other => messages.push(other),
+            }
+        }
+        messages
+    }
+
+    /// Apply the transcript's existing display/storage bound to native tool
+    /// results before they enter a checkpoint or canonical ACP history.
+    pub fn bounded_transcript_messages(
+        messages: &[ConversationMessage],
+    ) -> Vec<ConversationMessage> {
+        messages
+            .iter()
+            .cloned()
+            .map(|message| match message {
+                ConversationMessage::ToolResults(mut results) => {
+                    for result in &mut results {
+                        result.content = Self::bounded_tool_output(&result.content);
+                    }
+                    ConversationMessage::ToolResults(results)
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    pub fn bounded_tool_output(output: &str) -> String {
+        if output.len() <= MAX_PERSISTED_TOOL_OUTPUT_BYTES {
+            return output.to_string();
+        }
+        let mut end = MAX_PERSISTED_TOOL_OUTPUT_BYTES;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…[truncated]", &output[..end])
+    }
+
+    /// Produce provider-safe ACP history while preserving client-visible text.
+    /// Only an immediately adjacent tool-call/result pair is retained, and one
+    /// result is kept for each unambiguous call id. Duplicate call or result IDs
+    /// within a batch are rejected; recovery markers stay transcript-only.
+    pub fn provider_safe_history(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+        let mut repaired = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            match &messages[index] {
+                ConversationMessage::Chat(chat)
+                    if chat.role == "system" || chat.role == SYNTHETIC_INTERRUPTION_ROLE =>
+                {
+                    index += 1;
+                }
+                ConversationMessage::Chat(_) => {
+                    repaired.push(messages[index].clone());
+                    index += 1;
+                }
+                ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    let adjacent_results =
+                        messages.get(index + 1).and_then(|message| match message {
+                            ConversationMessage::ToolResults(results) => Some(results),
+                            _ => None,
+                        });
+                    let mut paired_calls = Vec::new();
+                    let mut paired_results = Vec::new();
+                    if let Some(results) = adjacent_results {
+                        let mut call_id_counts = std::collections::HashMap::new();
+                        for call in tool_calls {
+                            *call_id_counts.entry(call.id.as_str()).or_insert(0usize) += 1;
+                        }
+                        for call in tool_calls {
+                            // Reserving a result is insufficient: even with two
+                            // results, duplicated call IDs cannot identify a pair.
+                            if call_id_counts.get(call.id.as_str()) != Some(&1) {
+                                continue;
+                            }
+                            let mut matching_results = results
+                                .iter()
+                                .filter(|result| result.tool_call_id == call.id);
+                            if let Some(result) = matching_results.next()
+                                && matching_results.next().is_none()
+                            {
+                                paired_calls.push(call.clone());
+                                paired_results.push(result.clone());
+                            }
+                        }
+                    }
+
+                    if paired_calls.is_empty() {
+                        if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                            repaired.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
+                        }
+                    } else {
+                        repaired.push(ConversationMessage::AssistantToolCalls {
+                            text: text.clone(),
+                            tool_calls: paired_calls,
+                            reasoning_content: reasoning_content.clone(),
+                        });
+                        repaired.push(ConversationMessage::ToolResults(paired_results));
+                    }
+                    index += if adjacent_results.is_some() { 2 } else { 1 };
+                }
+                ConversationMessage::ToolResults(_) => {
+                    index += 1;
+                }
+            }
+        }
+        repaired
     }
 
     pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
@@ -1659,7 +2889,8 @@ impl AcpSessionStore {
     /// Summaries of every ACP session (live or killed) attributed to
     /// `agent_alias`, for the export-then-delete archive.
     pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Agent(agent_alias))?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -1668,7 +2899,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1
@@ -1717,6 +2948,29 @@ impl AcpSessionStore {
         Ok(out)
     }
 
+    /// Persisted projected conversation-entry count for the session, the
+    /// same number the session picker lists and `turn_end` reports. Reading
+    /// it avoids hydrating the full message history that `load_session`
+    /// performs just to re-derive the count; a cache another writer left
+    /// stale is rescored from the session's rows here first. `None` when the
+    /// session UUID is unknown.
+    pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(
+            &mut conn,
+            ProjectedCountScope::Session(session_uuid),
+        )?;
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT projected_message_count FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query projected_message_count")?;
+        Ok(count.map(|n| n.max(0) as usize))
+    }
+
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
     /// row count. Child tables (`acp_messages`/`acp_tool_calls`/`acp_session_events`)
     /// cascade via their `ON DELETE CASCADE` FKs (`foreign_keys = ON`).
@@ -1746,21 +3000,73 @@ impl AcpSessionStore {
         Ok(rows)
     }
 
-    /// Persist that an admin intentionally killed this ACP session. The
-    /// transcript stays durable, but runtime rehydration must not revive it.
-    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+    /// Atomically persist that an admin intentionally killed this ACP session.
+    /// The transcript and any checkpoint stay durable, but runtime rehydration
+    /// must not revive it.
+    pub fn mark_session_killed_atomic(
+        &self,
+        session_uuid: &str,
+    ) -> Result<AcpSessionKillTransition> {
+        self.mark_session_killed_atomic_for_owner(session_uuid, None)
+    }
+
+    /// Tombstone only the durable row still owned by this principal. The
+    /// update predicate and transition inspection share one transaction.
+    pub fn mark_session_killed_atomic_for_owner(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+    ) -> Result<AcpSessionKillTransition> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        let rows = conn
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin ACP session kill transition")?;
+        let rows = tx
             .execute(
                 "UPDATE acp_sessions
                     SET killed_at = COALESCE(killed_at, ?1),
                         last_activity = ?1
-                  WHERE session_uuid = ?2",
-                params![now, session_uuid],
+                  WHERE session_uuid = ?2 AND killed_at IS NULL
+                    AND (?3 IS NULL OR principal_id = ?3)",
+                params![now, session_uuid, owner_principal_id],
             )
             .context("Failed to mark ACP session killed")?;
-        Ok(rows > 0)
+        let transition = if rows == 1 {
+            AcpSessionKillTransition::Marked
+        } else {
+            let killed_at: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT killed_at FROM acp_sessions
+                     WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
+                    params![session_uuid, owner_principal_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("Failed to inspect ACP session kill transition")?;
+            match killed_at {
+                Some(Some(_)) => AcpSessionKillTransition::AlreadyKilled,
+                Some(None) => {
+                    anyhow::bail!("ACP session kill transition made no durable change")
+                }
+                None => AcpSessionKillTransition::Missing,
+            }
+        };
+        tx.commit()
+            .context("Failed to commit ACP session kill transition")?;
+        Ok(transition)
+    }
+
+    /// Persist that an admin intentionally killed this ACP session. The
+    /// transcript stays durable, but runtime rehydration must not revive it.
+    /// This compatibility wrapper retains the original boolean contract for
+    /// existing callers; use `mark_session_killed_atomic` when the distinction
+    /// between marked, already-killed, and missing matters.
+    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        Ok(matches!(
+            self.mark_session_killed_atomic(session_uuid)?,
+            AcpSessionKillTransition::Marked | AcpSessionKillTransition::AlreadyKilled
+        ))
     }
 
     /// Return whether this durable ACP session has been intentionally killed.
@@ -2132,12 +3438,190 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+    use zeroclaw_api::model_provider::{
+        ChatMessage, ToolCall, ToolResultMessage, projected_entry_count,
+    };
 
     fn open_store() -> (TempDir, AcpSessionStore) {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn retained_context_two_trims_recover_once_without_rewriting_originals() {
+        let (tmp, store) = open_store();
+        let sid = "retained-recovery";
+        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        let old = ConversationMessage::Chat(ChatMessage::user("archived request"));
+        store.append_turn(sid, &[old]).unwrap();
+        let original_id: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT id FROM acp_messages", [], |row| row.get(0))
+            .unwrap();
+        store
+            .begin_turn_checkpoint(
+                sid,
+                "turn",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "active request",
+                ))],
+            )
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                sid,
+                "turn",
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "earlier progress",
+                ))],
+            )
+            .unwrap();
+        store
+            .persist_retained_context(
+                sid,
+                "turn",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("active request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("earlier progress")),
+                ],
+                false,
+            )
+            .unwrap();
+        let call = ConversationMessage::AssistantToolCalls {
+            text: Some("checking".into()),
+            tool_calls: vec![ToolCall {
+                id: "retained-call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        store
+            .append_turn_checkpoint(sid, "turn", std::slice::from_ref(&call))
+            .unwrap();
+        // A later real trim deliberately drops earlier active progress. The
+        // retained call is still incomplete at the snapshot boundary.
+        store
+            .persist_retained_context(
+                sid,
+                "turn",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("retry request")),
+                    call,
+                ],
+                false,
+            )
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                sid,
+                "turn",
+                &[
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "retained-call".into(),
+                        tool_name: "read".into(),
+                        content: "result".into(),
+                    }]),
+                    ConversationMessage::Chat(ChatMessage::assistant("after snapshot")),
+                ],
+            )
+            .unwrap();
+        drop(store);
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(store.recover_turn_checkpoint(sid, "interrupted").unwrap());
+        let recovered = store.load_session(sid).unwrap().unwrap();
+        let model = recovered.retained_context.unwrap();
+        assert_eq!(model.len(), 4);
+        assert!(matches!(
+            &model[1],
+            ConversationMessage::AssistantToolCalls { .. }
+        ));
+        assert!(matches!(&model[2], ConversationMessage::ToolResults(_)));
+        let model_json = serde_json::to_string(&model).unwrap();
+        assert!(!model_json.contains("earlier progress"));
+        assert!(!model_json.contains("archived request"));
+        let transcript = serde_json::to_string(&recovered.messages).unwrap();
+        assert!(transcript.contains("earlier progress"));
+        assert!(transcript.contains("archived request"));
+        assert_eq!(transcript.matches("after snapshot").count(), 1);
+        let preserved_id: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT MIN(id) FROM acp_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original_id, preserved_id);
+        drop(store);
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(!store.recover_turn_checkpoint(sid, "interrupted").unwrap());
+        assert_eq!(
+            serde_json::to_string(&store.load_session(sid).unwrap().unwrap().messages).unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn empty_retention_is_authoritative_and_stale_turn_cannot_replace_it() {
+        let (_tmp, store) = open_store();
+        let sid = "empty-retention";
+        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .append_turn(
+                sid,
+                &[ConversationMessage::Chat(ChatMessage::user("archived"))],
+            )
+            .unwrap();
+        store.begin_turn_checkpoint(sid, "current", &[]).unwrap();
+        store
+            .persist_retained_context(sid, "current", &[], false)
+            .unwrap();
+        assert!(
+            store
+                .persist_retained_context(
+                    sid,
+                    "stale",
+                    &[ConversationMessage::Chat(ChatMessage::user("wrong")),],
+                    false
+                )
+                .is_err()
+        );
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(data.messages.len(), 1);
+        assert!(data.retained_context.unwrap().is_empty());
+        assert!(store.recover_turn_checkpoint(sid, "interrupted").unwrap());
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .retained_context
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_replacement_invalidates_retained_context() {
+        let (_tmp, store) = open_store();
+        let sid = "legacy-replacement";
+        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store.persist_retained_context_seed(sid, &[], true).unwrap();
+        let replacement = vec![ConversationMessage::Chat(ChatMessage::user("replacement"))];
+        store
+            .replace_messages_and_breadcrumb(sid, &replacement, false)
+            .unwrap();
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert!(restored.retained_context.is_none());
+        assert!(!restored.trim_breadcrumb);
+        assert_eq!(
+            serde_json::to_value(restored.messages).unwrap(),
+            serde_json::to_value(replacement).unwrap()
+        );
+        store.set_trim_breadcrumb(sid, true).unwrap();
+        store.replace_messages(sid, &[]).unwrap();
+        assert_eq!(raw_trim_breadcrumb_column(&store, sid), Some(1));
     }
 
     /// Read the raw `trim_breadcrumb` column, bypassing the inference
@@ -2156,7 +3640,7 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_all_four_tables() {
+    fn new_creates_all_tables() {
         let (_tmp, store) = open_store();
         let conn = store.conn.lock();
         for table in [
@@ -2164,6 +3648,8 @@ mod tests {
             "acp_messages",
             "acp_tool_calls",
             "acp_session_events",
+            "acp_turn_checkpoints",
+            "acp_turn_checkpoint_events",
         ] {
             let name: String = conn
                 .query_row(
@@ -2173,6 +3659,21 @@ mod tests {
                 )
                 .unwrap_or_else(|_| panic!("table {table} should exist"));
             assert_eq!(name, table);
+        }
+        // A fresh database carries the projected-count cache columns, added
+        // idempotently at open and never scored there.
+        let mut stmt = conn.prepare("PRAGMA table_info(acp_sessions)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        for column in ["projected_message_count", "projected_count_through"] {
+            assert!(
+                columns.contains(&column.to_string()),
+                "fresh store must carry the {column} cache column"
+            );
         }
     }
 
@@ -2205,6 +3706,22 @@ mod tests {
         assert_eq!(
             store.load_session("unowned").unwrap().unwrap().principal_id,
             None,
+        );
+        assert_eq!(
+            store.session_owner_and_surface("owned").unwrap(),
+            Some((Some("alice".to_string()), None)),
+        );
+        assert_eq!(
+            store.session_owner_and_surface("unowned").unwrap(),
+            Some((None, None)),
+        );
+        assert_eq!(store.session_owner_and_surface("missing").unwrap(), None);
+        assert_eq!(
+            store
+                .load_message_page("owned", 1, None)
+                .unwrap()
+                .principal_id,
+            Some("alice".to_string()),
         );
 
         let summaries = store.list_sessions().unwrap();
@@ -2422,6 +3939,498 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_checkpoint_recovers_once_with_marker() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-session", "default", "/tmp/workspace", None)
+            .unwrap();
+        let initial = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-session", "turn-1", &initial)
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-session",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "partial ",
+                ))],
+            )
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-session",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant("answer"))],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-session", "stream interrupted")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .recover_turn_checkpoint("checkpoint-session", "stream interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session("checkpoint-session").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+                ConversationMessage::Chat(marker),
+            ] if user.role == "user"
+                && assistant.content == "partial answer"
+                && marker.role == "system"
+                && marker.content == "stream interrupted"
+        ));
+    }
+
+    #[test]
+    fn interruption_boundaries_restore_transcript_and_provider_safe_history() {
+        struct Case {
+            name: &'static str,
+            fragments: Vec<ConversationMessage>,
+            expected_transcript_tool_counts: (usize, usize),
+            expected_tool_exchange: bool,
+        }
+
+        let tool_call = || ToolCall {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+        let assistant = ConversationMessage::Chat(ChatMessage::assistant("checking"));
+        let call = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![tool_call()],
+            reasoning_content: None,
+        };
+        let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "shell".to_string(),
+            content: "/tmp/workspace".to_string(),
+        }]);
+        let cases = [
+            Case {
+                name: "assistant-text",
+                fragments: vec![assistant.clone()],
+                expected_transcript_tool_counts: (0, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-call",
+                fragments: vec![assistant.clone(), call.clone()],
+                expected_transcript_tool_counts: (1, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-result",
+                fragments: vec![assistant, call, result],
+                expected_transcript_tool_counts: (1, 1),
+                expected_tool_exchange: true,
+            },
+        ];
+
+        for case in cases {
+            let (_tmp, store) = open_store();
+            let session_id = format!("checkpoint-{}", case.name);
+            store
+                .create_session(&session_id, "default", "/tmp/workspace", None)
+                .unwrap();
+            store
+                .begin_turn_checkpoint(
+                    &session_id,
+                    "turn-1",
+                    &[ConversationMessage::Chat(ChatMessage::user("question"))],
+                )
+                .unwrap();
+            for fragment in case.fragments {
+                store
+                    .append_turn_checkpoint(&session_id, "turn-1", &[fragment])
+                    .unwrap();
+            }
+
+            assert!(
+                store
+                    .recover_turn_checkpoint(&session_id, "stream interrupted")
+                    .unwrap(),
+                "{} checkpoint should recover",
+                case.name
+            );
+            let restored = store.load_session(&session_id).unwrap().unwrap();
+            assert!(
+                matches!(
+                    restored.messages.last(),
+                    Some(ConversationMessage::Chat(marker))
+                        if marker.role == "system" && marker.content == "stream interrupted"
+                ),
+                "{} transcript should end with the interruption marker",
+                case.name
+            );
+            assert!(
+                restored.messages.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} transcript should retain visible assistant text",
+                case.name
+            );
+            let transcript_tool_counts =
+                restored
+                    .messages
+                    .iter()
+                    .fold((0, 0), |(calls, results), message| match message {
+                        ConversationMessage::AssistantToolCalls { .. } => (calls + 1, results),
+                        ConversationMessage::ToolResults(_) => (calls, results + 1),
+                        ConversationMessage::Chat(_) => (calls, results),
+                    });
+            assert_eq!(
+                transcript_tool_counts, case.expected_transcript_tool_counts,
+                "{} transcript should retain every visible tool boundary",
+                case.name
+            );
+
+            let provider_history = AcpSessionStore::provider_safe_history(&restored.messages);
+            assert!(
+                provider_history.iter().all(|message| !matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.role == "system"
+                )),
+                "{} provider history should exclude the interruption marker",
+                case.name
+            );
+            assert!(
+                matches!(
+                    provider_history.first(),
+                    Some(ConversationMessage::Chat(user))
+                        if user.role == "user" && user.content == "question"
+                ),
+                "{} provider history should retain the accepted prompt",
+                case.name
+            );
+            assert!(
+                provider_history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} provider history should retain visible assistant text",
+                case.name
+            );
+            let tool_call_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::AssistantToolCalls { .. }))
+                .count();
+            let tool_result_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::ToolResults(_)))
+                .count();
+            assert_eq!(
+                (tool_call_count, tool_result_count),
+                if case.expected_tool_exchange {
+                    (1, 1)
+                } else {
+                    (0, 0)
+                },
+                "{} provider history should contain only a complete tool exchange",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn missing_session_has_no_checkpoint_to_recover() {
+        let (_tmp, store) = open_store();
+
+        assert!(
+            !store
+                .recover_turn_checkpoint("missing-session", "stream interrupted")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_turn_id_mismatch_cannot_append_or_finalize() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-identity", "default", "/tmp/workspace", None)
+            .unwrap();
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-identity", "turn-current", &messages)
+            .unwrap();
+
+        assert!(
+            store
+                .append_turn_checkpoint("checkpoint-identity", "turn-stale", &messages)
+                .is_err()
+        );
+        assert!(
+            store
+                .finalize_turn_checkpoint("checkpoint-identity", "turn-stale", &messages)
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-identity", "interrupted")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_checkpoint_finalization_preserves_recoverable_fragments() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-finalize", "default", "/tmp/workspace", None)
+            .unwrap();
+        let initial = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-finalize", "turn-1", &initial)
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-finalize",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+            )
+            .unwrap();
+
+        let invalid_terminal = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "missing".to_string(),
+            tool_name: "shell".to_string(),
+            content: "orphan".to_string(),
+        }])];
+        assert!(
+            store
+                .finalize_turn_checkpoint("checkpoint-finalize", "turn-1", &invalid_terminal,)
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-finalize", "interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session("checkpoint-finalize").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+                ConversationMessage::Chat(marker),
+            ] if user.role == "user"
+                && assistant.content == "partial"
+                && marker.role == "system"
+        ));
+    }
+
+    #[test]
+    fn killed_session_checkpoint_is_not_promoted() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-killed", "default", "/tmp/workspace", None)
+            .unwrap();
+        let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-killed", "turn-1", &initial)
+            .unwrap();
+        assert!(store.mark_session_killed("checkpoint-killed").unwrap());
+
+        assert!(
+            !store
+                .recover_turn_checkpoint("checkpoint-killed", "interrupted")
+                .unwrap()
+        );
+        assert!(
+            store
+                .load_session("checkpoint-killed")
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(
+            store
+                .append_turn_checkpoint("checkpoint-killed", "turn-1", &[])
+                .is_ok(),
+            "the untouched checkpoint should retain its turn identity"
+        );
+    }
+
+    #[test]
+    fn provider_safe_history_requires_adjacent_exact_tool_pairs() {
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::system("interrupted")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("partial".to_string()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "paired".to_string(),
+                        name: "shell".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "orphan".to_string(),
+                        name: "shell".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "paired".to_string(),
+                tool_name: "shell".to_string(),
+                content: "first".to_string(),
+            }]),
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "orphan".to_string(),
+                tool_name: "shell".to_string(),
+                content: "misplaced".to_string(),
+            }]),
+        ];
+
+        let repaired = AcpSessionStore::provider_safe_history(&messages);
+        assert_eq!(repaired.len(), 2);
+        assert!(matches!(
+            &repaired[0],
+            ConversationMessage::AssistantToolCalls { text, tool_calls, .. }
+                if text.as_deref() == Some("partial")
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "paired"
+        ));
+        assert!(matches!(
+            &repaired[1],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "paired"
+                    && results[0].content == "first"
+        ));
+    }
+
+    #[test]
+    fn provider_safe_history_rejects_ambiguous_tool_ids_per_batch() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let result = |id: &str| ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            content: format!("output for {id}"),
+        };
+        for (call_count, result_count) in [(2, 1), (2, 2), (1, 2)] {
+            for keep_unique_peer in [false, true] {
+                let mut calls = vec![call("duplicate"); call_count];
+                let mut results = vec![result("duplicate"); result_count];
+                if keep_unique_peer {
+                    calls.push(call("unique"));
+                    results.push(result("unique"));
+                }
+                let messages = vec![
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("partial text".into()),
+                        tool_calls: calls,
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(results),
+                ];
+                let mut expected = if keep_unique_peer {
+                    vec![
+                        ConversationMessage::AssistantToolCalls {
+                            text: Some("partial text".into()),
+                            tool_calls: vec![call("unique")],
+                            reasoning_content: None,
+                        },
+                        ConversationMessage::ToolResults(vec![result("unique")]),
+                    ]
+                } else {
+                    vec![ConversationMessage::Chat(ChatMessage::assistant(
+                        "partial text",
+                    ))]
+                };
+                // Reusing the ID in a later, unambiguous batch remains valid.
+                let later = vec![
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![call("duplicate")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![result("duplicate")]),
+                ];
+                let mut messages = messages;
+                messages.extend(later.clone());
+                expected.extend(later);
+                let original = serde_json::to_value(&messages).unwrap();
+                assert_eq!(
+                    serde_json::to_value(AcpSessionStore::provider_safe_history(&messages))
+                        .unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "call count={call_count}, result count={result_count}, unique peer={keep_unique_peer}"
+                );
+                assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_transcript_messages_caps_terminal_tool_output() {
+        let messages = [
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+                content: "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES + 10),
+            }]),
+        ];
+        let bounded = AcpSessionStore::bounded_transcript_messages(&messages);
+        assert!(matches!(
+            &bounded[1],
+            ConversationMessage::ToolResults(results)
+                if results[0].content.ends_with("…[truncated]")
+                    && results[0].content.len()
+                        <= MAX_PERSISTED_TOOL_OUTPUT_BYTES + "…[truncated]".len()
+        ));
+
+        let (_tmp, store) = open_store();
+        store
+            .create_session("bounded-terminal", "default", "/tmp/workspace", None)
+            .unwrap();
+        store.append_turn("bounded-terminal", &messages).unwrap();
+        let restored = store.load_session("bounded-terminal").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[1],
+            ConversationMessage::ToolResults(results)
+                if results[0].content.ends_with("…[truncated]")
+        ));
+    }
+
+    #[test]
     fn replace_messages_drops_prior_rows_and_cascades_to_tool_calls() {
         let (_tmp, store) = open_store();
         store
@@ -2510,6 +4519,106 @@ mod tests {
             .unwrap();
         let data = store.load_session("sess-replace").unwrap().unwrap();
         assert_eq!(data.messages.len(), 4);
+    }
+
+    #[test]
+    fn replace_paths_reset_the_projected_count_to_the_new_transcript() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-count-replace", "alpha", "/tmp/proj", None)
+            .unwrap();
+
+        // A tool-loop turn whose projected count (5) exceeds its chat rows:
+        // one chat entry, a batch contributing its text plus two call
+        // entries, both results folding into open calls, one more chat.
+        let seeded = vec![
+            ConversationMessage::Chat(ChatMessage::user("fold me")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("batch".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "c1".into(),
+                    content: "ok".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "c2".into(),
+                    content: "ok".into(),
+                    tool_name: "read".into(),
+                },
+            ]),
+            ConversationMessage::Chat(ChatMessage::user("orphan")),
+        ];
+        store.append_turn("sess-count-replace", &seeded).unwrap();
+        assert_eq!(projected_entry_count(&seeded), 5);
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(5)
+        );
+
+        // A trim-driven replace swaps the transcript for two chat turns: the
+        // persisted counter must follow the new transcript, not keep the
+        // pre-trim value or grow by the replaced batch.
+        store
+            .replace_messages(
+                "sess-count-replace",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("kept")),
+                    ConversationMessage::Chat(ChatMessage::assistant("kept answer")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(2)
+        );
+
+        // The breadcrumb variant carries the same contract.
+        store
+            .replace_messages_and_breadcrumb(
+                "sess-count-replace",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("trimmed")),
+                    ConversationMessage::Chat(ChatMessage::assistant("trimmed answer")),
+                    ConversationMessage::Chat(ChatMessage::user("next")),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(3)
+        );
+
+        // Appends after a replace build on the replaced base, so the store
+        // and the runtime projection stay in step across a trim.
+        store
+            .append_turn(
+                "sess-count-replace",
+                &[ConversationMessage::Chat(ChatMessage::user("more"))],
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(4)
+        );
+        assert_eq!(raw_count_pair(&store, "sess-count-replace"), (4, Some(9)));
     }
 
     #[test]
@@ -2732,6 +4841,43 @@ mod tests {
         store.append_turn("sess-empty", &[]).unwrap();
         let data = store.load_session("sess-empty").unwrap().unwrap();
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn append_turn_skips_zero_entry_tool_call_batches() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-degenerate", "alpha", "/tmp/proj", None)
+            .unwrap();
+        store
+            .append_turn(
+                "sess-degenerate",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("first")),
+                    // Degenerate zero-entry batches: no text, no calls. The
+                    // counting contract scores them zero entries, so nothing
+                    // may be persisted for them; a stored row would reload
+                    // as a plain chat message and project as 1.
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some(String::new()),
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::Chat(ChatMessage::user("second")),
+                ],
+            )
+            .unwrap();
+
+        let summary = &store.list_sessions().unwrap()[0];
+        assert_eq!(summary.message_count, 2);
+        let data = store.load_session("sess-degenerate").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 2);
+        assert_eq!(projected_entry_count(&data.messages), 2);
     }
 
     #[test]
@@ -3142,24 +5288,18 @@ mod tests {
         store
             .create_session("bad-empty", "alpha", "/tmp", None)
             .unwrap();
-        store
-            .append_turn(
-                "bad-empty",
-                &[ConversationMessage::AssistantToolCalls {
-                    text: None,
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                }],
-            )
-            .unwrap();
+        // `append_turn` persists nothing for a zero-entry tool-call batch, so
+        // the empty assistant row a malformed-only group hangs off is written
+        // directly, as an older binary or a damaged DB would leave it.
         let conn = store.conn.lock();
-        let message_id: i64 = conn
-            .query_row(
-                "SELECT id FROM acp_messages WHERE session_id = (SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES ((SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty'),
+                     'assistant', '', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO acp_tool_calls
              (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
@@ -3350,6 +5490,60 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_recovery_and_finalization_keep_the_durable_owner() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("owned-checkpoint", "agent", "/ws", Some("user:alice"))
+            .unwrap();
+        let pending = ConversationMessage::Chat(ChatMessage::user("pending request"));
+        store
+            .begin_turn_checkpoint("owned-checkpoint", "turn-1", std::slice::from_ref(&pending))
+            .unwrap();
+        assert!(
+            store
+                .finalize_turn_checkpoint_with_context_for_owner(
+                    "owned-checkpoint",
+                    "turn-1",
+                    &[],
+                    &[],
+                    false,
+                    Some("user:bob"),
+                )
+                .is_err()
+        );
+        assert!(
+            !store
+                .recover_turn_checkpoint_for_owner(
+                    "owned-checkpoint",
+                    "stream interrupted",
+                    Some("user:bob"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_session_owned("owned-checkpoint", "user:bob")
+                .unwrap()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint_for_owner(
+                    "owned-checkpoint",
+                    "stream interrupted",
+                    Some("user:alice"),
+                )
+                .unwrap()
+        );
+        let restored = store.load_session("owned-checkpoint").unwrap().unwrap();
+        assert_eq!(restored.principal_id.as_deref(), Some("user:alice"));
+        assert!(matches!(
+            &restored.messages[..],
+            [ConversationMessage::Chat(user), ConversationMessage::Chat(marker)]
+                if user.content == "pending request" && marker.content == "stream interrupted"
+        ));
+    }
+
+    #[test]
     fn mark_session_killed_persists_without_deleting_history() {
         let (tmp, store) = open_store();
         store
@@ -3390,6 +5584,36 @@ mod tests {
         let (_tmp, store) = open_store();
         assert!(!store.mark_session_killed("ghost").unwrap());
         assert!(!store.is_session_killed("ghost").unwrap());
+    }
+
+    #[test]
+    fn atomic_kill_transition_distinguishes_marked_already_killed_and_missing() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-atomic-kill", "alpha", "/tmp/proj", None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mark_session_killed_atomic("sess-atomic-kill")
+                .unwrap(),
+            AcpSessionKillTransition::Marked
+        );
+        assert_eq!(
+            store
+                .mark_session_killed_atomic("sess-atomic-kill")
+                .unwrap(),
+            AcpSessionKillTransition::AlreadyKilled
+        );
+        assert!(
+            store.mark_session_killed("sess-atomic-kill").unwrap(),
+            "the compatibility wrapper must retain its existing-row contract"
+        );
+        assert_eq!(
+            store.mark_session_killed_atomic("ghost").unwrap(),
+            AcpSessionKillTransition::Missing
+        );
+        assert!(store.load_session("sess-atomic-kill").unwrap().is_some());
     }
 
     #[test]
@@ -3604,6 +5828,938 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_uuid, "sess-live");
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: id.to_string(),
+            content: "out".into(),
+            tool_name: "shell".into(),
+        }
+    }
+
+    fn assert_list_matches_projection(
+        store: &AcpSessionStore,
+        session_uuid: &str,
+        expected: usize,
+    ) {
+        let summary = &store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_uuid == session_uuid)
+            .unwrap_or_else(|| panic!("session {session_uuid} should be listed"));
+        let data = store.load_session(session_uuid).unwrap().unwrap();
+        assert_eq!(summary.message_count, expected, "session {session_uuid}");
+        assert_eq!(
+            summary.message_count,
+            projected_entry_count(&data.messages),
+            "session {session_uuid} persisted count must match the projection"
+        );
+        // The live agent-scoped listing must agree with the other listings:
+        // it reads the same persisted counter, never a fresh row count.
+        let live = &store
+            .list_live_sessions_by_agent(&summary.agent_alias)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_uuid == session_uuid)
+            .unwrap_or_else(|| {
+                panic!("session {session_uuid} should be live-listed for its agent")
+            });
+        assert_eq!(
+            live.message_count, expected,
+            "session {session_uuid} live listing must match the projection"
+        );
+    }
+
+    #[test]
+    fn list_sessions_message_count_matches_projection_after_mixed_writes() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-mixed", "alpha", "/tmp/mixed", None)
+            .unwrap();
+
+        // Chat only.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::Chat(ChatMessage::user("hi"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 1);
+
+        // One batch of 3 calls with text: text + 3 calls = +4. Results come
+        // in a later turn so the cross-turn fold is exercised there.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("inspecting".into()),
+                    tool_calls: vec![tool_call("a"), tool_call("b"), tool_call("c")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 5);
+
+        // One batch of 2 calls with empty text: calls only = +2.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some(String::new()),
+                    tool_calls: vec![tool_call("d"), tool_call("e")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 7);
+
+        // Results folding into the same-turn call ("f") and into calls
+        // written in PREVIOUS append_turns ("a", "b", "c"): only the new
+        // call adds an entry.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("f")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("f"),
+                        tool_result("a"),
+                        tool_result("b"),
+                        tool_result("c"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 8);
+
+        // An orphan result (no call was ever written for it) counts as its
+        // own entry on top of the same-turn call; the unconsumed previous
+        // turn's call ("d") still folds.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("g")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("g"),
+                        tool_result("d"),
+                        tool_result("orphan"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 10);
+    }
+
+    #[test]
+    fn append_turn_orphan_result_does_not_consume_later_reused_call() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-reuse", "alpha", "/tmp/reuse", None)
+            .unwrap();
+
+        // Turn 1 issues x. Turn 2 must open a batch before its results, so y
+        // rides along and never resolves; its second x result has no call
+        // left to fold into. Turn 3 reuses the x id.
+        store
+            .append_turn(
+                "sess-reuse",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![tool_call("x")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "sess-reuse",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("y")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("x"), tool_result("x")]),
+                ],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "sess-reuse",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("x")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("x")]),
+                ],
+            )
+            .unwrap();
+
+        // Entries: call x, call y, folded result, orphan duplicate result,
+        // reused call x, folded result. The orphan duplicate must leave the
+        // open-call balance untouched so the reused call's result folds.
+        assert_list_matches_projection(&store, "sess-reuse", 4);
+    }
+
+    #[test]
+    fn open_calls_after_clamps_orphan_results_at_zero() {
+        assert_eq!(open_calls_after([ToolEventKind::In]), 1);
+        assert_eq!(open_calls_after([ToolEventKind::In, ToolEventKind::Out]), 0);
+        // A duplicate out is an orphan entry and leaves the balance at zero.
+        assert_eq!(
+            open_calls_after([ToolEventKind::In, ToolEventKind::Out, ToolEventKind::Out]),
+            0
+        );
+        // So a later call reusing the id still opens fresh.
+        assert_eq!(
+            open_calls_after([
+                ToolEventKind::In,
+                ToolEventKind::Out,
+                ToolEventKind::Out,
+                ToolEventKind::In,
+            ]),
+            1
+        );
+        assert_eq!(open_calls_after([ToolEventKind::Out]), 0);
+        assert_eq!(
+            open_calls_after([ToolEventKind::In, ToolEventKind::In, ToolEventKind::Out]),
+            1
+        );
+    }
+
+    #[test]
+    fn append_turn_orphan_result_after_callless_assistant_chat_keeps_parent() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-callless-chat", "alpha", "/tmp/callless-chat", None)
+            .unwrap();
+
+        // An orphan result attaches to the most recent assistant message,
+        // which may be a plain chat with no calls in the turn. The persisted
+        // counter scores the parent text and the orphan result as separate
+        // entries, so the reload must keep both.
+        store
+            .append_turn(
+                "sess-callless-chat",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::Chat(ChatMessage::assistant("a")),
+                    ConversationMessage::ToolResults(vec![tool_result("z")]),
+                ],
+            )
+            .unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list[0].message_count, 3);
+        let data = store.load_session("sess-callless-chat").unwrap().unwrap();
+        assert_eq!(list[0].message_count, projected_entry_count(&data.messages));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "a"
+        ));
+        match &data.messages[2] {
+            ConversationMessage::ToolResults(results) => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].tool_call_id, "z");
+            }
+            other => panic!("expected ToolResults, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_turn_orphan_result_after_callless_batch_keeps_parent_text() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-callless-batch", "alpha", "/tmp/callless-batch", None)
+            .unwrap();
+
+        // A text-only batch (no calls) persists its text as an assistant
+        // row and sets the parent for later results, so an orphan result
+        // riding the same turn must not drop that text on reload.
+        store
+            .append_turn(
+                "sess-callless-batch",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("t".into()),
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("z")]),
+                ],
+            )
+            .unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list[0].message_count, 3);
+        let data = store.load_session("sess-callless-batch").unwrap().unwrap();
+        assert_eq!(list[0].message_count, projected_entry_count(&data.messages));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "t"
+        ));
+        assert!(matches!(
+            &data.messages[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1 && results[0].tool_call_id == "z"
+        ));
+    }
+
+    /// The schema as it was before the projected-count columns existed.
+    /// `AcpSessionStore::new` adds the rest of the current columns through
+    /// its idempotent migrations, so tests only hand-build what predates
+    /// the change under test.
+    fn legacy_schema_without_projected_count(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE acp_sessions (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_uuid  TEXT NOT NULL UNIQUE,
+                 agent_alias   TEXT NOT NULL,
+                 workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
+                 token_count   INTEGER NOT NULL DEFAULT 0,
+                 killed_at     TEXT,
+                 created_at    TEXT NOT NULL,
+                 last_activity TEXT NOT NULL
+             );
+             CREATE TABLE acp_messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  INTEGER NOT NULL REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 role        TEXT NOT NULL,
+                 content     TEXT NOT NULL,
+                 reasoning_content TEXT,
+                 created_at  TEXT NOT NULL
+             );
+             CREATE TABLE acp_tool_calls (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id   INTEGER NOT NULL REFERENCES acp_messages(id) ON DELETE CASCADE,
+                 tool_call_id TEXT NOT NULL,
+                 tool_name    TEXT NOT NULL,
+                 event_kind   TEXT NOT NULL,
+                 payload      TEXT NOT NULL,
+                 outcome      TEXT,
+                 created_at   TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    }
+
+    /// Read the raw cache pair, bypassing the read paths, so a test can tell
+    /// a session that was never scored (0, NULL) apart from one the store
+    /// scored (count, watermark) and from a cache another writer left
+    /// behind the rows.
+    fn raw_count_pair(store: &AcpSessionStore, session_uuid: &str) -> (i64, Option<i64>) {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT projected_message_count, projected_count_through
+                  FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rollback_writes_by_an_older_binary_self_heal_on_the_next_list() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("self-heal-s", "alpha", "/tmp/s", None)
+            .unwrap();
+        store
+            .append_turn(
+                "self-heal-s",
+                &[ConversationMessage::Chat(ChatMessage::user("first"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 1);
+        drop(store);
+
+        // A binary without the cache columns writes the same file: it
+        // inserts session T and appends rows to S without touching either
+        // column, so both caches are left behind the rows.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-binary-t', 'alpha', '/tmp/t', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        let s_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = 'self-heal-s'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let t_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = 'old-binary-t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'user', 'old binary q', 't')",
+            params![t_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'assistant', 'old binary a', 't')",
+            params![t_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'user', 'old binary turn', 't')",
+            params![s_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The next list self-heals both sessions from their rows.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 2);
+        assert_list_matches_projection(&store, "old-binary-t", 2);
+
+        // A later append then increments the healed base, never a stale one.
+        store
+            .append_turn(
+                "self-heal-s",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "after upgrade",
+                ))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 3);
+        assert_eq!(
+            store.projected_message_count("self-heal-s").unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn old_binary_emptying_a_transcript_reads_as_zero() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("emptied-s", "alpha", "/tmp/e", None)
+            .unwrap();
+        store
+            .append_turn(
+                "emptied-s",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::Chat(ChatMessage::assistant("a")),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "emptied-s", 2);
+        drop(store);
+
+        // A binary without the cache columns empties the transcript without
+        // knowing either column, leaving the pair behind rows that no longer
+        // exist.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "DELETE FROM acp_messages WHERE session_id =
+                 (SELECT id FROM acp_sessions WHERE session_uuid = 'emptied-s')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The next read heals to the empty transcript: zero rows, zero
+        // count, NULL watermark (valid at 0).
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let list = store.list_sessions().unwrap();
+        let emptied = list.iter().find(|s| s.session_uuid == "emptied-s").unwrap();
+        assert_eq!(emptied.message_count, 0);
+        assert_eq!(store.projected_message_count("emptied-s").unwrap(), Some(0));
+        assert_eq!(raw_count_pair(&store, "emptied-s"), (0, None));
+    }
+
+    #[test]
+    fn unreadable_session_does_not_block_the_store_or_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session A (healthy): a chat, a batch with text and two calls,
+        // both results folding: 4 entries.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('healthy-a', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'hi', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'working', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'read', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', '/tmp', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'y', 'read', 'out', 'data', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session B: an assistant text and one call, plus one row whose
+        // event_kind no reload accepts.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('unreadable-b', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', 'plan', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (3, 'z', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'z', 'shell', 'bogus', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = AcpSessionStore::new(tmp.path())
+            .expect("an unreadable session must not fail the store open");
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list.len(), 2, "both sessions must list");
+        assert_list_matches_projection(&store, "healthy-a", 4);
+        let unreadable = list
+            .iter()
+            .find(|s| s.session_uuid == "unreadable-b")
+            .unwrap();
+        assert_eq!(
+            unreadable.message_count, 0,
+            "a session that was never scored lists with its stored count"
+        );
+        assert!(
+            store.load_session("unreadable-b").is_err(),
+            "the unreadable session must still fail closed on load"
+        );
+
+        // Repairing the row lets the next list score the session.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE acp_tool_calls SET event_kind = 'out' WHERE event_kind = 'bogus'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_list_matches_projection(&store, "unreadable-b", 2);
+    }
+
+    #[test]
+    fn lazy_refresh_scores_pre_column_rows_on_first_list() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session 1: chat (1), batch with text + 2 calls (3), results fold.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-full', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'hi', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'working', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'read', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', '/tmp', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'y', 'read', 'out', 'data', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session 2: empty-text batch (0 text entries), one call whose
+        // result folds, and one orphan 'out' row for a call never issued.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-orphan', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (3, 'z', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'z', 'shell', 'out', 'ok', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'ghost', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening the store adds the cache columns without scoring anyone:
+        // the pre-column rows stay at the column default with a NULL
+        // watermark until a read scores them.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-full"), (0, None));
+        assert_eq!(raw_count_pair(&store, "old-orphan"), (0, None));
+
+        // The first list scores both sessions from their rows and moves
+        // each watermark to the session's own highest row id.
+        assert_list_matches_projection(&store, "old-full", 4);
+        assert_list_matches_projection(&store, "old-orphan", 2);
+        assert_eq!(raw_count_pair(&store, "old-full"), (4, Some(2)));
+        assert_eq!(raw_count_pair(&store, "old-orphan"), (2, Some(3)));
+
+        // A post-scoring append keeps incrementing from the scored base.
+        store
+            .append_turn(
+                "old-full",
+                &[ConversationMessage::Chat(ChatMessage::user("again"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "old-full", 5);
+
+        // A valid cache is not rescored: rewriting the count by raw SQL
+        // without moving the watermark pins the refresh to the watermark
+        // and not to the list itself.
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE acp_sessions SET projected_message_count = 99 WHERE session_uuid = 'old-full'",
+                [],
+            )
+            .unwrap();
+        }
+        let list = store.list_sessions().unwrap();
+        let full = list.iter().find(|s| s.session_uuid == "old-full").unwrap();
+        assert_eq!(
+            full.message_count, 99,
+            "a valid cache must survive a list without rescore"
+        );
+        let orphan = list
+            .iter()
+            .find(|s| s.session_uuid == "old-orphan")
+            .unwrap();
+        assert_eq!(orphan.message_count, 2);
+    }
+
+    #[test]
+    fn lazy_refresh_partitions_tool_call_pairing_by_session() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session A (id 1): an unmatched 'in' row for tool-call ID 'x'.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('session-a', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (1, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session B (id 2): 'in y' followed by an orphan 'out x'. Tool-call
+        // IDs are scoped per session, so B's 'out x' must NOT consume A's
+        // unmatched 'in x'.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('session-b', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The open adds the cache columns without scoring anyone.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "session-a"), (0, None));
+        assert_eq!(raw_count_pair(&store, "session-b"), (0, None));
+
+        // The first list scores both: A: 1 entry for the unmatched 'in x'.
+        // B: 1 for 'in y' plus 1 for the orphan 'out x' (2 total); a
+        // cross-session pairing would fold B's orphan into A's call and
+        // undercount B to 1.
+        assert_list_matches_projection(&store, "session-a", 1);
+        assert_list_matches_projection(&store, "session-b", 2);
+    }
+
+    #[test]
+    fn lazy_refresh_orphan_result_does_not_consume_later_reused_call() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // One session, one id: the call, its result, a duplicate result with
+        // no call left to fold into, then a reused call and its result.
+        conn.execute(
+            "INSERT INTO acp_sessions
+                (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-reuse', 'alpha', '/tmp/r', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (1, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (1, 'x', 'shell', 'out', 'ok', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (1, 'x', 'shell', 'out', 'duplicate', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', 'again', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Entries: call, fold, orphan duplicate, reused call, fold = 3. The
+        // orphan duplicate must not consume the reused call. The open adds
+        // the cache columns without scoring anyone; the first list scores.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-reuse"), (0, None));
+        assert_list_matches_projection(&store, "old-reuse", 3);
+    }
+
+    #[test]
+    fn lazy_refresh_keeps_callless_parent_with_orphan_result() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // One session: a user chat, an assistant row with text and no
+        // calls, and an orphan result attached to that assistant row.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-callless', 'alpha', '/tmp/c', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'q', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'a', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'z', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The open adds the cache columns without scoring anyone. The
+        // refresh scores the reloaded projection, so the callless parent
+        // text and the orphan result must both reload for the scored count
+        // to see all three entries.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-callless"), (0, None));
+        assert_list_matches_projection(&store, "old-callless", 3);
+        let data = store.load_session("old-callless").unwrap().unwrap();
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "a"
+        ));
     }
 
     #[test]
