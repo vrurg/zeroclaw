@@ -16561,7 +16561,9 @@ mod tests {
         let risk = config.risk_profiles.get_mut("test-profile").unwrap();
         risk.allowed_tools.push("shell".into());
         risk.allowed_commands = vec!["env".into()];
-        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&agent_workspace)
+            .expect("the operator-bound agent workspace exists before session creation");
         config
             .permission_profiles
             .get_mut("principal-test")
