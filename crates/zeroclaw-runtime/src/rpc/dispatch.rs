@@ -1739,10 +1739,7 @@ async fn resolve_session_record_in_context(
 ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
     use super::session::{DurableSession, SessionRecord};
     let mut owners: Vec<Option<String>> = Vec::new();
-    let live = context
-        .sessions
-        .owner_generation_and_mode(session_id)
-        .await;
+    let live = context.sessions.owner_generation_and_mode(session_id).await;
     if let Some((owner, _, _)) = &live {
         owners.push(owner.clone());
     }
@@ -1816,8 +1813,9 @@ async fn resolve_session_record_in_context(
         has_acp,
         chat_durable,
     ) {
-        (Some(crate::rpc::types::ChatMode::Acp), true, _)
-        | (None, true, None) => Some(DurableSession::Acp),
+        (Some(crate::rpc::types::ChatMode::Acp), true, _) | (None, true, None) => {
+            Some(DurableSession::Acp)
+        }
         (Some(crate::rpc::types::ChatMode::Acp), false, _) => None,
         (Some(crate::rpc::types::ChatMode::Chat), _, chat) | (None, false, chat) => chat,
         (None, true, Some(_)) => {
