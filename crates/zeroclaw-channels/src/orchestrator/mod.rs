@@ -21092,7 +21092,7 @@ temperature = 0.3
 
     #[tokio::test]
     async fn matrix_goal_help_is_available_without_a_control_plane() {
-        let response = submit_matrix_goal(
+        let mut response = submit_matrix_goal(
             router_test_ctx(),
             "matrix_goal-help".to_owned(),
             channel_message("matrix", Some("primary")),
