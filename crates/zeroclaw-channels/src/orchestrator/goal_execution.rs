@@ -917,74 +917,73 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult> {
-        let defaults = runtime_defaults_snapshot(self.context.as_ref());
-        let provider_ref = defaults.config.goal.verifier.model_provider.as_str();
-        let (provider_name, entry) =
-            model_provider_entry_for_ref(defaults.config.as_ref(), provider_ref)?;
-        let model = defaults.config.goal.verifier.model.as_deref().unwrap_or(
-            entry
-                .model
-                .as_deref()
-                .context("Goal verifier has no model")?,
-        );
-        let verifier_defaults =
-            runtime_defaults_from_config(defaults.config.as_ref(), &provider_name)?;
-        let provider = get_or_create_provider(
-            self.context.as_ref(),
-            &provider_name,
-            entry.api_key.as_deref(),
-            &defaults,
-        )
-        .await?;
-        let messages = turn.to_chat_messages();
-        let mut settled_attempts = Vec::new();
-        let response = resolved_channel_execution(
-            self.context.as_ref(),
-            provider.as_ref(),
-            &ChannelRouteSelection {
-                model_provider: provider_name,
-                model: model.to_owned(),
-                api_key: entry.api_key.clone(),
-            },
-            self.context.observer.as_ref(),
-            &LoopKnobs::default(),
-            &[],
-            verifier_defaults.temperature,
-        )
-        .model_access
-        .run_model_query(
-            ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            },
-            &mut settled_attempts,
-        )
+        let result: Result<GoalVerifierResult> = async {
+            let defaults = runtime_defaults_snapshot(self.context.as_ref());
+            let provider_ref = defaults.config.goal.verifier.model_provider.as_str();
+            let (provider_name, entry) =
+                model_provider_entry_for_ref(defaults.config.as_ref(), provider_ref)?;
+            let model = defaults.config.goal.verifier.model.as_deref().unwrap_or(
+                entry
+                    .model
+                    .as_deref()
+                    .context("Goal verifier has no model")?,
+            );
+            let verifier_defaults =
+                runtime_defaults_from_config(defaults.config.as_ref(), &provider_name)?;
+            let provider = get_or_create_provider(
+                self.context.as_ref(),
+                &provider_name,
+                entry.api_key.as_deref(),
+                &defaults,
+            )
+            .await?;
+            let messages = turn.to_chat_messages();
+            let mut settled_attempts = Vec::new();
+            let response = resolved_channel_execution(
+                self.context.as_ref(),
+                provider.as_ref(),
+                &ChannelRouteSelection {
+                    model_provider: provider_name,
+                    model: model.to_owned(),
+                    api_key: entry.api_key.clone(),
+                },
+                self.context.observer.as_ref(),
+                &LoopKnobs::default(),
+                &[],
+                verifier_defaults.temperature,
+            )
+            .model_access
+            .run_model_query(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &mut settled_attempts,
+            )
+            .await?;
+            let response = response.text.context("Goal verifier returned no text")?;
+            let attribution =
+                verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
+                    (
+                        attempt.accepted,
+                        attempt.provider_ref.as_str(),
+                        attempt.model.as_str(),
+                    )
+                }));
+            Ok(GoalVerifierResult {
+                response,
+                attribution,
+            })
+        }
         .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(channel) =
-                    find_channel_for_message(&self.context.channels_by_name, &self.message)
-                {
-                    publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
-                }
-                return Err(error);
-            }
-        };
-        let response = response.text.context("Goal verifier returned no text")?;
-        let attribution =
-            verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
-                (
-                    attempt.accepted,
-                    attempt.provider_ref.as_str(),
-                    attempt.model.as_str(),
-                )
-            }));
-        Ok(GoalVerifierResult {
-            response,
-            attribution,
-        })
+        if let Err(error) = &result
+            && let Some(channel) =
+                find_channel_for_message(&self.context.channels_by_name, &self.message)
+        {
+            publish_matrix_goal_core_error(channel.as_ref(), &self.message, error).await;
+        }
+        result
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
