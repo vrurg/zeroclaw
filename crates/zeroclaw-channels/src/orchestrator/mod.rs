@@ -11437,7 +11437,7 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
     } else {
         "goal-mode-no"
     });
-    let message = channel_runtime_cli_string_with_args(
+    channel_runtime_cli_string_with_args(
         "goal-mode-details",
         &[
             ("status", status),
@@ -11448,8 +11448,7 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
             ("cost_limit", &cost_limit),
             ("pause_reason", &pause_reason),
         ],
-    );
-    message
+    )
 }
 
 #[cfg(test)]
