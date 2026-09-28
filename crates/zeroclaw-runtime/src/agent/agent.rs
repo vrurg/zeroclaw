@@ -1643,7 +1643,7 @@ impl Agent {
     /// tool-call envelopes and text-tool transcripts retain their own wire
     /// shape. System messages remain Agent-owned and are rebuilt when an
     /// isolated turn starts.
-    pub fn isolated_canonical_prefix(&self) -> Result<Vec<ChatMessage>> {
+    pub async fn isolated_canonical_prefix(&self) -> Result<Vec<ChatMessage>> {
         let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
         let dispatch_model = self.model_name.clone();
         let selected_route = self.model_route_resolver.resolve(&dispatch_model);
@@ -1655,7 +1655,9 @@ impl Agent {
             &selected_route.provider_name,
             &selected_route.model,
             &dispatch_model,
-        )?;
+            Some(self.security.as_ref()),
+        )
+        .await?;
         let (active_provider, active_model): (&dyn ModelProvider, &str) =
             vision_provider_box.as_ref().map_or(
                 (self.model_provider.as_ref(), selected_route.model.as_str()),
@@ -1726,7 +1728,9 @@ impl Agent {
             &selected_route.provider_name,
             &selected_route.model,
             &dispatch_model,
-        )?;
+            Some(self.security.as_ref()),
+        )
+        .await?;
         let (active_provider, active_provider_name, active_model) =
             vision_provider_box.as_ref().map_or(
                 (
@@ -1787,6 +1791,7 @@ impl Agent {
                         observer: self.observer.as_ref(),
                         silent: true,
                         approval: self.approval_manager.as_deref(),
+                        security: Some(self.security.as_ref()),
                         multimodal_config: &self.multimodal_config,
                         config: self
                             .provider_switch_config
@@ -10203,8 +10208,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn isolated_canonical_prefix_excludes_the_agent_owned_system_prompt() {
+    #[tokio::test]
+    async fn isolated_canonical_prefix_excludes_the_agent_owned_system_prompt() {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
@@ -10236,6 +10241,7 @@ mod tests {
 
         let prefix = agent
             .isolated_canonical_prefix()
+            .await
             .expect("Goal prefix should project canonical history");
 
         assert!(prefix.iter().all(|message| message.role != "system"));
@@ -10331,6 +10337,7 @@ mod tests {
         let canonical_before = format!("{:?}", agent.history());
         let prefix = agent
             .isolated_canonical_prefix()
+            .await
             .expect("Goal prefix should project canonical history");
 
         let input =
