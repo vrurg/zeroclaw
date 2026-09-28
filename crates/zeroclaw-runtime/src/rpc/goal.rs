@@ -360,55 +360,55 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult> {
-        let (provider, model_selector, route_resolver) = {
-            let config = self.context.config.read();
-            let (provider, _provider_ref, model_selector, route_resolver) =
-                build_session_model_provider(
-                    &config,
-                    &config.goal.verifier.model_provider,
-                    config.goal.verifier.model.as_deref(),
-                )?;
-            (provider, model_selector, route_resolver)
-        };
-        let route = route_resolver.resolve(&model_selector);
-        let messages = turn.to_chat_messages();
-        let mut settled_attempts = Vec::new();
-        let response = crate::agent::loop_::ResolvedModelAccess {
-            model_provider: provider.as_ref(),
-            provider_name: &route.provider_name,
-            model: &route.model,
-            dispatch_model: &model_selector,
-            temperature: None,
-        }
-        .run_model_query(
-            ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            },
-            &mut settled_attempts,
-        )
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                self.publish_parent_turn_failure(error.to_string()).await;
-                return Err(error);
+        let result: Result<GoalVerifierResult> = async {
+            let (provider, model_selector, route_resolver) = {
+                let config = self.context.config.read();
+                let (provider, _provider_ref, model_selector, route_resolver) =
+                    build_session_model_provider(
+                        &config,
+                        &config.goal.verifier.model_provider,
+                        config.goal.verifier.model.as_deref(),
+                    )?;
+                (provider, model_selector, route_resolver)
+            };
+            let route = route_resolver.resolve(&model_selector);
+            let messages = turn.to_chat_messages();
+            let mut settled_attempts = Vec::new();
+            let response = crate::agent::loop_::ResolvedModelAccess {
+                model_provider: provider.as_ref(),
+                provider_name: &route.provider_name,
+                model: &route.model,
+                dispatch_model: &model_selector,
+                temperature: None,
             }
-        };
-        let response = response.text.context("Goal verifier returned no text")?;
-        let attribution =
-            verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
-                (
-                    attempt.accepted,
-                    attempt.provider_ref.as_str(),
-                    attempt.model.as_str(),
-                )
-            }));
-        Ok(GoalVerifierResult {
-            response,
-            attribution,
-        })
+            .run_model_query(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &mut settled_attempts,
+            )
+            .await?;
+            let response = response.text.context("Goal verifier returned no text")?;
+            let attribution =
+                verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
+                    (
+                        attempt.accepted,
+                        attempt.provider_ref.as_str(),
+                        attempt.model.as_str(),
+                    )
+                }));
+            Ok(GoalVerifierResult {
+                response,
+                attribution,
+            })
+        }
+        .await;
+        if let Err(error) = &result {
+            self.publish_parent_turn_failure(error.to_string()).await;
+        }
+        result
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
