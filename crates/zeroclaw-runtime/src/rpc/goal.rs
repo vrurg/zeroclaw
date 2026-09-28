@@ -30,7 +30,8 @@ use zeroclaw_goal::control::{
     GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_turn_input,
+    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, dispose_unowned_session_goal,
+    goal_parent_turn_input,
 };
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
@@ -243,6 +244,19 @@ impl ZeroCodeGoalExecutionLease {
     }
 }
 
+fn verifier_attribution_from_attempts<'a>(
+    attempts: impl IntoIterator<Item = (bool, &'a str, &'a str)>,
+) -> Option<GoalVerifierAttribution> {
+    attempts
+        .into_iter()
+        .filter(|(accepted, _, _)| *accepted)
+        .map(|(_, provider_ref, model)| GoalVerifierAttribution {
+            provider_ref: provider_ref.to_owned(),
+            model: model.to_owned(),
+        })
+        .last()
+}
+
 fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
     let kind = match turn.kind {
         GoalParentTurnKind::Start => "start",
@@ -346,7 +360,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         &mut self,
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
-    ) -> Result<String> {
+    ) -> Result<GoalVerifierResult> {
         let (provider, model_selector, route_resolver) = {
             let config = self.context.config.read();
             let (provider, _provider_ref, model_selector, route_resolver) =
@@ -375,8 +389,27 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             },
             &mut settled_attempts,
         )
-        .await?;
-        response.text.context("Goal verifier returned no text")
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.publish_parent_turn_failure(error.to_string()).await;
+                return Err(error);
+            }
+        };
+        let response = response.text.context("Goal verifier returned no text")?;
+        let attribution =
+            verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
+                (
+                    attempt.accepted,
+                    attempt.provider_ref.as_str(),
+                    attempt.model.as_str(),
+                )
+            }));
+        Ok(GoalVerifierResult {
+            response,
+            attribution,
+        })
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
@@ -417,6 +450,37 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod verifier_attribution_tests {
+    use super::{GoalVerifierAttribution, verifier_attribution_from_attempts};
+
+    #[test]
+    fn reports_the_provider_and_model_of_the_accepted_attempt() {
+        let attribution = verifier_attribution_from_attempts([
+            (false, "openai.primary", "gpt-primary"),
+            (true, "anthropic.fallback", "claude-fallback"),
+        ]);
+
+        assert_eq!(
+            attribution,
+            Some(GoalVerifierAttribution {
+                provider_ref: "anthropic.fallback".to_owned(),
+                model: "claude-fallback".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_attribution_absent_when_no_attempt_was_accepted() {
+        let attribution = verifier_attribution_from_attempts([
+            (false, "openai.primary", "gpt-primary"),
+            (false, "anthropic.fallback", "claude-fallback"),
+        ]);
+
+        assert_eq!(attribution, None);
     }
 }
 
