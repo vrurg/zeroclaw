@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
-use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_infra::session_queue::{SessionActorQueue, SessionEvictionGuard};
 use zeroclaw_providers::ModelProvider;
 
 /// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
@@ -265,6 +265,12 @@ type RemovalSignalPause = (
 );
 
 type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
+
+#[derive(Debug, Clone)]
+pub(crate) struct SameModeSiblingEvictionCandidate {
+    pub(crate) id: String,
+    pub(crate) generation: u64,
+}
 
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
@@ -1390,12 +1396,12 @@ impl SessionStore {
         true
     }
 
-    pub async fn evict_same_mode_sibling(
+    pub(crate) async fn same_mode_sibling_eviction_candidates(
         &self,
         tui_id: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         except_id: &str,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<SameModeSiblingEvictionCandidate> {
         let in_flight: std::collections::HashSet<String> = self
             .cancel_tokens
             .lock()
@@ -1403,7 +1409,7 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let candidates: Vec<String> = self
+        let candidates = self
             .sessions
             .lock()
             .await
@@ -1414,47 +1420,55 @@ impl SessionStore {
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
-            .map(|(key, _)| key.clone())
+            .map(|(key, session)| SameModeSiblingEvictionCandidate {
+                id: key.clone(),
+                generation: session.generation,
+            })
             .collect();
-        let mut queue_busy = std::collections::HashSet::new();
-        for key in &candidates {
-            if self.session_queue.queue_depth(key).await > 0 {
-                queue_busy.insert(key.clone());
-            }
+        candidates
+    }
+
+    /// Remove one exact idle sibling while its actor queue is reserved for
+    /// eviction. Both the live generation and owner/mode stamps are checked
+    /// under the session-store lock; a later incarnation under the same id is
+    /// never removed by stale LRU work.
+    pub(crate) async fn evict_same_mode_sibling_candidate(
+        &self,
+        guard: &SessionEvictionGuard,
+        candidate: &SameModeSiblingEvictionCandidate,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        except_id: &str,
+    ) -> Option<(String, String)> {
+        debug_assert_eq!(guard.session_id(), candidate.id);
+        if guard.session_id() != candidate.id || candidate.id == except_id {
+            return None;
         }
+
         let mut sessions = self.sessions.lock().await;
-        let in_flight: std::collections::HashSet<String> = self
+        let has_cancel_token = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        let victims: Vec<String> = candidates
-            .into_iter()
-            .filter(|key| {
-                !queue_busy.contains(key)
-                    && !in_flight.contains(key)
-                    && sessions.get(key).is_some_and(|s| {
-                        s.owner_tui_id.as_deref() == Some(tui_id) && &s.chat_mode == chat_mode
-                    })
+            .contains_key(&candidate.id);
+        if has_cancel_token
+            || !sessions.get(&candidate.id).is_some_and(|session| {
+                session.generation == candidate.generation
+                    && session.owner_tui_id.as_deref() == Some(tui_id)
+                    && &session.chat_mode == chat_mode
             })
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        let mut pending = Vec::new();
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                if let Some(notify) = s.pending_generation {
-                    pending.push(notify);
-                }
-                evicted.push((key, s.agent_alias));
-            }
+        {
+            return None;
         }
+
+        let session = sessions.remove(&candidate.id)?;
+        let pending = session.pending_generation;
+        let agent_alias = session.agent_alias;
         drop(sessions);
-        for notify in pending {
+        if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        evicted
+        Some((candidate.id.clone(), agent_alias))
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -2476,12 +2490,33 @@ mod tests {
             .await
             .unwrap();
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
-
-        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["old_chat"]);
+        assert!(
+            store.get_agent("old_chat").await.is_some(),
+            "candidate discovery must not remove a session"
+        );
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .expect("idle candidate can be reserved");
+        let evicted = store
+            .evict_same_mode_sibling_candidate(
+                &eviction_guard,
+                &candidates[0],
+                "tui1",
+                &ChatMode::Chat,
+                "new_chat",
+            )
+            .await;
+        assert_eq!(evicted, Some(("old_chat".to_string(), "a".to_string())));
         assert!(
             store.get_agent("new_chat").await.is_some(),
             "new session preserved"
@@ -2498,6 +2533,53 @@ mod tests {
             store.get_agent("old_chat").await.is_none(),
             "abandoned same-mode session evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_same_mode_eviction_candidate_preserves_replacement_generation() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = || {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some("tui1".to_string()))
+        };
+        store.insert("old_chat".into(), mk()).await.unwrap();
+        let candidate = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
+            .await
+            .remove(0);
+
+        let admission = store.session_queue.acquire("old_chat").await.unwrap();
+        assert!(
+            store
+                .remove_generation("old_chat", candidate.generation)
+                .await
+        );
+        store
+            .insert_admitted(&admission, "old_chat".to_string(), mk())
+            .await
+            .unwrap();
+        drop(admission);
+
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .evict_same_mode_sibling_candidate(
+                    &eviction_guard,
+                    &candidate,
+                    "tui1",
+                    &ChatMode::Chat,
+                    "new_chat",
+                )
+                .await
+                .is_none(),
+            "stale LRU work must not remove a same-id successor"
+        );
+        assert!(store.get_agent("old_chat").await.is_some());
     }
 
     #[tokio::test]
@@ -2522,7 +2604,7 @@ mod tests {
         store.register_cancel_token("busy_chat", token.clone());
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         assert!(
@@ -2551,14 +2633,18 @@ mod tests {
         store.insert("new_chat".into(), mk("tui1")).await.unwrap();
         let _turn_guard = store.session_queue.acquire("busy_chat").await.unwrap();
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
-
+        assert_eq!(candidates.len(), 1);
         assert!(
-            evicted.is_empty(),
-            "queue-owned session must not be evicted"
+            store
+                .session_queue
+                .try_begin_eviction(&candidates[0].id)
+                .await
+                .is_none()
         );
+
         assert!(
             store.get_agent("busy_chat").await.is_some(),
             "session must remain until its actor releases the queue"

@@ -599,6 +599,35 @@ pub struct RpcGoalRuntime {
 }
 
 impl RpcGoalRuntime {
+    /// Whether this session's Goal can be safely disposed without waiting for
+    /// a process-local worker. LRU eviction is nonblocking: resumable Goals
+    /// and sessions with a live resident worker stay attached rather than
+    /// being fenced while an actor permit is held. A completed worker may be
+    /// drained because it no longer owns the session execution lease.
+    pub async fn can_evict_session_goal(&self, session_id: &str) -> Result<bool> {
+        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
+        let supervisor = self.supervisor(session_id).await;
+        if let Some(supervisor) = supervisor.as_ref()
+            && !supervisor
+                .worker_completed_for_session(&durable_session_id)
+                .await
+        {
+            return Ok(false);
+        }
+        let Some(control_plane) = control_plane() else {
+            return Ok(supervisor.is_none());
+        };
+        let registry = control_plane.goal_store()?;
+        let Some(task) = registry
+            .current_goal_for_session(&durable_session_id)
+            .await?
+        else {
+            return Ok(true);
+        };
+
+        Ok(task.status.is_terminal())
+    }
+
     /// Fence and dispose the current Goal before its RPC session disappears.
     ///
     /// This must run before the caller waits on `SessionActorQueue`: an active
