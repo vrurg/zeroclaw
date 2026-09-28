@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use zeroclaw_api::{
-    jsonrpc::RpcOutbound,
+    jsonrpc::{JsonRpcNotification, RpcOutbound},
     model_provider::{ChatMessage, ChatRequest},
 };
 
@@ -58,6 +58,7 @@ struct RpcGoalPostResponse {
     supervisor: Arc<GoalExecutionSupervisor>,
     settings: GoalHostSettings,
     submission: GoalExecutionSubmission,
+    outbound: Arc<RpcOutbound>,
     starts_execution: bool,
 }
 
@@ -70,20 +71,67 @@ impl RpcGoalCommandSubmission {
     /// same queue preserves response-before-agent-event ordering for both
     /// local IPC and WSS.
     pub(super) async fn after_response(self) -> Result<()> {
-        let Some(mut post_response) = self.post_response else {
+        let initial_response = self.response;
+        let Some(post_response) = self.post_response else {
             return Ok(());
         };
-        post_response
-            .supervisor
-            .launch_after_response(post_response.settings, &mut post_response.submission)
-            .await
+        let RpcGoalPostResponse {
+            runtime,
+            session_id,
+            supervisor,
+            settings,
+            mut submission,
+            outbound,
+            ..
+        } = post_response;
+        let late_response = supervisor
+            .launch_after_response(settings, &mut submission)
+            .await?;
+        let lifecycle_delivery_result = async {
+            if let Some(response) = late_response.as_ref() {
+                let params =
+                    serde_json::to_value(crate::rpc::types::SessionGoalUpdate::Lifecycle {
+                        session_id: session_id.clone(),
+                        response: response.clone(),
+                    })?;
+                let notification =
+                    serde_json::to_string(&JsonRpcNotification::new(GOAL_UPDATE_METHOD, params))?;
+                ensure!(
+                    outbound.send_raw(notification).await,
+                    "ZeroCode Goal lifecycle response could not be queued"
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let initial_is_final = matches!(
+            &initial_response,
+            GoalResponse::Paused(_)
+                | GoalResponse::AlreadyPaused(_)
+                | GoalResponse::Cancelled(_)
+                | GoalResponse::AlreadyCancelled(_)
+                | GoalResponse::Terminal(_)
+        );
+        let pending_was_finalized = matches!(&initial_response, GoalResponse::TransitionPending(_))
+            && late_response.is_some();
+        if initial_is_final || pending_was_finalized {
+            runtime
+                .remove_supervisor_if_current(&session_id, &supervisor)
+                .await;
+        }
+        lifecycle_delivery_result?;
+        Ok(())
     }
 
     /// If a start/resume acknowledgement cannot be queued, pause before any
     /// parent model call so an unseen Goal cannot begin running.
     pub(super) async fn response_delivery_failed(self) -> Result<()> {
         if let Some(mut post_response) = self.post_response
-            && post_response.starts_execution
+            && (post_response.starts_execution
+                || matches!(
+                    post_response.submission.response(),
+                    GoalResponse::TransitionPending(_)
+                ))
         {
             post_response
                 .supervisor
@@ -598,6 +646,7 @@ impl RpcGoalRuntime {
             control_plane.boot_id.clone(),
         )?;
         let session_id = driver.raw_session_id().to_owned();
+        let outbound = Arc::clone(&driver.outbound);
         let supervisor = match self.supervisor(&session_id).await {
             Some(supervisor) => supervisor,
             None => {
@@ -632,17 +681,6 @@ impl RpcGoalRuntime {
         let submission = supervisor
             .submit(settings.clone(), ingress, driver, command)
             .await?;
-        if matches!(
-            submission.response(),
-            GoalResponse::Paused(_)
-                | GoalResponse::AlreadyPaused(_)
-                | GoalResponse::Cancelled(_)
-                | GoalResponse::AlreadyCancelled(_)
-                | GoalResponse::Terminal(_)
-        ) {
-            self.remove_supervisor_if_current(&session_id, &supervisor)
-                .await;
-        }
         let starts_execution = matches!(
             submission.response(),
             GoalResponse::Started(_) | GoalResponse::Resumed(_)
@@ -655,6 +693,7 @@ impl RpcGoalRuntime {
                 supervisor,
                 settings,
                 submission,
+                outbound,
                 starts_execution,
             }),
         })
