@@ -8942,7 +8942,72 @@ async fn process_channel_message_body(
             )
             .await
             {
-                Ok(response) => render_goal_response(&response),
+                Ok(submission) => {
+                    let response = render_goal_response(submission.response());
+                    let delivery_error = match find_channel_for_message(
+                        &ctx.channels_by_name,
+                        &original_goal_message,
+                    ) {
+                        Some(channel) => channel
+                            .send(&SendMessage::reply_to(&original_goal_message, response))
+                            .await
+                            .err(),
+                        None => Some(anyhow::Error::msg(
+                            "Matrix channel is unavailable for Goal acknowledgement",
+                        )),
+                    };
+                    if let Some(error) = delivery_error {
+                        if let Err(pause_error) = submission.response_delivery_failed().await {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "error": zeroclaw_providers::sanitize_api_error(&pause_error.to_string()),
+                                })),
+                                "Goal could not be paused after Matrix acknowledgement failure"
+                            );
+                        }
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                            })),
+                            "Goal command acknowledgement could not be delivered"
+                        );
+                        // A failed send can still mean the channel accepted
+                        // the event before losing its acknowledgement. Do not
+                        // retry with a second response that could duplicate it.
+                        return;
+                    } else {
+                        match submission.after_response().await {
+                            Ok(()) => return,
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({
+                                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                                    })),
+                                    "Goal execution could not start after Matrix acknowledgement"
+                                );
+                                channel_runtime_cli_string("goal-mode-command-failed")
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
