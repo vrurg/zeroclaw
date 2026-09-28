@@ -11,7 +11,7 @@ pub use control::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
     GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
     GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
-    GoalSubmission, GoalSurface, GoalVerifierTurn,
+    GoalSubmission, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
