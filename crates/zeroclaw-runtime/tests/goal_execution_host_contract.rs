@@ -12,7 +12,8 @@ use zeroclaw_config::{
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
     GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalVerifierTurn,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalVerifierResult,
+    GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
@@ -52,8 +53,11 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         &mut self,
         _scope: &GoalExecutionScope,
         turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
-        Ok(format!("verifier:{}", turn.candidate))
+    ) -> anyhow::Result<GoalVerifierResult> {
+        Ok(GoalVerifierResult {
+            response: format!("verifier:{}", turn.candidate),
+            attribution: None,
+        })
     }
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
@@ -225,7 +229,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
         &mut self,
         _scope: &GoalExecutionScope,
         _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalVerifierResult> {
         anyhow::bail!("lease execution test does not run verifier turns")
     }
 
@@ -280,6 +284,7 @@ impl LeaseObservingRegistry {
                 depth: 0,
                 parent_id: None,
                 originator_route: Some(ingress.route().to_owned()),
+                originator_chain: Vec::new(),
                 delivered: false,
                 idem_key: None,
                 principal_id: Some("@alice:example.org".to_owned()),
@@ -724,7 +729,8 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                 }
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .response,
         "verifier:candidate"
     );
     lease
