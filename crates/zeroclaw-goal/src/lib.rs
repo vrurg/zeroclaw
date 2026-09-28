@@ -12,10 +12,10 @@ pub use control::{
     GoalController, GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost,
     GoalExecutionOutcome, GoalExecutionRequest, GoalExecutionRestartCoordinator,
     GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalRuntime,
-    GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
-    GoalSessionKey, GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSurface,
-    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalIngressContext, GoalIngressPrincipal, GoalParentTurn, GoalPendingAction, GoalResponse,
+    GoalRuntime, GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
+    GoalSubmission, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
