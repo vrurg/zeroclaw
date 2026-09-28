@@ -1960,6 +1960,13 @@ pub async fn handle_api_session_message_post(
             )
                 .into_response();
         }
+        Err(crate::session_queue::SessionQueueError::Evicting { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "Session is being removed"})),
+            )
+                .into_response();
+        }
         Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
@@ -2056,6 +2063,13 @@ pub async fn handle_api_session_delete(
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Evicting { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "Session is being removed"})),
             )
                 .into_response();
         }
