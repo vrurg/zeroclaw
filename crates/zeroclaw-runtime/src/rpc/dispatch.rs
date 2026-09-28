@@ -3772,6 +3772,31 @@ impl RpcDispatcher {
             }
         }
 
+        // A cross-mode replacement invalidates the old session's Goal
+        // binding. Serialize its disposal with Goal commands before taking the
+        // actor permit: disposal may need the active Goal worker to finish an
+        // admitted turn, and holding the permit here would deadlock that drain.
+        let _replacement_goal_lifecycle_guard = if let Some(snapshot) =
+            self.ctx.sessions.goal_session_snapshot(&session_id).await
+            && snapshot.chat_mode != chat_mode
+        {
+            let generation = snapshot.generation;
+            let guard = self
+                .ctx
+                .sessions
+                .lock_goal_lifecycle(&session_id, generation)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_BUSY, "Session changed before Goal disposal"))?;
+            self.ctx
+                .goal_runtime
+                .dispose_session(&session_id)
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            Some(guard)
+        } else {
+            None
+        };
+
         // Session replacement and prompt execution share one admission
         // permit. Acquire it BEFORE any durable state is read so the whole
         // incarnation — transcript load, Agent build, publish, history
@@ -4659,6 +4684,18 @@ impl RpcDispatcher {
         self.ctx
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
+        let _goal_lifecycle_guard = match requested_generation {
+            Some(generation) => Some(
+                self.ctx
+                    .sessions
+                    .lock_goal_lifecycle(&req.session_id, generation)
+                    .await
+                    .ok_or_else(|| {
+                        rpc_err(SESSION_NOT_FOUND, "Session was replaced before close")
+                    })?,
+            ),
+            None => None,
+        };
         self.ctx
             .goal_runtime
             .dispose_session(&req.session_id)
@@ -4802,6 +4839,18 @@ impl RpcDispatcher {
             .sessions
             .signal_session_kill_for_generation(sid, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        let _goal_lifecycle_guard = match requested_generation {
+            Some(generation) => Some(
+                self.ctx
+                    .sessions
+                    .lock_goal_lifecycle(sid, generation)
+                    .await
+                    .ok_or_else(|| {
+                        rpc_err(SESSION_NOT_FOUND, "Session was replaced before kill")
+                    })?,
+            ),
+            None => None,
+        };
         self.ctx
             .goal_runtime
             .dispose_session(sid)
@@ -7369,6 +7418,18 @@ impl RpcDispatcher {
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        let _goal_lifecycle_guard = match requested_generation {
+            Some(generation) => Some(
+                self.ctx
+                    .sessions
+                    .lock_goal_lifecycle(&req.session_id, generation)
+                    .await
+                    .ok_or_else(|| {
+                        rpc_err(SESSION_NOT_FOUND, "Session was replaced before delete")
+                    })?,
+            ),
+            None => None,
+        };
         self.ctx
             .goal_runtime
             .dispose_session(&req.session_id)
@@ -25319,6 +25380,91 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    fn test_goal_supervisor(
+        store: Arc<crate::control_plane::SqliteTaskStore>,
+    ) -> Arc<zeroclaw_goal::control::GoalExecutionSupervisor> {
+        use zeroclaw_goal::{
+            GoalExecutionScope, GoalTaskRegistry,
+            accounting::{
+                GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
+                GoalOperationSettlement,
+            },
+            control::{GoalExecutionSupervisor, GoalRuntime},
+        };
+
+        struct NoopAccounting;
+
+        #[async_trait::async_trait]
+        impl GoalOperationAccounting for NoopAccounting {
+            async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn pricing_complete(&self) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+        }
+
+        struct NoopAccountingFactory;
+
+        impl GoalOperationAccountingFactory for NoopAccountingFactory {
+            fn for_scope(&self, _scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
+                Arc::new(NoopAccounting)
+            }
+        }
+
+        let registry: Arc<dyn GoalTaskRegistry> = store;
+        let runtime = GoalRuntime::new(registry);
+        let engine = Arc::new(runtime.execution_engine(Arc::new(NoopAccountingFactory)));
+        Arc::new(GoalExecutionSupervisor::new(engine))
+    }
+
+    async fn insert_running_goal(
+        store: &crate::control_plane::SqliteTaskStore,
+        session_id: &str,
+        task_id: &str,
+    ) {
+        use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
+        use zeroclaw_goal::{GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult};
+
+        let task = TaskRecord {
+            id: task_id.to_owned(),
+            kind: TaskKind::Goal,
+            agent: "test-agent".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "rpc-generation-test".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(format!("zerocode:{session_id}")),
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(session_id.to_owned()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task_id.to_owned(),
+            objective: "retain the successor Goal".to_owned(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .expect("seed the successor Goal"),
+            GoalTransitionResult::Applied
+        );
+    }
+
     /// Like `make_persistence_test_dispatcher`, but arms the test-only
     /// `config_commit_pause` hook so a regression can act deterministically
     /// inside the refresh transaction: `commit_config_with_live_session_refresh`
@@ -29699,6 +29845,88 @@ mod tests {
                 "stale {method} must not tombstone the original ACP durable row"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_zero_code_delete_does_not_dispose_successor_goal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-to-chat-with-goal-successor";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("initial ACP session should succeed");
+        let original_generation = sessions.get_generation(sid).await.unwrap();
+
+        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        goal_runtime
+            .install_supervisor_if_absent(
+                sid.to_owned(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher context is uniquely owned before spawning")
+            .goal_runtime = Arc::clone(&goal_runtime);
+
+        let (captured, release_removal, _) = sessions.set_test_removal_signal_pause();
+        let removal_handle = dispatcher.spawn_handle();
+        let removal = zeroclaw_spawn::spawn!(async move {
+            removal_handle
+                .handle_session_delete(&json!({ "session_id": sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), captured.notified())
+            .await
+            .expect("delete must pause after capturing the predecessor generation");
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "session_id": sid,
+            }))
+            .await
+            .expect("same-ID Chat replacement should succeed");
+        let successor_generation = sessions.get_generation(sid).await.unwrap();
+        assert_ne!(successor_generation, original_generation);
+
+        let durable_session_id = format!("rpc_{sid}");
+        insert_running_goal(&goal_store, &durable_session_id, "successor-goal").await;
+        goal_runtime
+            .install_supervisor_if_absent(
+                sid.to_owned(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+
+        release_removal.notify_one();
+        let error = removal
+            .await
+            .expect("stale delete task must not panic")
+            .expect_err("stale delete must reject a replaced generation");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            Some(successor_generation)
+        );
+        use zeroclaw_goal::GoalTaskRegistry;
+        let current = goal_store
+            .current_goal_for_session(&durable_session_id)
+            .await
+            .expect("read the successor Goal");
+        assert_eq!(
+            current.map(|task| task.id).as_deref(),
+            Some("successor-goal")
+        );
     }
 
     #[tokio::test]
