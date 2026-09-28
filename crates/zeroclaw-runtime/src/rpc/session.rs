@@ -882,6 +882,32 @@ impl SessionStore {
             })
     }
 
+    /// Serialize a lifecycle action with Goal commands for one exact live
+    /// session generation. The generation is checked both before waiting and
+    /// after acquiring the session-owned lock, so a caller that was delayed by
+    /// a same-ID replacement cannot act on the successor's Goal.
+    pub(crate) async fn lock_goal_lifecycle(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            if session.generation != expected_generation {
+                return None;
+            }
+            Arc::clone(&session.goal_command)
+        };
+        let guard = lock.lock_owned().await;
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .filter(|session| session.generation == expected_generation)
+            .map(|_| guard)
+    }
+
     /// Await the test-only pause gate before validating captured session
     /// identity/generation in `set_overrides_gated` and
     /// `apply_model_provider`. Returns the `done` notifier which must be
