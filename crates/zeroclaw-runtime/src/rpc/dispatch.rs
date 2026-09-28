@@ -4837,6 +4837,9 @@ impl RpcDispatcher {
                 "Session was replaced before kill",
             ));
         }
+        if requested_generation.is_none() && authorized.is_none() {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
         self.ctx.sessions.wait_test_removal_signal_pause().await;
 
         // Preserve kill semantics by signalling the admitted prompt first,
@@ -4846,6 +4849,52 @@ impl RpcDispatcher {
             .sessions
             .signal_session_kill_for_generation(sid, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        // For a reaped durable session, serialize Goal disposal with any
+        // same-ID restoration, then prove the authorized durable row is still
+        // the target. Live generations keep fence-before-drain ordering:
+        // their Goal worker owns this permit while executing.
+        let reaped_session_guard = if requested_generation.is_none() {
+            Some(
+                self.ctx
+                    .sessions
+                    .session_queue
+                    .acquire(sid)
+                    .await
+                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
+            )
+        } else {
+            None
+        };
+        if requested_generation.is_none() {
+            let current = self
+                .revalidate_admitted_session(sid, authorized.as_ref())
+                .await?;
+            let same_durable_target = current
+                .as_ref()
+                .map(|record| (&record.owner, &record.durable))
+                == authorized
+                    .as_ref()
+                    .map(|record| (&record.owner, &record.durable));
+            if !same_durable_target
+                || current
+                    .as_ref()
+                    .and_then(|record| record.live_generation)
+                    .is_some()
+            {
+                return Err(rpc_err(
+                    SESSION_NOT_FOUND,
+                    "Session was replaced before kill",
+                ));
+            }
+            // A resident Goal worker with no live session is still settling.
+            // Never hold its actor permit while asking it to drain.
+            if self.ctx.goal_runtime.supervisor(sid).await.is_some() {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "Session lifecycle is still settling; retry kill",
+                ));
+            }
+        }
         let _goal_lifecycle_guard = match requested_generation {
             Some(generation) => Some(
                 self.ctx
@@ -4863,13 +4912,16 @@ impl RpcDispatcher {
             .dispose_session(sid)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _guard = match reaped_session_guard {
+            Some(guard) => guard,
+            None => self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(sid)
+                .await
+                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
+        };
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await
@@ -30141,6 +30193,119 @@ mod tests {
             .await
             .expect("delete task must not panic")
             .expect_err("stale reaped delete must reject the restored generation");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            Some(successor_generation)
+        );
+
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::GoalTaskRegistry;
+        let current = goal_store
+            .current_goal_for_session(&durable_session_id)
+            .await
+            .expect("read the successor Goal");
+        assert_eq!(current.map(|task| task.status), Some(TaskStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn reaped_kill_with_unknown_id_does_not_dispose_orphan_goal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "unknown-session-kill-preserves-goal";
+        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let durable_session_id = format!("rpc_{sid}");
+        insert_running_goal(&goal_store, &durable_session_id, "orphan-goal").await;
+        let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        goal_runtime
+            .install_supervisor_if_absent(
+                sid.to_owned(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher context is uniquely owned before spawning")
+            .goal_runtime = goal_runtime;
+
+        let error = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect_err("killing an unknown session must report not found");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::GoalTaskRegistry;
+        let current = goal_store
+            .current_goal_for_session(&durable_session_id)
+            .await
+            .expect("read the orphan Goal");
+        assert_eq!(current.map(|task| task.status), Some(TaskStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn reaped_kill_revalidates_before_disposing_successor_goal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "reaped-kill-preserves-restored-successor-goal";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("initial ACP session should succeed");
+        let original_generation = sessions.get_generation(sid).await.unwrap();
+        sessions.remove(sid).await;
+
+        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher context is uniquely owned before spawning")
+            .goal_runtime = Arc::clone(&goal_runtime);
+
+        let (captured, release_removal, _) = sessions.set_test_removal_signal_pause();
+        let removal_handle = dispatcher.spawn_handle();
+        let removal = zeroclaw_spawn::spawn!(async move {
+            removal_handle
+                .handle_session_kill(&json!({ "session_id": sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), captured.notified())
+            .await
+            .expect("kill must pause after capturing the reaped durable session");
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("the same durable ACP session should be restored");
+        let successor_generation = sessions.get_generation(sid).await.unwrap();
+        assert_ne!(successor_generation, original_generation);
+
+        let durable_session_id = format!("rpc_{sid}");
+        insert_running_goal(&goal_store, &durable_session_id, "successor-goal").await;
+        goal_runtime
+            .install_supervisor_if_absent(
+                sid.to_owned(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+
+        release_removal.notify_one();
+        let error = removal
+            .await
+            .expect("kill task must not panic")
+            .expect_err("stale reaped kill must reject the restored generation");
         assert_eq!(error.code, SESSION_NOT_FOUND);
         assert_eq!(
             sessions.get_generation(sid).await,
