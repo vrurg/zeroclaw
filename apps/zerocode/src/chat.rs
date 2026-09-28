@@ -2813,10 +2813,7 @@ impl Chat {
                         .lag_reattach
                         .as_ref()
                         .is_some_and(|lag| lag.generation == state.turn_generation)
-                        && Self::turn_complete_matches_generation(
-                            &update,
-                            state.turn_generation,
-                        )
+                        && Self::turn_complete_matches_generation(&update, state.turn_generation)
                     {
                         state.intercept_terminal_frame_for_reload(update);
                         terminal_reconcile = true;
