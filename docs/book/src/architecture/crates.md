@@ -6,7 +6,9 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ### `zeroclaw-runtime`
 
-The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.
+The agent loop, security-policy enforcement, SOP engine, cron scheduler,
+SubAgent lifecycle, and RPC layer for zerocode. It also supplies the concrete
+runtime adapters for Goal Mode. Depends on every other core and edge crate.
 
 Notable submodules:
 
@@ -18,6 +20,17 @@ Notable submodules:
 - `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
+
+### `zeroclaw-goal`
+
+Goal-specific control and execution policy: the controller, verifier contract,
+execution supervision, and operation-accounting scopes. It extends the
+canonical task and usage contracts rather than introducing a parallel
+lifecycle store or ledger. The runtime implements Goal persistence through the
+existing SQLite task store and supplies the session, provider-pricing, and
+ZeroCode adapters; `zeroclaw-channels` owns Matrix ingress and presentation.
+See [Background work lifecycle → Goal mode](./background-work-lifecycle.md#goal-mode-target-contract)
+for the lifecycle and recovery boundary.
 
 ### `zeroclaw-config`
 
