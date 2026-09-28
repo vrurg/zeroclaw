@@ -359,6 +359,22 @@ pub struct GoalVerifierTurn {
     pub candidate: String,
 }
 
+/// Safe attribution for the provider route that actually accepted a verifier
+/// response. This carries only routing identity, never credentials or usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalVerifierAttribution {
+    pub provider_ref: String,
+    pub model: String,
+}
+
+/// Result of one completed verifier call, including its actual accepted route
+/// when the ordinary provider accounting boundary can identify it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalVerifierResult {
+    pub response: String,
+    pub attribution: Option<GoalVerifierAttribution>,
+}
+
 impl GoalVerifierTurn {
     /// Build the transport-neutral verifier request used by every Goal
     /// surface. The objective defines scope; the candidate is evidence only.
@@ -444,7 +460,7 @@ pub trait GoalSessionExecutionLease: Send {
         &mut self,
         scope: &GoalExecutionScope,
         turn: GoalVerifierTurn,
-    ) -> Result<String>;
+    ) -> Result<GoalVerifierResult>;
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
 }
 
