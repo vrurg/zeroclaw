@@ -147,7 +147,9 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
-use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
+use self::goal_execution::{
+    deliver_matrix_goal_stop, dispose_matrix_goal, submit_matrix_goal, submit_matrix_goal_stop,
+};
 use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -12161,7 +12163,29 @@ async fn run_message_dispatch_loop_until_cancelled(
                         })
                     });
 
-            let reply = if had_registered_turn || cancelled_bucket {
+            // Goal workers are owned by their durable supervisor rather than
+            // the ordinary inbound-turn registry above. Route Matrix /stop
+            // through the same immediate Goal pause command so it fences the
+            // Goal before any successor operation can be admitted.
+            let goal_pause_error = if is_matrix_channel_name(&msg.channel) {
+                match submit_matrix_goal_stop(Arc::clone(&ctx), msg.clone()).await {
+                    Ok(Some(submission)) => {
+                        let channel =
+                            find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+                        let message = msg.clone();
+                        notice_tasks.spawn(async move {
+                            deliver_matrix_goal_stop(submission, channel, message).await;
+                        });
+                        continue;
+                    }
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                }
+            } else {
+                None
+            };
+
+            let mut reply = if had_registered_turn || cancelled_bucket {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else if folded_into_another_scope {
                 zeroclaw_runtime::i18n::get_required_cli_string(
@@ -12170,6 +12194,13 @@ async fn run_message_dispatch_loop_until_cancelled(
             } else {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
+            if let Some(error) = goal_pause_error {
+                let detail = zeroclaw_providers::sanitize_api_error(&error.to_string());
+                reply = format!(
+                    "{reply}\n{}\n{detail}",
+                    channel_runtime_cli_string("goal-mode-command-failed")
+                );
+            }
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
                 // `/stop` bypasses every admission budget so cancellation
