@@ -118,7 +118,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     } else {
         "zc-goal-no"
     });
-    let message = crate::i18n::t_args(
+    crate::i18n::t_args(
         "zc-goal-details",
         &[
             ("status", &projection.status),
@@ -129,8 +129,7 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             ("cost_limit", &cost_limit),
             ("pause_reason", &pause_reason),
         ],
-    );
-    message
+    )
 }
 
 fn goal_failure_message(reason: crate::wire::GoalFailureReason) -> String {
