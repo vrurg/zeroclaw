@@ -1272,7 +1272,7 @@ impl GoalSessionExecutionLease for UnpairedParentErrorExecutionLease {
         &mut self,
         _scope: &GoalOperationScope,
         _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalVerifierResult> {
         anyhow::bail!("verifier must not run after the parent error")
     }
 
