@@ -123,10 +123,30 @@ impl MatrixGoalCommandSubmission {
     }
 
     /// Release the admitted worker after Matrix confirms lifecycle delivery.
-    pub(super) async fn after_response(mut self) -> Result<()> {
+    pub(super) async fn after_response(&mut self) -> Result<Option<GoalResponse>> {
         self.supervisor
-            .launch_after_response(self.settings, &mut self.submission)
+            .launch_after_response(self.settings.clone(), &mut self.submission)
             .await
+    }
+
+    /// Retire a supervisor only after the corresponding final lifecycle
+    /// response has been delivered by Matrix.
+    pub(super) async fn final_response_delivered(&self, late_response: Option<&GoalResponse>) {
+        let initial_is_final = matches!(
+            self.submission.response(),
+            GoalResponse::Paused(_)
+                | GoalResponse::AlreadyPaused(_)
+                | GoalResponse::Cancelled(_)
+                | GoalResponse::AlreadyCancelled(_)
+                | GoalResponse::Terminal(_)
+        );
+        let pending_was_finalized = matches!(
+            self.submission.response(),
+            GoalResponse::TransitionPending(_)
+        ) && late_response.is_some();
+        if initial_is_final || pending_was_finalized {
+            clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+        }
     }
 
     /// Keep an unseen Goal from starting when Matrix cannot deliver its
@@ -233,19 +253,6 @@ pub(super) async fn submit_matrix_goal(
     let submission = supervisor
         .submit(settings.clone(), ingress, driver, command)
         .await?;
-    if matches!(
-        submission.response(),
-        GoalResponse::Paused(_)
-            | GoalResponse::AlreadyPaused(_)
-            | GoalResponse::Cancelled(_)
-            | GoalResponse::AlreadyCancelled(_)
-            | GoalResponse::Terminal(_)
-    ) {
-        // Pause and cancellation drain the old worker before the supervisor
-        // returns. Rebuilding on an explicit resume picks up live policy and
-        // pricing instead of keeping a stale configuration snapshot.
-        clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
-    }
     Ok(MatrixGoalCommandSubmission {
         supervisor,
         supervisor_slot,
