@@ -16,7 +16,7 @@ use zeroclaw_goal::{
     GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierTurn, control::goal_parent_turn_input,
+    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, control::goal_parent_turn_input,
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
@@ -621,6 +621,19 @@ impl MatrixGoalExecutionLease {
     }
 }
 
+fn verifier_attribution_from_attempts<'a>(
+    attempts: impl IntoIterator<Item = (bool, &'a str, &'a str)>,
+) -> Option<GoalVerifierAttribution> {
+    attempts
+        .into_iter()
+        .filter(|(accepted, _, _)| *accepted)
+        .map(|(_, provider_ref, model)| GoalVerifierAttribution {
+            provider_ref: provider_ref.to_owned(),
+            model: model.to_owned(),
+        })
+        .last()
+}
+
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     fn session_key(&self) -> &GoalSessionKey {
@@ -875,7 +888,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         &mut self,
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
-    ) -> Result<String> {
+    ) -> Result<GoalVerifierResult> {
         let defaults = runtime_defaults_snapshot(self.context.as_ref());
         let provider_ref = defaults.config.goal.verifier.model_provider.as_str();
         let (provider_name, entry) =
@@ -931,7 +944,19 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 return Err(error);
             }
         };
-        response.text.context("Goal verifier returned no text")
+        let response = response.text.context("Goal verifier returned no text")?;
+        let attribution =
+            verifier_attribution_from_attempts(settled_attempts.iter().map(|attempt| {
+                (
+                    attempt.accepted,
+                    attempt.provider_ref.as_str(),
+                    attempt.model.as_str(),
+                )
+            }));
+        Ok(GoalVerifierResult {
+            response,
+            attribution,
+        })
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
@@ -1248,6 +1273,32 @@ mod tests {
         publish_matrix_goal_core_error(&channel, &message, &error).await;
 
         assert!(channel.messages.lock().await.is_empty());
+    }
+
+    #[test]
+    fn verifier_attribution_uses_the_provider_and_model_of_the_accepted_attempt() {
+        let attribution = verifier_attribution_from_attempts([
+            (false, "openai.primary", "gpt-primary"),
+            (true, "anthropic.fallback", "claude-fallback"),
+        ]);
+
+        assert_eq!(
+            attribution,
+            Some(GoalVerifierAttribution {
+                provider_ref: "anthropic.fallback".to_owned(),
+                model: "claude-fallback".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn verifier_attribution_is_absent_when_no_attempt_was_accepted() {
+        let attribution = verifier_attribution_from_attempts([
+            (false, "openai.primary", "gpt-primary"),
+            (false, "anthropic.fallback", "claude-fallback"),
+        ]);
+
+        assert_eq!(attribution, None);
     }
 
     #[test]
