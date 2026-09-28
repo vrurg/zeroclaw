@@ -44,6 +44,8 @@ const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
 pub enum GoalExecutionOutcome {
     Completed,
     VerifierBlocked,
+    /// The admitted operation settled after its exact task/epoch was fenced.
+    Fenced,
 }
 
 /// A Goal command result whose surface lease remains held until the transport
@@ -61,6 +63,10 @@ pub struct GoalExecutionSubmission {
     /// A replaced predecessor has been fenced durably, but must settle before
     /// the admitted successor can launch.
     predecessor: Option<GoalExecutionScope>,
+    /// Retained so the surface can reacquire its command/liveness lease after
+    /// waiting for a predecessor, without holding that lease across the wait.
+    driver: Arc<dyn GoalSessionDriver>,
+    ingress: GoalIngressContext,
     _lease: Option<GoalSessionLease>,
     /// Keeps daemon-restart admission closed across the durable Running
     /// transition and its acknowledgement-to-worker handoff.
@@ -251,6 +257,10 @@ struct GoalWorker {
     task_id: String,
     execution_epoch: i64,
     completion: watch::Receiver<Option<GoalWorkerCompletion>>,
+    /// Serializes lifecycle finalization while leaving the command lease free.
+    /// A resume may be admitted while a pause is draining, but it cannot
+    /// launch until this exact predecessor has been fully classified.
+    lifecycle_finalization: Arc<Mutex<()>>,
     // Retaining the join handle keeps the worker owned until a lifecycle
     // drainer has observed its completion. Drainers wait on `completion` so
     // multiple lifecycle paths can safely observe one terminal result.
@@ -331,6 +341,7 @@ impl GoalExecutionSupervisor {
                 task_id,
                 execution_epoch,
                 completion,
+                lifecycle_finalization: Arc::new(Mutex::new(())),
                 _handle: handle,
             })),
         );
@@ -356,34 +367,43 @@ impl GoalExecutionSupervisor {
             None => None,
         };
         let previous = self.scope_for_session(&ingress).await?;
-        let (response, execution, lease) = self
+        let retained_driver = Arc::clone(&driver);
+        let retained_ingress = ingress.clone();
+        let (mut response, execution, lease) = self
             .engine
             .runtime
             .submit(&settings, ingress, driver, command)
             .await?
             .into_parts_with_lease();
 
-        if execution.is_none()
-            && matches!(
+        let needs_predecessor_drain = execution.is_some()
+            || matches!(
                 &response,
-                GoalResponse::Paused(_) | GoalResponse::Cancelled(_)
-            )
-            && let Some(scope) = previous.as_ref()
-            && let Some(response) = self.drain_lifecycle_fence(scope).await?
-        {
-            return Ok(GoalExecutionSubmission {
-                response,
-                execution: None,
-                predecessor: None,
-                _lease: lease,
-                _admission: admission,
-            });
+                GoalResponse::Paused(_)
+                    | GoalResponse::AlreadyPaused(_)
+                    | GoalResponse::Cancelled(_)
+                    | GoalResponse::AlreadyCancelled(_)
+                    | GoalResponse::Terminal(_)
+            );
+        let predecessor = needs_predecessor_drain.then_some(previous).flatten();
+        if predecessor.is_some() {
+            response = match response {
+                GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) => {
+                    GoalResponse::TransitionPending(super::GoalPendingAction::Pause)
+                }
+                GoalResponse::Cancelled(_) | GoalResponse::AlreadyCancelled(_) => {
+                    GoalResponse::TransitionPending(super::GoalPendingAction::Cancel)
+                }
+                response => response,
+            };
         }
 
         Ok(GoalExecutionSubmission {
             response,
             execution,
-            predecessor: previous,
+            predecessor,
+            driver: retained_driver,
+            ingress: retained_ingress,
             _lease: lease,
             _admission: admission,
         })
@@ -395,25 +415,34 @@ impl GoalExecutionSupervisor {
         &self,
         settings: GoalHostSettings,
         submission: &mut GoalExecutionSubmission,
-    ) -> Result<()> {
+    ) -> Result<Option<GoalResponse>> {
         let result = async {
+            // The surface has already made the lifecycle response observable.
+            // Release command serialization before waiting for the admitted
+            // operation so an immediate pause/cancel remains available.
+            drop(submission._lease.take());
+
+            if let Some(predecessor) = submission.predecessor.take() {
+                let response = self.drain_lifecycle_fence(&predecessor).await?;
+                if matches!(&submission.response, GoalResponse::TransitionPending(_)) {
+                    return Ok(response);
+                }
+            }
+
             let Some(request) = submission.execution.take() else {
-                return Ok(());
+                return Ok(None);
             };
             let scope = request.scope().clone();
-            if let Some(predecessor) = submission.predecessor.take()
-                && let Err(error) = self.drain_after_fence(&predecessor).await
-            {
-                self.engine.fail(&scope, "executor_start_failed").await?;
-                return Err(
-                    error.context("Goal predecessor could not settle before executor launch")
-                );
+            let lease = submission.driver.bind(&submission.ingress).await?;
+            if !self.execution_is_current(&scope).await? {
+                return Ok(None);
             }
             if let Err(error) = self.launch(settings, request).await {
                 self.engine.fail(&scope, "executor_start_failed").await?;
                 return Err(error).context("Goal executor launch failed");
             }
-            Ok(())
+            drop(lease);
+            Ok(None)
         }
         .await;
         // Once launch/failure handling is settled, restart may close admission
@@ -433,32 +462,32 @@ impl GoalExecutionSupervisor {
         reason: GoalPauseReason,
     ) -> Result<()> {
         let result = async {
-            let Some(request) = submission.execution.take() else {
-                return Ok(());
-            };
-            let scope = request.scope();
-            match self
-                .engine
-                .registry
-                .pause_session_goal(
-                    scope.task_id(),
-                    scope.session_id(),
-                    scope.execution_epoch(),
-                    GoalPauseState {
-                        reason,
-                        description: None,
-                        blockers: Vec::new(),
-                    },
-                )
-                .await?
-            {
-                GoalTransitionResult::Applied => {}
-                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                    bail!("Goal pre-launch pause lost its execution fence")
+            if let Some(request) = submission.execution.take() {
+                let scope = request.scope();
+                match self
+                    .engine
+                    .registry
+                    .pause_session_goal(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        GoalPauseState {
+                            reason,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied => {}
+                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                        bail!("Goal pre-launch pause lost its execution fence")
+                    }
                 }
             }
             if let Some(predecessor) = submission.predecessor.take() {
-                self.drain_after_fence(&predecessor)
+                let _ = self
+                    .drain_lifecycle_fence(&predecessor)
                     .await
                     .context("drain fenced Goal predecessor after acknowledgement failure")?;
             }
@@ -517,7 +546,7 @@ impl GoalExecutionSupervisor {
             // logical operation. Its worker gets the opportunity to settle;
             // any join error is classified from the durable pending slot
             // below rather than trusted as evidence that no usage occurred.
-            let _ = self.drain(&scope).await;
+            let _ = self.drain_lifecycle_fence(&scope).await?;
         }
 
         let Some(reloaded) = self
@@ -705,18 +734,19 @@ impl GoalExecutionSupervisor {
             worker_guard.completion.clone()
         };
         loop {
-            let outcome = { completion.borrow().clone() };
-            if let Some(outcome) = outcome {
-                self.remove_worker_if_exact(scope.session_id(), &worker)
-                    .await;
-                return outcome.map_err(anyhow::Error::msg);
-            }
-            if completion.changed().await.is_err() {
-                self.remove_worker_if_exact(scope.session_id(), &worker)
-                    .await;
-                bail!("Goal execution worker stopped without reporting its completion");
+            if completion.borrow().is_some() || completion.changed().await.is_err() {
+                break;
             }
         }
+        let outcome = completion
+            .borrow()
+            .clone()
+            .context("Goal execution worker stopped without reporting its completion")?
+            .map_err(anyhow::Error::msg);
+        // Lifecycle finalization owns worker retirement and pending-operation
+        // classification. Never let a generic drainer remove the handle first.
+        let _ = self.drain_lifecycle_fence(scope).await?;
+        outcome
     }
 
     async fn remove_worker_if_exact(&self, session_id: &str, expected: &Arc<Mutex<GoalWorker>>) {
@@ -754,48 +784,6 @@ impl GoalExecutionSupervisor {
         .map(Some)
     }
 
-    /// Consume an epoch after its durable lifecycle has fenced it.
-    ///
-    /// A fenced worker normally returns an error once it observes that its
-    /// epoch is stale. That is expected only after its pending operation has
-    /// settled; otherwise the failure is surfaced so the caller can classify
-    /// the accounting state rather than silently discarding a possible spend.
-    async fn drain_after_fence(&self, scope: &GoalExecutionScope) -> Result<()> {
-        match self.drain(scope).await {
-            Ok(_) => Ok(()),
-            Err(_error) => {
-                let current = self
-                    .engine
-                    .registry
-                    .current_goal_for_session(scope.session_id())
-                    .await?;
-                let goal = self.engine.registry.get_goal_task(scope.task_id()).await?;
-                let Some(goal) = goal else {
-                    ensure!(
-                        current
-                            .as_ref()
-                            .is_none_or(|task| task.id != scope.task_id()),
-                        "Goal extension disappeared while its exact task remains current"
-                    );
-                    return Ok(());
-                };
-                ensure!(
-                    goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
-                    "Goal worker stopped with an unsettled operation"
-                );
-                if current.as_ref().is_some_and(|task| {
-                    task.id == scope.task_id()
-                        && task.status == TaskStatus::Running
-                        && task.execution_epoch == scope.execution_epoch()
-                }) {
-                    self.engine.fail(scope, "executor_failed").await?;
-                    bail!("Goal worker stopped while its exact epoch remained running");
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Drain a command-fenced worker and fail closed if its durable pending
     /// operation did not settle. Pausing with unknown spend becomes Failed;
     /// explicit cancellation remains Cancelled but carries the same durable
@@ -804,16 +792,59 @@ impl GoalExecutionSupervisor {
         &self,
         scope: &GoalExecutionScope,
     ) -> Result<Option<GoalResponse>> {
-        let _ = self.drain(scope).await;
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(scope.session_id()).cloned()
+        };
+        let Some(worker) = worker else {
+            return self.fenced_response(scope, None).await;
+        };
+        let (finalization, mut completion) = {
+            let worker_guard = worker.lock().await;
+            ensure!(
+                worker_guard.task_id == scope.task_id()
+                    && worker_guard.execution_epoch == scope.execution_epoch(),
+                "Goal execution worker epoch is stale"
+            );
+            (
+                Arc::clone(&worker_guard.lifecycle_finalization),
+                worker_guard.completion.clone(),
+            )
+        };
+        let _finalization = finalization.lock().await;
+        let still_registered = {
+            let workers = self.workers.lock().await;
+            workers
+                .get(scope.session_id())
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &worker))
+        };
+        if !still_registered {
+            return self.fenced_response(scope, None).await;
+        }
+        loop {
+            if completion.borrow().is_some() || completion.changed().await.is_err() {
+                break;
+            }
+        }
+        let completion_error = match completion.borrow().clone() {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(error),
+            None => Some("Goal worker stopped without reporting its completion".to_owned()),
+        };
+
         let Some(current) = self
             .engine
             .registry
             .current_goal_for_session(scope.session_id())
             .await?
         else {
+            self.remove_worker_if_exact(scope.session_id(), &worker)
+                .await;
             return Ok(None);
         };
-        if current.id != scope.task_id() {
+        if current.id != scope.task_id() || !is_fenced_lifecycle_epoch(&current, scope) {
+            self.remove_worker_if_exact(scope.session_id(), &worker)
+                .await;
             return Ok(None);
         }
         let goal = self
@@ -822,52 +853,32 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared while classifying a fenced operation")?;
-        let Some((pending_id, admitted_epoch)) =
+        if let Some((pending_id, admitted_epoch)) =
             goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-        else {
-            return Ok(None);
-        };
-        match self
-            .engine
-            .registry
-            .settle_pending_operation(
-                &current.id,
-                scope.session_id(),
-                admitted_epoch,
-                pending_id,
-                GoalAccountingState::OutcomeUnknown,
-            )
-            .await?
         {
-            GoalTransitionResult::Applied => {}
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-        }
-        let Some(current) = self
-            .engine
-            .registry
-            .current_goal_for_session(scope.session_id())
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current.id != scope.task_id() {
-            return Ok(None);
-        }
-        if current.status == TaskStatus::Paused {
+            if admitted_epoch != scope.execution_epoch() {
+                self.remove_worker_if_exact(scope.session_id(), &worker)
+                    .await;
+                return Ok(None);
+            }
             match self
                 .engine
                 .registry
-                .finish_session_goal(
+                .settle_pending_operation(
                     &current.id,
                     scope.session_id(),
-                    current.execution_epoch,
-                    TaskStatus::Failed,
-                    Some("accounting_outcome_unknown".to_owned()),
+                    admitted_epoch,
+                    pending_id,
+                    GoalAccountingState::OutcomeUnknown,
                 )
                 .await?
             {
                 GoalTransitionResult::Applied => {}
-                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                    self.remove_worker_if_exact(scope.session_id(), &worker)
+                        .await;
+                    return Ok(None);
+                }
             }
         }
         let Some(current) = self
@@ -876,8 +887,84 @@ impl GoalExecutionSupervisor {
             .current_goal_for_session(scope.session_id())
             .await?
         else {
+            self.remove_worker_if_exact(scope.session_id(), &worker)
+                .await;
             return Ok(None);
         };
+        if current.id != scope.task_id() || !is_fenced_lifecycle_epoch(&current, scope) {
+            self.remove_worker_if_exact(scope.session_id(), &worker)
+                .await;
+            return Ok(None);
+        }
+        let mut classified_epoch = None;
+        if matches!(current.status, TaskStatus::Paused | TaskStatus::Running)
+            && (goal.pending_call_id.is_some() || completion_error.is_some())
+        {
+            let failure_epoch = current.execution_epoch;
+            match self
+                .engine
+                .registry
+                .finish_session_goal(
+                    &current.id,
+                    scope.session_id(),
+                    failure_epoch,
+                    TaskStatus::Failed,
+                    Some(if goal.pending_call_id.is_some() {
+                        "accounting_outcome_unknown".to_owned()
+                    } else {
+                        "executor_failed".to_owned()
+                    }),
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {
+                    classified_epoch = Some(if failure_epoch < i64::MAX {
+                        failure_epoch + 1
+                    } else {
+                        failure_epoch
+                    });
+                }
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                    self.remove_worker_if_exact(scope.session_id(), &worker)
+                        .await;
+                    return Ok(None);
+                }
+            }
+        }
+        self.remove_worker_if_exact(scope.session_id(), &worker)
+            .await;
+        self.fenced_response(scope, classified_epoch).await
+    }
+
+    async fn fenced_response(
+        &self,
+        scope: &GoalExecutionScope,
+        classified_epoch: Option<i64>,
+    ) -> Result<Option<GoalResponse>> {
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let same_epoch = current.execution_epoch == scope.execution_epoch();
+        let immediate_transition_epoch =
+            scope.execution_epoch().checked_add(1).is_some_and(|epoch| {
+                epoch == current.execution_epoch
+                    && (current.status == TaskStatus::Paused || current.status.is_terminal())
+            });
+        if current.id != scope.task_id()
+            || (!same_epoch
+                && !immediate_transition_epoch
+                && classified_epoch != Some(current.execution_epoch))
+        {
+            return Ok(None);
+        }
+        if current.status == TaskStatus::Running {
+            return Ok(None);
+        }
         let goal = self
             .engine
             .registry
@@ -892,6 +979,28 @@ impl GoalExecutionSupervisor {
             _ => GoalResponse::Stale,
         }))
     }
+
+    async fn execution_is_current(&self, scope: &GoalExecutionScope) -> Result<bool> {
+        Ok(self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+            .is_some_and(|task| {
+                task.id == scope.task_id()
+                    && task.status == TaskStatus::Running
+                    && task.execution_epoch == scope.execution_epoch()
+            }))
+    }
+}
+
+fn is_fenced_lifecycle_epoch(task: &TaskRecord, scope: &GoalExecutionScope) -> bool {
+    task.execution_epoch == scope.execution_epoch()
+        || (task.status == TaskStatus::Paused || task.status.is_terminal())
+            && scope
+                .execution_epoch()
+                .checked_add(1)
+                .is_some_and(|epoch| task.execution_epoch == epoch)
 }
 
 impl GoalExecutionEngine {
@@ -917,9 +1026,19 @@ impl GoalExecutionEngine {
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let resume_response = request.resume_response().map(ToOwned::to_owned);
-        let objective = self.current_objective(&scope).await?;
+        let Some(objective) = self.current_objective(&scope).await? else {
+            return Ok(GoalExecutionOutcome::Fenced);
+        };
         let accountant = self.accounting_factory.for_scope(scope.clone());
-        let mut lease = self.runtime.acquire_execution(settings, request).await?;
+        let mut lease = match self.runtime.acquire_execution(settings, request).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                if self.exact_running_task_or_fenced(&scope).await?.is_none() {
+                    return Ok(GoalExecutionOutcome::Fenced);
+                }
+                return Err(error).context("acquire Goal session execution lease");
+            }
+        };
 
         if let Some(response) = resume_response {
             // A resumed answer belongs to the same canonical conversation and
@@ -934,8 +1053,10 @@ impl GoalExecutionEngine {
             .await
     }
 
-    async fn current_objective(&self, scope: &GoalExecutionScope) -> Result<String> {
-        let task = self.exact_running_task(scope).await?;
+    async fn current_objective(&self, scope: &GoalExecutionScope) -> Result<Option<String>> {
+        let Some(task) = self.exact_running_task_or_fenced(scope).await? else {
+            return Ok(None);
+        };
         let goal = self
             .registry
             .get_goal_task(&task.id)
@@ -949,7 +1070,7 @@ impl GoalExecutionEngine {
             goal.accounting_state == GoalAccountingState::Complete,
             "Goal execution begins with incomplete accounting"
         );
-        Ok(goal.objective)
+        Ok(Some(goal.objective))
     }
 
     async fn run_scoped(
@@ -969,7 +1090,9 @@ impl GoalExecutionEngine {
             // after a pause, cancellation, or replacement fenced this epoch.
             // That call is allowed to settle its already-incurred usage, but
             // its result must never admit a new parent or verifier operation.
-            self.exact_running_task(scope).await?;
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
             let candidate = match lease
                 .run_parent_turn(
                     scope,
@@ -1006,7 +1129,9 @@ impl GoalExecutionEngine {
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
             // a drained parent result cannot start a second model operation.
-            self.exact_running_task(scope).await?;
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
 
             let candidate_fingerprint = verifier_candidate_fingerprint(&candidate);
             let verifier = match lease
@@ -1053,6 +1178,13 @@ impl GoalExecutionEngine {
                     return Err(error).context("Goal verifier operation failed");
                 }
             };
+
+            // A control fence may commit while an admitted verifier call is
+            // settling. Its result cannot override that transition or admit
+            // another parent/verifier call.
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
 
             let decision = match parse_verifier_response(&verifier.response) {
                 Ok(decision) => {
@@ -1188,6 +1320,26 @@ impl GoalExecutionEngine {
             "Goal execution epoch is stale"
         );
         Ok(task)
+    }
+
+    async fn exact_running_task_or_fenced(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<TaskRecord>> {
+        let Some(task) = self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if task.id != scope.task_id()
+            || task.status != TaskStatus::Running
+            || task.execution_epoch != scope.execution_epoch()
+        {
+            return Ok(None);
+        }
+        Ok(Some(task))
     }
 
     async fn complete(&self, scope: &GoalExecutionScope) -> Result<()> {

@@ -943,6 +943,10 @@ pub enum GoalResponse {
     Status(GoalStatusProjection),
     Budget(GoalStatusProjection),
     BudgetUpdated(GoalStatusProjection),
+    /// An immediate lifecycle fence was committed, but an already-admitted
+    /// operation still has to settle before the final lifecycle event is
+    /// published.
+    TransitionPending(GoalPendingAction),
     Paused(GoalStatusProjection),
     AlreadyPaused(GoalStatusProjection),
     Resumed(GoalStatusProjection),
@@ -952,6 +956,15 @@ pub enum GoalResponse {
     AlreadyActive,
     Terminal(GoalStatusProjection),
     Stale,
+}
+
+/// Immediate lifecycle transition that is waiting for an admitted operation
+/// to settle before its final status can be reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPendingAction {
+    Pause,
+    Cancel,
 }
 
 /// Durable state visible to the future Matrix and ZeroCode renderers.
