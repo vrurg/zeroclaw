@@ -414,6 +414,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             originator_route: Some("matrix:test-room".to_owned()),
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: Some("@test:example.org".to_owned()),
