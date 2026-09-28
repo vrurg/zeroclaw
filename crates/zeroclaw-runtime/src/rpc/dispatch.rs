@@ -1299,7 +1299,17 @@ impl GoalSessionAuthorization {
             scope.as_deref(),
         )
         .await
-        .map_err(|denied| anyhow::anyhow!(denied.message))?;
+        .map_err(|denied| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Session)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "rpc_error_code": denied.code })),
+                "ZeroClaw Goal session authority revalidation failed"
+            );
+            anyhow::Error::msg(denied.message)
+        })?;
 
         if let Some(mine) = scope.as_deref()
             && current
