@@ -1001,13 +1001,21 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         if let Some(typing) = typing_controller.as_ref() {
             typing.resume().await;
         }
-        let approval_channel: Option<Arc<dyn Channel>> = match typing_controller.as_ref() {
+        let approval_origin: Option<Arc<dyn Channel>> = match typing_controller.as_ref() {
             Some(typing) => Some(Arc::new(super::ApprovalTypingChannel::new(
                 Arc::clone(channel),
                 Arc::clone(typing),
             ))),
             None => Some(Arc::clone(channel)),
         };
+        let (approval_manager, approval_channel) = super::channel_turn_approval(
+            &self.context.approval_manager,
+            self.context
+                .prompt_config
+                .risk_profile_for_agent(self.context.agent_alias.as_str()),
+            self.context.channels_by_name.as_ref(),
+            approval_origin,
+        );
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start(
             self.context.observer.as_ref(),
@@ -1052,6 +1060,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 provider.as_ref(),
                 &route,
                 notify_observer.as_ref(),
+                &approval_manager,
                 &loop_knobs,
                 Self::excluded_tools(self.context.as_ref(), &self.message),
                 thinking.effective_temperature,
@@ -1204,6 +1213,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .await?;
             let messages = turn.to_chat_messages();
             let mut settled_attempts = Vec::new();
+            let approval_manager = self.context.approval_manager.for_new_turn();
             let response = resolved_channel_execution(
                 self.context.as_ref(),
                 provider.as_ref(),
@@ -1213,6 +1223,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                     api_key: entry.api_key.clone(),
                 },
                 self.context.observer.as_ref(),
+                &approval_manager,
                 &LoopKnobs::default(),
                 &[],
                 verifier_defaults.temperature,
