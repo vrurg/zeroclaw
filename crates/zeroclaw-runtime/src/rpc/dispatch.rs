@@ -2975,7 +2975,9 @@ impl RpcDispatcher {
                     let result = handle.handle_session_prompt(&params_clone).await;
                     if !is_notif {
                         match result {
-                            Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
+                            Ok(_) => {
+                                handle.send_result(id_clone, serde_json::json!({})).await;
+                            }
                             Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
                         }
                     }
@@ -2994,16 +2996,9 @@ impl RpcDispatcher {
                 self.prompt_tasks.retain(|task| !task.is_finished());
                 let task = zeroclaw_spawn::spawn!(async move {
                     let result = handle.handle_session_goal(&params_clone).await;
-                    if !is_notif {
-                        match result {
-                            Ok(value) => handle.send_result(id_clone, value).await,
-                            Err(error) => {
-                                handle
-                                    .send_error(id_clone, error.code, &error.message)
-                                    .await;
-                            }
-                        }
-                    }
+                    handle
+                        .finish_session_goal_command(id_clone, is_notif, result)
+                        .await;
                 });
                 self.prompt_tasks.push(task);
                 return;
@@ -3156,7 +3151,9 @@ impl RpcDispatcher {
         }
 
         match result {
-            Ok(v) => self.send_result(req_id, v).await,
+            Ok(v) => {
+                self.send_result(req_id, v).await;
+            }
             Err(e) => self.send_error(req_id, e.code, &e.message).await,
         }
     }
@@ -6497,7 +6494,10 @@ impl RpcDispatcher {
         denied
     }
 
-    async fn handle_session_goal(&self, params: &Value) -> RpcResult {
+    async fn handle_session_goal(
+        &self,
+        params: &Value,
+    ) -> Result<(Value, super::goal::RpcGoalCommandSubmission), JsonRpcError> {
         let req: SessionGoalParams = parse_params(params)?;
         let authorized = self
             .authorize_session_owner(&req.session_id, Method::SessionGoal)
@@ -6558,7 +6558,7 @@ impl RpcDispatcher {
                 )
             })?,
         );
-        let response = self
+        let submission = self
             .ctx
             .goal_runtime
             .submit(Arc::clone(&self.ctx), driver, command)
@@ -6579,7 +6579,82 @@ impl RpcDispatcher {
                     "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.",
                 )
             })?;
-        to_result(SessionGoalResult { response })
+        let result = match to_result(SessionGoalResult {
+            response: submission.response().clone(),
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Err(pause_error) = submission.response_delivery_failed().await {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_providers::sanitize_api_error(&pause_error.to_string()),
+                            })),
+                        "ZeroCode Goal could not be paused after response serialization failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        Ok((result, submission))
+    }
+
+    async fn finish_session_goal_command(
+        &self,
+        id: Value,
+        is_notification: bool,
+        result: Result<(Value, super::goal::RpcGoalCommandSubmission), JsonRpcError>,
+    ) {
+        let (value, submission) = match result {
+            Ok(submission) => submission,
+            Err(error) => {
+                if !is_notification {
+                    self.send_error(id, error.code, &error.message).await;
+                }
+                return;
+            }
+        };
+
+        if is_notification {
+            if let Err(error) = submission.response_delivery_failed().await {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                        })),
+                    "ZeroCode Goal could not be paused without an acknowledgement"
+                );
+            }
+            return;
+        }
+
+        if self.send_result(id, value).await {
+            if let Err(error) = submission.after_response().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                        })),
+                    "ZeroCode Goal execution could not start after its acknowledgement"
+                );
+            }
+        } else if let Err(error) = submission.response_delivery_failed().await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                    })),
+                "ZeroCode Goal could not be paused after its acknowledgement failed"
+            );
+        }
     }
 
     /// Emit the terminal `session/update` notification for a turn.
@@ -9745,15 +9820,16 @@ impl RpcDispatcher {
 
     // ── Wire helpers ─────────────────────────────────────────────
 
-    async fn send_result(&self, id: Value, result: Value) {
+    async fn send_result(&self, id: Value, result: Value) -> bool {
         let resp = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: Some(result),
             error: None,
             id,
         };
-        if let Ok(json) = serde_json::to_string(&resp) {
-            let _ = self.rpc.send_raw(json).await;
+        match serde_json::to_string(&resp) {
+            Ok(json) => self.rpc.send_raw(json).await,
+            Err(_) => false,
         }
     }
 
