@@ -2418,6 +2418,8 @@ impl RpcDispatcher {
         // Join each handle where it is stored, and remove it only once its
         // join has returned. Moving handles out first would detach whichever
         // prompt is being awaited if this future is itself dropped.
+        // The listener force-aborts a connection that outlives its drain
+        // deadline, and `Drop` below can only abort the handles it still holds.
         while !self.prompt_tasks.is_empty() {
             if let Some(task) = self.prompt_tasks.last_mut() {
                 let _ = task.await;
@@ -29364,6 +29366,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_kill_uses_durable_fallback_after_live_acp_session_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-kill-after-reap-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP row");
+        assert!(
+            sessions.remove(sid).await,
+            "test reaper removes the live owner"
+        );
+
+        let killed = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("durable ACP fallback should mark the row");
+        assert_eq!(killed["killed"], json!(true));
+        assert!(acp_store.is_session_killed(sid).unwrap());
+
+        let repeated = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("repeated kill should be idempotent");
+        assert_eq!(
+            repeated["killed"],
+            json!(false),
+            "an already-killed durable row is not a new kill"
+        );
+    }
+
+    #[tokio::test]
     async fn rehydrate_queue_admission_failure_is_reported_as_session_busy() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -37220,5 +37262,56 @@ mod tests {
                 .and_then(|overrides| overrides.model_provider),
             Some("openai.test-provider".to_string())
         );
+    }
+
+    /// A listener force-aborts a connection task that outlives its drain
+    /// deadline, so the dispatcher can be dropped while `shutdown` is joining a
+    /// prompt. The prompt has to end with the connection: had `shutdown` moved
+    /// the handles out of `prompt_tasks` first, `Drop` would hold nothing to
+    /// abort and the prompt would run on after the listener reported the
+    /// connection gone.
+    #[tokio::test]
+    async fn shutdown_aborted_mid_join_still_ends_its_prompt() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = connection_test_support::fixture(tmp.path()).await;
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(8);
+        let connection_cancel = CancellationToken::new();
+        let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+            Arc::clone(&fixture.ctx),
+            writer_tx,
+            "test:forced-drain".to_string(),
+            connection_cancel.clone(),
+        );
+
+        // A prompt that ignores cancellation, as a stuck provider or tool call
+        // does. The sender is dropped with the task, so a resolved receiver
+        // proves the task ended instead of being detached.
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        dispatcher
+            .prompt_tasks
+            .push(zeroclaw_spawn::spawn!(async move {
+                let _ends_with_the_task = ended_tx;
+                std::future::pending::<()>().await;
+            }));
+
+        let shutdown = zeroclaw_spawn::spawn!(async move {
+            dispatcher.shutdown().await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection_cancel.cancelled())
+            .await
+            .expect("shutdown should cancel the generation before joining its prompts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The forced listener path: the connection task is aborted while it is
+        // still inside that join.
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .expect("an aborted shutdown must still end the prompt it was joining")
+            .expect_err("the prompt must be aborted rather than run to completion");
     }
 }
