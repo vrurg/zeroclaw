@@ -28,6 +28,7 @@ pub enum GoalResponse {
     BudgetUpdated(GoalStatusProjection),
     Paused(GoalStatusProjection),
     AlreadyPaused(GoalStatusProjection),
+    TransitionPending(GoalPendingAction),
     Resumed(GoalStatusProjection),
     Cancelled(GoalStatusProjection),
     AlreadyCancelled(GoalStatusProjection),
@@ -35,6 +36,12 @@ pub enum GoalResponse {
     AlreadyActive,
     Terminal(GoalStatusProjection),
     Stale,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPendingAction {
+    Pause,
+    Cancel,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionGoalResult {

@@ -317,6 +317,10 @@ rpc_type! {
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
+        Lifecycle {
+            session_id: String,
+            response: zeroclaw_goal::control::GoalResponse,
+        },
     }
 }
 
