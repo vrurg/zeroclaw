@@ -8942,12 +8942,11 @@ async fn process_channel_message_body(
             )
             .await
             {
-                Ok(submission) => {
+                Ok(mut submission) => {
                     let response = render_goal_response(submission.response());
-                    let delivery_error = match find_channel_for_message(
-                        &ctx.channels_by_name,
-                        &original_goal_message,
-                    ) {
+                    let channel =
+                        find_channel_for_message(&ctx.channels_by_name, &original_goal_message);
+                    let delivery_error = match channel {
                         Some(channel) => channel
                             .send(&SendMessage::reply_to(&original_goal_message, response))
                             .await
@@ -8989,7 +8988,36 @@ async fn process_channel_message_body(
                         return;
                     } else {
                         match submission.after_response().await {
-                            Ok(()) => return,
+                            Ok(late_response) => {
+                                if let Some(response) = late_response.as_ref() {
+                                    if let Some(channel) = channel {
+                                        if let Err(error) = channel
+                                            .send(&SendMessage::reply_to(
+                                                &original_goal_message,
+                                                render_goal_response(response),
+                                            ))
+                                            .await
+                                        {
+                                            ::zeroclaw_log::record!(
+                                                WARN,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Fail,
+                                                )
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({
+                                                    "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                                                })),
+                                                "Final Goal lifecycle response could not be delivered"
+                                            );
+                                        }
+                                    }
+                                }
+                                submission
+                                    .final_response_delivered(late_response.as_ref())
+                                    .await;
+                                return;
+                            }
                             Err(error) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -11148,7 +11176,7 @@ fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
 }
 
 fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
-    use zeroclaw_goal::GoalResponse;
+    use zeroclaw_goal::{GoalPendingAction, GoalResponse};
     let key = match response {
         GoalResponse::Help => "goal-mode-help",
         GoalResponse::Disabled => "goal-mode-disabled",
@@ -11158,6 +11186,8 @@ fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
         GoalResponse::BudgetUpdated(_) => "goal-mode-budget-updated",
         GoalResponse::Paused(_) => "goal-mode-paused",
         GoalResponse::AlreadyPaused(_) => "goal-mode-already-paused",
+        GoalResponse::TransitionPending(GoalPendingAction::Pause) => "goal-mode-pause-pending",
+        GoalResponse::TransitionPending(GoalPendingAction::Cancel) => "goal-mode-cancel-pending",
         GoalResponse::Resumed(_) => "goal-mode-resumed",
         GoalResponse::Cancelled(_) => "goal-mode-cancelled",
         GoalResponse::AlreadyCancelled(_) => "goal-mode-already-cancelled",
@@ -11171,7 +11201,20 @@ fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
 
 #[cfg(test)]
 mod goal_command_message_tests {
-    use super::channel_runtime_cli_string;
+    use super::{channel_runtime_cli_string, render_goal_response};
+    use zeroclaw_goal::{GoalPendingAction, GoalResponse};
+
+    #[test]
+    fn matrix_renders_deferred_pause_and_cancel_acknowledgements() {
+        assert_eq!(
+            render_goal_response(&GoalResponse::TransitionPending(GoalPendingAction::Pause)),
+            "Goal pause accepted; waiting for the active operation to settle."
+        );
+        assert_eq!(
+            render_goal_response(&GoalResponse::TransitionPending(GoalPendingAction::Cancel)),
+            "Goal cancellation accepted; waiting for the active operation to settle."
+        );
+    }
 
     #[test]
     fn goal_command_errors_are_actionable_without_internal_details() {
