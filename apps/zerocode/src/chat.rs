@@ -23435,10 +23435,11 @@ mod tests {
         chat.drain_goal_completions();
 
         let entries = active_state(&mut chat).entries();
+        let started_heading = crate::i18n::t("zc-goal-started");
         let started = entries
             .iter()
             .position(|entry| {
-                matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-started"))
+                matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref().lines().next() == Some(started_heading.as_str()))
             })
             .expect("start acknowledgement should be visible");
         let agent = entries
@@ -30125,9 +30126,10 @@ mod tests {
             ChatEntry::SystemMessage(text)
                 if text.as_ref() == crate::i18n::t("zc-goal-pause-pending")
         ));
+        let paused_heading = crate::i18n::t("zc-goal-paused");
         assert!(matches!(
             &entries[3],
-            ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-paused")
+            ChatEntry::SystemMessage(text) if text.as_ref().lines().next() == Some(paused_heading.as_str())
         ));
     }
 
