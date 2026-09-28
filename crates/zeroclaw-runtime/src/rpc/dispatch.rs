@@ -4581,24 +4581,84 @@ impl RpcDispatcher {
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
         {
-            let evicted = self
+            let candidates = self
                 .ctx
                 .sessions
-                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .same_mode_sibling_eviction_candidates(tui_id, &chat_mode, &session_id)
                 .await;
-            if !evicted.is_empty() {
-                // `evict_same_mode_sibling` excludes both registered prompt
-                // work and any session that owns the actor queue. The
-                // remaining sessions are idle, so their Goals have no live
-                // execution lease and can be disposed through the durable
-                // no-worker path without interrupting work.
-                for (sid, _) in &evicted {
-                    self.ctx
-                        .goal_runtime
-                        .dispose_session(sid)
-                        .await
-                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            let mut evicted = Vec::new();
+            for candidate in candidates {
+                let Some(_goal_lifecycle_guard) = self
+                    .ctx
+                    .sessions
+                    .lock_goal_lifecycle(&candidate.id, candidate.generation)
+                    .await
+                else {
+                    continue;
+                };
+                let Some(eviction_guard) = self
+                    .ctx
+                    .sessions
+                    .session_queue
+                    .try_begin_eviction(&candidate.id)
+                    .await
+                else {
+                    continue;
+                };
+
+                // Do not drain a Goal worker while holding its actor permit:
+                // the worker may be between launch and queue admission. A live
+                // worker or any durable nonterminal Goal is retained so an
+                // eviction cannot erase resumable work.
+                let can_dispose = match self
+                    .ctx
+                    .goal_runtime
+                    .can_evict_session_goal(&candidate.id)
+                    .await
+                {
+                    Ok(can_dispose) => can_dispose,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": candidate.id,
+                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                            })),
+                            "Skipped same-mode session eviction because Goal safety could not be verified"
+                        );
+                        false
+                    }
+                };
+                if !can_dispose {
+                    continue;
                 }
+
+                self.ctx
+                    .goal_runtime
+                    .dispose_session(&candidate.id)
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                if let Some(evicted_session) = self
+                    .ctx
+                    .sessions
+                    .evict_same_mode_sibling_candidate(
+                        &eviction_guard,
+                        &candidate,
+                        tui_id,
+                        &chat_mode,
+                        &session_id,
+                    )
+                    .await
+                {
+                    evicted.push(evicted_session);
+                }
+            }
+            if !evicted.is_empty() {
                 if let Some(ref hooks) = self.ctx.hooks {
                     for (sid, _) in &evicted {
                         hooks.fire_session_end(sid, "rpc").await;
@@ -24936,6 +24996,48 @@ mod tests {
         assert!(
             sessions.get_agent("sibling-new").await.is_some(),
             "the new session must survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_eviction_preserves_session_with_resident_goal_supervisor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-goal-evict".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-goal", Some(true)).await;
+        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let durable_session_id = "rpc_sibling-goal";
+        insert_running_goal(&goal_store, durable_session_id, "sibling-goal-task").await;
+        let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        goal_runtime
+            .install_supervisor_if_absent(
+                "sibling-goal".to_string(),
+                test_goal_supervisor(Arc::clone(&goal_store)),
+            )
+            .await;
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher context is uniquely owned before spawning")
+            .goal_runtime = goal_runtime;
+
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-new", None).await;
+
+        assert!(
+            sessions.get_agent("sibling-goal").await.is_some(),
+            "LRU must not remove the session bound to a resident Goal supervisor"
+        );
+        assert!(sessions.get_agent("sibling-new").await.is_some());
+        use zeroclaw_goal::GoalTaskRegistry;
+        assert_eq!(
+            goal_store
+                .current_goal_for_session(durable_session_id)
+                .await
+                .unwrap()
+                .map(|task| task.id)
+                .as_deref(),
+            Some("sibling-goal-task"),
+            "the evicted-sibling pass must preserve its Goal task"
         );
     }
 
