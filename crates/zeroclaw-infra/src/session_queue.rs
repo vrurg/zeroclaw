@@ -29,6 +29,7 @@ struct SessionSlot {
     semaphore: Arc<Semaphore>,
     last_active: Mutex<Instant>,
     pending: AtomicUsize,
+    eviction_reserved: std::sync::atomic::AtomicBool,
 }
 
 /// RAII guard that releases the session permit on drop.
@@ -39,6 +40,27 @@ pub struct SessionGuard {
     /// `SessionStore::insert_admitted`) verify the caller holds the permit
     /// for the session it is about to mutate.
     session_id: String,
+}
+
+/// Nonblocking admission reservation used while a session is being evicted.
+pub struct SessionEvictionGuard {
+    slot: Arc<SessionSlot>,
+    _permit: OwnedSemaphorePermit,
+    _registration: PendingRegistration,
+    session_id: String,
+}
+
+impl SessionEvictionGuard {
+    /// The session id whose idle queue this eviction owns.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+impl Drop for SessionEvictionGuard {
+    fn drop(&mut self) {
+        self.slot.eviction_reserved.store(false, Ordering::Release);
+    }
 }
 
 impl SessionGuard {
@@ -63,6 +85,8 @@ impl Drop for PendingRegistration {
 pub enum SessionQueueError {
     /// Too many requests queued for this session.
     QueueFull { session_id: String, depth: usize },
+    /// The session is at the short, atomic eviction boundary.
+    Evicting { session_id: String },
     /// Timed out waiting for the session lock.
     Timeout { session_id: String },
 }
@@ -75,6 +99,9 @@ impl std::fmt::Display for SessionQueueError {
                     f,
                     "Session {session_id} queue full ({depth} pending requests)"
                 )
+            }
+            Self::Evicting { session_id } => {
+                write!(f, "Session {session_id} is being removed")
             }
             Self::Timeout { session_id } => {
                 write!(f, "Timed out waiting for session {session_id}")
@@ -132,9 +159,16 @@ impl SessionActorQueue {
                         semaphore: Arc::new(Semaphore::new(1)),
                         last_active: Mutex::new(Instant::now()),
                         pending: AtomicUsize::new(0),
+                        eviction_reserved: std::sync::atomic::AtomicBool::new(false),
                     })
                 })
                 .clone();
+
+            if slot.eviction_reserved.load(Ordering::Acquire) {
+                return Err(SessionQueueError::Evicting {
+                    session_id: session_id.to_string(),
+                });
+            }
 
             #[cfg(test)]
             let registration_hook = match self.registration_hook.lock() {
@@ -175,6 +209,57 @@ impl SessionActorQueue {
                 session_id: session_id.to_string(),
             }),
         }
+    }
+
+    /// Reserve an idle session for eviction without waiting. The reservation
+    /// is linearized under the slot-map lock: earlier admissions make this
+    /// return `None`, and later admissions receive `SessionQueueError::Evicting`
+    /// until the returned guard is dropped.
+    pub async fn try_begin_eviction(&self, session_id: &str) -> Option<SessionEvictionGuard> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionSlot {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    last_active: Mutex::new(Instant::now()),
+                    pending: AtomicUsize::new(0),
+                    eviction_reserved: std::sync::atomic::AtomicBool::new(false),
+                })
+            })
+            .clone();
+
+        if self.max_queue_depth == 0
+            || slot.pending.load(Ordering::Acquire) != 0
+            || slot
+                .eviction_reserved
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+
+        slot.pending.fetch_add(1, Ordering::AcqRel);
+        let registration = PendingRegistration {
+            slot: Arc::clone(&slot),
+        };
+        let permit = match Arc::clone(&slot.semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                slot.eviction_reserved.store(false, Ordering::Release);
+                drop(registration);
+                return None;
+            }
+        };
+        let guard = SessionEvictionGuard {
+            slot,
+            _permit: permit,
+            _registration: registration,
+            session_id: session_id.to_string(),
+        };
+        drop(slots);
+        *guard.slot.last_active.lock().await = Instant::now();
+        Some(guard)
     }
 
     #[cfg(test)]
@@ -255,6 +340,34 @@ mod tests {
 
         drop(guard);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn eviction_reservation_rejects_new_admissions_until_removal_finishes() {
+        let queue = SessionActorQueue::new(8, 5, 600);
+        let eviction = queue.try_begin_eviction("s1").await.unwrap();
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        assert!(matches!(
+            queue.acquire("s1").await,
+            Err(SessionQueueError::Evicting { ref session_id }) if session_id == "s1"
+        ));
+
+        drop(eviction);
+        let _guard = queue.acquire("s1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eviction_reservation_skips_active_or_queued_work() {
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 600));
+        let active = queue.acquire("s1").await.unwrap();
+        assert!(queue.try_begin_eviction("s1").await.is_none());
+
+        let queue_clone = Arc::clone(&queue);
+        let waiting = zeroclaw_spawn::spawn!(async move { queue_clone.acquire("s1").await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(queue.try_begin_eviction("s1").await.is_none());
+        drop(active);
+        drop(waiting.await.unwrap().unwrap());
     }
 
     #[tokio::test]
