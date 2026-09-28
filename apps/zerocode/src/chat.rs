@@ -65,7 +65,7 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
 }
 
 fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
-    use crate::wire::GoalResponse;
+    use crate::wire::{GoalPendingAction, GoalResponse};
 
     let key = match response {
         GoalResponse::Help => "zc-goal-help",
@@ -75,6 +75,8 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         GoalResponse::Budget(_) => "zc-goal-budget",
         GoalResponse::BudgetUpdated(_) => "zc-goal-budget-updated",
         GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) => "zc-goal-paused",
+        GoalResponse::TransitionPending(GoalPendingAction::Pause) => "zc-goal-pause-pending",
+        GoalResponse::TransitionPending(GoalPendingAction::Cancel) => "zc-goal-cancel-pending",
         GoalResponse::Resumed(_) => "zc-goal-resumed",
         GoalResponse::Cancelled(_) | GoalResponse::AlreadyCancelled(_) => "zc-goal-cancelled",
         GoalResponse::NoCurrentGoal => "zc-goal-none",
@@ -103,7 +105,8 @@ fn notification_session_id(notif: &RpcNotification) -> Option<String> {
         "session/goal_update" => parse_goal_update(&notif.params).map(|update| match update {
             GoalUpdate::VerifiedCandidate { session_id, .. }
             | GoalUpdate::Completed { session_id }
-            | GoalUpdate::PausedForBlocker { session_id } => session_id.to_string(),
+            | GoalUpdate::PausedForBlocker { session_id }
+            | GoalUpdate::Lifecycle { session_id, .. } => session_id.to_string(),
         }),
         _ => None,
     }
@@ -123,6 +126,10 @@ enum GoalUpdate<'a> {
     PausedForBlocker {
         session_id: &'a str,
     },
+    Lifecycle {
+        session_id: &'a str,
+        response: crate::wire::GoalResponse,
+    },
 }
 
 fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
@@ -140,6 +147,15 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "lifecycle" => {
+            if payload.len() != 2 {
+                return None;
+            }
+            Some(GoalUpdate::Lifecycle {
+                session_id,
+                response: serde_json::from_value(payload.get("response")?.clone()).ok()?,
+            })
+        }
         _ => None,
     }
 }
@@ -2821,7 +2837,8 @@ impl Chat {
                 let session_id = match &update {
                     GoalUpdate::VerifiedCandidate { session_id, .. }
                     | GoalUpdate::Completed { session_id }
-                    | GoalUpdate::PausedForBlocker { session_id } => *session_id,
+                    | GoalUpdate::PausedForBlocker { session_id }
+                    | GoalUpdate::Lifecycle { session_id, .. } => *session_id,
                 };
                 let Some(state) = self.state_for_session_mut(session_id) else {
                     return false;
@@ -2846,6 +2863,14 @@ impl Chat {
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                                 "zc-goal-paused",
                             ))));
+                        state.mark_dirty_append();
+                    }
+                    GoalUpdate::Lifecycle { response, .. } => {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                goal_response_message(&response),
+                            )));
                         state.mark_dirty_append();
                     }
                 }
@@ -29385,7 +29410,7 @@ mod tests {
     async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
-        let (notif_tx, notif_rx) = broadcast::channel(4);
+        let (notif_tx, notif_rx) = broadcast::channel(8);
         chat.notif_rx = notif_rx;
 
         for params in [
@@ -29409,6 +29434,33 @@ mod tests {
                 }
             }),
             serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+            serde_json::json!({
+                "lifecycle": {
+                    "session_id": "sess-1",
+                    "response": { "kind": "transition_pending", "status": "pause" }
+                }
+            }),
+            serde_json::json!({
+                "lifecycle": {
+                    "session_id": "sess-1",
+                    "response": {
+                        "kind": "paused",
+                        "status": {
+                            "task_id": "goal-1",
+                            "status": "paused",
+                            "execution_epoch": 3,
+                            "token_limit": null,
+                            "cost_limit_usd": null,
+                            "accounting_state": "complete",
+                            "pause_reason": "operator",
+                            "resumable": true
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "lifecycle": { "session_id": "sess-1", "response": { "kind": "unknown" } }
+            }),
         ] {
             notif_tx
                 .send(RpcNotification {
@@ -29426,7 +29478,7 @@ mod tests {
         chat.drain_notifications();
 
         let entries = active_state(&mut chat).entries();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         assert!(
             matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result"),
             "the candidate must settle streamed output without duplicating it"
@@ -29434,6 +29486,15 @@ mod tests {
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
         );
+        assert!(matches!(
+            &entries[2],
+            ChatEntry::SystemMessage(text)
+                if text.as_ref() == crate::i18n::t("zc-goal-pause-pending")
+        ));
+        assert!(matches!(
+            &entries[3],
+            ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-paused")
+        ));
     }
 
     #[test]
