@@ -5531,11 +5531,16 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
         .await
         .unwrap();
     assert!(matches!(started.response(), GoalResponse::Started(_)));
-    supervisor
-        .launch_after_response(settings.clone(), &mut started)
+    assert!(
+        supervisor
+            .launch_after_response(settings, &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    timeout(Duration::from_secs(2), parent_started.notified())
         .await
-        .unwrap();
-    parent_started.notified().await;
+        .expect("the admitted parent starts after its start acknowledgement");
 
     let session_id = ingress.session_key().durable_id();
     let cancelling = Arc::clone(&supervisor);
@@ -5551,7 +5556,11 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
         "external cancellation must let the admitted operation settle before returning"
     );
     release_parent.notify_one();
-    let cancellation = cancel.await.unwrap().unwrap();
+    let cancellation = timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("external cancellation completes after the parent settles")
+        .unwrap()
+        .unwrap();
     if let Some(delivery) = cancellation.failure_notice {
         delivery.deliver().await;
     }
@@ -5618,11 +5627,16 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
         .await
         .unwrap();
     assert!(matches!(started.response(), GoalResponse::Started(_)));
-    supervisor
-        .launch_after_response(settings, &mut started)
+    assert!(
+        supervisor
+            .launch_after_response(settings, &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    timeout(Duration::from_secs(2), parent_started.notified())
         .await
-        .unwrap();
-    parent_started.notified().await;
+        .expect("the admitted parent starts after its start acknowledgement");
 
     let session_id = ingress.session_key().durable_id();
     let current = store
@@ -5667,7 +5681,11 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
         "external cancellation still drains its stale resident worker"
     );
     release_parent.notify_one();
-    let cancellation = cancel.await.unwrap().unwrap();
+    let cancellation = timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("stale external cancellation completes after the parent settles")
+        .unwrap()
+        .unwrap();
     if let Some(delivery) = cancellation.failure_notice {
         delivery.withdraw().await;
     }
