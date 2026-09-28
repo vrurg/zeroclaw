@@ -769,6 +769,21 @@ impl GoalExecutionSupervisor {
         }
     }
 
+    /// Return whether the registered worker for one session has reported
+    /// completion. A completed worker no longer owns its session execution
+    /// lease, so lifecycle cleanup may inspect or remove terminal state
+    /// without waiting behind that worker.
+    pub async fn worker_completed_for_session(&self, session_id: &str) -> bool {
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(session_id).cloned()
+        };
+        let Some(worker) = worker else {
+            return false;
+        };
+        worker.lock().await.completion.borrow().is_some()
+    }
+
     /// Await the exact fenced epoch without interrupting its in-flight model
     /// operation. A pause path uses this after durable fencing so the admitted
     /// operation can settle its usage but cannot admit another operation.
