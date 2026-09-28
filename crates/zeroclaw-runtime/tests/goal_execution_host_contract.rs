@@ -2172,7 +2172,7 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
 }
 
 #[tokio::test]
-async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier() {
+async fn supervisor_immediate_pause_acknowledges_before_draining_parent() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
@@ -2229,36 +2229,72 @@ async fn supervisor_pause_drains_the_admitted_parent_without_starting_a_verifier
             .is_err(),
         "the admitted worker must wait until its surface delivers the start acknowledgement"
     );
-    supervisor
-        .launch_after_response(settings.clone(), &mut started)
-        .await
-        .unwrap();
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
     parent_started.notified().await;
 
-    let pause_supervisor = Arc::clone(&supervisor);
-    let pause_settings = settings.clone();
-    let pause_ingress = ingress.clone();
-    let pause_driver = driver.clone();
-    let mut pause = zeroclaw_spawn::spawn!(async move {
-        pause_supervisor
-            .submit(
-                pause_settings,
-                pause_ingress,
-                pause_driver,
-                GoalCommand::Pause { immediate: false },
-            )
+    let mut pause = timeout(
+        Duration::from_millis(20),
+        supervisor.submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        ),
+    )
+    .await
+    .expect("immediate pause must return before the admitted parent settles")
+    .unwrap();
+    assert!(matches!(
+        pause.response(),
+        GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Pause)
+    ));
+
+    let drain_supervisor = Arc::clone(&supervisor);
+    let drain_settings = settings.clone();
+    let mut draining = zeroclaw_spawn::spawn!(async move {
+        drain_supervisor
+            .launch_after_response(drain_settings, &mut pause)
             .await
     });
     assert!(
-        timeout(Duration::from_millis(20), &mut pause)
+        timeout(Duration::from_millis(20), &mut draining)
             .await
             .is_err(),
-        "pause must wait for the admitted parent operation to settle"
+        "post-response drain must wait for the admitted parent operation"
+    );
+
+    let mut status = timeout(
+        Duration::from_millis(20),
+        supervisor.submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Status,
+        ),
+    )
+    .await
+    .expect("draining a fenced parent must not hold the Goal command lease")
+    .unwrap();
+    assert!(matches!(status.response(), GoalResponse::Status(_)));
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut status)
+            .await
+            .unwrap()
+            .is_none()
     );
 
     release_parent.notify_one();
-    let paused = pause.await.unwrap().unwrap();
-    assert!(matches!(paused.response(), GoalResponse::Paused(_)));
+    assert!(matches!(
+        draining.await.unwrap().unwrap(),
+        Some(GoalResponse::Paused(_))
+    ));
     assert_eq!(
         verifier_calls.load(Ordering::SeqCst),
         0,
@@ -2315,10 +2351,13 @@ async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
         .await
         .unwrap();
     assert!(matches!(started.response(), GoalResponse::Started(_)));
-    supervisor
-        .launch_after_response(settings.clone(), &mut started)
-        .await
-        .unwrap();
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let paused = timeout(Duration::from_secs(1), async {
         loop {
@@ -2481,10 +2520,13 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
         GoalResponse::Started(projection) => projection.task_id.clone(),
         response => panic!("expected start response, got {response:?}"),
     };
-    supervisor
-        .launch_after_response(settings.clone(), &mut started)
-        .await
-        .unwrap();
+    assert!(
+        supervisor
+            .launch_after_response(settings.clone(), &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
     parent_started.notified().await;
 
     let restarting = Arc::clone(&coordinator);
@@ -2552,10 +2594,13 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
         .await
         .unwrap();
     assert!(matches!(resumed.response(), GoalResponse::Resumed(_)));
-    supervisor
-        .launch_after_response(settings, &mut resumed)
-        .await
-        .unwrap();
+    assert!(
+        supervisor
+            .launch_after_response(settings, &mut resumed)
+            .await
+            .unwrap()
+            .is_none()
+    );
     parent_started.notified().await;
     release_parent.notify_one();
     let completed = timeout(Duration::from_secs(1), async {
