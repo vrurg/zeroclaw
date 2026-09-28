@@ -160,7 +160,7 @@ impl GoalExecutionEngine {
                 }
             };
 
-            match parse_verifier_response(&verifier) {
+            match parse_verifier_response(&verifier.response) {
                 Ok(VerifierDecision::Complete) => {
                     self.complete(scope, lease, candidate).await?;
                     return Ok(GoalExecutionOutcome::Completed);
