@@ -1041,12 +1041,11 @@ impl GoalExecutionSupervisor {
                         return Ok(None);
                     }
                 }
-                let Some((updated_current, _)) = self.fenced_goal_state(scope).await? else {
+                if self.fenced_goal_state(scope).await?.is_none() {
                     self.remove_worker_if_exact(scope.session_id(), &worker)
                         .await;
                     return Ok(None);
-                };
-                current = updated_current;
+                }
             }
         }
         let Some(current) = self
