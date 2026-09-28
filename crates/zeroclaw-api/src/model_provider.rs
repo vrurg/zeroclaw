@@ -476,6 +476,18 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// The connection for the failing request hop could not be opened
+    /// (connect, TLS handshake or DNS), as reported by the transport at
+    /// the send site. For a request that followed no redirect, nothing
+    /// was delivered. A redirect-following client may already have
+    /// delivered an earlier hop; callers that must not re-send delivered
+    /// work cannot rely on this variant alone.
+    ///
+    /// The display text matches [`StreamError::Http`] so logs, diagnostics
+    /// and user-facing messages are unchanged.
+    #[error("HTTP error: {0}")]
+    ConnectFailed(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
@@ -487,6 +499,16 @@ pub enum StreamError {
 
     #[error(transparent)]
     ModelRefusal(#[from] Box<ModelRefusalError>),
+
+    /// The provider already exhausted its own retry/fallback budget producing
+    /// this error; consumers must not retry or fall back. Produced only when a
+    /// completed non-streaming call is synthesized into a stream (the wrapped
+    /// failure already survived the full ladder). A genuine streaming leg never
+    /// emits it, so fallback recovery for streamed failures is unaffected.
+    /// The payload is the completed call's failure; consumers walk its chain
+    /// for the typed terminal cause beneath it.
+    #[error("terminal provider error: {0}")]
+    Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

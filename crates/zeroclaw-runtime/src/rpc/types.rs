@@ -376,6 +376,10 @@ rpc_type! {
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
     }
 }
 
@@ -386,6 +390,10 @@ rpc_type! {
         pub limit: Option<usize>,
         #[serde(default)]
         pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
     }
 }
 
@@ -690,6 +698,25 @@ rpc_type! {
 rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry and at most the
+    /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
         pub set: bool,
     }
 }
@@ -1803,6 +1830,18 @@ mod tests {
             let wire = serde_json::to_value(&params).unwrap();
             assert_eq!(wire["keep_siblings"], json!(keep));
         }
+    }
+
+    #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
     }
 
     #[test]

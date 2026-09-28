@@ -1104,6 +1104,9 @@ pub async fn run(
                 crate::agent_sidebar::SidebarEvent::CloseSession { pane, session_id }
                     if connected =>
                 {
+                    // The pane keeps the row until the daemon acknowledges the
+                    // close. The daemon cancels and fences an in-flight turn
+                    // before removing the live session; durable history stays.
                     match pane {
                         chat::PaneKind::Chat => {
                             chat_pane.close_session(&session_id).await;
@@ -1837,6 +1840,21 @@ pub async fn run(
                         help_overlay = Some(HelpOverlayState::default());
                     }
                     _ => {}
+                }
+                // Ctrl+N is the keyboard form of the sidebar `[+]`. Routing it
+                // through the same event keeps the picker, the session cap, the
+                // cancellation/error handling and the remote-Code directory
+                // selection on one path instead of two.
+                let add_session_requested = match mode {
+                    Mode::Acp => acp_pane.take_add_session_request(),
+                    Mode::Chat => chat_pane.take_add_session_request(),
+                    _ => false,
+                };
+                if add_session_requested {
+                    apply_sidebar_event!(
+                        crate::agent_sidebar::SidebarEvent::OpenPicker,
+                        dispatch_state
+                    );
                 }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     // Return to wherever the sidebar launched the wizard from
@@ -2809,7 +2827,7 @@ fn draw_quit_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
     let footer = format!(
         "{} = {confirm}   {} = {quit}   {} = {cancel}",
         chords_for(ModalAction::bindings(), ModalAction::Confirm),
-        chords_for(GlobalAction::bindings(), GlobalAction::Quit),
+        chords_for(GlobalAction::resolved_bindings(), GlobalAction::Quit),
         chords_for(ModalAction::bindings(), ModalAction::Cancel),
         confirm = ModalAction::Confirm.label(),
         quit = GlobalAction::Quit.label(),
@@ -3523,6 +3541,50 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn quit_confirmation_renders_the_resolved_quit_binding() {
+        use std::collections::HashMap;
+
+        use crate::keymap::{Chord, overrides};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::set_active(HashMap::from([(
+            GlobalAction::TAG.to_string(),
+            HashMap::from([(
+                "quit".to_string(),
+                vec![Chord::with(KeyCode::Char('q'), KeyModifiers::ALT)],
+            )]),
+        )]));
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_quit_confirm_modal(frame, frame.area()))
+            .expect("draw quit confirmation");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let configured = Chord::with(KeyCode::Char('q'), KeyModifiers::ALT).display();
+        let default = Chord::ctrl('c').display();
+        assert!(
+            rendered.contains(&format!("{configured} = quit")),
+            "rendered modal should advertise configured binding: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&format!("{default} = quit")),
+            "rendered modal should not advertise default binding: {rendered:?}"
+        );
+        overrides::reset();
     }
 
     #[test]

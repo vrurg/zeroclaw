@@ -5937,6 +5937,7 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+        execution_order: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl DelayTool {
@@ -5951,7 +5952,16 @@ mod tests {
                 delay_ms,
                 active,
                 max_active,
+                execution_order: None,
             }
+        }
+
+        fn with_execution_order(
+            mut self,
+            execution_order: Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> Self {
+            self.execution_order = Some(execution_order);
+            self
         }
     }
 
@@ -5979,6 +5989,13 @@ mod tests {
             &self,
             args: serde_json::Value,
         ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(execution_order) = &self.execution_order {
+                execution_order
+                    .lock()
+                    .expect("execution order lock should be valid")
+                    .push(self.name.clone());
+            }
+
             let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now_active, Ordering::SeqCst);
 
@@ -7499,6 +7516,159 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_file_mutation_rewrites_force_sequential_execution() {
+        struct RewriteAsFileMutations;
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for RewriteAsFileMutations {
+            fn name(&self) -> &str {
+                "rewrite-as-file-mutations"
+            }
+
+            async fn before_tool_call_with_context(
+                &self,
+                _context: &zeroclaw_api::hook::ToolCallHookContext,
+                name: String,
+                args: serde_json::Value,
+            ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+                let prepared_name = match name.as_str() {
+                    "delay_a" => "file_edit",
+                    "delay_b" => "file_write",
+                    _ => &name,
+                };
+                crate::hooks::HookResult::Continue((prepared_name.to_string(), args))
+            }
+        }
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"delay_b","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(
+                DelayTool::new(
+                    "file_edit",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+            Box::new(
+                DelayTool::new(
+                    "file_write",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+        ]);
+        let approval_mgr =
+            ApprovalManager::from_risk_profile(&zeroclaw_config::schema::RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            });
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteAsFileMutations));
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: true,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("prepared file mutations should complete");
+
+        assert!(result.ends_with("done"));
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "parallel policy must evaluate the hook-rewritten prepared calls"
+        );
+        assert_eq!(
+            *execution_order
+                .lock()
+                .expect("execution order lock should be valid"),
+            ["file_edit", "file_write"],
+            "both rewritten calls must execute in model order"
         );
     }
 

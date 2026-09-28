@@ -1524,18 +1524,73 @@ async fn prepare_messages_inner(
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
     // First pass: apply age-based trimming when configured.
     let age_trimmed = if config.max_image_turns > 0 {
-        trim_images_by_age(messages, config.max_image_turns)
+        let before = count_image_markers_with_current_turn_tool_results(
+            messages,
+            &current_turn_tool_indices,
+        );
+        let trimmed = trim_images_by_age(messages, config.max_image_turns);
+        let after = count_image_markers_with_current_turn_tool_results(
+            &trimmed,
+            &current_turn_tool_indices,
+        );
+        if after < before {
+            // Indices into the sanitized input list of this preparation,
+            // the list the trims now consume directly, zero-based, system
+            // message included: the span the age trim rewrote in this
+            // request, relative to that same input.
+            let span = trimmed_span(messages, &trimmed);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_image_turns": config.max_image_turns,
+                        "images_before": before,
+                        "images_after": after,
+                        "images_dropped": before - after,
+                        "first_trimmed_index": span.map(|s| s.0),
+                        "last_trimmed_index": span.map(|s| s.1),
+                    })),
+                "multimodal: age-trimmed old images from conversation history"
+            );
+        }
+        trimmed
     } else {
         messages.to_vec()
     };
 
     // Second pass: apply per-request image cap before normalization.
-    let candidate_messages = if count_image_markers_with_current_turn_tool_results(
+    // The trim runs before the event so its attrs can name the span of
+    // messages this request's trim rewrote; see `trimmed_span` for what the
+    // indices mean and how consecutive events relate.
+    let images_before_cap = count_image_markers_with_current_turn_tool_results(
         &age_trimmed,
         &current_turn_tool_indices,
-    ) > max_images
-    {
-        trim_old_images(&age_trimmed, max_images)
+    );
+    let candidate_messages = if images_before_cap > max_images {
+        let trimmed = trim_old_images(&age_trimmed, max_images);
+        // Indices into the sanitized input list of this preparation, the
+        // list the trims now consume directly, zero-based, system message
+        // included: the span the cap trim rewrote in this request, relative
+        // to that same input.
+        let span = trimmed_span(&age_trimmed, &trimmed);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "images_before_cap": images_before_cap,
+                    "max_images": max_images,
+                    "first_trimmed_index": span.map(|s| s.0),
+                    "last_trimmed_index": span.map(|s| s.1),
+                    "images_evicted": images_before_cap
+                        - count_image_markers_with_current_turn_tool_results(
+                            &trimmed,
+                            &current_turn_tool_indices,
+                        ),
+                })),
+            "multimodal: image cap exceeded, trimming oldest images"
+        );
+        trimmed
     } else {
         age_trimmed
     };
@@ -1586,9 +1641,21 @@ async fn prepare_messages_inner(
         let cleaned_text = parsed.cleaned;
         let refs = parsed.refs;
         if refs.is_empty() {
+            // A message with no loadable marker leaves preparation
+            // byte-for-byte as it arrived, matching the no-image fast path
+            // above: the rewritten text is whitespace-trimmed, and applying
+            // it here would strip leading indentation from user-supplied
+            // code whenever some other message in the history carries an
+            // image. Only a rejected marker changes the text, and that
+            // rewrite must still be dispatched in place of the raw marker.
+            let content = if parsed.rejected_count == 0 {
+                message.content.clone()
+            } else {
+                cleaned_text
+            };
             normalized_messages.push(ChatMessage {
                 role: message.role.clone(),
-                content: cleaned_text,
+                content,
             });
             continue;
         }
@@ -1735,6 +1802,27 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
             trim_message_images(m, drop_here)
         })
         .collect()
+}
+
+/// First and last index whose role or content differs between a trim's
+/// stage input and its stage output, or `None` when the trim changed
+/// nothing. Both indices are into this preparation's sanitized input
+/// list, the list the trims now consume directly (the cap trim's stage
+/// input is the age-trimmed view of that list, position for position),
+/// zero-based, system message included: the span names what the trim
+/// rewrote in THIS request, relative to that same request's own untrimmed
+/// input. The comparison never touches the previous request, and the event
+/// itself does not know it. Consecutive events for one conversation can
+/// still be compared by a reader: a `last_trimmed_index` that grew alongside
+/// a grown `images_evicted` marks the request whose new image moved the
+/// eviction frontier, while an unchanged pair means no new rewrite.
+fn trimmed_span(before: &[ChatMessage], after: &[ChatMessage]) -> Option<(usize, usize)> {
+    let differs = |(a, b): (&ChatMessage, &ChatMessage)| a.role != b.role || a.content != b.content;
+    before
+        .iter()
+        .zip(after.iter())
+        .position(differs)
+        .zip(before.iter().zip(after.iter()).rposition(differs))
 }
 
 /// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
@@ -7842,6 +7930,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_keeps_marker_free_user_text_verbatim_beside_an_image() {
+        // An image anywhere in the history sends every user message through
+        // full preparation. Messages without a loadable marker must still
+        // leave it unchanged: leading indentation of pasted code and
+        // trailing newlines are content.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("sample.png");
+        std::fs::write(&image_path, valid_png()).unwrap();
+
+        let pasted_code = "    fn indented() {\n        body();\n    }\n\n";
+        let placeholder = format!("  see {IMAGE_MARKER_PREFIX}<path>] in the docs  \n");
+        let messages = vec![
+            ChatMessage::user(pasted_code),
+            ChatMessage::user(placeholder.clone()),
+            ChatMessage::user(format!(
+                "and this {IMAGE_MARKER_PREFIX}{}]",
+                image_path.display()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images, "the real image must survive");
+        assert_eq!(prepared.messages.len(), 3);
+        assert_eq!(prepared.messages[0].content, pasted_code);
+        assert_eq!(prepared.messages[1].content, placeholder);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_rewrites_rejected_marker_in_user_text_beside_an_image() {
+        // The verbatim pass-through covers text without a refused marker
+        // only. A user message whose sole marker is refused still dispatches
+        // the rewrite, never the raw marker body.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("sample.png");
+        std::fs::write(&image_path, valid_png()).unwrap();
+
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let data_uri_head = concat!("data:image/png", ";base64,");
+        let messages = vec![
+            ChatMessage::user(format!(
+                "  look {IMAGE_MARKER_PREFIX}{data_uri_head}{payload}]"
+            )),
+            ChatMessage::user(format!(
+                "and this {IMAGE_MARKER_PREFIX}{}]",
+                image_path.display()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("a refused marker must not fail preparation");
+
+        assert!(prepared.contains_images, "the real image must survive");
+        let rewritten = &prepared.messages[0].content;
+        assert!(rewritten.contains("look"));
+        assert!(rewritten.contains(REJECTED_IMAGE_MARKER_NOTE));
+        assert!(!rewritten.contains(&payload[..128]));
+    }
+
+    #[tokio::test]
     async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("tool-sample.png");
@@ -9061,6 +9212,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// At the cap, one new image rewrites exactly the oldest image-bearing
+    /// message; an image-free follow-up produces a byte-identical provider
+    /// view; the next new image evicts the next-oldest image. This pins the
+    /// bounded, deterministic eviction the cap events report, for persistent
+    /// user images with age trimming disabled and no tool-result images.
+    /// Outside that scope, a current-turn tool image going stale undoes its
+    /// eviction of a user image on the next turn, and `max_image_turns` can
+    /// age out an image on an image-free turn.
+    #[tokio::test]
+    async fn image_cap_eviction_is_bounded_and_prefix_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let png_data = valid_png();
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let p = img(i);
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", p.display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", p.display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+        let p0 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        // Fifth image arrives: only the oldest image message is rewritten, and
+        // it keeps its caption while losing the image.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        // The fixtures must decode: a rejected image would still be trimmed by
+        // marker count but never reach the provider, and the contract below
+        // would pass without a single image block in play.
+        let inlined = |p: &PreparedMessages| {
+            p.messages
+                .iter()
+                .filter(|m| m.content.contains("data:image"))
+                .count()
+        };
+        assert_eq!(inlined(&p0), 4, "all four fixtures inline before the cap");
+        assert_eq!(inlined(&p1), 4, "the cap keeps exactly four inlined images");
+        let changed1: Vec<usize> = p0
+            .messages
+            .iter()
+            .zip(p1.messages.iter())
+            .enumerate()
+            .filter(|(_, (x, y))| x.content != y.content)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed1,
+            vec![1],
+            "fifth image mutates only the oldest image message"
+        );
+        assert!(p1.messages[1].content.contains("caption 0"));
+        assert!(!p1.messages[1].content.contains("data:image"));
+
+        // Following image-free request: the provider view is byte-stable.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let prefix_equal = p1
+            .messages
+            .iter()
+            .zip(p2.messages.iter())
+            .all(|(x, y)| x.role == y.role && x.content == y.content);
+        assert!(prefix_equal, "image-free follow-up must be byte-stable");
+
+        // Sixth image: the next mutation lands on the second-oldest image
+        // message, the image-only one, which becomes the removal placeholder.
+        history.push(ChatMessage::assistant("ok"));
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 5",
+            img(5).display()
+        )));
+        let p3 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let d3 = trimmed_span(&p2.messages, &p3.messages);
+        assert_eq!(
+            d3,
+            Some((3, 3)),
+            "sixth image mutates the second-oldest image message"
+        );
+        assert_eq!(p3.messages[3].content, "[image removed from history]");
+    }
+
+    #[tokio::test]
+    async fn image_cap_eviction_event_names_the_rewritten_message() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // A failing assertion must not skip the hook cleanup, so the clear
+        // lives in a drop guard rather than a trailing call.
+        struct HookCleanup;
+        impl Drop for HookCleanup {
+            fn drop(&mut self) {
+                zeroclaw_log::clear_broadcast_hook();
+            }
+        }
+        let _cleanup = HookCleanup;
+
+        let temp = tempfile::tempdir().unwrap();
+        let png_data = valid_png();
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // One image-only turn (i == 1), captioned turns otherwise, each
+        // answered; the image-only message becomes the removal placeholder
+        // once its image is evicted.
+        let history_with = |turns: usize| {
+            let mut history = vec![ChatMessage::system("sys")];
+            for i in 0..turns {
+                let content = if i == 1 {
+                    format!("[IMAGE:{}]", img(i).display())
+                } else {
+                    format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+                };
+                history.push(ChatMessage::user(content));
+                history.push(ChatMessage::assistant(format!("saw {i}")));
+            }
+            history
+        };
+
+        // Scenario 1: four images against `max_images: 3`. The
+        // (`max_images`, `images_before_cap`) pair (3, 4) is
+        // unique to this invocation among the crate's tests, so another
+        // test's frame can never be selected here.
+        let config = MultimodalConfig {
+            max_images: 3,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let history = history_with(4);
+        let _ = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        // Other tests in this process emit into the same channel; select on
+        // the message text plus both values, never just the first frame.
+        let mut found = None;
+        while let Ok(value) = rx.try_recv() {
+            let attrs = &value["attributes"];
+            if value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("image cap exceeded"))
+                && value["severity_text"] == "WARN"
+                && attrs["max_images"] == 3
+                && attrs["images_before_cap"] == 4
+            {
+                found = Some(value);
+                break;
+            }
+        }
+        let frame = found.expect("cap WARN frame with max_images 3 and images_before_cap 4");
+        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["images_evicted"], 1);
+
+        // Scenario 2: five images against `max_images: 2` evicts several
+        // images in one trim; the pair (2, 5) is likewise unique to this
+        // invocation.
+        let config = MultimodalConfig {
+            max_images: 2,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let history = history_with(5);
+        let _ = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        let mut found = None;
+        while let Ok(value) = rx.try_recv() {
+            let attrs = &value["attributes"];
+            if value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("image cap exceeded"))
+                && value["severity_text"] == "WARN"
+                && attrs["max_images"] == 2
+                && attrs["images_before_cap"] == 5
+            {
+                found = Some(value);
+                break;
+            }
+        }
+        let frame = found.expect("cap WARN frame with max_images 2 and images_before_cap 5");
+        // The span covers every message the trim rewrote: first is the
+        // oldest image message, last the newest evicted one.
+        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 5);
+        assert_eq!(frame["attributes"]["images_evicted"], 3);
     }
 
     #[tokio::test]
