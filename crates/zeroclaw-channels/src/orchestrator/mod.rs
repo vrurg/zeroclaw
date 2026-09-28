@@ -33730,6 +33730,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
+            security: Arc::new(SecurityPolicy::default()),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
