@@ -9,7 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::accounting::GoalOperationAccountingFactory;
+use crate::accounting::{GoalOperationAccountingFactory, GoalUsageTotals, GoalUsageTotalsReader};
 use crate::checkpoint::GoalParentTurnCheckpoint;
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
@@ -1003,6 +1003,14 @@ impl GoalRuntime {
         }
     }
 
+    /// Attach the runtime's canonical task-attributed ledger reader to status
+    /// projections. Existing constructors remain usable by non-runtime tests
+    /// and integrations, which omit totals when no ledger reader is available.
+    pub fn with_usage_totals_reader(mut self, reader: Arc<dyn GoalUsageTotalsReader>) -> Self {
+        self.controller = self.controller.with_usage_totals_reader(reader);
+        self
+    }
+
     /// Create an execution engine bound to this runtime's canonical task
     /// registry. This prevents an adapter from admitting a Goal through one
     /// control plane and running/accounting it through another.
@@ -1229,6 +1237,8 @@ pub struct GoalStatusProjection {
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
     pub resumable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_totals: Option<GoalUsageTotals>,
 }
 
 impl GoalStatusProjection {
@@ -1243,6 +1253,7 @@ impl GoalStatusProjection {
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
             resumable,
+            usage_totals: None,
         }
     }
 }
@@ -1266,11 +1277,20 @@ fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
 #[derive(Clone)]
 pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
+    usage_totals_reader: Option<Arc<dyn GoalUsageTotalsReader>>,
 }
 
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            usage_totals_reader: None,
+        }
+    }
+
+    fn with_usage_totals_reader(mut self, reader: Arc<dyn GoalUsageTotalsReader>) -> Self {
+        self.usage_totals_reader = Some(reader);
+        self
     }
 
     /// Apply a previously host-validated Goal submission through guarded
@@ -1650,21 +1670,86 @@ impl GoalController {
         session_id: &str,
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
-        match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, goal))),
-            None => {
-                // A terminal predecessor can be atomically replaced between
-                // the current-task read and extension read. Recheck only on
-                // that exceptional missing-extension path so a genuine
-                // corrupt current task remains an error.
-                let current = self.current(ingress, session_id).await?;
-                if current.as_ref().is_none_or(|current| current.id != task.id) {
-                    Ok(None)
-                } else {
-                    bail!("Goal task extension is missing")
-                }
-            }
+        let Some(goal) = self.registry.get_goal_task(&task.id).await? else {
+            // A terminal predecessor can be atomically replaced between the
+            // current-task read and extension read. Recheck only on that
+            // exceptional missing-extension path so a genuine corrupt
+            // current task remains an error.
+            let current = self.current(ingress, session_id).await?;
+            return if current.as_ref().is_none_or(|current| current.id != task.id) {
+                Ok(None)
+            } else {
+                bail!("Goal task extension is missing")
+            };
+        };
+        let Some(reader) = self.usage_totals_reader.as_ref() else {
+            return Ok(Some(GoalStatusProjection::from_parts(task, goal)));
+        };
+
+        let totals = reader.read_for_task(&task.id).await?;
+        let Some(current) = self.current(ingress, session_id).await? else {
+            return Ok(None);
+        };
+        if current.id != task.id {
+            return Ok(None);
         }
+        let Some(current_goal) = self.registry.get_goal_task(&current.id).await? else {
+            return Err(anyhow::anyhow!("Goal task extension is missing"));
+        };
+        let totals =
+            mark_stale_totals_if_state_changed(totals, task, &current, &goal, &current_goal);
+        let mut projection = GoalStatusProjection::from_parts(&current, current_goal);
+        projection.usage_totals = Some(totals);
+        Ok(Some(projection))
+    }
+
+    /// Build an execution-owned lifecycle projection using the same totals
+    /// reader as command responses, then revalidate the exact durable session
+    /// binding before returning it to the surface.
+    pub(super) async fn project_execution_scope(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<GoalStatusProjection>> {
+        let Some(task) = self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if task.id != scope.task_id() {
+            return Ok(None);
+        }
+        let Some(goal) = self.registry.get_goal_task(&task.id).await? else {
+            return Err(anyhow::anyhow!(
+                "Goal extension disappeared after fenced-tool classification"
+            ));
+        };
+        let Some(reader) = self.usage_totals_reader.as_ref() else {
+            return Ok(Some(GoalStatusProjection::from_parts(&task, goal)));
+        };
+
+        let totals = reader.read_for_task(&task.id).await?;
+        let Some(current) = self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != task.id {
+            return Ok(None);
+        }
+        let Some(current_goal) = self.registry.get_goal_task(&current.id).await? else {
+            return Err(anyhow::anyhow!(
+                "Goal extension disappeared after fenced-tool classification"
+            ));
+        };
+        let totals =
+            mark_stale_totals_if_state_changed(totals, &task, &current, &goal, &current_goal);
+        let mut projection = GoalStatusProjection::from_parts(&current, current_goal);
+        projection.usage_totals = Some(totals);
+        Ok(Some(projection))
     }
 
     async fn projection_response(
@@ -1690,6 +1775,28 @@ impl GoalController {
             .await?
             .map_or(GoalResponse::Stale, response))
     }
+}
+
+fn mark_stale_totals_if_state_changed(
+    mut totals: GoalUsageTotals,
+    observed_task: &TaskRecord,
+    current_task: &TaskRecord,
+    observed_goal: &GoalTaskRecord,
+    current_goal: &GoalTaskRecord,
+) -> GoalUsageTotals {
+    let task_changed = observed_task.status != current_task.status
+        || observed_task.execution_epoch != current_task.execution_epoch;
+    let accounting_changed = observed_goal.accounting_state != current_goal.accounting_state
+        || observed_goal.pending_call_id != current_goal.pending_call_id
+        || observed_goal.pending_call_epoch != current_goal.pending_call_epoch
+        || observed_goal.pending_tool_batch_id != current_goal.pending_tool_batch_id
+        || observed_goal.pending_tool_epoch != current_goal.pending_tool_epoch;
+    let operation_pending = current_goal.pending_call_id.is_some()
+        || current_goal.pending_call_epoch.is_some()
+        || current_goal.pending_tool_batch_id.is_some()
+        || current_goal.pending_tool_epoch.is_some();
+    totals.ledger_complete &= !(task_changed || accounting_changed || operation_pending);
+    totals
 }
 
 fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
@@ -1947,6 +2054,130 @@ mod tests {
         let serialized = raw.to_string();
         assert!(!serialized.contains("private pause detail"));
         assert!(!serialized.contains("private blocker request"));
+    }
+
+    #[test]
+    fn totals_read_across_an_epoch_transition_are_marked_incomplete() {
+        let observed = TaskRecord {
+            id: "goal-status".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let mut current = observed.clone();
+        current.status = TaskStatus::Paused;
+        current.execution_epoch += 1;
+        let totals = GoalUsageTotals {
+            total_tokens: 120,
+            cost_usd: Some(0.25),
+            pricing_available: true,
+            ledger_complete: true,
+        };
+
+        let observed_goal = GoalTaskRecord {
+            task_id: observed.id.clone(),
+            ..GoalTaskRecord::default()
+        };
+        let current_goal = GoalTaskRecord {
+            task_id: current.id.clone(),
+            ..GoalTaskRecord::default()
+        };
+        assert!(
+            !mark_stale_totals_if_state_changed(
+                totals.clone(),
+                &observed,
+                &current,
+                &observed_goal,
+                &current_goal,
+            )
+            .ledger_complete
+        );
+        assert!(
+            mark_stale_totals_if_state_changed(
+                GoalUsageTotals {
+                    total_tokens: 120,
+                    cost_usd: Some(0.25),
+                    pricing_available: true,
+                    ledger_complete: true,
+                },
+                &observed,
+                &observed,
+                &observed_goal,
+                &observed_goal,
+            )
+            .ledger_complete
+        );
+        let pending_goal = GoalTaskRecord {
+            pending_call_id: Some("operation".to_owned()),
+            pending_call_epoch: Some(observed.execution_epoch),
+            ..observed_goal.clone()
+        };
+        assert!(
+            !mark_stale_totals_if_state_changed(
+                totals,
+                &observed,
+                &observed,
+                &pending_goal,
+                &observed_goal,
+            )
+            .ledger_complete
+        );
+
+        let active_call = GoalTaskRecord {
+            pending_call_id: Some("active-operation".to_owned()),
+            pending_call_epoch: Some(observed.execution_epoch),
+            ..observed_goal.clone()
+        };
+        let active_call_totals = mark_stale_totals_if_state_changed(
+            GoalUsageTotals {
+                total_tokens: 120,
+                cost_usd: Some(0.25),
+                pricing_available: true,
+                ledger_complete: true,
+            },
+            &observed,
+            &observed,
+            &active_call,
+            &active_call,
+        );
+        assert!(!active_call_totals.ledger_complete);
+        assert_eq!(active_call_totals.total_tokens, 120);
+        assert_eq!(active_call_totals.cost_usd, Some(0.25));
+
+        let active_tool_batch = GoalTaskRecord {
+            pending_tool_batch_id: Some("active-tool-batch".to_owned()),
+            pending_tool_epoch: Some(observed.execution_epoch),
+            ..observed_goal.clone()
+        };
+        assert!(
+            !mark_stale_totals_if_state_changed(
+                GoalUsageTotals {
+                    total_tokens: 120,
+                    cost_usd: Some(0.25),
+                    pricing_available: true,
+                    ledger_complete: true,
+                },
+                &observed,
+                &observed,
+                &active_tool_batch,
+                &active_tool_batch,
+            )
+            .ledger_complete
+        );
     }
 
     #[test]
