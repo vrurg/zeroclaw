@@ -2847,7 +2847,8 @@ impl Chat {
                     let session_id = match &update {
                         GoalUpdate::VerifiedCandidate { session_id, .. }
                         | GoalUpdate::Completed { session_id }
-                        | GoalUpdate::PausedForBlocker { session_id } => session_id,
+                        | GoalUpdate::PausedForBlocker { session_id }
+                        | GoalUpdate::Lifecycle { session_id, .. } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
@@ -2872,6 +2873,14 @@ impl Chat {
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                                     "zc-goal-paused",
                                 ))));
+                            state.mark_dirty_append();
+                        }
+                        GoalUpdate::Lifecycle { response, .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    goal_response_message(&response),
+                                )));
                             state.mark_dirty_append();
                         }
                     }
