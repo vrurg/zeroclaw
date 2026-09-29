@@ -1092,6 +1092,10 @@ impl Channel for WhatsAppChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // The text transport has no verified literal confirmation renderer.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let token = crate::util::new_approval_token();
         let strict_session_prompt_approval =
             zeroclaw_api::is_strict_session_prompt_approval(request);
@@ -1162,6 +1166,38 @@ impl Channel for WhatsAppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let channel = WhatsAppChannel::new(
+            "test-token".into(),
+            "123".into(),
+            "verify".into(),
+            "strict-denial-test",
+            Arc::new(Vec::new),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(
+            !PENDING_APPROVALS
+                .lock()
+                .await
+                .values()
+                .any(|pending| pending.alias == "strict-denial-test")
+        );
+    }
 
     fn make_channel() -> WhatsAppChannel {
         WhatsAppChannel::new(

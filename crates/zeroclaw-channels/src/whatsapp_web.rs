@@ -4389,6 +4389,11 @@ impl Channel for WhatsAppWebChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        // No verified literal renderer exists here. The attributed trait
+        // default also denies strict requests before invoking this legacy path.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         // Bind the token to the issuing alias AND the chat it is about to be
         // posted into, so a reply from anywhere else cannot answer it. The
         // alias matters because the map is process-wide: without it, a second
@@ -4717,6 +4722,45 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let channel = WhatsAppWebChannel::new(
+            &approval_cfg(30),
+            "strict-denial-test",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("1@s.whatsapp.net", &request)
+                .await
+                .expect("attributed strict denial")
+                .is_none()
+        );
+        assert!(
+            channel
+                .request_approval("1@s.whatsapp.net", &request)
+                .await
+                .expect("legacy strict denial")
+                .is_none()
+        );
+        assert!(
+            !PENDING_APPROVALS
+                .lock()
+                .await
+                .values()
+                .any(|pending| pending.binding.alias == "strict-denial-test")
+        );
+    }
 
     // ── Outgoing image previews ──
 

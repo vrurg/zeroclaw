@@ -3178,6 +3178,10 @@ impl Channel for LarkChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // This approval card interprets its body as Markdown, not literal data.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let approval_id = Uuid::new_v4().to_string();
         let strict_session_prompt_approval =
             zeroclaw_api::is_strict_session_prompt_approval(request);
@@ -4298,6 +4302,35 @@ fn should_respond_in_group(
 mod tests {
     use super::*;
     use axum::{body::to_bytes, extract::State, http::StatusCode};
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let server = wiremock::MockServer::start().await;
+        let mut channel = make_channel();
+        channel.api_base_override = Some(server.uri());
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("chat", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("HTTP requests")
+                .is_empty()
+        );
+    }
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));

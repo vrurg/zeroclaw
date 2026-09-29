@@ -425,6 +425,11 @@ impl Channel for AcpChannel {
         _recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // ACP clients choose their own rendering; this bridge cannot attest
+        // that proposed prompt content is displayed literally and inertly.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let is_edit_tool = matches!(request.tool_name.as_str(), "file_edit" | "file_write");
         let mut options = vec![
             json!({
@@ -554,6 +559,36 @@ mod tests {
     fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
         (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let (rpc, mut receiver) = make_rpc();
+        let channel = AcpChannel::new(
+            "acp",
+            "strict-test",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

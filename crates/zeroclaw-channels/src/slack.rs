@@ -5011,6 +5011,7 @@ impl SlackChannel {
 /// [`crate::util::build_yesno_approval_prompt`], so the position line has to be
 /// threaded into both surfaces the operator can read: the `text` notification
 /// fallback and the `mrkdwn` section.
+/// Strict session confirmations instead use literal plain text on both surfaces.
 fn build_socket_mode_approval_body(
     recipient: &str,
     token: &str,
@@ -5034,6 +5035,22 @@ fn build_socket_mode_approval_body(
     }
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
+    if strict_session_prompt_approval {
+        let text = format!(
+            "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
+        );
+        return serde_json::json!({
+            "channel": recipient,
+            "text": text,
+            "mrkdwn": false,
+            "unfurl_links": false,
+            "unfurl_media": false,
+            "blocks": [{
+                "type": "section",
+                "text": {"type": "plain_text", "text": text, "emoji": false}
+            }, {"type": "actions", "elements": elements}]
+        });
+    }
     serde_json::json!({
         "channel": recipient,
         "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
@@ -6057,6 +6074,49 @@ impl Channel for SlackChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
+        let strict = zeroclaw_api::is_strict_session_prompt_approval(request);
+        let strict_body = if strict {
+            let body = if self.app_token.is_some() {
+                build_socket_mode_approval_body(
+                    recipient,
+                    &token,
+                    &request.tool_name,
+                    &request.arguments_summary,
+                    request.position_counter(),
+                    true,
+                )
+            } else {
+                let message = SendMessage::new(
+                    crate::util::build_yesno_approval_prompt_with_policy(
+                        &token,
+                        &request.tool_name,
+                        &request.arguments_summary,
+                        request.position_counter(),
+                        true,
+                    ),
+                    recipient,
+                );
+                let mut body = serde_json::json!({
+                    "channel": recipient,
+                    "text": message.content,
+                    "mrkdwn": false,
+                    "unfurl_links": false,
+                    "unfurl_media": false,
+                });
+                if let Some(ts) = self.outbound_thread_ts(&message) {
+                    body["thread_ts"] = serde_json::json!(ts);
+                }
+                body
+            };
+            // Exact confirmation cannot be split or silently truncated. Deny
+            // before parking an approval that the surface cannot display.
+            if body["text"].as_str().map_or(0, str::len) > SLACK_BLOCK_TEXT_MAX_CHARS {
+                return Ok(None);
+            }
+            Some(body)
+        } else {
+            None
+        };
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -6077,7 +6137,30 @@ impl Channel for SlackChannel {
 
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
-        let send_result = if self.app_token.is_some() {
+        let send_result = if let Some(body) = strict_body {
+            // Proposed content is data: bypass attachment extraction entirely.
+            async {
+                let response = self
+                    .http_client()
+                    .post(self.slack_api_url("chat.postMessage"))
+                    .bearer_auth(&self.bot_token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    anyhow::bail!(
+                        "strict approval delivery failed with HTTP {}",
+                        response.status()
+                    );
+                }
+                let result: serde_json::Value = response.json().await?;
+                if result["ok"] != true {
+                    anyhow::bail!("Slack rejected strict approval delivery");
+                }
+                Ok(())
+            }
+            .await
+        } else if self.app_token.is_some() {
             let body = build_socket_mode_approval_body(
                 recipient,
                 &token,
@@ -6143,6 +6226,127 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_delivery_is_literal_and_rejects_oversized_previews() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for socket_mode in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let workspace = tempfile::tempdir().expect("synthetic workspace");
+            std::fs::write(workspace.path().join("report.txt"), "private-test-report")
+                .expect("synthetic attachment");
+            let mut channel =
+                test_slack_channel(&server, workspace.path()).with_approval_timeout_secs(0);
+            channel.app_token = socket_mode.then(|| "test-app-token".into());
+            let summary = "[FILE:report.txt] *literal* <!channel> <https://example.invalid|text>";
+            let mut request = ChannelApprovalRequest {
+                tool_name: "session_prompt_set".into(),
+                arguments_summary: summary.into(),
+                raw_arguments: None,
+                position: None,
+                strict_session_prompt_approval: true,
+            };
+            let response = channel
+                .request_approval_attributed("C123", &request)
+                .await
+                .expect("literal delivery")
+                .expect("timeout decision");
+            assert_eq!(
+                response.source,
+                zeroclaw_api::channel::ApprovalSource::TimedOut
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+            let requests = server.received_requests().await.expect("HTTP requests");
+            assert_eq!(requests.len(), 1, "no attachment expansion calls");
+            let body: serde_json::Value = requests[0].body_json().expect("Slack payload");
+            assert!(
+                body["text"]
+                    .as_str()
+                    .expect("fallback text")
+                    .contains(summary)
+            );
+            for field in ["mrkdwn", "unfurl_links", "unfurl_media"] {
+                assert_eq!(body[field], false);
+            }
+            if socket_mode {
+                assert_eq!(body["blocks"][0]["text"]["type"], "plain_text");
+                assert_eq!(body["blocks"][0]["text"]["text"], body["text"]);
+                assert_eq!(
+                    body["blocks"][1]["elements"]
+                        .as_array()
+                        .expect("buttons")
+                        .len(),
+                    2
+                );
+            } else {
+                assert!(body.get("blocks").is_none());
+            }
+            request.arguments_summary = "x".repeat(SLACK_BLOCK_TEXT_MAX_CHARS);
+            assert!(
+                channel
+                    .request_approval_attributed("C123", &request)
+                    .await
+                    .expect("oversized denial")
+                    .is_none()
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("HTTP requests")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    /// Both strict delivery modes must release pending state on HTTP or API denial.
+    #[tokio::test]
+    async fn strict_approval_failure_removes_pending_without_echoing_content() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for socket_mode in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/chat.postMessage"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({"ok": false, "error": "PRIVATE-PREVIEW"}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let workspace = tempfile::tempdir().expect("synthetic workspace");
+                let mut channel = test_slack_channel(&server, workspace.path());
+                channel.app_token = socket_mode.then(|| "test-app-token".into());
+                let request = ChannelApprovalRequest {
+                    tool_name: "session_prompt_set".into(),
+                    arguments_summary: "PRIVATE-PREVIEW".into(),
+                    raw_arguments: None,
+                    position: None,
+                    strict_session_prompt_approval: true,
+                };
+                let error = channel
+                    .request_approval_attributed("C123", &request)
+                    .await
+                    .expect_err("delivery denied");
+                assert!(!error.to_string().contains("PRIVATE-PREVIEW"));
+                assert!(channel.pending_approvals.lock().await.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {

@@ -78,6 +78,15 @@ action, attachment ID, and, when setting content, the exact content and its
 SHA-256 digest. If the active approval surface cannot show that binding, the
 mutation is denied.
 
+Strict confirmations use literal previews on CLI, Matrix, Slack, Telegram,
+Signal, Web and ZeroCode. They do not interpret proposed content as attachment
+markers or rich-text instructions. Slack and Telegram deny a confirmation that
+cannot fit their message limit rather than truncating the proposed content.
+Discord, Lark, Mattermost, WhatsApp Cloud, WhatsApp Web, ACP clients and channel
+plugins cannot currently guarantee that literal preview and therefore deny
+mutations when this policy is required. This does not disable ordinary tool
+approval or change the separately configurable policy below.
+
 The global setting is:
 
 ```toml
@@ -105,8 +114,9 @@ Generic completion records for these mutation tools are intentionally omitted,
 including when an operator has selected `session_prompt_approval = "disabled"`
 and ordinary auto-approval permits the call; this keeps the opaque content out
 of generic sinks at the cost of less detailed completion visibility. The
-explicit list result and the provider request remain the only content-bearing
-surfaces. Durable session transcripts and retained/export copies also replace
+explicit list result, provider request and dedicated operator confirmation are
+the content-bearing surfaces. Durable session transcripts and retained/export
+copies also replace
 the prompt-mutation tool exchange with a redaction marker rather than storing
 the opaque arguments or results. This redaction is the restart boundary: after
 loading a retained transcript, the model does not recover the hidden tool

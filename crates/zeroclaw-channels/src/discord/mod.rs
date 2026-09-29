@@ -4023,6 +4023,10 @@ impl Channel for DiscordChannel {
         if parse_discord_interaction_target(recipient).is_some() {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
+        // Discord cannot disable interpretation of Markdown in this preview.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let token = crate::util::new_approval_token();
         let strict_session_prompt_approval =
             zeroclaw_api::is_strict_session_prompt_approval(request);
@@ -4233,6 +4237,48 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let channel = Arc::new(DiscordChannel::new(
+            "test-token".into(),
+            vec![],
+            "strict-test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        ));
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+        let paced = crate::paced_channel::PacedChannel::wrap(
+            channel.clone(),
+            &zeroclaw_config::schema::DiscordConfig {
+                reply_min_interval_secs: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            paced
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("paced strict denial")
+                .is_none()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+    }
 
     #[test]
     fn effective_recipient_prefers_per_message_target() {

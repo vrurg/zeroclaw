@@ -1264,6 +1264,10 @@ impl Channel for MattermostChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // Post rendering does not guarantee an inert exact-content preview.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Allocation and registration are one critical section, and the token is
         // drawn so it collides with neither a live prompt nor one still inside
@@ -2469,6 +2473,50 @@ fn normalize_mattermost_content(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let server = wiremock::MockServer::start().await;
+        let channel = MattermostChannel::new(
+            server.uri(),
+            Some("test-token".into()),
+            None,
+            None,
+            vec![],
+            "strict-test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("chat", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        {
+            let state = channel.approvals.lock();
+            assert!(state.pending.is_empty());
+            assert!(state.posts.is_empty());
+            assert!(state.retired.is_empty());
+            assert_eq!(state.next_generation, 0);
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("HTTP requests")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn mattermost_url_trimming() {

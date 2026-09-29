@@ -8508,6 +8508,11 @@ impl TelegramChannel {
              {args}\n\n\
              {tap_instruction}",
         );
+        // Confirmation must remain complete; do not split or truncate it to
+        // fit a transport that cannot display the exact proposed content.
+        if strict_session_prompt_approval && text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            return Ok(None);
+        }
 
         let mut buttons = vec![
             serde_json::json!({ "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) }),
@@ -8527,6 +8532,9 @@ impl TelegramChannel {
             "parse_mode": "HTML",
             "reply_markup": reply_markup,
         });
+        if strict_session_prompt_approval {
+            body["link_preview_options"] = serde_json::json!({"is_disabled": true});
+        }
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
         }
@@ -8560,7 +8568,11 @@ impl TelegramChannel {
                 Ok(r) if r.status().is_success() => Ok(()),
                 Ok(r) => {
                     let status = r.status();
-                    let err = r.text().await.unwrap_or_default();
+                    let err = if strict_session_prompt_approval {
+                        "strict confirmation response redacted".to_string()
+                    } else {
+                        r.text().await.unwrap_or_default()
+                    };
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8585,6 +8597,10 @@ impl TelegramChannel {
                         "text": plain_text,
                         "reply_markup": reply_markup,
                     });
+                    if strict_session_prompt_approval {
+                        plain_body["link_preview_options"] =
+                            serde_json::json!({"is_disabled": true});
+                    }
                     if let Some(tid) = thread_id {
                         plain_body["message_thread_id"] =
                             serde_json::Value::String(tid.to_string());
@@ -8601,7 +8617,11 @@ impl TelegramChannel {
                         Ok(r) if r.status().is_success() => Ok(()),
                         Ok(r) => {
                             let status = r.status();
-                            let err = r.text().await.unwrap_or_default();
+                            let err = if strict_session_prompt_approval {
+                                "strict confirmation response redacted".to_string()
+                            } else {
+                                r.text().await.unwrap_or_default()
+                            };
                             anyhow::bail!(
                                 "Telegram sendMessage (approval) failed ({status}): {err}"
                             );
@@ -8695,6 +8715,164 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use zeroclaw_config::schema::{Config, TelegramConfig};
+
+    #[tokio::test]
+    async fn strict_approval_delivery_disables_previews_and_preserves_ordinary_cards() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for fallback in [false, true] {
+            for strict in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path_regex(r"/bot[^/]+/sendMessage$"))
+                    .respond_with(move |request: &Request| {
+                        let body: serde_json::Value = request.body_json().expect("request JSON");
+                        if fallback && body.get("parse_mode").is_some() {
+                            ResponseTemplate::new(400).set_body_string("synthetic HTML rejection")
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                "ok": true, "result": {"message_id": 55}
+                            }))
+                        }
+                    })
+                    .expect(if fallback { 2 } else { 1 })
+                    .mount(&server)
+                    .await;
+                let channel = TelegramChannel::new(
+                    "fake-token".into(),
+                    "telegram_test_alias",
+                    Arc::new(Vec::new),
+                    false,
+                )
+                .with_mock_api_base(server.uri());
+                let mut request = zeroclaw_api::channel::ChannelApprovalRequest {
+                    tool_name: if strict {
+                        "session_prompt_set"
+                    } else {
+                        "shell"
+                    }
+                    .into(),
+                    arguments_summary: "[FILE:report.txt] <b>literal</b> & https://example.invalid"
+                        .into(),
+                    raw_arguments: None,
+                    position: None,
+                    strict_session_prompt_approval: strict,
+                };
+                let response = channel
+                    .request_approval_attributed_with_timeout(
+                        "12345:7",
+                        &request,
+                        Duration::from_millis(100),
+                    )
+                    .await
+                    .expect("approval delivery")
+                    .expect("timeout decision");
+                assert_eq!(
+                    response.source,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut
+                );
+                assert!(channel.pending_approvals.lock().await.is_empty());
+                let calls = server.received_requests().await.expect("HTTP requests");
+                assert_eq!(calls.len(), if fallback { 2 } else { 1 });
+                for call in &calls {
+                    let body: serde_json::Value = call.body_json().expect("message body");
+                    assert_eq!(body["message_thread_id"], "7");
+                    assert!(
+                        body["text"]
+                            .as_str()
+                            .expect("text")
+                            .contains("[FILE:report.txt]")
+                    );
+                    if strict {
+                        assert_eq!(body["link_preview_options"]["is_disabled"], true);
+                    } else {
+                        assert!(body.get("link_preview_options").is_none());
+                    }
+                    assert_eq!(
+                        body["reply_markup"]["inline_keyboard"][0]
+                            .as_array()
+                            .expect("buttons")
+                            .len(),
+                        if strict { 2 } else { 3 }
+                    );
+                    if body.get("parse_mode").is_some() {
+                        assert!(
+                            body["text"]
+                                .as_str()
+                                .expect("HTML text")
+                                .contains("&lt;b&gt;literal&lt;/b&gt;")
+                        );
+                    } else {
+                        assert!(
+                            body["text"]
+                                .as_str()
+                                .expect("plain text")
+                                .contains("<b>literal</b>")
+                        );
+                    }
+                }
+                if strict {
+                    request.arguments_summary = "x".repeat(TELEGRAM_MAX_MESSAGE_LENGTH);
+                    assert!(
+                        channel
+                            .request_approval_attributed_with_timeout(
+                                "12345:7",
+                                &request,
+                                Duration::from_millis(100),
+                            )
+                            .await
+                            .expect("oversized denial")
+                            .is_none()
+                    );
+                    assert!(channel.pending_approvals.lock().await.is_empty());
+                    assert_eq!(
+                        server
+                            .received_requests()
+                            .await
+                            .expect("HTTP requests")
+                            .len(),
+                        calls.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Failed HTML and fallback sends must not leak the preview or leave a live token.
+    #[tokio::test]
+    async fn strict_approval_failure_removes_pending_without_echoing_content() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("PRIVATE-PREVIEW"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_mock_api_base(server.uri());
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "PRIVATE-PREVIEW".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        let error = channel
+            .request_approval_attributed_with_timeout("12345", &request, Duration::from_secs(5))
+            .await
+            .expect_err("both sends denied");
+        assert!(!error.to_string().contains("PRIVATE-PREVIEW"));
+        assert!(channel.pending_approvals.lock().await.is_empty());
+    }
 
     fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> Arc<RwLock<Config>> {
         let mut config = Config::default();
