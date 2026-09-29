@@ -18,9 +18,9 @@ use zeroclaw_config::{
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalParentTurn, GoalPauseReason, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-    GoalVerifierResult, GoalVerifierTurn,
+    GoalParentTurn, GoalParentTurnCheckpoint, GoalPauseReason, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
@@ -147,6 +147,7 @@ impl GoalSessionDriver for PausingExecutionDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(PausingExecutionLease {
             session_key: self.binding.session_key().clone(),
@@ -221,6 +222,7 @@ impl GoalSessionDriver for UserInputExecutionDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(UserInputExecutionLease {
             session_key: self.binding.session_key().clone(),
@@ -244,6 +246,7 @@ impl GoalSessionDriver for ExecutionDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(RecordingExecutionLease {
@@ -273,6 +276,7 @@ impl GoalSessionDriver for WrongExecutionLeaseDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(RecordingExecutionLease {
@@ -303,6 +307,7 @@ impl GoalSessionDriver for WrongBindingDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         anyhow::bail!("wrong binding driver has no execution lease")
     }
@@ -323,6 +328,7 @@ impl GoalSessionDriver for RecordingDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &zeroclaw_goal::GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn zeroclaw_goal::GoalSessionExecutionLease>> {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("recording driver has no execution lease")
@@ -413,6 +419,7 @@ impl GoalSessionDriver for LeaseDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &zeroclaw_goal::GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn zeroclaw_goal::GoalSessionExecutionLease>> {
         Ok(Box::new(self.acquire_reconnect_lease()?))
     }
@@ -791,7 +798,11 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
         .await
         .unwrap();
 
-    let error = match host.acquire_execution(&settings, submission, &scope).await {
+    let checkpoint = GoalParentTurnCheckpoint::new();
+    let error = match host
+        .acquire_execution(&settings, submission, &scope, &checkpoint)
+        .await
+    {
         Ok(_) => panic!("mismatched scope must not acquire an execution lease"),
         Err(error) => error,
     };
@@ -870,8 +881,9 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         .await
         .unwrap();
 
+    let checkpoint = GoalParentTurnCheckpoint::new();
     let mut lease = host
-        .acquire_execution(&settings, submission, &scope)
+        .acquire_execution(&settings, submission, &scope, &checkpoint)
         .await
         .unwrap();
 
@@ -930,7 +942,11 @@ async fn execution_lease_must_match_trusted_ingress_after_revalidation() {
         .await
         .unwrap();
 
-    let error = match host.acquire_execution(&settings, submission, &scope).await {
+    let checkpoint = GoalParentTurnCheckpoint::new();
+    let error = match host
+        .acquire_execution(&settings, submission, &scope, &checkpoint)
+        .await
+    {
         Ok(_) => panic!("mismatched execution lease must be rejected"),
         Err(error) => error,
     };
@@ -956,7 +972,11 @@ async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
         .await
         .unwrap();
 
-    let error = match host.acquire_execution(&settings, submission, &scope).await {
+    let checkpoint = GoalParentTurnCheckpoint::new();
+    let error = match host
+        .acquire_execution(&settings, submission, &scope, &checkpoint)
+        .await
+    {
         Ok(_) => panic!("disabled Goal Mode must not acquire an execution lease"),
         Err(error) => error,
     };
@@ -2158,9 +2178,10 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
         .await
         .unwrap();
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let checkpoint = GoalParentTurnCheckpoint::new();
 
     let execution = host
-        .acquire_execution(&host_settings(true), submission, &scope)
+        .acquire_execution(&host_settings(true), submission, &scope, &checkpoint)
         .await
         .unwrap();
     assert!(
