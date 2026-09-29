@@ -11,6 +11,7 @@ use zeroclaw_api::{
     channel::{Channel, ChannelMessage, SendMessage},
     model_provider::{ChatMessage, ChatRequest},
 };
+use zeroclaw_commands::goal::GoalBudgetLimits;
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
@@ -290,8 +291,16 @@ async fn submit_matrix_goal_with_command_lease(
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
     let defaults = runtime_defaults_snapshot(context.as_ref());
-    let settings = GoalHostSettings::from_config(
-        &defaults.config.goal,
+    let effective_limits =
+        defaults.config.goal.effective_limits().map_err(|error| {
+            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
+        })?;
+    let settings = GoalHostSettings::from_validated_limits(
+        defaults.config.goal.enabled,
+        GoalBudgetLimits {
+            token_limit: effective_limits.token_limit,
+            cost_limit_usd: effective_limits.cost_limit_usd,
+        },
         std::process::id(),
         control_plane.boot_id.clone(),
     )?;
