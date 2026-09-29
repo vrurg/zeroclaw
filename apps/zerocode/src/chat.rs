@@ -24,8 +24,8 @@ use crate::attachment::{
     CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
 };
 use crate::client::{
-    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionStateResult, SessionUpdate,
-    TurnEndOutcome, method, parse_session_update,
+    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionGoalCallError,
+    SessionStateResult, SessionUpdate, TurnEndOutcome, method, parse_session_update,
 };
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
@@ -129,7 +129,19 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     };
     let pause_reason = projection
         .pause_reason
-        .clone()
+        .as_deref()
+        .map(|value| match value {
+            "operator_paused" => crate::i18n::t("zc-goal-pause-reason-operator-paused"),
+            "needs_user_input" => crate::i18n::t("zc-goal-pause-reason-needs-user-input"),
+            "human_escalation" => crate::i18n::t("zc-goal-pause-reason-human-escalation"),
+            "external_dependency" => crate::i18n::t("zc-goal-pause-reason-external-dependency"),
+            "provider_unavailable" => crate::i18n::t("zc-goal-pause-reason-provider-unavailable"),
+            "verifier_blocked" => crate::i18n::t("zc-goal-pause-reason-verifier-blocked"),
+            "budget_exhausted" => crate::i18n::t("zc-goal-pause-reason-budget-exhausted"),
+            "budget_unavailable" => crate::i18n::t("zc-goal-pause-reason-budget-unavailable"),
+            "daemon_restarted" => crate::i18n::t("zc-goal-pause-reason-daemon-restarted"),
+            _ => crate::i18n::t("zc-goal-value-unknown"),
+        })
         .unwrap_or_else(|| crate::i18n::t("zc-goal-value-none"));
     let resumable = crate::i18n::t(if projection.resumable {
         "zc-goal-yes"
@@ -137,21 +149,28 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
         "zc-goal-no"
     });
     let status = match projection.status.as_str() {
-        "running" => "🟢 running",
-        "paused" => "⏸️ paused",
-        "completed" => "✅ completed",
-        "failed" => "❌ failed",
-        "cancelled" => "🛑 cancelled",
-        "lost" => "⚠️ lost",
-        "timed_out" => "⚠️ timed_out",
-        _ => "⚠️ unknown",
+        "running" => format!("🟢 {}", crate::i18n::t("zc-goal-status-running")),
+        "paused" => format!("⏸️ {}", crate::i18n::t("zc-goal-status-paused")),
+        "completed" => format!("✅ {}", crate::i18n::t("zc-goal-status-completed")),
+        "failed" => format!("❌ {}", crate::i18n::t("zc-goal-status-failed")),
+        "cancelled" => format!("🛑 {}", crate::i18n::t("zc-goal-status-cancelled")),
+        "lost" => format!("⚠️ {}", crate::i18n::t("zc-goal-status-lost")),
+        "timed_out" => format!("⚠️ {}", crate::i18n::t("zc-goal-status-timed-out")),
+        _ => format!("⚠️ {}", crate::i18n::t("zc-goal-value-unknown")),
+    };
+    let accounting = match projection.accounting_state.as_str() {
+        "complete" => crate::i18n::t("zc-goal-accounting-complete"),
+        "missing" => crate::i18n::t("zc-goal-accounting-missing"),
+        "invalid" => crate::i18n::t("zc-goal-accounting-invalid"),
+        "outcome_unknown" => crate::i18n::t("zc-goal-accounting-outcome-unknown"),
+        _ => crate::i18n::t("zc-goal-value-unknown"),
     };
     let mut message = crate::i18n::t_args(
         "zc-goal-details",
         &[
-            ("status", status),
+            ("status", status.as_str()),
             ("epoch", &projection.execution_epoch.to_string()),
-            ("accounting", &projection.accounting_state),
+            ("accounting", accounting.as_str()),
             ("resumable", &resumable),
             ("token_limit", &token_limit),
             ("cost_limit", &cost_limit),
@@ -211,6 +230,16 @@ fn goal_command_starts_execution(command: &str) -> bool {
         && words.next().is_some_and(|word| {
             word.eq_ignore_ascii_case("start") || word.eq_ignore_ascii_case("resume")
         })
+}
+
+/// Match the canonical first-token rule used by
+/// `zeroclaw_commands::goal::parse_goal_command`; `/goals` and `/goalpost`
+/// remain ordinary prompts.
+fn is_goal_command(prompt: &str) -> bool {
+    prompt
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("/goal"))
 }
 
 fn notification_session_id(notif: &RpcNotification) -> Option<String> {
@@ -1074,10 +1103,47 @@ fn token_source_fluent_key(source: &str) -> String {
     }
 }
 
+/// Classifies `session/goal` failures into safe catalogue categories; the
+/// daemon-provided error message is never rendered to the user.
+#[derive(Debug, Clone, Copy)]
+enum GoalCommandFailure {
+    Invalid,
+    NotOwned,
+    SessionUnavailable,
+    Refused,
+    Failed,
+}
+
+impl GoalCommandFailure {
+    fn from(error: &SessionGoalCallError) -> Self {
+        match error {
+            SessionGoalCallError::Rpc(error) => match error.code {
+                zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS => Self::Invalid,
+                zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED => Self::NotOwned,
+                zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_FOUND => Self::SessionUnavailable,
+                zeroclaw_api::jsonrpc::error_codes::FORBIDDEN
+                | zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED => Self::Refused,
+                _ => Self::Failed,
+            },
+            SessionGoalCallError::Transport(_) => Self::Failed,
+        }
+    }
+
+    fn fluent_key(self) -> &'static str {
+        match self {
+            Self::Invalid => "zc-goal-command-invalid",
+            Self::NotOwned => "zc-goal-command-not-owned",
+            Self::SessionUnavailable => "zc-goal-command-session-unavailable",
+            Self::Refused => "zc-goal-command-refused",
+            Self::Failed => "zc-goal-command-failed",
+        }
+    }
+}
+
 struct GoalCompletion {
     session_id: String,
     releases_launch_barrier: bool,
-    result: Result<crate::wire::GoalResponse, String>,
+    result: Result<crate::wire::GoalResponse, GoalCommandFailure>,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -3023,7 +3089,7 @@ impl Chat {
                 state
                     .entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                        "zc-goal-paused",
+                        "zc-goal-paused-blocked",
                     ))));
                 state.mark_dirty_append();
             }
@@ -3210,7 +3276,7 @@ impl Chat {
         while let Ok(completion) = self.goal_completion_rx.try_recv() {
             let message = match completion.result {
                 Ok(response) => goal_response_message(&response),
-                Err(_) => crate::i18n::t("zc-goal-command-failed"),
+                Err(failure) => crate::i18n::t(failure.fluent_key()),
             };
             if let Some(state) = self.state_for_session_mut(&completion.session_id) {
                 state
@@ -4755,7 +4821,7 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
-                    if attachments.is_empty() && prompt.trim_start().starts_with("/goal") {
+                    if attachments.is_empty() && is_goal_command(&prompt) {
                         let session_id = state.session_id.clone();
                         let releases_launch_barrier = goal_command_starts_execution(&prompt);
                         if releases_launch_barrier {
@@ -4771,7 +4837,7 @@ impl Chat {
                                 .session_goal(&session_id, &prompt)
                                 .await
                                 .map(|result| result.response)
-                                .map_err(|error| error.to_string());
+                                .map_err(|error| GoalCommandFailure::from(&error));
                             let _ = tx
                                 .send(GoalCompletion {
                                     session_id,
@@ -13417,7 +13483,7 @@ mod tests {
         assert!(rendered.contains("Status: ⏸️ paused"));
         assert!(rendered.contains("token limit: 12,000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
-        assert!(rendered.contains("pause reason: needs_user_input"));
+        assert!(rendered.contains("pause reason: needs user input"));
         assert!(!rendered.contains("Which target should receive the change?"));
     }
 
@@ -13430,7 +13496,7 @@ mod tests {
             ("failed", "❌", "failed"),
             ("cancelled", "🛑", "cancelled"),
             ("lost", "⚠️", "lost"),
-            ("timed_out", "⚠️", "timed_out"),
+            ("timed_out", "⚠️", "timed out"),
         ] {
             let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
                 task_id: "goal-1".to_owned(),
@@ -23642,6 +23708,396 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_prefixed_words_are_ordinary_prompts() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for prompt in ["/goals for this sprint", "/goalpost x"] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let outbound = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+                let mut chat = Chat::new(client, kind);
+                let mut active = state();
+                active.input_bar.insert_text(prompt);
+                chat.phase = ChatPhase::Active(Box::new(active));
+
+                chat.handle_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut headless_term(),
+                )
+                .await;
+
+                let request =
+                    next_rpc_request(&mut rx, "prefixed words must use session/prompt").await;
+                assert_eq!(request["method"], method::SESSION_PROMPT);
+                assert_eq!(request["params"]["prompt"], prompt);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uppercase_goal_command_routes_to_session_goal() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for prompt in ["/GOAL help", " /Goal status"] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let outbound = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+                let mut chat = Chat::new(client, kind);
+                let mut active = state();
+                active.input_bar.insert_text(prompt);
+                chat.phase = ChatPhase::Active(Box::new(active));
+
+                chat.handle_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut headless_term(),
+                )
+                .await;
+
+                let request =
+                    next_rpc_request(&mut rx, "uppercase goal command must use session/goal").await;
+                assert_eq!(request["method"], method::SESSION_GOAL);
+                assert_eq!(request["params"]["command"], prompt);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_command_with_attachments_stays_an_ordinary_prompt() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let outbound = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active.input_bar.add_attachment(PendingAttachment {
+                path: std::path::PathBuf::from("/tmp/goal-attachment.txt"),
+                mime_type: "text/plain".into(),
+                filename: "goal-attachment.txt".into(),
+                size_bytes: 1,
+                source: crate::attachment::AttachmentSource::File,
+            });
+            active.input_bar.insert_text("/goal help");
+            chat.phase = ChatPhase::Active(Box::new(active));
+
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut headless_term(),
+            )
+            .await;
+
+            let request =
+                next_rpc_request(&mut rx, "attachments must keep /goal on session/prompt").await;
+            assert_eq!(request["method"], method::SESSION_PROMPT);
+            assert_eq!(request["params"]["prompt"], "/goal help");
+            assert_eq!(
+                request["params"]["attachments"][0]["filename"],
+                "goal-attachment.txt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_command_rpc_errors_render_their_catalogued_category() {
+        let cases = [
+            (
+                -32602,
+                "That is not a valid Goal command. Use `/goal help` to see the supported commands.",
+            ),
+            (
+                -32003,
+                "Another ZeroCode client controls this session, so this client cannot run Goal commands for it.",
+            ),
+            (
+                -32000,
+                "This session is no longer available. Refresh it and try again.",
+            ),
+            (
+                -32012,
+                "The daemon refused this Goal command for this session.",
+            ),
+            (
+                -32010,
+                "The daemon refused this Goal command for this session.",
+            ),
+            (
+                -32603,
+                "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.",
+            ),
+            (
+                12345,
+                "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.",
+            ),
+        ];
+
+        for (code, expected) in cases {
+            let (mut chat, mut rx) = test_chat();
+            let mut active = state();
+            active.input_bar.insert_text("/goal help");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut headless_term(),
+            )
+            .await;
+            let request = next_rpc_request(&mut rx, "goal command must reach the mocked RPC").await;
+            respond_err(&chat.rpc_out, &request, code, "daemon secret detail");
+            let completion =
+                tokio::time::timeout(Duration::from_secs(2), chat.goal_completion_rx.recv())
+                    .await
+                    .expect("goal RPC completion should arrive")
+                    .expect("goal completion channel should stay open");
+            chat.goal_completion_tx
+                .send(completion)
+                .await
+                .expect("goal completion should be drainable");
+            chat.drain_goal_completions();
+
+            let entries = active_state(&mut chat).entries();
+            assert!(
+                entries.iter().any(|entry| {
+                    matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref() == expected)
+                }),
+                "code {code} rendered {entries:?}"
+            );
+            assert!(entries.iter().all(|entry| {
+                !matches!(entry, ChatEntry::SystemMessage(text) if text.contains("daemon secret detail"))
+            }));
+        }
+
+        // A malformed result is a client/transport failure and must use the
+        // same generic catalogue entry as an unrecognised daemon code.
+        let (mut chat, mut rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        active_state(&mut chat).input_bar.insert_text("/goal help");
+        chat.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut headless_term(),
+        )
+        .await;
+        let request = next_rpc_request(&mut rx, "malformed goal response must be observed").await;
+        respond_ok(
+            &chat.rpc_out,
+            &request,
+            serde_json::json!({"response": {"kind": "unknown"}}),
+        );
+        let completion =
+            tokio::time::timeout(Duration::from_secs(2), chat.goal_completion_rx.recv())
+                .await
+                .expect("malformed goal response completion should arrive")
+                .expect("goal completion channel should stay open");
+        chat.goal_completion_tx
+            .send(completion)
+            .await
+            .expect("goal completion should be drainable");
+        chat.drain_goal_completions();
+        assert!(active_state(&mut chat).entries().iter().any(|entry| {
+            matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref().contains("Goal Mode could not complete that command"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn blocker_pause_renders_the_resolution_notice_not_the_operator_pause() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({"paused_for_blocker": {"session_id": "sess-1"}}),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({"lifecycle": {
+                "session_id": "sess-1",
+                "response": {"kind": "paused", "status": {
+                    "task_id": "goal-1", "status": "paused", "execution_epoch": 1,
+                    "token_limit": null, "cost_limit_usd": null,
+                    "accounting_state": "complete", "pause_reason": "operator_paused",
+                    "resumable": true
+                }}
+            }}),
+        );
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert!(matches!(
+            &entries[0],
+            ChatEntry::SystemMessage(text)
+                if text.as_ref() == "Goal paused: resolution is required before it can continue."
+        ));
+        assert!(matches!(
+            &entries[1],
+            ChatEntry::SystemMessage(text)
+                if text.as_ref().starts_with(&crate::i18n::t("zc-goal-paused"))
+        ));
+    }
+
+    #[test]
+    fn goal_status_details_use_catalogued_labels() {
+        for key in [
+            "zc-goal-status-running",
+            "zc-goal-status-paused",
+            "zc-goal-status-completed",
+            "zc-goal-status-failed",
+            "zc-goal-status-cancelled",
+            "zc-goal-status-lost",
+            "zc-goal-status-timed-out",
+            "zc-goal-accounting-complete",
+            "zc-goal-accounting-missing",
+            "zc-goal-accounting-invalid",
+            "zc-goal-accounting-outcome-unknown",
+            "zc-goal-pause-reason-operator-paused",
+            "zc-goal-pause-reason-needs-user-input",
+            "zc-goal-pause-reason-human-escalation",
+            "zc-goal-pause-reason-external-dependency",
+            "zc-goal-pause-reason-provider-unavailable",
+            "zc-goal-pause-reason-verifier-blocked",
+            "zc-goal-pause-reason-budget-exhausted",
+            "zc-goal-pause-reason-budget-unavailable",
+            "zc-goal-pause-reason-daemon-restarted",
+            "zc-goal-value-unknown",
+        ] {
+            let value = crate::i18n::t(key);
+            assert!(
+                !value.starts_with('{'),
+                "catalogue key {key} is unresolved: {value}"
+            );
+            assert!(!value.trim().is_empty(), "catalogue key {key} is empty");
+        }
+
+        for (raw, label) in [
+            ("running", "🟢 running"),
+            ("paused", "⏸️ paused"),
+            ("completed", "✅ completed"),
+            ("failed", "❌ failed"),
+            ("cancelled", "🛑 cancelled"),
+            ("lost", "⚠️ lost"),
+            ("timed_out", "⚠️ timed out"),
+        ] {
+            let projection: crate::wire::GoalStatusProjection =
+                serde_json::from_value(serde_json::json!({
+                    "task_id": "goal-fixture",
+                    "status": raw,
+                    "execution_epoch": 1,
+                    "token_limit": null,
+                    "cost_limit_usd": null,
+                    "accounting_state": "complete",
+                    "pause_reason": null,
+                    "resumable": false
+                }))
+                .unwrap();
+            assert!(
+                goal_projection_message(&projection).contains(&format!("Status: {label}")),
+                "status {raw} was not catalogued: {}",
+                goal_projection_message(&projection)
+            );
+        }
+        for (raw, label) in [
+            ("complete", "complete"),
+            ("missing", "missing"),
+            ("invalid", "invalid"),
+            ("outcome_unknown", "outcome unknown"),
+        ] {
+            let projection: crate::wire::GoalStatusProjection =
+                serde_json::from_value(serde_json::json!({
+                    "task_id": "goal-fixture",
+                    "status": "running",
+                    "execution_epoch": 1,
+                    "token_limit": null,
+                    "cost_limit_usd": null,
+                    "accounting_state": raw,
+                    "pause_reason": null,
+                    "resumable": false
+                }))
+                .unwrap();
+            assert!(
+                goal_projection_message(&projection).contains(&format!("accounting: {label}")),
+                "accounting {raw} was not catalogued: {}",
+                goal_projection_message(&projection)
+            );
+        }
+        for (raw, label) in [
+            ("operator_paused", "operator pause"),
+            ("needs_user_input", "needs user input"),
+            ("human_escalation", "human escalation"),
+            ("external_dependency", "external dependency"),
+            ("provider_unavailable", "provider unavailable"),
+            ("verifier_blocked", "verifier blocked"),
+            ("budget_exhausted", "budget exhausted"),
+            ("budget_unavailable", "budget unavailable"),
+            ("daemon_restarted", "daemon restarted"),
+        ] {
+            let projection: crate::wire::GoalStatusProjection =
+                serde_json::from_value(serde_json::json!({
+                    "task_id": "goal-fixture",
+                    "status": "paused",
+                    "execution_epoch": 1,
+                    "token_limit": null,
+                    "cost_limit_usd": null,
+                    "accounting_state": "complete",
+                    "pause_reason": raw,
+                    "resumable": true
+                }))
+                .unwrap();
+            assert!(
+                goal_projection_message(&projection).contains(&format!("pause reason: {label}")),
+                "pause reason {raw} was not catalogued: {}",
+                goal_projection_message(&projection)
+            );
+        }
+
+        let mut value = serde_json::json!({
+            "task_id": "goal-fixture",
+            "status": "timed_out",
+            "execution_epoch": 3,
+            "token_limit": null,
+            "cost_limit_usd": null,
+            "accounting_state": "outcome_unknown",
+            "pause_reason": "daemon_restarted",
+            "resumable": true
+        });
+        let projection: crate::wire::GoalStatusProjection =
+            serde_json::from_value(value.take()).unwrap();
+        let rendered = goal_projection_message(&projection);
+        assert!(rendered.contains("Status: ⚠️ timed out"), "{rendered}");
+        assert!(
+            rendered.contains("accounting: outcome unknown"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("pause reason: daemon restarted"),
+            "{rendered}"
+        );
+
+        let unknown: crate::wire::GoalStatusProjection =
+            serde_json::from_value(serde_json::json!({
+                "task_id": "goal-fixture",
+                "status": "future_status",
+                "execution_epoch": 4,
+                "token_limit": null,
+                "cost_limit_usd": null,
+                "accounting_state": "future_accounting",
+                "pause_reason": "future_pause",
+                "resumable": false
+            }))
+            .unwrap();
+        let rendered = goal_projection_message(&unknown);
+        assert!(rendered.contains("Status: ⚠️ unknown"), "{rendered}");
+        assert!(rendered.contains("accounting: unknown"), "{rendered}");
+        assert!(rendered.contains("pause reason: unknown"), "{rendered}");
+        assert!(!rendered.contains("future_accounting"), "{rendered}");
+        assert!(!rendered.contains("future_pause"), "{rendered}");
+    }
+
+    #[tokio::test]
     async fn goal_start_ack_is_rendered_before_buffered_execution_events() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
@@ -30489,6 +30945,32 @@ mod tests {
                 ChatEntry::SystemMessage(text)
                     if text.as_ref() == goal_failure_message(crate::wire::GoalFailureReason::ToolResultsUnpaired)
             ));
+        }
+    }
+
+    #[test]
+    fn every_goal_failure_reason_resolves_to_a_fluent_message() {
+        use crate::wire::GoalFailureReason;
+
+        for reason in [
+            GoalFailureReason::AgentOperationFailed,
+            GoalFailureReason::ToolResultsUnpaired,
+            GoalFailureReason::EmptyAgentResponse,
+            GoalFailureReason::VerifierOperationFailed,
+            GoalFailureReason::VerifierResponseInvalid,
+            GoalFailureReason::AccountingIncomplete,
+            GoalFailureReason::PricingIncomplete,
+            GoalFailureReason::OperationOutcomeUnknown,
+            GoalFailureReason::ExecutorStartFailed,
+            GoalFailureReason::ExecutorFailed,
+            GoalFailureReason::Other,
+        ] {
+            let message = goal_failure_message(reason);
+            assert!(
+                !message.starts_with("{zc-goal-failure-"),
+                "missing Fluent message for {reason:?}: {message}"
+            );
+            assert!(!message.trim().is_empty());
         }
     }
 

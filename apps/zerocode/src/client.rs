@@ -850,6 +850,29 @@ pub struct RpcClient {
     commands: Vec<crate::wire::CommandDescriptor>,
 }
 
+/// The typed failure boundary for `session/goal`: callers classify daemon
+/// JSON-RPC codes without exposing daemon-provided messages to the UI.
+#[derive(Debug)]
+pub enum SessionGoalCallError {
+    Rpc(JsonRpcError),
+    Transport(anyhow::Error),
+}
+
+impl fmt::Display for SessionGoalCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rpc(error) => write!(
+                formatter,
+                "RPC session/goal: {} ({})",
+                error.message, error.code
+            ),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SessionGoalCallError {}
+
 #[derive(Debug, Default)]
 struct InboundResponseTracker {
     pending: AtomicUsize,
@@ -2802,12 +2825,22 @@ impl RpcClient {
         &self,
         session_id: &str,
         command: &str,
-    ) -> Result<crate::wire::SessionGoalResult> {
-        self.call(
+    ) -> std::result::Result<crate::wire::SessionGoalResult, SessionGoalCallError> {
+        let request = self.rpc.request(
             method::SESSION_GOAL,
             serde_json::json!({ "session_id": session_id, "command": command }),
-        )
-        .await
+        );
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(Ok(result)) => serde_json::from_value(result).map_err(|error| {
+                SessionGoalCallError::Transport(
+                    anyhow::Error::new(error).context("deserializing session/goal result"),
+                )
+            }),
+            Ok(Err(error)) => Err(SessionGoalCallError::Rpc(error)),
+            Err(_) => Err(SessionGoalCallError::Transport(anyhow::Error::msg(
+                "RPC session/goal: timed out after 5s",
+            ))),
+        }
     }
 
     /// Apply session-scoped overrides (model, model_provider, temperature) to a
