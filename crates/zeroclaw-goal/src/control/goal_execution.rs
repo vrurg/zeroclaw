@@ -23,6 +23,7 @@ use zeroclaw_commands::goal::GoalCommand;
 
 use crate::{
     accounting::{GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory},
+    checkpoint::{GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint},
     task::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
         GoalTaskRegistry, GoalTransitionResult,
@@ -256,6 +257,7 @@ struct GoalExecutionAdmission {
 struct GoalWorker {
     task_id: String,
     execution_epoch: i64,
+    checkpoint: GoalParentTurnCheckpoint,
     completion: watch::Receiver<Option<GoalWorkerCompletion>>,
     /// Serializes lifecycle finalization while leaving the command lease free.
     /// A resume may be admitted while a pause is draining, but it cannot
@@ -316,9 +318,14 @@ impl GoalExecutionSupervisor {
 
         let engine = Arc::clone(&self.engine);
         let execution_epoch = scope.execution_epoch();
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let worker_checkpoint = checkpoint.clone();
         let (completion_tx, completion) = watch::channel(None);
         let handle = zeroclaw_spawn::spawn!(async move {
-            let result = engine.run(&settings, request).await;
+            let result = engine
+                .run(&settings, request, worker_checkpoint.clone())
+                .await;
+            worker_checkpoint.close();
 
             // The engine normally records its own expected execution failures.
             // Acquisition and other unexpected failures can occur before that
@@ -340,6 +347,7 @@ impl GoalExecutionSupervisor {
             Arc::new(Mutex::new(GoalWorker {
                 task_id,
                 execution_epoch,
+                checkpoint,
                 completion,
                 lifecycle_finalization: Arc::new(Mutex::new(())),
                 _handle: handle,
@@ -713,6 +721,34 @@ impl GoalExecutionSupervisor {
         worker.task_id == scope.task_id() && worker.execution_epoch == scope.execution_epoch()
     }
 
+    /// Register a deferred control after its typed intent has been durably
+    /// recorded by the existing control plane. A missing, stale, or completed
+    /// worker means the caller should revalidate and apply the command without
+    /// waiting for a Goal parent-turn boundary.
+    pub async fn register_deferred_control(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<GoalDeferredControlTicket>> {
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(scope.session_id()).cloned()
+        };
+        let Some(worker) = worker else {
+            return Ok(None);
+        };
+        let worker = worker.lock().await;
+        if worker.task_id != scope.task_id()
+            || worker.execution_epoch != scope.execution_epoch()
+            || worker.completion.borrow().is_some()
+        {
+            return Ok(None);
+        }
+        match worker.checkpoint.register_control() {
+            Ok(ticket) => Ok(Some(ticket)),
+            Err(GoalCheckpointClosed) => Ok(None),
+        }
+    }
+
     /// Await the exact fenced epoch without interrupting its in-flight model
     /// operation. A pause path uses this after durable fencing so the admitted
     /// operation can settle its usage but cannot admit another operation.
@@ -1023,6 +1059,7 @@ impl GoalExecutionEngine {
         &self,
         settings: &GoalHostSettings,
         request: GoalExecutionRequest,
+        checkpoint: GoalParentTurnCheckpoint,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let resume_response = request.resume_response().map(ToOwned::to_owned);
@@ -1048,7 +1085,8 @@ impl GoalExecutionEngine {
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
-                self.run_scoped(&scope, &objective, lease.as_mut()).await
+                self.run_scoped(&scope, &objective, lease.as_mut(), &checkpoint)
+                    .await
             })
             .await
     }
@@ -1078,6 +1116,7 @@ impl GoalExecutionEngine {
         scope: &GoalExecutionScope,
         objective: &str,
         lease: &mut dyn GoalSessionExecutionLease,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<GoalExecutionOutcome> {
         let accountant = GOAL_OPERATION_ACCOUNTING
             .try_with(Clone::clone)
@@ -1090,6 +1129,13 @@ impl GoalExecutionEngine {
             // after a pause, cancellation, or replacement fenced this epoch.
             // That call is allowed to settle its already-incurred usage, but
             // its result must never admit a new parent or verifier operation.
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
+            let parent_operation = match checkpoint.admit_operation().await {
+                Ok(operation) => operation,
+                Err(_) => return Ok(GoalExecutionOutcome::Fenced),
+            };
             if self.exact_running_task_or_fenced(scope).await?.is_none() {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
@@ -1125,10 +1171,18 @@ impl GoalExecutionEngine {
                     return Err(error).context("Goal parent operation failed");
                 }
             };
+            drop(parent_operation);
 
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
             // a drained parent result cannot start a second model operation.
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
+            let verifier_operation = match checkpoint.admit_operation().await {
+                Ok(operation) => operation,
+                Err(_) => return Ok(GoalExecutionOutcome::Fenced),
+            };
             if self.exact_running_task_or_fenced(scope).await?.is_none() {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
@@ -1177,6 +1231,16 @@ impl GoalExecutionEngine {
                     self.fail(scope, "verifier_operation_failed").await?;
                     return Err(error).context("Goal verifier operation failed");
                 }
+            };
+            drop(verifier_operation);
+
+            // Serialize validated verifier actions with controls submitted
+            // while the verifier operation was in flight. A pause/cancel
+            // fence must win before a completion transition or a successor
+            // operation can be admitted.
+            let _decision_operation = match checkpoint.admit_operation().await {
+                Ok(operation) => operation,
+                Err(_) => return Ok(GoalExecutionOutcome::Fenced),
             };
 
             // A control fence may commit while an admitted verifier call is
