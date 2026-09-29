@@ -9,6 +9,10 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::task::{
+    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
+    GoalTransitionResult,
+};
 use anyhow::{Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,12 +25,6 @@ use zeroclaw_api::{
 use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
-};
-use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
-
-use crate::task::{
-    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalTransitionResult,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.
@@ -714,9 +712,9 @@ impl GoalHostSettings {
     /// controller admission.
     ///
     /// When enabled, this constructor requires at least one finite default.
-    /// Call [`Self::from_config`] for an enabled configuration whose explicit
-    /// zero values mean unlimited; that path retains the operator's declaration
-    /// provenance before normalization.
+    /// Call [`Self::from_validated_limits`] for resolved limits whose config
+    /// validation already established that explicitly configured zero values
+    /// mean unlimited.
     ///
     /// # Errors
     ///
@@ -725,7 +723,7 @@ impl GoalHostSettings {
     /// unlimited default to `None` before constructing this value.
     pub fn new(
         enabled: bool,
-        default_limits: ConfigGoalBudgetLimits,
+        default_limits: GoalBudgetLimits,
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
@@ -737,8 +735,24 @@ impl GoalHostSettings {
                 "enabled Goal Mode unlimited defaults require validated configuration provenance"
             );
         }
+        Self::from_validated_limits(enabled, default_limits, owner_pid, owner_boot_id)
+    }
+
+    /// Build settings from limits normalized by the runtime's validated Goal
+    /// configuration. The Goal component deliberately accepts this narrow
+    /// value rather than depending on the configuration crate.
+    ///
+    /// Unlike [`Self::new`], this constructor permits both normalized limits
+    /// to be unlimited. Callers must first validate the source configuration
+    /// and resolve its declared defaults.
+    pub fn from_validated_limits(
+        enabled: bool,
+        default_limits: GoalBudgetLimits,
+        owner_pid: u32,
+        owner_boot_id: impl Into<String>,
+    ) -> Result<Self> {
         validate_default_limits(default_limits)?;
-        let ConfigGoalBudgetLimits {
+        let GoalBudgetLimits {
             token_limit,
             cost_limit_usd,
         } = default_limits;
@@ -752,42 +766,9 @@ impl GoalHostSettings {
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
     }
-
-    /// Resolve settings from the active configuration without losing whether
-    /// unlimited defaults were explicitly selected by the operator.
-    ///
-    /// This is the only construction path that permits an enabled Goal Mode
-    /// with both normalized default limits unlimited. It first runs
-    /// [`GoalConfig::effective_limits`], which requires both raw defaults to
-    /// have been declared even when they normalize from explicit zeroes.
-    pub fn from_config(
-        config: &GoalConfig,
-        owner_pid: u32,
-        owner_boot_id: impl Into<String>,
-    ) -> Result<Self> {
-        let ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        } = config
-            .effective_limits()
-            .map_err(|error| Error::msg(format!("Goal configuration is invalid: {error:?}")))?;
-        validate_default_limits(ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        })?;
-        Ok(Self {
-            enabled: config.enabled,
-            default_limits: GoalBudgetLimits {
-                token_limit,
-                cost_limit_usd,
-            },
-            owner_pid,
-            owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
-        })
-    }
 }
 
-fn validate_default_limits(limits: ConfigGoalBudgetLimits) -> Result<()> {
+fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
     if limits
         .token_limit
         .is_some_and(|limit| !is_valid_finite_goal_token_limit(limit))
