@@ -586,10 +586,45 @@ impl fmt::Debug for GoalVerifierTurn {
 /// The executor supplies semantics only. Each admitted surface renders the
 /// message through its own Fluent boundary and must not substitute ordinary
 /// turn-progress output for these notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalFailureReason {
+    AgentOperationFailed,
+    ToolResultsUnpaired,
+    EmptyAgentResponse,
+    VerifierOperationFailed,
+    VerifierResponseInvalid,
+    AccountingIncomplete,
+    PricingIncomplete,
+    OperationOutcomeUnknown,
+    ExecutorStartFailed,
+    ExecutorFailed,
+    Other,
+}
+
+impl GoalFailureReason {
+    pub(crate) fn from_terminal_reason(reason: Option<&str>) -> Self {
+        match reason {
+            Some("parent_operation_failed") => Self::AgentOperationFailed,
+            Some("goal_tool_pairing_incomplete") => Self::ToolResultsUnpaired,
+            Some("candidate_empty") => Self::EmptyAgentResponse,
+            Some("verifier_operation_failed") => Self::VerifierOperationFailed,
+            Some("verifier_protocol_invalid") => Self::VerifierResponseInvalid,
+            Some("accounting_missing_or_invalid") => Self::AccountingIncomplete,
+            Some("pricing_unavailable") => Self::PricingIncomplete,
+            Some("accounting_outcome_unknown") => Self::OperationOutcomeUnknown,
+            Some("executor_start_failed") => Self::ExecutorStartFailed,
+            Some("executor_failed") => Self::ExecutorFailed,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalExecutionNotice {
     Completed,
     PausedForBlocker,
+    Failed(GoalFailureReason),
 }
 
 /// Surface-owned foreground execution bridge. It retains the live-session
