@@ -269,6 +269,39 @@ pub enum DaemonExit {
     Reload(Box<Config>),
 }
 
+/// Project the validated config into Goal's narrow policy input. Keeping this
+/// adapter here prevents the Goal component from depending on config types.
+pub(crate) fn goal_policy_snapshot(config: &Config) -> zeroclaw_goal::control::GoalPolicySnapshot {
+    use zeroclaw_goal::control::{GoalAgentPolicySnapshot, GoalPolicySnapshot};
+
+    GoalPolicySnapshot {
+        goal_mode_enabled: config.goal.enabled,
+        agents: config
+            .agents
+            .iter()
+            .map(|(alias, agent)| {
+                (
+                    alias.clone(),
+                    GoalAgentPolicySnapshot {
+                        enabled: agent.enabled,
+                        channels: agent
+                            .channels
+                            .iter()
+                            .map(|channel| channel.as_str().to_owned())
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+        matrix_channels: config
+            .channels
+            .matrix
+            .iter()
+            .map(|(alias, channel)| (alias.clone(), channel.enabled))
+            .collect(),
+    }
+}
+
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
 /// Load the exact successor configuration and apply its Goal-policy cutover
@@ -287,9 +320,10 @@ fn prepare_reload_config()
         };
         let coordinator = control_plane.goal_execution_restart();
         coordinator.begin_policy_cutover().await;
+        let policy = goal_policy_snapshot(&successor);
         let result = async {
             let registry = control_plane.goal_store()?;
-            zeroclaw_goal::control::revoke_goals_under_policy(registry.as_ref(), &successor).await
+            zeroclaw_goal::control::revoke_goals_under_policy(registry.as_ref(), &policy).await
         }
         .await;
         if let Err(error) = result {
@@ -2941,6 +2975,36 @@ mod tests {
     use zeroclaw_config::schema::MattermostListenMode;
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn goal_policy_snapshot_projects_validated_agent_and_matrix_routes() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent
+            .channels
+            .push(zeroclaw_config::providers::ChannelRef::new("matrix.main"));
+        config.agents.insert("main".into(), agent);
+        config.channels.matrix.insert(
+            "main".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MatrixConfig::default()
+            },
+        );
+
+        let snapshot = goal_policy_snapshot(&config);
+        assert!(snapshot.goal_mode_enabled);
+        assert_eq!(snapshot.matrix_channels.get("main"), Some(&true));
+        let agent = snapshot.agents.get("main").unwrap();
+        assert!(agent.enabled);
+        assert!(
+            agent
+                .channels
+                .iter()
+                .any(|channel| channel == "matrix.main")
+        );
+    }
 
     /// The reload drain must report the connections that were still unwinding
     /// when its budget expired, not silently declare the generation retired.

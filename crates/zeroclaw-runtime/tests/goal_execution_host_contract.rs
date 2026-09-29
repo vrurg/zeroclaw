@@ -137,12 +137,14 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         if self.continue_once {
             self.continue_once = false;
             Ok(GoalVerifierResult {
-                response: r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned(),
+                response:
+                    r#"{"decision":"continue","reason":"add the missing detail","blockers":[]}"#
+                        .to_owned(),
                 attribution: None,
             })
         } else {
             Ok(GoalVerifierResult {
-                response: r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
+                response: r#"{"decision":"complete","reason":"candidate satisfies the objective","blockers":[]}"#
                     .to_owned(),
                 attribution: None,
             })
