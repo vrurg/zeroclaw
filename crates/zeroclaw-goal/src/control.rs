@@ -9,6 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::accounting::GoalOperationAccountingFactory;
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult,
@@ -26,7 +27,6 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use crate::accounting::GoalOperationAccountingFactory;
 
 mod goal_execution;
 
@@ -278,13 +278,18 @@ pub trait GoalSessionDriver: Send + Sync {
 
     /// Acquire the exact session's foreground execution lease.
     ///
+    /// Acquisition revalidates live-session identity only: this lease also
+    /// delivers notices after terminal failure. Before its first protected
+    /// execution effect, the lease must re-establish live execution authority.
+    ///
     /// The returned lease must retain the driver's authoritative live-session
     /// guard until it is dropped, exclusively serialize foreground work for
     /// this session, and tolerate being held across the executor's durable
     /// lifecycle and accounting I/O. It must not re-enter a lock that the
     /// Goal lifecycle needs. The executor treats `ingress` as admission-time
     /// audit data only; live policy stays with the driver and is revalidated
-    /// there. `canonical_history` is read-only, parent and verifier calls
+    /// before the lease executes protected work. `canonical_history` is
+    /// read-only, parent and verifier calls
     /// mutate only process-local working state, and `append_verified_candidate`
     /// appends and delivers exactly one already-verified final candidate.
     /// The object is the sole transport bridge used by the later Goal executor.
