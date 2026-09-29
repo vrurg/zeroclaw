@@ -54,7 +54,7 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_accounting::{
         ModelProviderGoalUsagePricer, RuntimeGoalDiagnosticTextGuard,
-        RuntimeGoalOperationAccountingFactory,
+        RuntimeGoalOperationAccountingFactory, RuntimeGoalUsageTotalsReader,
     },
 };
 
@@ -388,11 +388,13 @@ async fn submit_matrix_goal_with_command_lease(
             if let Some(supervisor) = slot.as_ref() {
                 Arc::clone(supervisor)
             } else {
-                let runtime = GoalRuntime::new(Arc::clone(&registry));
                 let tracker = CostTracker::get_or_init_global_required(
                     defaults.config.cost.clone(),
                     &defaults.config.data_dir,
                 )?;
+                let runtime = GoalRuntime::new(Arc::clone(&registry)).with_usage_totals_reader(
+                    Arc::new(RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))),
+                );
                 let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
                     build_type_level_model_provider_pricing(context.prompt_config.as_ref()),
                 )));
