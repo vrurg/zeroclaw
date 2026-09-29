@@ -154,6 +154,7 @@ impl GoalSessionDriver for UnpairedParentErrorExecutionDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(UnpairedParentErrorExecutionLease {
             session_key: self.binding.session_key().clone(),
