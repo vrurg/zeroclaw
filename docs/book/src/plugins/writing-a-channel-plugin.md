@@ -108,21 +108,24 @@ than omitting it: the host will call your export and trust the answer.
 
 `request-approval` is the deepest integration point. The runtime presents a
 compact `approval-request` (tool name, arguments summary, optional raw JSON
-arguments, and the host-owned `strict-session-prompt-approval` policy marker)
+arguments, and optional batch position)
 and your channel renders it however the platform allows (buttons, reactions, a
-reply convention). When the marker is `true`, render only one-time approve and
-deny actions; do not offer `always-approve`, because the host rejects that
-response for a strict session-prompt mutation. The `approval-response` variant
+reply convention). The `approval-response` variant
 you return drives the security machinery:
 
 - `approve`: execute this one call
 - `deny`: refuse it
 - `always-approve`: execute and add the tool to the session-scoped allowlist
-  (only when `strict-session-prompt-approval` is `false`)
 - `deny-with-edit(string)`: refuse, but supply edited replacement arguments
 
 Return `none` when the prompt cannot be presented; the caller falls back to
 auto-deny. Fail closed.
+
+The host does not delegate strict session-prompt confirmations to channel
+plugins: the plugin interface cannot attest that proposed content is displayed
+literally without rendering or delivery side effects. Such mutations are
+denied while the additional confirmation policy is required. Ordinary tool
+approval through this interface is unchanged.
 
 ## Inbound message shape
 

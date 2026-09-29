@@ -727,7 +727,6 @@ fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
             index: p.index,
             total: p.total,
         }),
-        strict_session_prompt_approval: req.strict_session_prompt_approval,
     }
 }
 
