@@ -1409,8 +1409,7 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let candidates = self
-            .sessions
+        self.sessions
             .lock()
             .await
             .iter()
@@ -1424,8 +1423,7 @@ impl SessionStore {
                 id: key.clone(),
                 generation: session.generation,
             })
-            .collect();
-        candidates
+            .collect()
     }
 
     /// Remove one exact idle sibling while its actor queue is reserved for
