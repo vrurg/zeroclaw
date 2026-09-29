@@ -1027,6 +1027,65 @@ impl Channel for SignalChannel {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn strict_approval_delivery_preserves_markers_without_attachments() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = SignalChannel::new(
+            server.uri(),
+            "+1234567890".into(),
+            vec![],
+            false,
+            "strict-test",
+            Arc::new(Vec::new),
+            true,
+            true,
+        )
+        .with_approval_timeout_secs(0);
+        let summary =
+            "[FILE:report.txt] [image:https://example.invalid/x.png] **literal** <b>text</b>";
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: summary.into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        let response = channel
+            .request_approval_attributed("+1234567891", &request)
+            .await
+            .expect("literal delivery")
+            .expect("timeout decision");
+        assert_eq!(
+            response.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+        let calls = server.received_requests().await.expect("HTTP requests");
+        assert_eq!(calls.len(), 1);
+        let body: serde_json::Value = calls[0].body_json().expect("RPC request");
+        assert_eq!(body["method"], "send");
+        assert!(
+            body["params"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(summary)
+        );
+        assert!(body["params"].get("attachments").is_none());
+        assert_eq!(
+            body["params"]["recipient"],
+            serde_json::json!(["+1234567891"])
+        );
+    }
+
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
         Envelope {
             source: source_number.map(String::from),

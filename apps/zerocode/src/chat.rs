@@ -25059,6 +25059,42 @@ mod tests {
     }
 
     #[test]
+    fn strict_approval_overlay_renders_markers_and_markup_literally() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        let summary = "[FILE:report.txt] **literal** <b>text</b> @room";
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".into(),
+            request_id: "strict-test".into(),
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: summary.into(),
+            timeout_secs: 30,
+            allow_always: false,
+        });
+        assert_eq!(
+            s.pending_approval().expect("approval").arguments_summary,
+            summary
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| render_approval_overlay(frame, &mut s, area))
+            .expect("literal overlay");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(summary));
+        assert!(rendered.contains("Enter=Allow") && rendered.contains("Ctrl+D=Reject"));
+        assert!(!rendered.contains("Always"));
+    }
+
+    #[test]
     fn approval_overlay_renders_scrolled_exact_details_with_fixed_actions() {
         use ratatui::{Terminal, backend::TestBackend};
 
