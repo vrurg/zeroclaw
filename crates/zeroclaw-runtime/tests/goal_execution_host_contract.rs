@@ -4,9 +4,9 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_commands::goal::{GoalBudgetLimits, GoalCommand};
 use zeroclaw_config::{
-    goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig, GoalVerifierConfig},
+    goal::{GoalConfig, GoalVerifierConfig},
     providers::ModelProviderRef,
 };
 use zeroclaw_goal::{
@@ -528,7 +528,7 @@ fn zerocode_ingress(agent: &str) -> GoalIngressContext {
 fn host_settings(enabled: bool) -> GoalHostSettings {
     GoalHostSettings::new(
         enabled,
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: Some(1.0),
         },
@@ -543,7 +543,7 @@ fn enabled_host_settings_reject_unproven_unlimited_defaults() {
     assert!(
         GoalHostSettings::new(
             true,
-            ConfigGoalBudgetLimits {
+            GoalBudgetLimits {
                 token_limit: None,
                 cost_limit_usd: None,
             },
@@ -566,7 +566,19 @@ fn explicitly_unlimited_enabled_config_retains_its_declaration_provenance() {
         },
     };
 
-    assert!(GoalHostSettings::from_config(&config, 42, "test-boot").is_ok());
+    let limits = config.effective_limits().unwrap();
+    assert!(
+        GoalHostSettings::from_validated_limits(
+            config.enabled,
+            GoalBudgetLimits {
+                token_limit: limits.token_limit,
+                cost_limit_usd: limits.cost_limit_usd,
+            },
+            42,
+            "test-boot",
+        )
+        .is_ok()
+    );
 }
 
 fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
@@ -955,19 +967,19 @@ fn trusted_ingress_rejects_noncanonical_principal_identity() {
 #[test]
 fn host_settings_reject_invalid_semantic_default_limits() {
     for default_limits in [
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(0),
             cost_limit_usd: None,
         },
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(i64::MAX as u64 + 1),
             cost_limit_usd: None,
         },
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: Some(-1.0),
         },
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: Some(f64::NAN),
         },
@@ -981,7 +993,7 @@ fn host_settings_rejects_a_blank_boot_id() {
     assert!(
         GoalHostSettings::new(
             true,
-            ConfigGoalBudgetLimits {
+            GoalBudgetLimits {
                 token_limit: Some(100),
                 cost_limit_usd: None,
             },
@@ -1000,7 +1012,19 @@ fn host_settings_rejects_a_blank_boot_id() {
             model: None,
         },
     };
-    assert!(GoalHostSettings::from_config(&config, 42, " \t\n").is_err());
+    let limits = config.effective_limits().unwrap();
+    assert!(
+        GoalHostSettings::from_validated_limits(
+            config.enabled,
+            GoalBudgetLimits {
+                token_limit: limits.token_limit,
+                cost_limit_usd: limits.cost_limit_usd,
+            },
+            42,
+            " \t\n",
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1039,7 +1063,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: Some(1.0),
         },
@@ -1513,7 +1537,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: None,
         },
@@ -1819,7 +1843,7 @@ async fn disabled_goal_submission_does_not_acquire_a_session_lease() {
     let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         false,
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
         },
@@ -1868,7 +1892,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     let controller = GoalController::new(registry.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        ConfigGoalBudgetLimits {
+        GoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: Some(1.0),
         },
