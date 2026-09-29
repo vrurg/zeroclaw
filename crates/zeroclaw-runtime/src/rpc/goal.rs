@@ -20,7 +20,10 @@ use crate::{
     agent::cost::build_type_level_model_provider_pricing,
     control_plane::control_plane,
     cost::CostTracker,
-    goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
+    goal_accounting::{
+        ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
+        RuntimeGoalUsageTotalsReader,
+    },
     rpc::context::RpcContext,
 };
 
@@ -766,11 +769,13 @@ impl RpcGoalRuntime {
         let supervisor = match self.supervisor(&session_id).await {
             Some(supervisor) => supervisor,
             None => {
-                let runtime = GoalRuntime::new(Arc::clone(&registry));
                 let tracker = CostTracker::get_or_init_global_required(
                     config.cost.clone(),
                     &config.data_dir,
                 )?;
+                let runtime = GoalRuntime::new(Arc::clone(&registry)).with_usage_totals_reader(
+                    Arc::new(RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))),
+                );
                 let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
                     build_type_level_model_provider_pricing(&config),
                 )));
