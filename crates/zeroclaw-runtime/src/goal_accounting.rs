@@ -12,7 +12,8 @@ use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
     accounting::{
         GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
-        GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice, GoalUsagePricer,
+        GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice, GoalUsagePricer, GoalUsageTotals,
+        GoalUsageTotalsReader,
     },
     task::{GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskGoal},
 };
@@ -62,6 +63,55 @@ impl GoalUsagePricer for ModelProviderGoalUsagePricer {
             pricing_available: priced.pricing_available,
             timestamp: priced.timestamp,
         })
+    }
+}
+
+/// Read-only status projection over the same canonical task-attributed ledger
+/// used to settle Goal-owned provider attempts.
+pub struct RuntimeGoalUsageTotalsReader {
+    tracker: Arc<CostTracker>,
+}
+
+impl RuntimeGoalUsageTotalsReader {
+    #[must_use]
+    pub fn new(tracker: Arc<CostTracker>) -> Self {
+        Self { tracker }
+    }
+}
+
+#[async_trait]
+impl GoalUsageTotalsReader for RuntimeGoalUsageTotalsReader {
+    async fn read_for_task(&self, task_id: &str) -> Result<GoalUsageTotals> {
+        let tracker = Arc::clone(&self.tracker);
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (total_tokens, cost_usd, pricing_available, ledger_complete) =
+                match tracker.get_strict_usage_totals_for_task_with_pricing(&task_id) {
+                    Ok((tokens, cost, pricing_available)) => {
+                        (tokens, cost, pricing_available, true)
+                    }
+                    Err(strict_error) => {
+                        let (tokens, cost, pricing_available) = tracker
+                            .get_usage_totals_for_task_with_pricing(&task_id)
+                            .with_context(|| {
+                                format!(
+                                    "strict task usage validation failed ({strict_error:#}) and known totals could not be read"
+                                )
+                            })?;
+                        (tokens, cost, pricing_available, false)
+                    }
+                };
+
+            let cost_usd = cost_usd.is_finite().then_some(cost_usd);
+            Ok(GoalUsageTotals {
+                total_tokens,
+                cost_usd,
+                pricing_available: pricing_available && cost_usd.is_some(),
+                ledger_complete: ledger_complete && cost_usd.is_some(),
+            })
+        })
+        .await
+        .context("join Goal task usage totals lookup")?
     }
 }
 
@@ -407,6 +457,7 @@ mod tests {
     use super::*;
     use crate::control_plane::{SqliteTaskStore, TaskKind, TaskRecord};
     use std::collections::HashMap;
+    use std::io::Write as _;
     use tempfile::TempDir;
     use zeroclaw_goal::GoalTaskRecord;
 
@@ -586,6 +637,14 @@ mod tests {
                 .0,
             1_700
         );
+        let totals = RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))
+            .read_for_task(scope.task_id())
+            .await
+            .unwrap();
+        assert_eq!(totals.total_tokens, 1_700);
+        assert!(totals.cost_usd.is_some_and(|cost| cost > 0.0));
+        assert!(totals.pricing_available);
+        assert!(totals.ledger_complete);
         let contents = std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
             .expect("settled usage record is durable");
         let record: zeroclaw_config::cost::types::CostRecord =
@@ -602,6 +661,45 @@ mod tests {
         assert!((record.usage.cost_usd - expected_cost).abs() < 1e-12);
         assert_eq!(record.usage.unpriced_tokens, 0);
         assert!(record.usage.pricing_available);
+    }
+
+    #[tokio::test]
+    async fn status_totals_keep_known_usage_when_strict_ledger_read_finds_bad_line() {
+        let (_store, factory, tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Invalid,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                    priceable: true,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let ledger = directory.path().join("state/costs.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(ledger)
+            .unwrap()
+            .write_all(b"not-json\n")
+            .unwrap();
+
+        let totals = RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))
+            .read_for_task(scope.task_id())
+            .await
+            .unwrap();
+        assert_eq!(totals.total_tokens, 15);
+        assert!(totals.cost_usd.is_some());
+        assert!(!totals.ledger_complete);
     }
 
     #[tokio::test]

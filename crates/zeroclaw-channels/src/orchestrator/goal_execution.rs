@@ -39,7 +39,10 @@ use zeroclaw_runtime::{
     },
     control_plane::control_plane,
     cost::CostTracker,
-    goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
+    goal_accounting::{
+        ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
+        RuntimeGoalUsageTotalsReader,
+    },
 };
 
 /// Immutable Matrix facts captured before mutable inbound hooks run.
@@ -342,11 +345,13 @@ async fn submit_matrix_goal_with_command_lease(
         if let Some(supervisor) = slot.as_ref() {
             Arc::clone(supervisor)
         } else {
-            let runtime = GoalRuntime::new(Arc::clone(&registry));
             let tracker = CostTracker::get_or_init_global_required(
                 defaults.config.cost.clone(),
                 &defaults.config.data_dir,
             )?;
+            let runtime = GoalRuntime::new(Arc::clone(&registry)).with_usage_totals_reader(
+                Arc::new(RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))),
+            );
             let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
                 build_type_level_model_provider_pricing(defaults.config.as_ref()),
             )));
