@@ -1,8 +1,11 @@
 //! Per-session actor queue for serializing concurrent access.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -40,6 +43,62 @@ pub struct SessionGuard {
     /// `SessionStore::insert_admitted`) verify the caller holds the permit
     /// for the session it is about to mutate.
     session_id: String,
+}
+
+/// A FIFO position registered on a session without waiting for its permit.
+///
+/// The semaphore waiter is polled during reservation so later requests cannot
+/// overtake this admission while the caller performs lifecycle work. The
+/// permit may already be held if it was immediately available. The queue-lock
+/// timeout begins when [`Self::acquire`] is called, matching the existing
+/// `SessionActorQueue::acquire` contract.
+pub struct SessionQueueAdmission {
+    registration: PendingRegistration,
+    session_id: String,
+    lock_timeout: Duration,
+    permit: Option<OwnedSemaphorePermit>,
+    waiter: Option<SemaphoreAcquire>,
+}
+
+type SemaphoreAcquire =
+    Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send>>;
+
+impl SessionQueueAdmission {
+    /// Wait for this reservation's FIFO turn and acquire its session permit.
+    pub async fn acquire(self) -> Result<SessionGuard, SessionQueueError> {
+        let Self {
+            registration,
+            session_id,
+            lock_timeout,
+            permit,
+            waiter,
+        } = self;
+        let permit = match permit {
+            Some(permit) => Ok(permit),
+            None => match tokio::time::timeout(
+                lock_timeout,
+                waiter.expect("pending reservation must retain its semaphore waiter"),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(SessionQueueError::Timeout { session_id });
+                }
+            },
+        };
+        match permit {
+            Ok(permit) => {
+                *registration.slot.last_active.lock().await = Instant::now();
+                Ok(SessionGuard {
+                    _permit: permit,
+                    _registration: registration,
+                    session_id,
+                })
+            }
+            Err(_) => Err(SessionQueueError::Timeout { session_id }),
+        }
+    }
 }
 
 /// Nonblocking admission reservation used while a session is being evicted.
@@ -150,6 +209,16 @@ impl SessionActorQueue {
     /// Acquire exclusive access to a session. Blocks until the session is free
     /// or the timeout expires. Returns a guard that releases on drop.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
+        self.reserve(session_id).await?.acquire().await
+    }
+
+    /// Register a session admission in semaphore FIFO order without waiting
+    /// for the permit. This lets lifecycle callers reserve their place before
+    /// draining work that may itself need the session permit to finish.
+    pub async fn reserve(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionQueueAdmission, SessionQueueError> {
         let registration = {
             let mut slots = self.slots.lock().await;
             let slot = slots
@@ -194,21 +263,26 @@ impl SessionActorQueue {
             registration
         };
 
-        // Acquire owned permit with timeout
-        let sem = registration.slot.semaphore.clone();
-        match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
-            Ok(Ok(permit)) => {
-                *registration.slot.last_active.lock().await = Instant::now();
-                Ok(SessionGuard {
-                    _permit: permit,
-                    _registration: registration,
+        let mut waiter: SemaphoreAcquire =
+            Box::pin(Arc::clone(&registration.slot.semaphore).acquire_owned());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        let (permit, waiter) = match first_poll {
+            Poll::Ready(Ok(permit)) => (Some(permit), None),
+            Poll::Ready(Err(_)) => {
+                return Err(SessionQueueError::Timeout {
                     session_id: session_id.to_string(),
-                })
+                });
             }
-            Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
-                session_id: session_id.to_string(),
-            }),
-        }
+            Poll::Pending => (None, Some(waiter)),
+        };
+        Ok(SessionQueueAdmission {
+            registration,
+            session_id: session_id.to_string(),
+            lock_timeout: self.lock_timeout,
+            permit,
+            waiter,
+        })
     }
 
     /// Reserve an idle session for eviction without waiting. The reservation
@@ -340,6 +414,59 @@ mod tests {
 
         drop(guard);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn admission_reservation_preserves_fifo_before_permit_wait() {
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 600));
+        let active = queue.acquire("s1").await.unwrap();
+        let reservation = queue.reserve("s1").await.unwrap();
+
+        let later_queue = Arc::clone(&queue);
+        let mut later = zeroclaw_spawn::spawn!(async move { later_queue.acquire("s1").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.queue_depth("s1").await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later admission must register behind the reserved FIFO position");
+
+        drop(active);
+        let first = tokio::time::timeout(Duration::from_secs(1), reservation.acquire())
+            .await
+            .expect("reserved admission should receive the next permit")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut later)
+                .await
+                .is_err(),
+            "a later ordinary admission must not overtake the reservation"
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), later)
+            .await
+            .expect("later admission should proceed after the reservation releases")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_admission_reservation_releases_queue_capacity() {
+        let queue = SessionActorQueue::new(2, 5, 600);
+        let active = queue.acquire("s1").await.unwrap();
+        let reservation = queue.reserve("s1").await.unwrap();
+        assert_eq!(queue.queue_depth("s1").await, 2);
+        assert!(matches!(
+            queue.reserve("s1").await,
+            Err(SessionQueueError::QueueFull { depth: 2, .. })
+        ));
+
+        drop(reservation);
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        drop(active);
+        let _admission = queue.reserve("s1").await.unwrap();
     }
 
     #[tokio::test]
