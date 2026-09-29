@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
 use uuid::Uuid;
 
 /// One process-local checkpoint shared by a session's Goal worker and control
@@ -28,6 +28,7 @@ struct CheckpointInner {
     /// stays held for the admitted operation and is paired with `state` so
     /// ticket registration and next-operation admission have one atomic order.
     operation_gate: Arc<AsyncMutex<()>>,
+    closed_notify: Notify,
 }
 
 #[derive(Default)]
@@ -167,12 +168,31 @@ impl GoalParentTurnCheckpoint {
                 generation: Uuid::new_v4(),
                 state: Mutex::new(CheckpointState::default()),
                 operation_gate: Arc::new(AsyncMutex::new(())),
+                closed_notify: Notify::new(),
             }),
         }
     }
 
     pub fn generation(&self) -> Uuid {
         self.inner.generation
+    }
+
+    /// Wait until this execution epoch can no longer admit work.
+    ///
+    /// Session adapters use this only while waiting to acquire the ordinary
+    /// foreground/session lease. Closing a checkpoint therefore lets a
+    /// lifecycle fence withdraw an unadmitted waiter without interrupting a
+    /// lease or model operation that was already admitted.
+    pub async fn wait_closed(&self) {
+        loop {
+            let notified = self.inner.closed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.lock_state().closed {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Register a deferred control atomically against the worker's next
@@ -251,6 +271,7 @@ impl GoalParentTurnCheckpoint {
             state.closed = true;
             std::mem::take(&mut state.pending)
         };
+        self.inner.closed_notify.notify_waiters();
         drop(pending);
     }
 }
@@ -343,6 +364,26 @@ mod tests {
         checkpoint.close();
         assert!(ticket.wait_until_turn().await.is_err());
         assert!(checkpoint.register_control().is_err());
+        assert!(checkpoint.admit_operation().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_wakes_unadmitted_lease_waiters_without_releasing_active_operation() {
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let operation = checkpoint.admit_operation().await.unwrap();
+        let waiting_checkpoint = checkpoint.clone();
+        let waiter = zeroclaw_spawn::spawn!(async move {
+            waiting_checkpoint.wait_closed().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        checkpoint.close();
+        waiter.await.unwrap();
+
+        // The active operation remains owned across checkpoint closure. Once
+        // it settles, no following operation may be admitted.
+        drop(operation);
         assert!(checkpoint.admit_operation().await.is_err());
     }
 }
