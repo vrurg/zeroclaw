@@ -957,6 +957,74 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn goal_status_uses_the_typed_session_goal_response_over_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::insert_immediate_session_with_owner;
+        use crate::rpc::types::SessionGoalResult;
+        use zeroclaw_goal::control::GoalResponse;
+
+        const SESSION_ID: &str = "goal-local-ipc-transport";
+        const TUI_ID: &str = "goal-local-ipc-tui";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.config.write().goal.enabled = false;
+        insert_immediate_session_with_owner(&ctx, tmp.path(), SESSION_ID, TUI_ID).await;
+
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&ctx);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(TUI_ID.to_owned()),
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &init, 1).as_bytes())
+            .await
+            .unwrap();
+        let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({
+                        "session_id": SESSION_ID,
+                        "command": "/goal status",
+                    }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, result): (_, SessionGoalResult) = read_result(&mut reader).await;
+        assert_eq!(result.response, GoalResponse::Disabled);
+
+        cancel.cancel();
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("local IPC listener should stop after cancellation")
+            .expect("local IPC listener task should not panic")
+            .expect("local IPC listener should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn socket_rejects_before_initialize() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
