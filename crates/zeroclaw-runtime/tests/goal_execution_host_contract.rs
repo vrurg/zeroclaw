@@ -22,12 +22,12 @@ use zeroclaw_goal::{
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
     GoalVerifierResult, GoalVerifierTurn,
 };
-use zeroclaw_runtime::goal_accounting::{
-    ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
-};
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
+};
+use zeroclaw_runtime::goal_accounting::{
+    ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
 };
 
 struct RecordingDriver {
@@ -116,7 +116,7 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
     ) -> anyhow::Result<GoalVerifierResult> {
         self.verifier_calls.fetch_add(1, Ordering::SeqCst);
         Ok(GoalVerifierResult {
-            response: r#"{"decision":"complete","reason":"done"}"#.to_owned(),
+            response: r#"{"decision":"complete","reason":"done","blockers":[]}"#.to_owned(),
             attribution: None,
         })
     }
@@ -2618,6 +2618,10 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
     })
     .await
     .expect("explicit resume must execute in the next generation");
-    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(
+        completed.status,
+        TaskStatus::Completed,
+        "resumed Goal terminal record: {completed:?}"
+    );
     assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
 }
