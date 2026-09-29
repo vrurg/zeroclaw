@@ -16,6 +16,15 @@ pub struct GoalStatusProjection {
     pub accounting_state: String,
     pub pause_reason: Option<String>,
     pub resumable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_totals: Option<GoalUsageTotals>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoalUsageTotals {
+    pub total_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub pricing_available: bool,
+    pub ledger_complete: bool,
 }
 
 /// Hand-maintained wire mirror of the daemon's typed Goal failure reason.
@@ -86,6 +95,7 @@ mod goal_wire_tests {
 
         let projection: GoalStatusProjection = serde_json::from_value(raw).unwrap();
         assert_eq!(projection.status, "paused");
+        assert!(projection.usage_totals.is_none());
     }
 
     #[test]
@@ -99,11 +109,13 @@ mod goal_wire_tests {
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             resumable: true,
+            usage_totals: None,
         };
 
         let raw = serde_json::to_value(projection).expect("serialize Goal status projection");
         assert!(raw.get("pause_description").is_none());
         assert!(raw.get("blocker_messages").is_none());
+        assert!(raw.get("usage_totals").is_none());
     }
 }
 
