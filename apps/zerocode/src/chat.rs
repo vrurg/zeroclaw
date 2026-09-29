@@ -87,6 +87,25 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     crate::i18n::t(key)
 }
 
+fn goal_failure_message(reason: crate::wire::GoalFailureReason) -> String {
+    use crate::wire::GoalFailureReason;
+
+    let key = match reason {
+        GoalFailureReason::AgentOperationFailed => "zc-goal-failure-agent-operation",
+        GoalFailureReason::ToolResultsUnpaired => "zc-goal-failure-tool-results-unpaired",
+        GoalFailureReason::EmptyAgentResponse => "zc-goal-failure-empty-agent-response",
+        GoalFailureReason::VerifierOperationFailed => "zc-goal-failure-verifier-operation",
+        GoalFailureReason::VerifierResponseInvalid => "zc-goal-failure-verifier-response",
+        GoalFailureReason::AccountingIncomplete => "zc-goal-failure-accounting",
+        GoalFailureReason::PricingIncomplete => "zc-goal-failure-pricing",
+        GoalFailureReason::OperationOutcomeUnknown => "zc-goal-failure-outcome-unknown",
+        GoalFailureReason::ExecutorStartFailed => "zc-goal-failure-executor-start",
+        GoalFailureReason::ExecutorFailed => "zc-goal-failure-executor",
+        GoalFailureReason::Other => "zc-goal-failure-other",
+    };
+    crate::i18n::t(key)
+}
+
 fn goal_command_starts_execution(command: &str) -> bool {
     let mut words = command.split_whitespace();
     words
@@ -106,6 +125,7 @@ fn notification_session_id(notif: &RpcNotification) -> Option<String> {
             GoalUpdate::VerifiedCandidate { session_id, .. }
             | GoalUpdate::Completed { session_id }
             | GoalUpdate::PausedForBlocker { session_id }
+            | GoalUpdate::Failed { session_id, .. }
             | GoalUpdate::Lifecycle { session_id, .. } => session_id.to_string(),
         }),
         _ => None,
@@ -125,6 +145,10 @@ enum GoalUpdate<'a> {
     },
     PausedForBlocker {
         session_id: &'a str,
+    },
+    Failed {
+        session_id: &'a str,
+        reason: crate::wire::GoalFailureReason,
     },
     Lifecycle {
         session_id: &'a str,
@@ -147,6 +171,15 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "failed" => {
+            if payload.len() != 2 {
+                return None;
+            }
+            Some(GoalUpdate::Failed {
+                session_id,
+                reason: serde_json::from_value(payload.get("reason")?.clone()).ok()?,
+            })
+        }
         "lifecycle" => {
             if payload.len() != 2 {
                 return None;
@@ -2735,46 +2768,7 @@ impl Chat {
                     let Some(update) = parse_goal_update(&notif.params) else {
                         continue;
                     };
-                    let session_id = match &update {
-                        GoalUpdate::VerifiedCandidate { session_id, .. }
-                        | GoalUpdate::Completed { session_id }
-                        | GoalUpdate::PausedForBlocker { session_id }
-                        | GoalUpdate::Lifecycle { session_id, .. } => session_id,
-                    };
-                    let Some(state) = self.state_for_session_mut(session_id) else {
-                        continue;
-                    };
-                    match update {
-                        GoalUpdate::VerifiedCandidate { candidate, .. } => {
-                            // Ordinary session/update chunks are authoritative when present;
-                            // the full candidate is a fallback for clients that missed them.
-                            state.commit_turn(candidate.to_owned(), true);
-                        }
-                        GoalUpdate::Completed { .. } => {
-                            state
-                                .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-completed",
-                                ))));
-                            state.mark_dirty_append();
-                        }
-                        GoalUpdate::PausedForBlocker { .. } => {
-                            state
-                                .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-paused",
-                                ))));
-                            state.mark_dirty_append();
-                        }
-                        GoalUpdate::Lifecycle { response, .. } => {
-                            state
-                                .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                                    goal_response_message(&response),
-                                )));
-                            state.mark_dirty_append();
-                        }
-                    }
+                    self.apply_goal_update(update);
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
@@ -2788,6 +2782,59 @@ impl Chat {
         }
         if applied {
             self.pump_all_queues();
+        }
+    }
+
+    fn apply_goal_update(&mut self, update: GoalUpdate<'_>) {
+        let session_id = match &update {
+            GoalUpdate::VerifiedCandidate { session_id, .. }
+            | GoalUpdate::Completed { session_id }
+            | GoalUpdate::PausedForBlocker { session_id }
+            | GoalUpdate::Failed { session_id, .. }
+            | GoalUpdate::Lifecycle { session_id, .. } => *session_id,
+        };
+        let Some(state) = self.state_for_session_mut(session_id) else {
+            return;
+        };
+
+        match update {
+            GoalUpdate::VerifiedCandidate { candidate, .. } => {
+                // Ordinary session/update chunks are authoritative when present;
+                // the full candidate is a fallback for clients that missed them.
+                state.commit_turn(candidate.to_owned(), true);
+            }
+            GoalUpdate::Completed { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-completed",
+                    ))));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::PausedForBlocker { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-paused",
+                    ))));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::Failed { reason, .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                        goal_failure_message(reason),
+                    )));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::Lifecycle { response, .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                        goal_response_message(&response),
+                    )));
+                state.mark_dirty_append();
+            }
         }
     }
 
@@ -2840,46 +2887,7 @@ impl Chat {
                 let Some(update) = parse_goal_update(&notif.params) else {
                     return false;
                 };
-                let session_id = match &update {
-                    GoalUpdate::VerifiedCandidate { session_id, .. }
-                    | GoalUpdate::Completed { session_id }
-                    | GoalUpdate::PausedForBlocker { session_id }
-                    | GoalUpdate::Lifecycle { session_id, .. } => *session_id,
-                };
-                let Some(state) = self.state_for_session_mut(session_id) else {
-                    return false;
-                };
-                match update {
-                    GoalUpdate::VerifiedCandidate { candidate, .. } => {
-                        // Ordinary session/update chunks are authoritative when present;
-                        // the full candidate is a fallback for clients that missed them.
-                        state.commit_turn(candidate.to_owned(), true);
-                    }
-                    GoalUpdate::Completed { .. } => {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-goal-completed",
-                            ))));
-                        state.mark_dirty_append();
-                    }
-                    GoalUpdate::PausedForBlocker { .. } => {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-goal-paused",
-                            ))));
-                        state.mark_dirty_append();
-                    }
-                    GoalUpdate::Lifecycle { response, .. } => {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                                goal_response_message(&response),
-                            )));
-                        state.mark_dirty_append();
-                    }
-                }
+                self.apply_goal_update(update);
                 false
             }
             _ => false,
@@ -29503,6 +29511,64 @@ mod tests {
             &entries[3],
             ChatEntry::SystemMessage(text) if text.as_ref().lines().next() == Some(paused_heading.as_str())
         ));
+    }
+
+    #[tokio::test]
+    async fn goal_failure_update_keeps_the_typed_reason_for_its_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        let notification = RpcNotification {
+            method: "session/goal_update".to_string(),
+            params: serde_json::json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            }),
+        };
+        assert_eq!(
+            notification_session_id(&notification).as_deref(),
+            Some("sess-1")
+        );
+        notif_tx.send(notification).unwrap();
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "failed": {
+                        "session_id": "sess-1",
+                        "reason": "unrecognized"
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        // The completion pump can route this notification through the
+        // alternate handler; both paths must render the same typed reason.
+        assert!(!chat.apply_session_notification(RpcNotification {
+            method: "session/goal_update".to_string(),
+            params: serde_json::json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            }),
+        }));
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 2, "invalid typed reasons must be rejected");
+        for entry in entries {
+            assert!(matches!(
+                entry,
+                ChatEntry::SystemMessage(text)
+                    if text.as_ref() == goal_failure_message(crate::wire::GoalFailureReason::ToolResultsUnpaired)
+            ));
+        }
     }
 
     #[test]
