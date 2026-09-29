@@ -1712,7 +1712,14 @@ impl GoalController {
             return Ok(None);
         }
         let Some(current_goal) = self.registry.get_goal_task(&current.id).await? else {
-            return Err(anyhow::anyhow!("Goal task extension is missing"));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"task_id": current.id})),
+                "Goal task extension is missing during status projection"
+            );
+            bail!("Goal task extension is missing");
         };
         let totals =
             mark_stale_totals_if_state_changed(totals, task, &current, &goal, &current_goal);
@@ -1739,9 +1746,14 @@ impl GoalController {
             return Ok(None);
         }
         let Some(goal) = self.registry.get_goal_task(&task.id).await? else {
-            return Err(anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"task_id": task.id})),
                 "Goal extension disappeared after fenced-tool classification"
-            ));
+            );
+            bail!("Goal extension disappeared after fenced-tool classification");
         };
         let Some(reader) = self.usage_totals_reader.as_ref() else {
             return Ok(Some(GoalStatusProjection::from_parts(&task, goal)));
@@ -1759,9 +1771,14 @@ impl GoalController {
             return Ok(None);
         }
         let Some(current_goal) = self.registry.get_goal_task(&current.id).await? else {
-            return Err(anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"task_id": current.id})),
                 "Goal extension disappeared after fenced-tool classification"
-            ));
+            );
+            bail!("Goal extension disappeared after fenced-tool classification");
         };
         let totals =
             mark_stale_totals_if_state_changed(totals, &task, &current, &goal, &current_goal);
