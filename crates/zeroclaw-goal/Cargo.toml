@@ -11,7 +11,6 @@ publish = true
 [dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-commands.workspace = true
-zeroclaw-config.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
