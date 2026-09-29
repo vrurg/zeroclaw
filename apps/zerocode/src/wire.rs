@@ -17,6 +17,25 @@ pub struct GoalStatusProjection {
     pub pause_reason: Option<String>,
     pub resumable: bool,
 }
+
+/// Hand-maintained wire mirror of the daemon's typed Goal failure reason.
+/// ZeroCode stays RPC-only; the daemon remains authoritative for classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalFailureReason {
+    AgentOperationFailed,
+    ToolResultsUnpaired,
+    EmptyAgentResponse,
+    VerifierOperationFailed,
+    VerifierResponseInvalid,
+    AccountingIncomplete,
+    PricingIncomplete,
+    OperationOutcomeUnknown,
+    ExecutorStartFailed,
+    ExecutorFailed,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "status", rename_all = "snake_case")]
 pub enum GoalResponse {
