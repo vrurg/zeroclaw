@@ -1264,6 +1264,120 @@ mod tests {
         assert_eq!(turn_usage.output_tokens, 0);
     }
 
+    struct CapturedGoalSettlement(Arc<Mutex<Vec<GoalOperationSettlement>>>);
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+            self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_attempts_do_not_enter_ordinary_recording_path() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "provider.first".to_string(),
+            HashMap::from([("model-a.input".to_string(), 1.0)]),
+        )]));
+        let context = ToolLoopCostTrackingContext::new(tracker, pricing);
+        let messages = vec![ChatMessage::user("hello")];
+        let attempts = AccountedChatScope::new();
+        let settlements = Arc::new(Mutex::new(Vec::new()));
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(CapturedGoalSettlement(Arc::clone(&settlements)));
+
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(context), async {
+                        attempts
+                            .scope(async {
+                                let failed = FailingWithUsageLeaf {
+                                    alias: "wrapper.first",
+                                };
+                                let _ = with_exact_dispatch_route(
+                                    "provider.first".to_string(),
+                                    "model-a".to_string(),
+                                    ProviderDispatch::from_ref(&failed).chat(
+                                        ChatRequest {
+                                            messages: &messages,
+                                            tools: None,
+                                            thinking: None,
+                                        },
+                                        "ignored",
+                                        None,
+                                    ),
+                                )
+                                .await;
+                                let fallback = NoUsageLeaf {
+                                    alias: "wrapper.second",
+                                };
+                                assert!(
+                                    with_exact_dispatch_route(
+                                        "provider.second".to_string(),
+                                        "model-b".to_string(),
+                                        ProviderDispatch::from_ref(&fallback).chat(
+                                            ChatRequest {
+                                                messages: &messages,
+                                                tools: None,
+                                                thinking: None,
+                                            },
+                                            "ignored",
+                                            None,
+                                        ),
+                                    )
+                                    .await
+                                    .is_ok()
+                                );
+                            })
+                            .await;
+                        let report = attempts.take();
+                        settle_provider_attempts(report.attempts(), Some(1))
+                            .await
+                            .expect("Goal-scoped physical attempts settle once");
+                    })
+                    .await;
+            })
+            .await;
+
+        let settlements = settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            crate::control_plane::GoalAccountingState::Missing
+        );
+        assert_eq!(settlements[0].events.len(), 1);
+        assert_eq!(settlements[0].events[0].provider_ref, "provider.first");
+        assert_eq!(settlements[0].events[0].model, "model-a");
+        assert_eq!(settlements[0].events[0].usage.input_tokens, Some(1_000_000));
+        drop(settlements);
+
+        assert!(
+            !workspace.path().join("state/costs.jsonl").exists(),
+            "Goal settlement must own this recording path without a duplicate ordinary record"
+        );
+    }
+
     #[test]
     fn goal_settlement_preserves_known_counts_from_invalid_usage() {
         let (event, state) = goal_usage_event_for_attempt(
