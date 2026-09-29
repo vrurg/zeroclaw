@@ -347,7 +347,6 @@ impl GoalExecutionSupervisor {
                     Arc::clone(&worker_failure_notice_published),
                 )
                 .await;
-            worker_checkpoint.close();
 
             // The engine normally records its own expected execution failures.
             // Acquisition and other unexpected failures can occur before that
@@ -367,12 +366,14 @@ impl GoalExecutionSupervisor {
                     &scope,
                     worker_driver.as_ref(),
                     &worker_ingress,
+                    &worker_checkpoint,
                     &worker_failure_notice_published,
                 )
                 .await
             {
                 log_failure_notice_delivery_failure(&scope);
             }
+            worker_checkpoint.close();
             let completion = result.map_err(|error| format!("{error:#}"));
             let _ = completion_tx.send(Some(completion));
         });
@@ -493,11 +494,13 @@ impl GoalExecutionSupervisor {
             {
                 self.engine.fail(&scope, "executor_start_failed").await?;
                 let failure_notice_published = Mutex::new(false);
+                let notice_checkpoint = GoalParentTurnCheckpoint::new();
                 if let Err(_error) = publish_failure_notice_if_terminal(
                     self.engine.as_ref(),
                     &scope,
                     submission.driver.as_ref(),
                     &submission.ingress,
+                    &notice_checkpoint,
                     &failure_notice_published,
                 )
                 .await
@@ -892,14 +895,7 @@ impl GoalExecutionSupervisor {
         let Some(worker) = worker else {
             return self.fenced_response(scope, None).await;
         };
-        let (
-            finalization,
-            mut completion,
-            checkpoint,
-            driver,
-            ingress,
-            failure_notice_published,
-        ) = {
+        let (finalization, mut completion, checkpoint, driver, ingress, failure_notice_published) = {
             let worker_guard = worker.lock().await;
             ensure!(
                 worker_guard.task_id == scope.task_id()
@@ -1057,6 +1053,7 @@ impl GoalExecutionSupervisor {
             scope,
             driver.as_ref(),
             &ingress,
+            &checkpoint,
             &failure_notice_published,
         )
         .await
@@ -1174,6 +1171,7 @@ async fn publish_failure_notice_if_terminal(
     scope: &GoalExecutionScope,
     driver: &dyn GoalSessionDriver,
     ingress: &GoalIngressContext,
+    checkpoint: &GoalParentTurnCheckpoint,
     published: &Mutex<bool>,
 ) -> Result<()> {
     let mut published = published.lock().await;
@@ -1200,7 +1198,7 @@ async fn publish_failure_notice_if_terminal(
     // the failed worker has released its original lease. This keeps notice
     // delivery on the native representation path and prevents stale-session
     // publication on ZeroCode reconnects.
-    let mut lease = driver.acquire_execution(ingress, scope).await?;
+    let mut lease = driver.acquire_execution(ingress, scope, checkpoint).await?;
     ensure!(
         lease.session_key() == ingress.session_key(),
         "Goal failure-notice lease does not match the admitted session"
