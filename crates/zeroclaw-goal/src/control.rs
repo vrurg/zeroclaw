@@ -9,6 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::accounting::GoalOperationAccountingFactory;
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult,
@@ -26,7 +27,6 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use crate::accounting::GoalOperationAccountingFactory;
 
 mod goal_execution;
 

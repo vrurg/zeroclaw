@@ -100,7 +100,19 @@ pub trait GoalUsagePricer: Send + Sync {
         provider_ref: &str,
         model: &str,
         usage: &TokenUsage,
-    ) -> anyhow::Result<zeroclaw_config::cost::types::TokenUsage>;
+    ) -> anyhow::Result<GoalUsagePrice>;
+}
+
+/// Pricing-only result returned by the runtime's existing provider-cost
+/// resolver. Token dimensions and model attribution remain sourced from the
+/// reported provider usage; runtime combines both into its canonical ledger
+/// record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoalUsagePrice {
+    pub cost_usd: f64,
+    pub unpriced_tokens: u64,
+    pub pricing_available: bool,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 /// A single admitted Goal-owned model operation can settle only after all
