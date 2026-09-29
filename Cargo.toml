@@ -40,6 +40,7 @@ directories = "6.0"
 sys-locale = "0.3"
 hmac = "0.12"
 zeroize = "1.8"
+num-format = "0.4.4"
 
 [package]
 name = "zeroclaw"
