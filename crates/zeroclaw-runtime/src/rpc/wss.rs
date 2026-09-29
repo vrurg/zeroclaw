@@ -2004,6 +2004,121 @@ mod accept_error_tests {
         tokio_tungstenite::Connector::Rustls(Arc::new(client_cfg))
     }
 
+    #[tokio::test]
+    async fn goal_status_uses_the_typed_session_goal_response_over_wss() {
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::dispatch::connection_test_support::insert_immediate_session_with_owner;
+        use crate::rpc::session::SessionStore;
+        use crate::rpc::types::SessionGoalResult;
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_goal::control::GoalResponse;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const SESSION_ID: &str = "goal-wss-transport";
+        const TUI_ID: &str = "goal-wss-tui";
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.gateway.paired_tokens = vec!["zc_tok".to_owned()];
+        config.goal.enabled = false;
+        let sessions = Arc::new(SessionStore::new(
+            64,
+            Arc::new(SessionActorQueue::new(4, 30, 60)),
+        ));
+        let ctx = RpcContext::minimal(config, sessions);
+        insert_immediate_session_with_owner(&ctx, tmp.path(), SESSION_ID, TUI_ID).await;
+
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
+        let ca_key_pem = std::fs::read_to_string(&materials.ca_key_path).unwrap();
+        let client =
+            zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key_pem, "goal-test-client").unwrap();
+        let acceptor = super::build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&ctx);
+        let server = zeroclaw_spawn::spawn!(super::serve_wss_listener(
+            server_ctx,
+            server_cancel,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acceptor,
+            listener,
+            super::WssLimits::default(),
+        ));
+
+        let connector = test_client_connector(&client.cert_pem, &client.key_pem);
+        let url = format!("wss://{addr}/");
+        let (websocket, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector)),
+        )
+        .await
+        .expect("WSS listener should accept the loopback test connection")
+        .expect("WSS handshake should succeed");
+        let (mut sink, mut stream) = websocket.split();
+
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(TUI_ID.to_owned()),
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: Some("zc_tok".to_owned()),
+            auth_provider: None,
+        };
+        sink.send(Message::Text(
+            rpc_request(Method::Initialize, &init, 1).into(),
+        ))
+        .await
+        .unwrap();
+        let initialized = read_response_with_id(&mut stream, 1).await;
+        assert!(
+            initialized["error"].is_null(),
+            "initialize failed: {initialized}"
+        );
+
+        sink.send(Message::Text(
+            rpc_request(
+                Method::SessionGoal,
+                &serde_json::json!({
+                    "session_id": SESSION_ID,
+                    "command": "/goal status",
+                }),
+                2,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let frame = read_response_with_id(&mut stream, 2).await;
+        assert!(frame["error"].is_null(), "Goal status failed: {frame}");
+        let result: SessionGoalResult = serde_json::from_value(frame["result"].clone()).unwrap();
+        assert_eq!(result.response, GoalResponse::Disabled);
+
+        cancel.cancel();
+        drop(sink);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("WSS listener should stop after cancellation")
+            .expect("WSS listener task should not panic")
+            .expect("WSS listener should stop cleanly");
+    }
+
     /// When the retiring generation releases its cleanup, relative to the
     /// listener's forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`).
     #[derive(Clone, Copy, PartialEq, Eq)]

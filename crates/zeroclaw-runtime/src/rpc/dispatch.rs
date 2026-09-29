@@ -12086,11 +12086,37 @@ pub(crate) mod connection_test_support {
         insert_session(ctx, path, IMMEDIATE_SID, Box::new(ImmediateProvider)).await;
     }
 
+    pub(crate) async fn insert_immediate_session_with_owner(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner_tui_id: &str,
+    ) {
+        insert_session_with_owner(
+            ctx,
+            path,
+            session_id,
+            Box::new(ImmediateProvider),
+            Some(owner_tui_id),
+        )
+        .await;
+    }
+
     pub(crate) async fn insert_session(
         ctx: &Arc<RpcContext>,
         path: &Path,
         session_id: &str,
         provider: Box<dyn ModelProvider>,
+    ) {
+        insert_session_with_owner(ctx, path, session_id, provider, None).await;
+    }
+
+    pub(crate) async fn insert_session_with_owner(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        provider: Box<dyn ModelProvider>,
+        owner_tui_id: Option<&str>,
     ) {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(provider)
@@ -12111,7 +12137,8 @@ pub(crate) mod connection_test_support {
                     "test-agent",
                     path.to_str().expect("test path should be UTF-8"),
                     crate::rpc::types::ChatMode::Chat,
-                ),
+                )
+                .with_owner(owner_tui_id.map(str::to_owned)),
             )
             .await
             .expect("connection lifecycle test session should insert");
