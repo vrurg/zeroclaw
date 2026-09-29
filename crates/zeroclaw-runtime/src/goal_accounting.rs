@@ -12,7 +12,7 @@ use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
     accounting::{
         GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
-        GoalOperationSettlement, GoalUsageEvent, GoalUsagePricer,
+        GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice, GoalUsagePricer,
     },
     task::{GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskGoal},
 };
@@ -33,7 +33,7 @@ impl ModelProviderGoalUsagePricer {
 }
 
 impl GoalUsagePricer for ModelProviderGoalUsagePricer {
-    fn price(&self, provider_ref: &str, model: &str, usage: &TokenUsage) -> Result<CostTokenUsage> {
+    fn price(&self, provider_ref: &str, model: &str, usage: &TokenUsage) -> Result<GoalUsagePrice> {
         let input = usage.input_tokens.context("usage has no input tokens")?;
         let output = usage.output_tokens.context("usage has no output tokens")?;
         ensure!(
@@ -47,7 +47,7 @@ impl GoalUsagePricer for ModelProviderGoalUsagePricer {
             cache_write <= input.saturating_sub(cached),
             "cache-write input exceeds uncached input tokens"
         );
-        Ok(cost_usage_with_pricing(
+        let priced = cost_usage_with_pricing(
             &self.pricing,
             provider_ref,
             model,
@@ -55,7 +55,13 @@ impl GoalUsagePricer for ModelProviderGoalUsagePricer {
             cached,
             cache_write,
             output,
-        ))
+        );
+        Ok(GoalUsagePrice {
+            cost_usd: priced.cost_usd,
+            unpriced_tokens: priced.unpriced_tokens,
+            pricing_available: priced.pricing_available,
+            timestamp: priced.timestamp,
+        })
     }
 }
 
@@ -223,21 +229,32 @@ impl GoalOperationAccountant {
         );
         ensure!(input != 0 || output != 0, "Goal usage is all zero");
 
-        let mut usage = self
+        let mut price = self
             .pricer
             .price(&event.provider_ref, &event.model, &event.usage)?;
         if !event.priceable {
             // Keep the observed token lower bound, but do not report a dollar
             // figure based on an invalid cache-token partition.
-            usage.cost_usd = 0.0;
-            usage.unpriced_tokens = usage.total_tokens;
-            usage.pricing_available = false;
+            price.cost_usd = 0.0;
+            price.unpriced_tokens = input + output;
+            price.pricing_available = false;
         }
         ensure!(
-            usage.cost_usd.is_finite() && usage.cost_usd >= 0.0,
+            price.cost_usd.is_finite() && price.cost_usd >= 0.0,
             "Goal usage cost is invalid"
         );
-        Ok(usage)
+        Ok(CostTokenUsage {
+            model: event.model.clone(),
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: event.usage.cached_input_tokens.unwrap_or(0),
+            cache_creation_input_tokens: event.usage.cache_creation_input_tokens.unwrap_or(0),
+            total_tokens: input + output,
+            cost_usd: price.cost_usd,
+            unpriced_tokens: price.unpriced_tokens,
+            pricing_available: price.pricing_available,
+            timestamp: price.timestamp,
+        })
     }
 
     async fn record_events(&self, events: Vec<(GoalUsageEvent, CostTokenUsage)>) -> Result<()> {
@@ -546,7 +563,12 @@ mod tests {
                 events: vec![GoalUsageEvent {
                     provider_ref: "fallback".to_owned(),
                     model: "model".to_owned(),
-                    usage: usage(10, 5),
+                    usage: TokenUsage {
+                        input_tokens: Some(1_200),
+                        output_tokens: Some(500),
+                        cached_input_tokens: Some(200),
+                        cache_creation_input_tokens: Some(300),
+                    },
                     priceable: true,
                 }],
             })
@@ -562,7 +584,7 @@ mod tests {
                 .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
                 .unwrap()
                 .0,
-            15
+            1_700
         );
         let contents = std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
             .expect("settled usage record is durable");
@@ -570,7 +592,16 @@ mod tests {
             serde_json::from_str(contents.lines().next().expect("one cost record")).unwrap();
         assert_eq!(record.provider_ref.as_deref(), Some("fallback"));
         assert_eq!(record.task_id.as_deref(), Some(scope.task_id()));
-        assert_eq!(record.usage.total_tokens, 15);
+        assert_eq!(record.usage.model, "model");
+        assert_eq!(record.usage.input_tokens, 1_200);
+        assert_eq!(record.usage.output_tokens, 500);
+        assert_eq!(record.usage.cached_input_tokens, 200);
+        assert_eq!(record.usage.cache_creation_input_tokens, 300);
+        assert_eq!(record.usage.total_tokens, 1_700);
+        let expected_cost = (700.0 + 300.0 * 1.5 + 200.0 * 0.5 + 500.0 * 2.0) / 1_000_000.0;
+        assert!((record.usage.cost_usd - expected_cost).abs() < 1e-12);
+        assert_eq!(record.usage.unpriced_tokens, 0);
+        assert!(record.usage.pricing_available);
     }
 
     #[tokio::test]
@@ -749,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_pricer_preserves_existing_cache_bands() {
+    fn injected_pricer_preserves_existing_cost_and_pricing_projection() {
         let mut rates = HashMap::new();
         rates.insert("model.input".to_owned(), 1.0);
         rates.insert("model.output".to_owned(), 2.0);
@@ -771,8 +802,8 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(priced.cache_creation_input_tokens, 300);
         assert!(priced.pricing_available);
+        assert_eq!(priced.unpriced_tokens, 0);
         let expected = (700.0 + 300.0 * 1.5 + 200.0 * 0.5 + 500.0 * 2.0) / 1_000_000.0;
         assert!((priced.cost_usd - expected).abs() < 1e-12);
     }
