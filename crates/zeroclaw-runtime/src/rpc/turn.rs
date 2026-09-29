@@ -415,6 +415,10 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    type SessionContext = (Option<String>, Option<String>);
+    type SessionContextObservation = Arc<std::sync::Mutex<Option<SessionContext>>>;
+    type SessionContextHistory = Arc<std::sync::Mutex<Vec<SessionContext>>>;
+
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {
         std::future::ready(())
     }
@@ -970,7 +974,7 @@ mod tests {
         // usage on the non-streaming `chat` path (the default the engine takes
         // when the provider does not advertise streaming).
         struct UsageProvider {
-            session_context_seen: Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>,
+            session_context_seen: SessionContextObservation,
         }
 
         #[async_trait]
@@ -1132,7 +1136,7 @@ mod tests {
 
         struct ScriptedProvider {
             responses: std::sync::Mutex<Vec<ChatResponse>>,
-            session_context_seen: Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+            session_context_seen: SessionContextHistory,
         }
 
         #[async_trait]
