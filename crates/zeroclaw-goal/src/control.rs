@@ -47,7 +47,8 @@ pub use goal_execution::{
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 pub use policy::{
-    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
+    GoalAgentPolicySnapshot, GoalPolicyDecision, GoalPolicyRevocation, GoalPolicySnapshot,
+    classify_goal_policy, revoke_goals_under_policy,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
