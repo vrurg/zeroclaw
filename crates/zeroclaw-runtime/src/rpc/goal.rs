@@ -22,7 +22,7 @@ use crate::{
     cost::CostTracker,
     goal_accounting::{
         ModelProviderGoalUsagePricer, RuntimeGoalDiagnosticTextGuard,
-        RuntimeGoalOperationAccountingFactory,
+        RuntimeGoalOperationAccountingFactory, RuntimeGoalUsageTotalsReader,
     },
     rpc::context::RpcContext,
 };
@@ -1222,11 +1222,13 @@ impl RpcGoalRuntime {
             let supervisor = match self.supervisor(&session_id).await {
                 Some(supervisor) => supervisor,
                 None => {
-                    let runtime = GoalRuntime::new(Arc::clone(&registry));
                     let tracker = CostTracker::get_or_init_global_required(
                         config.cost.clone(),
                         &config.data_dir,
                     )?;
+                    let runtime = GoalRuntime::new(Arc::clone(&registry)).with_usage_totals_reader(
+                        Arc::new(RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))),
+                    );
                     let pricer = Arc::new(ZeroCodeGoalUsagePricer {
                         config: Arc::clone(&context.config),
                     });
