@@ -837,7 +837,7 @@ impl GoalExecutionSupervisor {
         let Some(worker) = worker else {
             return self.fenced_response(scope, None).await;
         };
-        let (finalization, mut completion) = {
+        let (finalization, mut completion, checkpoint) = {
             let worker_guard = worker.lock().await;
             ensure!(
                 worker_guard.task_id == scope.task_id()
@@ -847,8 +847,26 @@ impl GoalExecutionSupervisor {
             (
                 Arc::clone(&worker_guard.lifecycle_finalization),
                 worker_guard.completion.clone(),
+                worker_guard.checkpoint.clone(),
             )
         };
+        let current = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?;
+        let exact_epoch_is_still_running = current.as_ref().is_some_and(|task| {
+            task.id == scope.task_id()
+                && task.execution_epoch == scope.execution_epoch()
+                && task.status == TaskStatus::Running
+        });
+        if !exact_epoch_is_still_running {
+            // A reserved session replacement/removal may be ahead of this
+            // worker in the ordinary foreground queue. Fence only its pending
+            // lease admission; an acquired lease and its logical operation
+            // remain untouched and can settle before this drain completes.
+            checkpoint.close();
+        }
         let _finalization = finalization.lock().await;
         let still_registered = {
             let workers = self.workers.lock().await;
@@ -1069,7 +1087,11 @@ impl GoalExecutionEngine {
             return Ok(GoalExecutionOutcome::Fenced);
         };
         let accountant = self.accounting_factory.for_scope(scope.clone());
-        let mut lease = match self.runtime.acquire_execution(settings, request).await {
+        let mut lease = match self
+            .runtime
+            .acquire_execution(settings, request, &checkpoint)
+            .await
+        {
             Ok(lease) => lease,
             Err(error) => {
                 if self.exact_running_task_or_fenced(&scope).await?.is_none() {
