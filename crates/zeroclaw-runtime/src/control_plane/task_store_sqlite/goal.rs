@@ -2066,8 +2066,9 @@ mod tests {
 
         let mut successor = zeroclaw_config::schema::Config::default();
         successor.goal.enabled = false;
+        let policy = crate::daemon::goal_policy_snapshot(&successor);
         assert_eq!(
-            zeroclaw_goal::control::revoke_goals_under_policy(&store, &successor)
+            zeroclaw_goal::control::revoke_goals_under_policy(&store, &policy)
                 .await
                 .unwrap(),
             vec![zeroclaw_goal::control::GoalPolicyRevocation::GoalModeDisabled]
