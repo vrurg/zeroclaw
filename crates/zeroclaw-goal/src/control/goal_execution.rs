@@ -1177,28 +1177,20 @@ impl GoalExecutionSupervisor {
                 GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
             }
         }
-        let Some(current) = self
+        let Some(projection) = self
             .engine
-            .registry
-            .current_goal_for_session(scope.session_id())
+            .runtime
+            .controller
+            .project_execution_scope(scope)
             .await?
         else {
             return Ok(None);
         };
-        if current.id != scope.task_id() {
-            return Ok(None);
-        }
-        let goal = self
-            .engine
-            .registry
-            .get_goal_task(&current.id)
-            .await?
-            .context("Goal extension disappeared after fenced-tool classification")?;
-        let projection = super::GoalStatusProjection::from_parts(&current, goal);
-        Ok(Some(match current.status {
+        let status = projection.status;
+        Ok(Some(match status {
             TaskStatus::Paused => GoalResponse::Paused(projection),
             TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
-            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
+            _ if status.is_terminal() => GoalResponse::Terminal(projection),
             _ => GoalResponse::Stale,
         }))
     }
