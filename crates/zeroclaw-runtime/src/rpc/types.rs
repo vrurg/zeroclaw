@@ -317,6 +317,10 @@ rpc_type! {
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
+        Failed {
+            session_id: String,
+            reason: zeroclaw_goal::control::GoalFailureReason,
+        },
         Lifecycle {
             session_id: String,
             response: zeroclaw_goal::control::GoalResponse,
@@ -1835,6 +1839,24 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
             ChatMode::Acp
+        );
+    }
+
+    #[test]
+    fn session_goal_failure_serializes_stable_client_payload() {
+        let update = SessionGoalUpdate::Failed {
+            session_id: "sess-1".into(),
+            reason: zeroclaw_goal::control::GoalFailureReason::ToolResultsUnpaired,
+        };
+
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            })
         );
     }
 
