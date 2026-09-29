@@ -13,10 +13,11 @@ use zeroclaw_api::{
 };
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
+    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason,
+    GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierAttribution, GoalVerifierResult,
+    GoalVerifierTurn,
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
@@ -1387,6 +1388,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         let key = match notice {
             GoalExecutionNotice::Completed => "goal-mode-completed",
             GoalExecutionNotice::PausedForBlocker => "goal-mode-paused-blocked",
+            GoalExecutionNotice::Failed(reason) => matrix_goal_failure_key(reason),
         };
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
@@ -1400,9 +1402,44 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 }
 
+fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
+    match reason {
+        GoalFailureReason::AgentOperationFailed => "goal-mode-failure-agent-operation",
+        GoalFailureReason::ToolResultsUnpaired => "goal-mode-failure-tool-results-unpaired",
+        GoalFailureReason::EmptyAgentResponse => "goal-mode-failure-empty-agent-response",
+        GoalFailureReason::VerifierOperationFailed => "goal-mode-failure-verifier-operation",
+        GoalFailureReason::VerifierResponseInvalid => "goal-mode-failure-verifier-response",
+        GoalFailureReason::AccountingIncomplete => "goal-mode-failure-accounting",
+        GoalFailureReason::PricingIncomplete => "goal-mode-failure-pricing",
+        GoalFailureReason::OperationOutcomeUnknown => "goal-mode-failure-outcome-unknown",
+        GoalFailureReason::ExecutorStartFailed => "goal-mode-failure-executor-start",
+        GoalFailureReason::ExecutorFailed => "goal-mode-failure-executor",
+        GoalFailureReason::Other => "goal-mode-failure-other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_goal_failure_reason_uses_a_fluent_key() {
+        for reason in [
+            GoalFailureReason::AgentOperationFailed,
+            GoalFailureReason::ToolResultsUnpaired,
+            GoalFailureReason::EmptyAgentResponse,
+            GoalFailureReason::VerifierOperationFailed,
+            GoalFailureReason::VerifierResponseInvalid,
+            GoalFailureReason::AccountingIncomplete,
+            GoalFailureReason::PricingIncomplete,
+            GoalFailureReason::OperationOutcomeUnknown,
+            GoalFailureReason::ExecutorStartFailed,
+            GoalFailureReason::ExecutorFailed,
+            GoalFailureReason::Other,
+        ] {
+            assert!(matrix_goal_failure_key(reason).starts_with("goal-mode-failure-"));
+        }
+    }
 
     #[test]
     fn matrix_stop_only_maps_a_running_goal_to_immediate_pause() {
