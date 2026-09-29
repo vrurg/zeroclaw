@@ -1399,7 +1399,13 @@ mod tests {
             GoalFailureReason::ExecutorFailed,
             GoalFailureReason::Other,
         ] {
-            assert!(matrix_goal_failure_key(reason).starts_with("goal-mode-failure-"));
+            let key = matrix_goal_failure_key(reason);
+            assert!(key.starts_with("goal-mode-failure-"));
+            assert_ne!(
+                zeroclaw_runtime::i18n::get_required_cli_string(key),
+                format!("{{{key}}}"),
+                "missing Fluent message for {key}"
+            );
         }
     }
 
