@@ -5,9 +5,14 @@
 //! their existing owners.
 
 pub mod accounting;
+pub mod checkpoint;
 pub mod control;
 pub mod task;
 
+pub use checkpoint::{
+    GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint,
+    GoalParentTurnOperation, GoalParentTurnTicketId,
+};
 pub use control::{
     GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionOutcome,
     GoalExecutionRequest, GoalExecutionRestartCoordinator, GoalExecutionScope,
