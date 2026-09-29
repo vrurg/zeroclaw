@@ -2560,11 +2560,7 @@ async fn parent_core_error_remains_visible_when_tool_pairing_also_fails() {
     ));
 
     let error = engine
-        .run(
-            &settings,
-            request,
-            zeroclaw_goal::GoalParentTurnCheckpoint::new(),
-        )
+        .run(&settings, request, GoalParentTurnCheckpoint::new())
         .await
         .expect_err("the failed parent/tool pairing must fail the Goal");
     let details = format!("{error:#}");
