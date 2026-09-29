@@ -1,4 +1,5 @@
 use fluent::{FluentArgs, FluentResource, concurrent::FluentBundle};
+use num_format::{Locale as NumberLocale, ToFormattedString};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -81,6 +82,50 @@ pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
     }
     record_missing(key);
     format!("{{{key}}}")
+}
+
+/// Format a token count using the active UI locale's CLDR grouping rules.
+pub fn format_grouped_integer(value: u64) -> String {
+    format_grouped_integer_for_locale(value, active_locale())
+}
+
+/// Format a USD amount with locale-aware grouping and decimal punctuation.
+/// Six fractional digits match Goal's existing cost-limit precision.
+pub fn format_grouped_usd(value: f64) -> Option<String> {
+    format_grouped_usd_for_locale(value, active_locale())
+}
+
+fn number_locale(locale: &str) -> NumberLocale {
+    let normalized = normalize_locale(locale);
+    let exact = normalized.replace('-', "_");
+    NumberLocale::from_name(&exact)
+        .or_else(|_| NumberLocale::from_name(normalized.split('-').next().unwrap_or("en")))
+        .unwrap_or(NumberLocale::en)
+}
+
+fn format_grouped_integer_for_locale(value: u64, locale: &str) -> String {
+    value.to_formatted_string(&number_locale(locale))
+}
+
+fn format_grouped_usd_for_locale(value: f64, locale: &str) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    let locale = number_locale(locale);
+    let sign = if value.is_sign_negative() {
+        locale.minus_sign()
+    } else {
+        ""
+    };
+    let fixed = format!("{:.6}", value.abs());
+    let (whole, fraction) = fixed.split_once('.')?;
+    let whole = whole.parse::<u64>().ok()?;
+    Some(format!(
+        "{sign}{}{decimal}{fraction}",
+        whole.to_formatted_string(&locale),
+        decimal = locale.decimal(),
+    ))
 }
 
 pub fn detect_locale() -> String {
@@ -828,6 +873,27 @@ mod tests {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
         assert_eq!(normalize_locale("fr"), "fr");
+    }
+
+    #[test]
+    fn goal_usage_numbers_follow_the_selected_locale() {
+        assert_eq!(
+            format_grouped_integer_for_locale(59_875_761, "en-US"),
+            "59,875,761"
+        );
+        assert_eq!(
+            format_grouped_integer_for_locale(59_875_761, "de-DE"),
+            "59.875.761"
+        );
+        assert_eq!(
+            format_grouped_usd_for_locale(12.3456, "en-US").as_deref(),
+            Some("12.345600")
+        );
+        assert_eq!(
+            format_grouped_usd_for_locale(12.3456, "de-DE").as_deref(),
+            Some("12,345600")
+        );
+        assert!(format_grouped_usd_for_locale(f64::INFINITY, "en-US").is_none());
     }
 
     #[test]
