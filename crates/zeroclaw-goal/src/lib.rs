@@ -16,8 +16,8 @@ pub use checkpoint::{
 pub use control::{
     GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionNotice,
     GoalExecutionOutcome, GoalExecutionRequest, GoalExecutionRestartCoordinator,
-    GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalFailureReason,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalPendingAction, GoalResponse, GoalRuntime,
     GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
     GoalSessionKey, GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSurface,
