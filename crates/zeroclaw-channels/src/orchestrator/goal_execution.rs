@@ -18,7 +18,7 @@ use zeroclaw_goal::{
     GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason,
     GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
     GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierAttribution, GoalVerifierResult,
-    GoalVerifierTurn,
+    GoalVerifierTurn, checkpoint::GoalParentTurnCheckpoint,
 };
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
@@ -106,6 +106,17 @@ impl MatrixGoalSessionDriver {
             }
             _ => bail!("Goal ingress principal is stale"),
         }
+    }
+}
+
+async fn acquire_goal_foreground_lease(
+    foreground_lock: Arc<tokio::sync::Mutex<()>>,
+    checkpoint: &GoalParentTurnCheckpoint,
+) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::select! {
+        biased;
+        _ = checkpoint.wait_closed() => bail!("Goal execution was fenced before foreground admission"),
+        foreground = foreground_lock.lock_owned() => Ok(foreground),
     }
 }
 
@@ -732,16 +743,16 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
         &self,
         ingress: &GoalIngressContext,
         scope: &GoalExecutionScope,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.assert_ingress(ingress)?;
         ensure!(
             scope.session_id() == self.session_key.durable_id(),
             "Goal execution session is stale"
         );
-        let foreground =
-            foreground_lock(&self.context.persist_locks, &self.session_key.durable_id())
-                .lock_owned()
-                .await;
+        let foreground_lock =
+            foreground_lock(&self.context.persist_locks, &self.session_key.durable_id());
+        let foreground = acquire_goal_foreground_lease(foreground_lock, checkpoint).await?;
         Ok(Box::new(MatrixGoalExecutionLease {
             _foreground: foreground,
             context: Arc::clone(&self.context),
@@ -1540,6 +1551,34 @@ mod tests {
                 .peek(key)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_fence_cancels_only_a_waiting_foreground_admission() {
+        let foreground_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = foreground_lock.clone().lock_owned().await;
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let waiter_checkpoint = checkpoint.clone();
+        let mut waiter = zeroclaw_spawn::spawn!(async move {
+            acquire_goal_foreground_lease(foreground_lock, &waiter_checkpoint).await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "foreground admission should remain pending while another turn owns the lease"
+        );
+        checkpoint.close();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+                .await
+                .expect("checkpoint closure must wake the lease waiter")
+                .expect("lease waiter must not panic")
+                .is_err(),
+            "a fenced Goal must not acquire the foreground lease"
+        );
+        drop(held);
     }
 
     #[tokio::test]
