@@ -401,6 +401,19 @@ mod tests {
         TempDir,
     ) {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        fixture_with_store(store, TempDir::new().unwrap()).await
+    }
+
+    async fn fixture_with_store(
+        store: Arc<SqliteTaskStore>,
+        directory: TempDir,
+    ) -> (
+        Arc<SqliteTaskStore>,
+        RuntimeGoalOperationAccountingFactory,
+        Arc<CostTracker>,
+        GoalExecutionScope,
+        TempDir,
+    ) {
         let scope =
             GoalExecutionScope::new("goal-accounting", "matrix_goal-accounting", 1).unwrap();
         let task = TaskRecord {
@@ -436,7 +449,6 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let directory = TempDir::new().unwrap();
         let tracker = Arc::new(
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig {
@@ -559,6 +571,79 @@ mod tests {
         assert_eq!(record.provider_ref.as_deref(), Some("fallback"));
         assert_eq!(record.task_id.as_deref(), Some(scope.task_id()));
         assert_eq!(record.usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn ledger_persistence_failure_preserves_durable_pending_operation() {
+        let directory = TempDir::new().unwrap();
+        let control_plane_dir = directory.path().join("control");
+        let store = Arc::new(SqliteTaskStore::new(&control_plane_dir).unwrap());
+        let (store, factory, _tracker, scope, directory) =
+            fixture_with_store(store, directory).await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let admitted = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        let pending_call_id = admitted
+            .pending_call_id
+            .clone()
+            .expect("admission must persist a pending operation");
+
+        // A directory at the JSONL path deterministically rejects ledger
+        // persistence without changing the already-durable task marker.
+        std::fs::create_dir(directory.path().join("state/costs.jsonl")).unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(41, 2),
+                    priceable: true,
+                }],
+            })
+            .await
+            .expect_err("ledger persistence failure must not settle the operation");
+        assert!(format!("{error:#}").contains("cost storage"));
+
+        let after_failure = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(
+            after_failure.pending_call_id.as_deref(),
+            Some(pending_call_id.as_str())
+        );
+        assert_eq!(
+            after_failure.pending_call_epoch,
+            Some(scope.execution_epoch())
+        );
+        assert_eq!(
+            after_failure.accounting_state,
+            GoalAccountingState::Complete
+        );
+
+        let next_error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect_err("a pending operation must fence the next model call");
+        assert!(next_error.to_string().contains("pending operation"));
+        drop(accountant);
+        drop(factory);
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(&directory.path().join("control")).unwrap();
+        let durable = reopened
+            .get_goal_task(scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.pending_call_id.as_deref(),
+            Some(pending_call_id.as_str())
+        );
+        assert_eq!(durable.pending_call_epoch, Some(scope.execution_epoch()));
+        assert_eq!(durable.accounting_state, GoalAccountingState::Complete);
+        drop(reopened);
     }
 
     #[tokio::test]
