@@ -915,6 +915,11 @@ pub async fn run(
             ),
             event_tx: Some(event_tx.clone()),
             event_history: Some(std::sync::Arc::clone(event_bus.history())),
+            subscriptions: {
+                let hub = std::sync::Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+                hub.attach_bus(&event_tx);
+                hub
+            },
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
@@ -2255,6 +2260,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                        task: "heartbeat:decision".to_string(),
+                    }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
@@ -2376,6 +2384,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    // Heartbeat tasks have no runtime-owned id (their text is
+                    // model-maintained content, which never enters the
+                    // principal), so the stamp names the pipeline phase.
+                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                        task: "heartbeat:execute".to_string(),
+                    }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
