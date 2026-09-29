@@ -31,7 +31,7 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
     else {
         return;
     };
-    let submission = match submission {
+    let submission = match *submission {
         GoalControlAdmission::Direct(submission) => GoalControlAdmission::Direct(submission),
         GoalControlAdmission::Queued { deferred, .. } => {
             let ready = match deferred.wait().await {
@@ -87,7 +87,7 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
                 supervisor_slot,
                 settings,
                 context,
-                submission: GoalControlAdmission::Direct(commit.release()),
+                submission: Box::new(GoalControlAdmission::Direct(commit.release())),
                 history_key,
             };
             if let Err(error) = delivery {
@@ -109,7 +109,7 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
         supervisor_slot,
         settings,
         context,
-        submission,
+        submission: Box::new(submission),
         history_key,
     };
     finish_after_response(command, channel.as_ref(), &message, false).await;

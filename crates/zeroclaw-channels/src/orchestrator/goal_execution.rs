@@ -147,7 +147,7 @@ pub(super) enum MatrixGoalCommandSubmission {
         supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
         settings: GoalHostSettings,
         context: Arc<ChannelRuntimeContext>,
-        submission: GoalControlAdmission,
+        submission: Box<GoalControlAdmission>,
         history_key: String,
     },
 }
@@ -156,7 +156,7 @@ impl MatrixGoalCommandSubmission {
     pub(super) fn response(&self) -> &GoalResponse {
         match self {
             Self::Immediate(response) => response,
-            Self::Deferred { submission, .. } => match submission {
+            Self::Deferred { submission, .. } => match submission.as_ref() {
                 GoalControlAdmission::Direct(submission) => submission.response(),
                 GoalControlAdmission::Queued { response, .. } => response,
             },
@@ -173,7 +173,7 @@ impl MatrixGoalCommandSubmission {
                 submission,
                 ..
             } => {
-                let GoalControlAdmission::Direct(submission) = submission else {
+                let GoalControlAdmission::Direct(submission) = submission.as_mut() else {
                     bail!("Goal deferred control must commit before launch handoff");
                 };
                 supervisor
@@ -220,7 +220,7 @@ impl MatrixGoalCommandSubmission {
                 submission,
                 ..
             } => {
-                match submission {
+                match *submission {
                     GoalControlAdmission::Direct(mut submission) => {
                         supervisor
                             .pause_before_launch(
@@ -481,7 +481,7 @@ async fn submit_matrix_goal_with_command_lease(
             supervisor_slot,
             settings,
             context,
-            submission,
+            submission: Box::new(submission),
             history_key,
         });
     }
