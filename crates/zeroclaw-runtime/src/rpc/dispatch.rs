@@ -3772,36 +3772,57 @@ impl RpcDispatcher {
             }
         }
 
+        // Reserve this request's FIFO session position before Goal lifecycle
+        // serialization. Disposal may need an admitted Goal turn to settle, so
+        // waiting for the actor permit must remain after disposal; the
+        // reservation prevents later session requests from overtaking while
+        // the lifecycle boundary is acquired.
+        let session_admission = self
+            .ctx
+            .sessions
+            .session_queue
+            .reserve(&session_id)
+            .await
+            .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+
         // A cross-mode replacement invalidates the old session's Goal
-        // binding. Serialize its disposal with Goal commands before taking the
-        // actor permit: disposal may need the active Goal worker to finish an
-        // admitted turn, and holding the permit here would deadlock that drain.
+        // binding. Serialize its disposal with Goal commands before awaiting
+        // the reserved actor permit, because disposal may need the active Goal
+        // worker to finish an already-admitted turn.
         let _replacement_goal_lifecycle_guard = if let Some(snapshot) =
             self.ctx.sessions.goal_session_snapshot(&session_id).await
             && snapshot.chat_mode != chat_mode
         {
             let generation = snapshot.generation;
-            let guard = self
+            if let Some(guard) = self
                 .ctx
                 .sessions
                 .lock_goal_lifecycle(&session_id, generation)
                 .await
-                .ok_or_else(|| rpc_err(SESSION_BUSY, "Session changed before Goal disposal"))?;
-            self.ctx
-                .goal_runtime
-                .dispose_session(&session_id)
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-            Some(guard)
+            {
+                self.ctx
+                    .goal_runtime
+                    .dispose_session(&session_id)
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                Some(guard)
+            } else {
+                // An earlier same-target replacement may have changed the
+                // captured generation while this request waited for the
+                // lifecycle lock. Keep this request's queue position and
+                // decide against the admitted incarnation below; never dispose
+                // that successor through the stale snapshot.
+                None
+            }
         } else {
             None
         };
 
         // Session replacement and prompt execution share one admission
-        // permit. Acquire it BEFORE any durable state is read so the whole
-        // incarnation — transcript load, Agent build, publish, history
-        // restore — runs after the previous same-ID turn has fully
-        // finalized its durable writes. In particular the ACP transcript
+        // permit. Acquire the reserved position BEFORE any durable state is
+        // read so the whole incarnation — transcript load, Agent build,
+        // publish, history restore — runs after the previous same-ID turn has
+        // fully finalized its durable writes. In particular the ACP transcript
         // load below must not observe a predecessor's pre-turn snapshot.
         // The same-mode reconnect above is exempt by design: it rebinds the
         // existing live incarnation and reads no durable state.
@@ -3812,11 +3833,8 @@ impl RpcDispatcher {
         // place. Publishing goes through `insert_admitted` (which does NOT
         // re-acquire the permit) rather than `insert`, so the permit-1
         // per-session semaphore is never acquired twice.
-        let _admission = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
+        let _admission = session_admission
+            .acquire()
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
@@ -4751,6 +4769,13 @@ impl RpcDispatcher {
         self.ctx
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
+        let session_admission = self
+            .ctx
+            .sessions
+            .session_queue
+            .reserve(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
         let _goal_lifecycle_guard = match requested_generation {
             Some(generation) => Some(
                 self.ctx
@@ -4768,11 +4793,8 @@ impl RpcDispatcher {
             .dispose_session(&req.session_id)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&req.session_id)
+        let _guard = session_admission
+            .acquire()
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
@@ -4909,6 +4931,18 @@ impl RpcDispatcher {
             .sessions
             .signal_session_kill_for_generation(sid, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        let live_session_admission = if requested_generation.is_some() {
+            Some(
+                self.ctx
+                    .sessions
+                    .session_queue
+                    .reserve(sid)
+                    .await
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+            )
+        } else {
+            None
+        };
         // For a reaped durable session, serialize Goal disposal with any
         // same-ID restoration, then prove the authorized durable row is still
         // the target. Live generations keep fence-before-drain ordering:
@@ -4972,15 +5006,14 @@ impl RpcDispatcher {
             .dispose_session(sid)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let _guard = match reaped_session_guard {
-            Some(guard) => guard,
-            None => self
-                .ctx
-                .sessions
-                .session_queue
-                .acquire(sid)
+        let _guard = if let Some(guard) = reaped_session_guard {
+            guard
+        } else {
+            live_session_admission
+                .expect("live session must reserve admission before lifecycle disposal")
+                .acquire()
                 .await
-                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?
         };
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
@@ -7540,6 +7573,18 @@ impl RpcDispatcher {
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        let live_session_admission = if requested_generation.is_some() {
+            Some(
+                self.ctx
+                    .sessions
+                    .session_queue
+                    .reserve(&req.session_id)
+                    .await
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+            )
+        } else {
+            None
+        };
         // A reaped durable session has no generation-owned Goal lock. Take
         // its ordinary actor permit before touching Goal state so a same-ID
         // session/new cannot publish a successor between validation and
@@ -7611,15 +7656,14 @@ impl RpcDispatcher {
             .dispose_session(&req.session_id)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let _guard = match reaped_session_guard {
-            Some(guard) => guard,
-            None => self
-                .ctx
-                .sessions
-                .session_queue
-                .acquire(&req.session_id)
+        let _guard = if let Some(guard) = reaped_session_guard {
+            guard
+        } else {
+            live_session_admission
+                .expect("live session must reserve admission before lifecycle disposal")
+                .acquire()
                 .await
-                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?
         };
 
         let record = match self
