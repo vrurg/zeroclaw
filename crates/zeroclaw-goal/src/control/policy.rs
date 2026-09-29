@@ -7,7 +7,7 @@
 //! text on their own.
 
 use anyhow::{Result, ensure};
-use zeroclaw_config::schema::Config;
+use std::collections::HashMap;
 
 use crate::{
     control::GoalSessionKey,
@@ -22,6 +22,23 @@ pub enum GoalPolicyRevocation {
     AgentUnavailable,
     MatrixChannelUnavailable,
     UnsupportedRoute,
+}
+
+/// Config-independent projection of the successor policy used to classify
+/// session-bound Goals. The runtime builds this value from its validated
+/// configuration; Goal policy never depends on the config schema crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPolicySnapshot {
+    pub goal_mode_enabled: bool,
+    pub agents: HashMap<String, GoalAgentPolicySnapshot>,
+    pub matrix_channels: HashMap<String, bool>,
+}
+
+/// The subset of an agent's validated policy relevant to Goal continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalAgentPolicySnapshot {
+    pub enabled: bool,
+    pub channels: Vec<String>,
 }
 
 /// One observed Goal and the policy consequence selected from a prospective
@@ -41,12 +58,15 @@ pub enum GoalPolicyDecision {
 /// V1 only supports Matrix and ZeroCode ingress. Unknown, malformed, or
 /// removed routes fail closed rather than retaining a Goal that a successor
 /// runtime cannot safely authorize.
-pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPolicyDecision> {
+pub fn classify_goal_policy(
+    successor: &GoalPolicySnapshot,
+    task: &TaskRecord,
+) -> Result<GoalPolicyDecision> {
     let target = policy_target(task)?;
-    if !config.goal.enabled {
+    if !successor.goal_mode_enabled {
         return Ok(revoked(target, GoalPolicyRevocation::GoalModeDisabled));
     }
-    let Some(agent) = config.agents.get(&task.agent) else {
+    let Some(agent) = successor.agents.get(&task.agent) else {
         return Ok(revoked(target, GoalPolicyRevocation::AgentUnavailable));
     };
     if !agent.enabled {
@@ -66,14 +86,13 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
     let Some((alias, reply_target)) = matrix_route(route) else {
         return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
     };
-    let Some(matrix) = config.channels.matrix.get(alias) else {
-        return Ok(revoked(
-            target,
-            GoalPolicyRevocation::MatrixChannelUnavailable,
-        ));
-    };
+    let matrix_enabled = successor
+        .matrix_channels
+        .get(alias)
+        .copied()
+        .unwrap_or(false);
     let required_channel = format!("matrix.{alias}");
-    if !matrix.enabled
+    if !matrix_enabled
         || !agent
             .channels
             .iter()
@@ -96,7 +115,7 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
 /// cutover.
 pub async fn revoke_goals_under_policy(
     registry: &dyn GoalTaskRegistry,
-    successor: &Config,
+    successor: &GoalPolicySnapshot,
 ) -> Result<Vec<GoalPolicyRevocation>> {
     let observed = registry.list_nonterminal_session_goals().await?;
     let mut targets = Vec::new();
@@ -164,10 +183,6 @@ fn matrix_route(route: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::{
-        providers::ChannelRef,
-        schema::{AliasedAgentConfig, MatrixConfig},
-    };
     fn task(route: &str) -> TaskRecord {
         let session_id = route
             .strip_prefix("zerocode:")
@@ -196,25 +211,23 @@ mod tests {
         }
     }
 
-    fn config() -> Config {
-        let mut config = Config::default();
-        config.goal.enabled = true;
-        let mut agent = AliasedAgentConfig::default();
-        agent.channels.push(ChannelRef::new("matrix.main"));
-        config.agents.insert("main".into(), agent);
-        config.channels.matrix.insert(
-            "main".into(),
-            MatrixConfig {
-                enabled: true,
-                ..MatrixConfig::default()
-            },
-        );
-        config
+    fn policy() -> GoalPolicySnapshot {
+        GoalPolicySnapshot {
+            goal_mode_enabled: true,
+            agents: HashMap::from([(
+                "main".to_owned(),
+                GoalAgentPolicySnapshot {
+                    enabled: true,
+                    channels: vec!["matrix.main".to_owned()],
+                },
+            )]),
+            matrix_channels: HashMap::from([("main".to_owned(), true)]),
+        }
     }
 
     #[test]
     fn successor_policy_revokes_only_removed_goal_scopes() {
-        let mut successor = config();
+        let mut successor = policy();
         assert_eq!(
             classify_goal_policy(&successor, &task("matrix:main:!room:example")).unwrap(),
             GoalPolicyDecision::Keep
@@ -223,7 +236,7 @@ mod tests {
             classify_goal_policy(&successor, &task("zerocode:local-session")).unwrap(),
             GoalPolicyDecision::Keep
         );
-        successor.channels.matrix.get_mut("main").unwrap().enabled = false;
+        successor.matrix_channels.insert("main".into(), false);
         assert!(matches!(
             classify_goal_policy(&successor, &task("matrix:main:!room:example")).unwrap(),
             GoalPolicyDecision::Revoke {
@@ -240,8 +253,8 @@ mod tests {
 
     #[test]
     fn disabled_goal_mode_and_unknown_routes_fail_closed() {
-        let mut successor = config();
-        successor.goal.enabled = false;
+        let mut successor = policy();
+        successor.goal_mode_enabled = false;
         assert!(matches!(
             classify_goal_policy(&successor, &task("zerocode:local-session")).unwrap(),
             GoalPolicyDecision::Revoke {
@@ -250,7 +263,7 @@ mod tests {
             }
         ));
 
-        let successor = config();
+        let successor = policy();
         assert!(matches!(
             classify_goal_policy(&successor, &task("telegram:main:chat")).unwrap(),
             GoalPolicyDecision::Revoke {
