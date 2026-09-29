@@ -25,7 +25,6 @@ use crate::{
 };
 
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalCommand};
-use zeroclaw_goal::GoalPauseReason;
 use zeroclaw_goal::control::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
@@ -34,8 +33,23 @@ use zeroclaw_goal::control::{
     GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, dispose_unowned_session_goal,
     goal_parent_turn_input,
 };
+use zeroclaw_goal::{GoalParentTurnCheckpoint, GoalPauseReason};
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
+
+async fn acquire_zero_code_goal_session_guard(
+    session_queue: Arc<zeroclaw_infra::session_queue::SessionActorQueue>,
+    session_id: &str,
+    checkpoint: &GoalParentTurnCheckpoint,
+) -> Result<zeroclaw_infra::session_queue::SessionGuard> {
+    tokio::select! {
+        biased;
+        _ = checkpoint.wait_closed() => bail!("ZeroCode Goal execution was fenced before session admission"),
+        result = session_queue.acquire(session_id) => {
+            result.context("ZeroCode Goal session is busy")
+        }
+    }
+}
 
 /// Retains a ZeroCode Goal admission until its JSON-RPC response has been
 /// queued ahead of any ordinary parent-turn events.
@@ -297,19 +311,19 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         &self,
         ingress: &GoalIngressContext,
         scope: &GoalExecutionScope,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.assert_ingress(ingress)?;
         ensure!(
             scope.session_id() == self.session_key.durable_id(),
             "Goal execution session is stale"
         );
-        let queue_guard = self
-            .context
-            .sessions
-            .session_queue
-            .acquire(self.raw_session_id())
-            .await
-            .context("ZeroCode Goal session is busy")?;
+        let queue_guard = acquire_zero_code_goal_session_guard(
+            Arc::clone(&self.context.sessions.session_queue),
+            self.raw_session_id(),
+            checkpoint,
+        )
+        .await?;
         let agent = self.revalidate_session().await?;
         let canonical_history = agent.lock().await.isolated_canonical_prefix().await?;
         Ok(Box::new(ZeroCodeGoalExecutionLease {
@@ -599,6 +613,58 @@ mod verifier_attribution_tests {
         ]);
 
         assert_eq!(attribution, None);
+    }
+}
+
+#[cfg(test)]
+mod zero_code_session_admission_tests {
+    use super::acquire_zero_code_goal_session_guard;
+    use std::{sync::Arc, time::Duration};
+    use zeroclaw_goal::GoalParentTurnCheckpoint;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    #[tokio::test]
+    async fn lifecycle_fence_withdraws_unadmitted_goal_behind_replacement_reservation() {
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 60));
+        let active_turn = queue.acquire("goal-session").await.unwrap();
+        let replacement = queue.reserve("goal-session").await.unwrap();
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let waiter_checkpoint = checkpoint.clone();
+        let waiter_queue = Arc::clone(&queue);
+        let mut goal_waiter = zeroclaw_spawn::spawn!(async move {
+            acquire_zero_code_goal_session_guard(waiter_queue, "goal-session", &waiter_checkpoint)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.queue_depth("goal-session").await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Goal execution must queue behind the already-reserved replacement");
+
+        checkpoint.close();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut goal_waiter)
+                .await
+                .expect("lifecycle fencing must wake an unadmitted Goal worker")
+                .expect("Goal worker must not panic")
+                .is_err()
+        );
+        assert_eq!(
+            queue.queue_depth("goal-session").await,
+            2,
+            "fenced Goal waiter must release its FIFO registration"
+        );
+
+        drop(active_turn);
+        let replacement_guard = tokio::time::timeout(Duration::from_secs(1), replacement.acquire())
+            .await
+            .expect("replacement must proceed after the admitted turn settles")
+            .expect("reserved replacement admission must succeed");
+        drop(replacement_guard);
+        assert_eq!(queue.queue_depth("goal-session").await, 0);
     }
 }
 
