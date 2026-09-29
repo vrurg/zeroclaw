@@ -22,7 +22,7 @@ use crate::{
     cost::CostTracker,
     goal_accounting::{
         ModelProviderGoalUsagePricer, RuntimeGoalDiagnosticTextGuard,
-        RuntimeGoalOperationAccountingFactory,
+        RuntimeGoalOperationAccountingFactory, RuntimeGoalUsageTotalsReader,
     },
     rpc::context::RpcContext,
 };
@@ -811,16 +811,21 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let result: Result<GoalVerifierResult> =
             crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_context, async {
-                    let (provider, model_selector, route_resolver) = {
-                        let config = self.context.config.read();
-                        let (provider, _provider_ref, model_selector, route_resolver) =
+                    // Alias-aware construction can do blocking credential work
+                    // (for example a MiniMax OAuth refresh). Build it on the
+                    // blocking pool from an owned per-call config snapshot so no
+                    // executor worker or live-config handle is held meanwhile.
+                    let config = self.context.config.read().clone();
+                    let (provider, _provider_ref, model_selector, route_resolver) =
+                        tokio::task::spawn_blocking(move || {
                             build_session_model_provider(
                                 &config,
                                 &config.goal.verifier.model_provider,
                                 config.goal.verifier.model.as_deref(),
-                            )?;
-                        (provider, model_selector, route_resolver)
-                    };
+                            )
+                        })
+                        .await
+                        .context("Goal verifier provider construction task failed")??;
                     let route = route_resolver.resolve(&model_selector);
                     let messages = turn.to_chat_messages();
                     let mut settled_attempts = Vec::new();
@@ -1261,11 +1266,13 @@ impl RpcGoalRuntime {
             let supervisor = match self.supervisor(&session_id).await {
                 Some(supervisor) => supervisor,
                 None => {
-                    let runtime = GoalRuntime::new(Arc::clone(&registry));
                     let tracker = CostTracker::get_or_init_global_required(
                         config.cost.clone(),
                         &config.data_dir,
                     )?;
+                    let runtime = GoalRuntime::new(Arc::clone(&registry)).with_usage_totals_reader(
+                        Arc::new(RuntimeGoalUsageTotalsReader::new(Arc::clone(&tracker))),
+                    );
                     let pricer = Arc::new(ZeroCodeGoalUsagePricer {
                         config: context.config.clone(),
                     });
