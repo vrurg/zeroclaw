@@ -1233,6 +1233,18 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
+                let goal_settlement = goal_operation_settlement(report.attempts());
+                assert_eq!(
+                    goal_settlement.accounting_state,
+                    crate::control_plane::GoalAccountingState::Missing
+                );
+                assert_eq!(goal_settlement.events.len(), 1);
+                assert_eq!(goal_settlement.events[0].provider_ref, "provider.first");
+                assert_eq!(goal_settlement.events[0].model, "model-a");
+                assert_eq!(
+                    goal_settlement.events[0].usage.input_tokens,
+                    Some(1_000_000)
+                );
                 settle_provider_attempts(report.attempts(), Some(1))
                     .await
                     .expect("provider attempt settlement");
