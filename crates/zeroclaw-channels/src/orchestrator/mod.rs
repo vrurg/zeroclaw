@@ -8991,29 +8991,27 @@ async fn process_channel_message_body(
                     } else {
                         match submission.after_response().await {
                             Ok(late_response) => {
-                                if let Some(response) = late_response.as_ref() {
-                                    if let Some(channel) = channel {
-                                        if let Err(error) = channel
-                                            .send(&SendMessage::reply_to(
-                                                &original_goal_message,
-                                                render_goal_response(response),
-                                            ))
-                                            .await
-                                        {
-                                            ::zeroclaw_log::record!(
-                                                WARN,
-                                                ::zeroclaw_log::Event::new(
-                                                    module_path!(),
-                                                    ::zeroclaw_log::Action::Fail,
-                                                )
-                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                                .with_attrs(::serde_json::json!({
-                                                    "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
-                                                })),
-                                                "Final Goal lifecycle response could not be delivered"
-                                            );
-                                        }
-                                    }
+                                if let Some(response) = late_response.as_ref()
+                                    && let Some(channel) = channel
+                                    && let Err(error) = channel
+                                        .send(&SendMessage::reply_to(
+                                            &original_goal_message,
+                                            render_goal_response(response),
+                                        ))
+                                        .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail,
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
+                                        })),
+                                        "Final Goal lifecycle response could not be delivered"
+                                    );
                                 }
                                 submission
                                     .final_response_delivered(late_response.as_ref())
