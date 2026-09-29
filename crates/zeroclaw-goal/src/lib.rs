@@ -11,6 +11,8 @@ pub mod control;
 pub mod task;
 pub mod tool_pairing;
 
+pub use accounting::{GoalUsageTotals, GoalUsageTotalsReader};
+
 pub use checkpoint::{
     GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint,
     GoalParentTurnOperation, GoalParentTurnTicketId,

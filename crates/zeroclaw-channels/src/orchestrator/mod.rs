@@ -11216,20 +11216,21 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
 
     let token_limit = projection
         .token_limit
-        .map(|value| value.to_string())
+        .map(zeroclaw_runtime::i18n::format_grouped_integer)
         .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
-    let cost_limit = projection
-        .cost_limit_usd
-        .map(|value| format!("{value:.6}"))
-        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
+    let cost_limit = match projection.cost_limit_usd {
+        Some(value) => zeroclaw_runtime::i18n::format_grouped_usd(value)
+            .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unavailable")),
+        None => channel_runtime_cli_string("goal-mode-unlimited"),
+    };
     let status = match projection.status {
-        TaskStatus::Running => "running",
-        TaskStatus::Paused => "paused",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::Lost => "lost",
-        TaskStatus::TimedOut => "timed_out",
+        TaskStatus::Running => "🟢 running",
+        TaskStatus::Paused => "⏸️ paused",
+        TaskStatus::Completed => "✅ completed",
+        TaskStatus::Failed => "❌ failed",
+        TaskStatus::Cancelled => "🛑 cancelled",
+        TaskStatus::Lost => "⚠️ lost",
+        TaskStatus::TimedOut => "⚠️ timed_out",
     };
     let accounting = match projection.accounting_state {
         GoalAccountingState::Complete => "complete",
@@ -11259,7 +11260,7 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
     } else {
         "goal-mode-no"
     });
-    channel_runtime_cli_string_with_args(
+    let mut message = channel_runtime_cli_string_with_args(
         "goal-mode-details",
         &[
             ("status", status),
@@ -11270,7 +11271,31 @@ fn render_goal_projection(projection: &zeroclaw_goal::GoalStatusProjection) -> S
             ("cost_limit", &cost_limit),
             ("pause_reason", &pause_reason),
         ],
-    )
+    );
+    if let Some(totals) = &projection.usage_totals {
+        let usage_tokens = zeroclaw_runtime::i18n::format_grouped_integer(totals.total_tokens);
+        let usage_usd = totals
+            .cost_usd
+            .and_then(zeroclaw_runtime::i18n::format_grouped_usd)
+            .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unavailable"));
+        let mut usage_note = String::new();
+        if projection.accounting_state != GoalAccountingState::Complete || !totals.ledger_complete {
+            usage_note.push_str(&channel_runtime_cli_string("goal-mode-usage-incomplete"));
+        }
+        if !totals.pricing_available || totals.cost_usd.is_none() {
+            usage_note.push_str(&channel_runtime_cli_string("goal-mode-cost-incomplete"));
+        }
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-usage-totals",
+            &[
+                ("usage_tokens", &usage_tokens),
+                ("usage_usd", &usage_usd),
+                ("usage_note", &usage_note),
+            ],
+        ));
+    }
+    message
 }
 
 #[cfg(test)]
@@ -11290,16 +11315,75 @@ mod goal_response_render_tests {
             accounting_state: GoalAccountingState::Complete,
             pause_reason: Some(GoalPauseReason::NeedsUserInput),
             resumable: true,
+            usage_totals: None,
         });
 
         let rendered = render_goal_response(&response);
 
         assert!(rendered.contains("Goal paused."));
-        assert!(rendered.contains("Status: paused"));
-        assert!(rendered.contains("token limit: 12000"));
+        assert!(rendered.contains("Status: ⏸️ paused"));
+        assert!(rendered.contains("token limit: 12,000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
         assert!(rendered.contains("pause reason: needs_user_input"));
         assert!(!rendered.contains("Which target should receive the change?"));
+    }
+
+    #[test]
+    fn matrix_status_renders_known_totals_before_incomplete_usage_notes() {
+        let response = GoalResponse::Paused(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Paused,
+            execution_epoch: 4,
+            token_limit: Some(12_000),
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::Invalid,
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            resumable: false,
+            usage_totals: Some(zeroclaw_goal::GoalUsageTotals {
+                total_tokens: 59_875_761,
+                cost_usd: Some(12.3456),
+                pricing_available: false,
+                ledger_complete: false,
+            }),
+        });
+
+        let rendered = render_goal_response(&response);
+        let token_offset = rendered.find("59,875,761 tokens").unwrap();
+        let incomplete_offset = rendered.find("usage may be incomplete").unwrap();
+        assert!(token_offset < incomplete_offset);
+        assert!(rendered.contains("USD 12.345600"));
+        assert!(rendered.contains("cost may be incomplete"));
+        assert!(rendered.contains("token limit: 12,000"));
+    }
+
+    #[test]
+    fn matrix_goal_status_icons_follow_the_typed_status() {
+        for (status, icon, label) in [
+            (TaskStatus::Running, "🟢", "running"),
+            (TaskStatus::Paused, "⏸️", "paused"),
+            (TaskStatus::Completed, "✅", "completed"),
+            (TaskStatus::Failed, "❌", "failed"),
+            (TaskStatus::Cancelled, "🛑", "cancelled"),
+            (TaskStatus::Lost, "⚠️", "lost"),
+            (TaskStatus::TimedOut, "⚠️", "timed_out"),
+        ] {
+            let response = GoalResponse::Status(GoalStatusProjection {
+                task_id: "goal-1".to_owned(),
+                status,
+                execution_epoch: 1,
+                token_limit: None,
+                cost_limit_usd: None,
+                accounting_state: GoalAccountingState::Complete,
+                pause_reason: None,
+                resumable: false,
+                usage_totals: None,
+            });
+
+            assert!(
+                render_goal_response(&response).contains(&format!("Status: {icon} {label}")),
+                "{status:?} must use {icon}"
+            );
+        }
     }
 }
 

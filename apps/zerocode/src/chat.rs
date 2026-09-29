@@ -103,12 +103,13 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
 fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
     let token_limit = projection
         .token_limit
-        .map(|value| value.to_string())
+        .map(crate::i18n::format_grouped_integer)
         .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
-    let cost_limit = projection
-        .cost_limit_usd
-        .map(|value| format!("{value:.6}"))
-        .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let cost_limit = match projection.cost_limit_usd {
+        Some(value) => crate::i18n::format_grouped_usd(value)
+            .unwrap_or_else(|| crate::i18n::t("zc-goal-unavailable")),
+        None => crate::i18n::t("zc-goal-unlimited"),
+    };
     let pause_reason = projection
         .pause_reason
         .clone()
@@ -118,10 +119,20 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
     } else {
         "zc-goal-no"
     });
-    crate::i18n::t_args(
+    let status = match projection.status.as_str() {
+        "running" => "🟢 running",
+        "paused" => "⏸️ paused",
+        "completed" => "✅ completed",
+        "failed" => "❌ failed",
+        "cancelled" => "🛑 cancelled",
+        "lost" => "⚠️ lost",
+        "timed_out" => "⚠️ timed_out",
+        _ => "⚠️ unknown",
+    };
+    let mut message = crate::i18n::t_args(
         "zc-goal-details",
         &[
-            ("status", &projection.status),
+            ("status", status),
             ("epoch", &projection.execution_epoch.to_string()),
             ("accounting", &projection.accounting_state),
             ("resumable", &resumable),
@@ -129,7 +140,31 @@ fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> St
             ("cost_limit", &cost_limit),
             ("pause_reason", &pause_reason),
         ],
-    )
+    );
+    if let Some(totals) = &projection.usage_totals {
+        let usage_tokens = crate::i18n::format_grouped_integer(totals.total_tokens);
+        let usage_usd = totals
+            .cost_usd
+            .and_then(crate::i18n::format_grouped_usd)
+            .unwrap_or_else(|| crate::i18n::t("zc-goal-unavailable"));
+        let mut usage_note = String::new();
+        if projection.accounting_state != "complete" || !totals.ledger_complete {
+            usage_note.push_str(&crate::i18n::t("zc-goal-usage-incomplete"));
+        }
+        if !totals.pricing_available || totals.cost_usd.is_none() {
+            usage_note.push_str(&crate::i18n::t("zc-goal-cost-incomplete"));
+        }
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-usage-totals",
+            &[
+                ("usage_tokens", &usage_tokens),
+                ("usage_usd", &usage_usd),
+                ("usage_note", &usage_note),
+            ],
+        ));
+    }
+    message
 }
 
 fn goal_failure_message(reason: crate::wire::GoalFailureReason) -> String {
@@ -13579,16 +13614,75 @@ mod tests {
             accounting_state: "complete".to_owned(),
             pause_reason: Some("needs_user_input".to_owned()),
             resumable: true,
+            usage_totals: None,
         });
 
         let rendered = goal_response_message(&response);
 
         assert!(rendered.contains("Goal paused."));
-        assert!(rendered.contains("Status: paused"));
-        assert!(rendered.contains("token limit: 12000"));
+        assert!(rendered.contains("Status: ⏸️ paused"));
+        assert!(rendered.contains("token limit: 12,000"));
         assert!(rendered.contains("cost limit USD: unlimited"));
         assert!(rendered.contains("pause reason: needs_user_input"));
         assert!(!rendered.contains("Which target should receive the change?"));
+    }
+
+    #[test]
+    fn goal_status_icons_follow_the_status_projection() {
+        for (status, icon, label) in [
+            ("running", "🟢", "running"),
+            ("paused", "⏸️", "paused"),
+            ("completed", "✅", "completed"),
+            ("failed", "❌", "failed"),
+            ("cancelled", "🛑", "cancelled"),
+            ("lost", "⚠️", "lost"),
+            ("timed_out", "⚠️", "timed_out"),
+        ] {
+            let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
+                task_id: "goal-1".to_owned(),
+                status: status.to_owned(),
+                execution_epoch: 1,
+                token_limit: None,
+                cost_limit_usd: None,
+                accounting_state: "complete".to_owned(),
+                pause_reason: None,
+                resumable: false,
+                usage_totals: None,
+            });
+
+            assert!(
+                goal_response_message(&response).contains(&format!("Status: {icon} {label}")),
+                "{status} must use {icon}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_status_renders_known_totals_before_incomplete_usage_notes() {
+        let response = crate::wire::GoalResponse::Paused(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 4,
+            token_limit: Some(12_000),
+            cost_limit_usd: None,
+            accounting_state: "invalid".to_owned(),
+            pause_reason: Some("needs_user_input".to_owned()),
+            resumable: false,
+            usage_totals: Some(crate::wire::GoalUsageTotals {
+                total_tokens: 59_875_761,
+                cost_usd: Some(12.3456),
+                pricing_available: false,
+                ledger_complete: false,
+            }),
+        });
+
+        let rendered = goal_response_message(&response);
+        let token_offset = rendered.find("59,875,761 tokens").unwrap();
+        let incomplete_offset = rendered.find("usage may be incomplete").unwrap();
+        assert!(token_offset < incomplete_offset);
+        assert!(rendered.contains("USD 12.345600"));
+        assert!(rendered.contains("cost may be incomplete"));
+        assert!(rendered.contains("token limit: 12,000"));
     }
 
     #[test]
@@ -13602,6 +13696,7 @@ mod tests {
             accounting_state: "complete".to_owned(),
             pause_reason: None,
             resumable: true,
+            usage_totals: None,
         });
 
         assert!(goal_response_message(&response).contains("pause reason: none"));
@@ -23057,6 +23152,7 @@ mod tests {
                         accounting_state: "complete".into(),
                         pause_reason: None,
                         resumable: false,
+                        usage_totals: None,
                     },
                 )),
             })

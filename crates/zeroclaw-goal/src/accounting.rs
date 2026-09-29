@@ -7,6 +7,27 @@ use zeroclaw_api::model_provider::TokenUsage;
 
 use crate::control::GoalExecutionScope;
 
+/// Read-only task-attributed totals from the canonical usage ledger.
+///
+/// `cost_usd` is absent only when the ledger's accumulated currency value
+/// cannot be represented as a finite number. `pricing_available` remains
+/// independent from `ledger_complete`: valid ledger rows can still lack a
+/// usable price.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GoalUsageTotals {
+    pub total_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub pricing_available: bool,
+    pub ledger_complete: bool,
+}
+
+/// Runtime adapter for reading known task totals without giving Goal a
+/// dependency on the concrete ledger implementation.
+#[async_trait]
+pub trait GoalUsageTotalsReader: Send + Sync {
+    async fn read_for_task(&self, task_id: &str) -> anyhow::Result<GoalUsageTotals>;
+}
+
 /// Configured route at the start of one logical Goal-owned provider operation.
 #[derive(Clone, Debug)]
 pub struct GoalOperationRequest {
