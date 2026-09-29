@@ -39,7 +39,8 @@ pub use goal_execution::{
     GoalExecutionSubmission, GoalExecutionSupervisor, dispose_unowned_session_goal,
 };
 pub use policy::{
-    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
+    GoalAgentPolicySnapshot, GoalPolicyDecision, GoalPolicyRevocation, GoalPolicySnapshot,
+    classify_goal_policy, revoke_goals_under_policy,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
