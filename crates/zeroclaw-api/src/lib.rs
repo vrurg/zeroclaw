@@ -58,9 +58,15 @@ tokio::task_local! {
     /// Read by model_providers that support native tool calling.
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
 
-    /// Session key for the currently active session.
-    /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
+    /// Canonical storage key for the currently active session. It may include
+    /// a storage-domain prefix not present in the caller-visible session ID.
+    /// Scoped by gateway and channel turns, read by session-scoped tools.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// Caller-visible session ID for child-process environment forwarding.
+    /// This remains distinct from `TOOL_LOOP_SESSION_KEY` when a storage
+    /// backend namespaces its keys.
+    pub static TOOL_LOOP_SESSION_ID: Option<String>;
 
     /// Capability marker for primary durable chat turns. It is deliberately
     /// absent from ACP, one-shot, delegate, cron, and auxiliary executions so

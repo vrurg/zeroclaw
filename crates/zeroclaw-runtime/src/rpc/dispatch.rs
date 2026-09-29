@@ -6077,6 +6077,7 @@ impl RpcDispatcher {
             cancel.clone(),
             TurnAttribution {
                 session_key: Some(tool_loop_session_key),
+                session_id: Some(sid.to_string()),
                 agent_alias,
                 model_provider,
                 model,
@@ -16717,16 +16718,17 @@ mod tests {
             .unwrap()
             .level = zeroclaw_config::autonomy::AutonomyLevel::Full;
 
-        let params = json!({"agent_alias": "test-agent", "session_id": "env-fresh"});
+        let sid = "rpc_alpha";
+        let params = json!({"agent_alias": "test-agent", "session_id": sid});
         dispatcher
             .handle_session_new_for_test(&params)
             .await
             .unwrap();
         assert_eq!(
-            ctx.sessions.has_forwarded_environment("env-fresh").await,
+            ctx.sessions.has_forwarded_environment(sid).await,
             Some(false)
         );
-        let agent = ctx.sessions.get_agent("env-fresh").await.unwrap();
+        let agent = ctx.sessions.get_agent(sid).await.unwrap();
         let observed = Arc::new(std::sync::Mutex::new(None));
         agent
             .lock()
@@ -16739,12 +16741,12 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(
             &agent,
-            &ctx.sessions.get_agent("env-fresh").await.unwrap()
+            &ctx.sessions.get_agent(sid).await.unwrap()
         ));
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             dispatcher.handle_session_prompt(&json!({
-                "session_id": "env-fresh", "prompt": "Inspect the environment"
+                "session_id": sid, "prompt": "Inspect the environment"
             })),
         )
         .await
@@ -16755,16 +16757,23 @@ mod tests {
             .unwrap()
             .clone()
             .expect("the prompt executed shell env");
+        let shell_environment: serde_json::Value =
+            serde_json::from_str(&tool_result).expect("shell result must be valid JSON");
+        let shell_environment = shell_environment["content"]
+            .as_str()
+            .expect("shell result must contain its output");
         assert!(
-            tool_result.contains("ZEROCLAW_SESSION_ID=env-fresh"),
-            "the probe must observe a real shell run: {tool_result}"
+            shell_environment
+                .lines()
+                .any(|line| line == "ZEROCLAW_SESSION_ID=rpc_alpha"),
+            "the real shell must receive the raw caller ID, not its namespaced storage key: {shell_environment}"
         );
         assert!(
-            !tool_result.contains("ZEROCLAW_ENV_SENTINEL"),
-            "demoted owner recovered forwarded values: {tool_result}"
+            !shell_environment.contains("ZEROCLAW_ENV_SENTINEL"),
+            "demoted owner recovered forwarded values: {shell_environment}"
         );
         assert!(
-            !session_shell_env(&ctx, "env-fresh")
+            !session_shell_env(&ctx, sid)
                 .await
                 .contains("ZEROCLAW_ENV_SENTINEL")
         );

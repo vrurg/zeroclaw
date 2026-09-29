@@ -64,6 +64,8 @@ impl TurnError {
 #[derive(Clone, Default)]
 pub struct TurnAttribution {
     pub session_key: Option<String>,
+    /// Caller-visible session ID, distinct from a namespaced storage key.
+    pub session_id: Option<String>,
     pub agent_alias: String,
     pub model_provider: String,
     pub model: String,
@@ -87,6 +89,7 @@ where
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
+    let session_id = attribution.session_id.clone();
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
@@ -110,40 +113,43 @@ where
         } else {
             None
         };
-        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        zeroclaw_api::TOOL_LOOP_SESSION_ID
             .scope(
-                session_prompt_tools_allowed,
-                TOOL_LOOP_SESSION_BACKEND.scope(
-                    session_prompt_backend.map(ScopedSessionBackend),
-                    TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
-                        session_prompt_budget,
-                        crate::agent::loop_::scope_session_key(
-                            attribution.session_key,
-                            async move {
-                                use ::zeroclaw_log::Instrument as _;
-                                let span = ::zeroclaw_log::info_span!(
-                                    target: "zeroclaw_log_internal_scope",
-                                    "zeroclaw_scope",
-                                    session_key = %sk.as_deref().unwrap_or(""),
-                                    agent_alias = %attribution.agent_alias,
-                                    model_provider = %attribution.model_provider,
-                                    model = %attribution.model,
-                                    channel = %attribution.channel,
-                                );
-                                TOOL_LOOP_COST_TRACKING_CONTEXT
-                                    .scope(
-                                        cost_context,
-                                        guard
-                                            .turn_streamed_with_steering_state(
-                                                &prompt,
-                                                event_tx,
-                                                Some(cancel_clone),
-                                                None,
-                                            )
-                                            .instrument(span),
-                                    )
-                                    .await
-                            },
+                session_id,
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                    session_prompt_tools_allowed,
+                    TOOL_LOOP_SESSION_BACKEND.scope(
+                        session_prompt_backend.map(ScopedSessionBackend),
+                        TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                            session_prompt_budget,
+                            crate::agent::loop_::scope_session_key(
+                                attribution.session_key,
+                                async move {
+                                    use ::zeroclaw_log::Instrument as _;
+                                    let span = ::zeroclaw_log::info_span!(
+                                        target: "zeroclaw_log_internal_scope",
+                                        "zeroclaw_scope",
+                                        session_key = %sk.as_deref().unwrap_or(""),
+                                        agent_alias = %attribution.agent_alias,
+                                        model_provider = %attribution.model_provider,
+                                        model = %attribution.model,
+                                        channel = %attribution.channel,
+                                    );
+                                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                                        .scope(
+                                            cost_context,
+                                            guard
+                                                .turn_streamed_with_steering_state(
+                                                    &prompt,
+                                                    event_tx,
+                                                    Some(cancel_clone),
+                                                    None,
+                                                )
+                                                .instrument(span),
+                                        )
+                                        .await
+                                },
+                            ),
                         ),
                     ),
                 ),
@@ -963,7 +969,9 @@ mod tests {
         // Minimal provider that returns a final answer carrying non-zero token
         // usage on the non-streaming `chat` path (the default the engine takes
         // when the provider does not advertise streaming).
-        struct UsageProvider;
+        struct UsageProvider {
+            session_context_seen: Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>,
+        }
 
         #[async_trait]
         impl ModelProvider for UsageProvider {
@@ -983,6 +991,17 @@ mod tests {
                 _model: &str,
                 _temperature: Option<f64>,
             ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                let session_context = (
+                    zeroclaw_api::TOOL_LOOP_SESSION_ID
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                );
+                *self.session_context_seen.lock().unwrap() = Some(session_context);
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
@@ -1036,8 +1055,11 @@ mod tests {
         let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
             .with_agent_alias("rpc-agent");
 
+        let session_context_seen = Arc::new(std::sync::Mutex::new(None));
         let agent = Agent::builder()
-            .model_provider(Box::new(UsageProvider))
+            .model_provider(Box::new(UsageProvider {
+                session_context_seen: Arc::clone(&session_context_seen),
+            }))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![],
             ))
@@ -1057,6 +1079,7 @@ mod tests {
             CancellationToken::new(),
             TurnAttribution {
                 session_key: Some("s1".into()),
+                session_id: None,
                 agent_alias: "rpc-agent".into(),
                 model_provider: "mock-provider".into(),
                 model: "test-model".into(),
@@ -1081,6 +1104,11 @@ mod tests {
              persisted (#5221)"
         );
         assert_eq!(summary.total_tokens, 1_200);
+        assert_eq!(
+            *session_context_seen.lock().unwrap(),
+            Some((None, Some("s1".into()))),
+            "a missing caller-visible ID must not be inferred from the storage key"
+        );
         let agent_summary = tracker
             .get_summary_for_agent("rpc-agent")
             .expect("agent-scoped summary");
@@ -1104,6 +1132,7 @@ mod tests {
 
         struct ScriptedProvider {
             responses: std::sync::Mutex<Vec<ChatResponse>>,
+            session_context_seen: Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
         }
 
         #[async_trait]
@@ -1124,6 +1153,20 @@ mod tests {
                 _model: &str,
                 _temperature: Option<f64>,
             ) -> anyhow::Result<ChatResponse> {
+                let session_context = (
+                    zeroclaw_api::TOOL_LOOP_SESSION_ID
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                );
+                self.session_context_seen
+                    .lock()
+                    .unwrap()
+                    .push(session_context);
                 Ok(self.responses.lock().unwrap().remove(0))
             }
         }
@@ -1147,7 +1190,9 @@ mod tests {
             zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
                 .expect("memory creation"),
         );
+        let session_context_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = ScriptedProvider {
+            session_context_seen: Arc::clone(&session_context_seen),
             responses: std::sync::Mutex::new(vec![
                 ChatResponse {
                     text: Some(
@@ -1203,7 +1248,8 @@ mod tests {
             "remember this".to_string(),
             CancellationToken::new(),
             TurnAttribution {
-                session_key: Some("rpc-current-session".into()),
+                session_key: Some("rpc_alpha".into()),
+                session_id: Some("alpha".into()),
                 agent_alias: "rpc-agent".into(),
                 model_provider: "session-prompt-test".into(),
                 model: "test-model".into(),
@@ -1218,10 +1264,18 @@ mod tests {
         .expect("turn must complete");
 
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
-        let prompts = backend.list_session_prompts("rpc-current-session").unwrap();
+        let prompts = backend.list_session_prompts("rpc_alpha").unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].id, "task");
         assert_eq!(prompts[0].content, "persisted marker");
+        assert_eq!(
+            *session_context_seen.lock().unwrap(),
+            vec![
+                (Some("alpha".into()), Some("rpc_alpha".into())),
+                (Some("alpha".into()), Some("rpc_alpha".into())),
+            ],
+            "the spawned turn must preserve caller identity separately from its storage key"
+        );
     }
     /// Regression: the drain callback must resolve `model_context_window`
     /// from the embedded `provider_ref` via config, not by reacquiring the
@@ -1345,6 +1399,7 @@ mod tests {
             CancellationToken::new(),
             TurnAttribution {
                 session_key: Some("drain-test".into()),
+                session_id: None,
                 agent_alias: "rpc-agent".into(),
                 model_provider: "openai.default".into(),
                 model: "test-model".into(),
@@ -1519,6 +1574,7 @@ mod tests {
                 CancellationToken::new(),
                 TurnAttribution {
                     session_key: Some("drain-matrix-test".into()),
+                    session_id: None,
                     agent_alias: "rpc-matrix".into(),
                     model_provider: cell.provider_ref.into(),
                     model: "matrix-model".into(),
@@ -1784,6 +1840,7 @@ mod tests {
             CancellationToken::new(),
             TurnAttribution {
                 session_key: Some("w1-test".into()),
+                session_id: None,
                 agent_alias: "rpc-w1".into(),
                 model_provider: "openai.default".into(),
                 model: "w1-model".into(),
@@ -2062,6 +2119,7 @@ mod tests {
                 turn_cancel,
                 TurnAttribution {
                     session_key: Some("forced-drop".into()),
+                    session_id: None,
                     agent_alias: "rpc-agent".into(),
                     model_provider: "held-provider".into(),
                     model: "test-model".into(),
