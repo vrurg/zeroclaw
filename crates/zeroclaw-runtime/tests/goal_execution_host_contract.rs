@@ -133,15 +133,19 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         &mut self,
         _operation: &GoalOperationScope,
         _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalVerifierResult> {
         if self.continue_once {
             self.continue_once = false;
-            Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned())
+            Ok(GoalVerifierResult {
+                response: r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned(),
+                attribution: None,
+            })
         } else {
-            Ok(
-                r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
+            Ok(GoalVerifierResult {
+                response: r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
                     .to_owned(),
-            )
+                attribution: None,
+            })
         }
     }
 
@@ -179,6 +183,7 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
         &self,
         _ingress: &GoalIngressContext,
         _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         Ok(Box::new(TranscriptExecutionLease {
             session_key: self.binding.session_key().clone(),
@@ -2387,7 +2392,10 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     ));
 
     assert_eq!(
-        engine.run(&settings, request).await.unwrap(),
+        engine
+            .run(&settings, request, GoalParentTurnCheckpoint::new())
+            .await
+            .unwrap(),
         GoalExecutionOutcome::Completed
     );
     assert_eq!(
