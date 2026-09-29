@@ -10,6 +10,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::accounting::GoalOperationAccountingFactory;
+use crate::checkpoint::GoalParentTurnCheckpoint;
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult,
@@ -280,12 +281,16 @@ pub trait GoalSessionDriver: Send + Sync {
     /// mutate only process-local working state, and `append_parent_candidate`
     /// durably appends and delivers each non-empty parent response before the
     /// verifier classifies it. This preserves the original agent response when
-    /// the verifier pauses the Goal.
+    /// the verifier pauses the Goal. While acquiring the lease, the driver must
+    /// also observe `checkpoint.wait_closed()` and abandon only a still-pending
+    /// admission when that future completes; after returning the lease, the
+    /// driver must not interrupt admitted work on account of checkpoint closure.
     /// The object is the sole transport bridge used by the later Goal executor.
     async fn acquire_execution(
         &self,
         ingress: &GoalIngressContext,
         scope: &GoalExecutionScope,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>>;
 }
 
@@ -665,6 +670,7 @@ impl GoalExecutionHost {
         settings: &GoalHostSettings,
         submission: GoalSubmission,
         scope: &GoalExecutionScope,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         if !settings.enabled {
             bail!("Goal Mode is disabled");
@@ -685,7 +691,9 @@ impl GoalExecutionHost {
             bail!("Goal execution scope session does not match trusted ingress");
         }
         drop(lease);
-        let lease = driver.acquire_execution(&ingress, scope).await?;
+        let lease = driver
+            .acquire_execution(&ingress, scope, checkpoint)
+            .await?;
         if lease.session_key() != ingress.session_key() {
             bail!("Goal execution lease session key does not match trusted ingress");
         }
@@ -817,9 +825,10 @@ impl GoalRuntime {
         &self,
         settings: &GoalHostSettings,
         request: GoalExecutionRequest,
+        checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
         self.host
-            .acquire_execution(settings, request.submission, &request.scope)
+            .acquire_execution(settings, request.submission, &request.scope, checkpoint)
             .await
     }
 }
