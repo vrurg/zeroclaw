@@ -29752,6 +29752,32 @@ mod tests {
     }
 
     #[test]
+    fn every_goal_failure_reason_resolves_to_a_fluent_message() {
+        use crate::wire::GoalFailureReason;
+
+        for reason in [
+            GoalFailureReason::AgentOperationFailed,
+            GoalFailureReason::ToolResultsUnpaired,
+            GoalFailureReason::EmptyAgentResponse,
+            GoalFailureReason::VerifierOperationFailed,
+            GoalFailureReason::VerifierResponseInvalid,
+            GoalFailureReason::AccountingIncomplete,
+            GoalFailureReason::PricingIncomplete,
+            GoalFailureReason::OperationOutcomeUnknown,
+            GoalFailureReason::ExecutorStartFailed,
+            GoalFailureReason::ExecutorFailed,
+            GoalFailureReason::Other,
+        ] {
+            let message = goal_failure_message(reason);
+            assert!(
+                !message.starts_with("{zc-goal-failure-"),
+                "missing Fluent message for {reason:?}: {message}"
+            );
+            assert!(!message.trim().is_empty());
+        }
+    }
+
+    #[test]
     fn restored_session_state_is_idle() {
         let mut active = state();
         active.push_user_message(Some("old prompt".to_string()), Vec::new());
