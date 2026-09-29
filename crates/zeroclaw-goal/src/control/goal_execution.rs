@@ -31,9 +31,10 @@ use crate::{
 };
 
 use super::{
-    GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalHostSettings,
-    GoalIngressContext, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionLease, GoalVerifierAttribution, GoalVerifierTurn,
+    GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalFailureReason,
+    GoalHostSettings, GoalIngressContext, GoalParentTurn, GoalResponse, GoalRuntime,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease, GoalVerifierAttribution,
+    GoalVerifierTurn,
 };
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
@@ -259,6 +260,9 @@ struct GoalExecutionAdmission {
 struct GoalWorker {
     task_id: String,
     execution_epoch: i64,
+    driver: Arc<dyn GoalSessionDriver>,
+    ingress: GoalIngressContext,
+    failure_notice_published: Arc<Mutex<bool>>,
     checkpoint: GoalParentTurnCheckpoint,
     completion: watch::Receiver<Option<GoalWorkerCompletion>>,
     /// Serializes lifecycle finalization while leaving the command lease free.
@@ -308,8 +312,15 @@ impl GoalExecutionSupervisor {
         &self,
         settings: GoalHostSettings,
         request: GoalExecutionRequest,
+        driver: Arc<dyn GoalSessionDriver>,
+        ingress: GoalIngressContext,
     ) -> Result<()> {
         let scope = request.scope().clone();
+        ensure!(
+            driver.session_key() == ingress.session_key()
+                && scope.session_id() == ingress.session_key().durable_id(),
+            "Goal failure-notice driver does not match the admitted session"
+        );
         let session_id = scope.session_id().to_owned();
         let task_id = scope.task_id().to_owned();
         let mut workers = self.workers.lock().await;
@@ -322,10 +333,19 @@ impl GoalExecutionSupervisor {
         let execution_epoch = scope.execution_epoch();
         let checkpoint = GoalParentTurnCheckpoint::new();
         let worker_checkpoint = checkpoint.clone();
+        let failure_notice_published = Arc::new(Mutex::new(false));
+        let worker_failure_notice_published = Arc::clone(&failure_notice_published);
+        let worker_driver = Arc::clone(&driver);
+        let worker_ingress = ingress.clone();
         let (completion_tx, completion) = watch::channel(None);
         let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine
-                .run(&settings, request, worker_checkpoint.clone())
+                .run_with_failure_notice(
+                    &settings,
+                    request,
+                    worker_checkpoint.clone(),
+                    Arc::clone(&worker_failure_notice_published),
+                )
                 .await;
             worker_checkpoint.close();
 
@@ -341,6 +361,18 @@ impl GoalExecutionSupervisor {
             } else {
                 result
             };
+            if result.is_err()
+                && let Err(_error) = publish_failure_notice_if_terminal(
+                    engine.as_ref(),
+                    &scope,
+                    worker_driver.as_ref(),
+                    &worker_ingress,
+                    &worker_failure_notice_published,
+                )
+                .await
+            {
+                log_failure_notice_delivery_failure(&scope);
+            }
             let completion = result.map_err(|error| format!("{error:#}"));
             let _ = completion_tx.send(Some(completion));
         });
@@ -349,6 +381,9 @@ impl GoalExecutionSupervisor {
             Arc::new(Mutex::new(GoalWorker {
                 task_id,
                 execution_epoch,
+                driver,
+                ingress,
+                failure_notice_published,
                 checkpoint,
                 completion,
                 lifecycle_finalization: Arc::new(Mutex::new(())),
@@ -447,8 +482,28 @@ impl GoalExecutionSupervisor {
             if !self.execution_is_current(&scope).await? {
                 return Ok(None);
             }
-            if let Err(error) = self.launch(settings, request).await {
+            if let Err(error) = self
+                .launch(
+                    settings,
+                    request,
+                    Arc::clone(&submission.driver),
+                    submission.ingress.clone(),
+                )
+                .await
+            {
                 self.engine.fail(&scope, "executor_start_failed").await?;
+                let failure_notice_published = Mutex::new(false);
+                if let Err(_error) = publish_failure_notice_if_terminal(
+                    self.engine.as_ref(),
+                    &scope,
+                    submission.driver.as_ref(),
+                    &submission.ingress,
+                    &failure_notice_published,
+                )
+                .await
+                {
+                    log_failure_notice_delivery_failure(&scope);
+                }
                 return Err(error).context("Goal executor launch failed");
             }
             drop(lease);
@@ -837,7 +892,14 @@ impl GoalExecutionSupervisor {
         let Some(worker) = worker else {
             return self.fenced_response(scope, None).await;
         };
-        let (finalization, mut completion, checkpoint) = {
+        let (
+            finalization,
+            mut completion,
+            checkpoint,
+            driver,
+            ingress,
+            failure_notice_published,
+        ) = {
             let worker_guard = worker.lock().await;
             ensure!(
                 worker_guard.task_id == scope.task_id()
@@ -848,6 +910,9 @@ impl GoalExecutionSupervisor {
                 Arc::clone(&worker_guard.lifecycle_finalization),
                 worker_guard.completion.clone(),
                 worker_guard.checkpoint.clone(),
+                Arc::clone(&worker_guard.driver),
+                worker_guard.ingress.clone(),
+                Arc::clone(&worker_guard.failure_notice_published),
             )
         };
         let current = self
@@ -987,6 +1052,17 @@ impl GoalExecutionSupervisor {
                 }
             }
         }
+        if let Err(_error) = publish_failure_notice_if_terminal(
+            self.engine.as_ref(),
+            scope,
+            driver.as_ref(),
+            &ingress,
+            &failure_notice_published,
+        )
+        .await
+        {
+            log_failure_notice_delivery_failure(scope);
+        }
         self.remove_worker_if_exact(scope.session_id(), &worker)
             .await;
         self.fenced_response(scope, classified_epoch).await
@@ -1059,6 +1135,114 @@ fn is_fenced_lifecycle_epoch(task: &TaskRecord, scope: &GoalExecutionScope) -> b
                 .is_some_and(|epoch| task.execution_epoch == epoch)
 }
 
+async fn publish_failure_notice_with_lease(
+    engine: &GoalExecutionEngine,
+    scope: &GoalExecutionScope,
+    lease: &mut dyn GoalSessionExecutionLease,
+    published: &Mutex<bool>,
+) -> Result<()> {
+    let mut published = published.lock().await;
+    if *published {
+        return Ok(());
+    }
+    let Some(current) = engine
+        .registry
+        .current_goal_for_session(scope.session_id())
+        .await?
+    else {
+        return Ok(());
+    };
+    if current.id != scope.task_id() || current.status != TaskStatus::Failed {
+        return Ok(());
+    }
+    let reason = GoalFailureReason::from_terminal_reason(
+        engine
+            .registry
+            .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+            .await?
+            .as_deref(),
+    );
+    lease
+        .publish_goal_notice(GoalExecutionNotice::Failed(reason))
+        .await?;
+    *published = true;
+    Ok(())
+}
+
+async fn publish_failure_notice_if_terminal(
+    engine: &GoalExecutionEngine,
+    scope: &GoalExecutionScope,
+    driver: &dyn GoalSessionDriver,
+    ingress: &GoalIngressContext,
+    published: &Mutex<bool>,
+) -> Result<()> {
+    let mut published = published.lock().await;
+    if *published {
+        return Ok(());
+    }
+    ensure!(
+        driver.session_key() == ingress.session_key()
+            && scope.session_id() == ingress.session_key().durable_id(),
+        "Goal failure-notice driver does not match the admitted session"
+    );
+    let Some(current) = engine
+        .registry
+        .current_goal_for_session(scope.session_id())
+        .await?
+    else {
+        return Ok(());
+    };
+    if current.id != scope.task_id() || current.status != TaskStatus::Failed {
+        return Ok(());
+    }
+
+    // Reacquire the surface's ordinary foreground/session lease only after
+    // the failed worker has released its original lease. This keeps notice
+    // delivery on the native representation path and prevents stale-session
+    // publication on ZeroCode reconnects.
+    let mut lease = driver.acquire_execution(ingress, scope).await?;
+    ensure!(
+        lease.session_key() == ingress.session_key(),
+        "Goal failure-notice lease does not match the admitted session"
+    );
+    let Some(current) = engine
+        .registry
+        .current_goal_for_session(scope.session_id())
+        .await?
+    else {
+        return Ok(());
+    };
+    if current.id != scope.task_id() || current.status != TaskStatus::Failed {
+        return Ok(());
+    }
+    let reason = GoalFailureReason::from_terminal_reason(
+        engine
+            .registry
+            .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+            .await?
+            .as_deref(),
+    );
+    lease
+        .publish_goal_notice(GoalExecutionNotice::Failed(reason))
+        .await?;
+    *published = true;
+    Ok(())
+}
+
+fn log_failure_notice_delivery_failure(scope: &GoalExecutionScope) {
+    zeroclaw_log::record!(
+        WARN,
+        zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Fail)
+            .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(serde_json::json!({
+                "task_id": scope.task_id(),
+                "execution_epoch": scope.execution_epoch(),
+                "phase": "failure_notice_delivery",
+            })),
+        "Goal failure lifecycle notice could not be delivered"
+    );
+}
+
 impl GoalExecutionEngine {
     pub fn new(
         runtime: GoalRuntime,
@@ -1080,6 +1264,32 @@ impl GoalExecutionEngine {
         settings: &GoalHostSettings,
         request: GoalExecutionRequest,
         checkpoint: GoalParentTurnCheckpoint,
+    ) -> Result<GoalExecutionOutcome> {
+        self.run_inner(settings, request, checkpoint, None).await
+    }
+
+    async fn run_with_failure_notice(
+        &self,
+        settings: &GoalHostSettings,
+        request: GoalExecutionRequest,
+        checkpoint: GoalParentTurnCheckpoint,
+        failure_notice_published: Arc<Mutex<bool>>,
+    ) -> Result<GoalExecutionOutcome> {
+        self.run_inner(
+            settings,
+            request,
+            checkpoint,
+            Some(failure_notice_published),
+        )
+        .await
+    }
+
+    async fn run_inner(
+        &self,
+        settings: &GoalHostSettings,
+        request: GoalExecutionRequest,
+        checkpoint: GoalParentTurnCheckpoint,
+        failure_notice_published: Option<Arc<Mutex<bool>>>,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let resume_response = request.resume_response().map(ToOwned::to_owned);
@@ -1108,7 +1318,7 @@ impl GoalExecutionEngine {
             lease.append_resume_response(response).await?;
         }
 
-        GOAL_OPERATION_ACCOUNTING
+        let result = GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
                 self.run_scoped(
                     &scope,
@@ -1119,7 +1329,20 @@ impl GoalExecutionEngine {
                 )
                 .await
             })
+            .await;
+        if result.is_err()
+            && let Some(failure_notice_published) = failure_notice_published
+            && let Err(_error) = publish_failure_notice_with_lease(
+                self,
+                &scope,
+                lease.as_mut(),
+                &failure_notice_published,
+            )
             .await
+        {
+            log_failure_notice_delivery_failure(&scope);
+        }
+        result
     }
 
     async fn current_objective(&self, scope: &GoalExecutionScope) -> Result<Option<String>> {
@@ -1854,6 +2077,56 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_failure_codes_map_to_typed_representation_reasons() {
+        for (code, expected) in [
+            (
+                "parent_operation_failed",
+                GoalFailureReason::AgentOperationFailed,
+            ),
+            (
+                "goal_tool_pairing_incomplete",
+                GoalFailureReason::ToolResultsUnpaired,
+            ),
+            ("candidate_empty", GoalFailureReason::EmptyAgentResponse),
+            (
+                "verifier_operation_failed",
+                GoalFailureReason::VerifierOperationFailed,
+            ),
+            (
+                "verifier_protocol_invalid",
+                GoalFailureReason::VerifierResponseInvalid,
+            ),
+            (
+                "accounting_missing_or_invalid",
+                GoalFailureReason::AccountingIncomplete,
+            ),
+            ("pricing_unavailable", GoalFailureReason::PricingIncomplete),
+            (
+                "accounting_outcome_unknown",
+                GoalFailureReason::OperationOutcomeUnknown,
+            ),
+            (
+                "executor_start_failed",
+                GoalFailureReason::ExecutorStartFailed,
+            ),
+            ("executor_failed", GoalFailureReason::ExecutorFailed),
+        ] {
+            assert_eq!(
+                GoalFailureReason::from_terminal_reason(Some(code)),
+                expected
+            );
+        }
+        assert_eq!(
+            GoalFailureReason::from_terminal_reason(Some("unrecognized")),
+            GoalFailureReason::Other
+        );
+        assert_eq!(
+            GoalFailureReason::from_terminal_reason(None),
+            GoalFailureReason::Other
+        );
+    }
 
     #[test]
     fn verifier_protocol_rejects_unknown_fields_and_nonblocked_blockers() {
