@@ -24,7 +24,7 @@ use crate::{
     rpc::context::RpcContext,
 };
 
-use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_commands::goal::{GoalBudgetLimits, GoalCommand};
 use zeroclaw_goal::GoalPauseReason;
 use zeroclaw_goal::control::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
@@ -662,8 +662,15 @@ impl RpcGoalRuntime {
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
         let restart_coordinator = control_plane.goal_execution_restart();
-        let settings = GoalHostSettings::from_config(
-            &config.goal,
+        let effective_limits = config.goal.effective_limits().map_err(|error| {
+            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
+        })?;
+        let settings = GoalHostSettings::from_validated_limits(
+            config.goal.enabled,
+            GoalBudgetLimits {
+                token_limit: effective_limits.token_limit,
+                cost_limit_usd: effective_limits.cost_limit_usd,
+            },
             std::process::id(),
             control_plane.boot_id.clone(),
         )?;
