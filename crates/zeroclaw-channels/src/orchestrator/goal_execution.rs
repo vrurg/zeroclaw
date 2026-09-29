@@ -133,7 +133,7 @@ pub(super) enum MatrixGoalCommandSubmission {
         supervisor: Arc<GoalExecutionSupervisor>,
         supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
         settings: GoalHostSettings,
-        submission: GoalExecutionSubmission,
+        submission: Box<GoalExecutionSubmission>,
     },
 }
 
@@ -423,7 +423,7 @@ async fn submit_matrix_goal_with_command_lease(
         supervisor,
         supervisor_slot,
         settings,
-        submission,
+        submission: Box::new(submission),
     })
 }
 
