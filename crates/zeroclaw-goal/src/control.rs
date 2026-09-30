@@ -343,6 +343,8 @@ pub trait GoalSessionDriver: Send + Sync {
     /// admission when that future completes; after returning the lease, the
     /// driver must not interrupt admitted work on account of checkpoint closure.
     /// The object is the sole transport bridge used by the later Goal executor.
+    /// Acquire identity/foreground ownership without rendering errors. Return
+    /// the producer's error unchanged; canonical projection is a lease concern.
     async fn acquire_execution(
         &self,
         ingress: &GoalIngressContext,
@@ -672,6 +674,8 @@ pub enum GoalExecutionNotice {
 pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.
     fn session_key(&self) -> &GoalSessionKey;
+    /// Return the original projection error without rendering it. Acquisition
+    /// proves session identity; history restoration has its own error boundary.
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
 
     /// Append an operator response to the same canonical session before a
@@ -682,14 +686,19 @@ pub trait GoalSessionExecutionLease: Send {
     /// The conservative default deliberately rejects the operation: silently
     /// treating a resume response as process-local context would let it vanish
     /// across a restart and break the session-continuity contract.
+    /// Return the producer's error unchanged without rendering it.
     async fn append_resume_response(&mut self, _response: String) -> Result<()> {
         bail!("Goal session driver cannot durably append a resume response")
     }
+    /// Run through ordinary execution and render every returned error through
+    /// the surface's native, scrubbed error path before returning it.
     async fn run_parent_turn(
         &mut self,
         operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult>;
+    /// Use ordinary verifier execution and render every returned error through
+    /// the surface's native, scrubbed error path before returning it.
     async fn run_verifier(
         &mut self,
         operation: &GoalOperationScope,
@@ -698,7 +707,18 @@ pub trait GoalSessionExecutionLease: Send {
     /// Persist the complete parent response to this exact canonical session
     /// and deliver it through the surface's ordinary response path before the
     /// verifier runs. Implementations must retain normal egress scrubbing.
+    /// Render every returned error through the ordinary native error path.
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()>;
+    /// Render an original Goal execution error through the surface's ordinary
+    /// native error path and egress scrub. This does not persist history, call
+    /// a model, publish a lifecycle notice, or spawn a delivery task.
+    ///
+    /// The conservative default rejects delivery instead of silently losing
+    /// the error. Hosts must override it, await their native delivery path and
+    /// return its result where the transport reports delivery failures.
+    async fn publish_goal_core_error(&mut self, _error: &anyhow::Error) -> Result<()> {
+        bail!("Goal session driver cannot publish an original execution error")
+    }
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()>;
 }
 
@@ -1997,6 +2017,7 @@ mod tests {
                 submission: admitted,
                 scope: GoalExecutionScope::new("test-goal", key.durable_id(), 1).unwrap(),
                 resume_response: None,
+                initial_turn_kind: GoalParentTurnKind::Resume,
             }),
             lease: None,
         };

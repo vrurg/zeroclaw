@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Once,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -31,15 +31,1127 @@ use zeroclaw_runtime::goal_accounting::{
     ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory,
 };
 
+#[path = "support/goal_transition_fault.rs"]
+mod goal_transition_fault;
+use goal_transition_fault::{FinishFaultPauseGate, FinishFaultRegistry, OriginalTransitionFailure};
+
 struct RecordingDriver {
     binding: GoalSessionBinding,
     binds: AtomicUsize,
     execution_acquires: AtomicUsize,
 }
 
+#[derive(Clone, Copy)]
+enum OriginalFailurePoint {
+    History,
+    Acquisition,
+    ResumeAppend,
+    HistoryDeliveryFailure,
+    HostParent,
+    HostVerifier,
+    HostCandidate,
+    EmptyCandidate,
+    HostParentTransition,
+    HostVerifierTransition,
+    HistoryWorkerTransition,
+    CandidateWorkerTransition,
+    IncompleteBeforeExecution,
+    ReacquisitionFailure,
+    ProtocolVerdict,
+    AccountingVerdict,
+    PricingVerdict,
+    CancelledParent,
+    ParentFencedPending,
+}
+
+impl OriginalFailurePoint {
+    fn transition_fault(self) -> Option<&'static str> {
+        match self {
+            Self::HostParentTransition => Some("parent_operation_failed"),
+            Self::HostVerifierTransition => Some("verifier_operation_failed"),
+            Self::HistoryWorkerTransition | Self::CandidateWorkerTransition => {
+                Some("executor_failed")
+            }
+            _ => None,
+        }
+    }
+
+    fn reason(self) -> (&'static str, zeroclaw_goal::GoalFailureReason) {
+        use zeroclaw_goal::GoalFailureReason;
+        match self {
+            Self::HostParent => (
+                "parent_operation_failed",
+                GoalFailureReason::AgentOperationFailed,
+            ),
+            Self::HostVerifier => (
+                "verifier_operation_failed",
+                GoalFailureReason::VerifierOperationFailed,
+            ),
+            Self::EmptyCandidate => ("candidate_empty", GoalFailureReason::EmptyAgentResponse),
+            Self::ProtocolVerdict => (
+                "verifier_protocol_invalid",
+                GoalFailureReason::VerifierResponseInvalid,
+            ),
+            Self::AccountingVerdict => (
+                "accounting_missing_or_invalid",
+                GoalFailureReason::AccountingIncomplete,
+            ),
+            Self::PricingVerdict => ("pricing_unavailable", GoalFailureReason::PricingIncomplete),
+            Self::ParentFencedPending => (
+                "accounting_outcome_unknown",
+                GoalFailureReason::OperationOutcomeUnknown,
+            ),
+            Self::CancelledParent => ("operator_cancel", GoalFailureReason::Other),
+            _ => ("executor_failed", GoalFailureReason::ExecutorFailed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OriginalExecutionFailure;
+
+impl std::fmt::Display for OriginalExecutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("distinctive original execution failure")
+    }
+}
+
+impl std::error::Error for OriginalExecutionFailure {}
+
+struct OriginalErrorDriver {
+    binding: GoalSessionBinding,
+    point: OriginalFailurePoint,
+    acquires: AtomicUsize,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    published: Arc<Notify>,
+    store: Arc<SqliteTaskStore>,
+    parent_gate: Option<Arc<OriginalParentGate>>,
+}
+
+#[derive(Default)]
+struct OriginalParentGate {
+    observed: Notify,
+    released: Notify,
+}
+
+struct OriginalErrorLease {
+    session_key: GoalSessionKey,
+    point: OriginalFailurePoint,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    published: Arc<Notify>,
+    store: Arc<SqliteTaskStore>,
+    parent_gate: Option<Arc<OriginalParentGate>>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for OriginalErrorLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        assert!(!matches!(
+            self.point,
+            OriginalFailurePoint::ResumeAppend
+                | OriginalFailurePoint::IncompleteBeforeExecution
+                | OriginalFailurePoint::ReacquisitionFailure
+        ));
+        match self.point {
+            OriginalFailurePoint::HostParent
+            | OriginalFailurePoint::HostVerifier
+            | OriginalFailurePoint::HostCandidate
+            | OriginalFailurePoint::EmptyCandidate
+            | OriginalFailurePoint::HostParentTransition
+            | OriginalFailurePoint::HostVerifierTransition
+            | OriginalFailurePoint::CandidateWorkerTransition
+            | OriginalFailurePoint::ProtocolVerdict
+            | OriginalFailurePoint::AccountingVerdict
+            | OriginalFailurePoint::PricingVerdict
+            | OriginalFailurePoint::CancelledParent
+            | OriginalFailurePoint::ParentFencedPending => Ok(Vec::new()),
+            _ => Err(OriginalExecutionFailure.into()),
+        }
+    }
+
+    async fn append_resume_response(&mut self, response: String) -> anyhow::Result<()> {
+        assert!(matches!(self.point, OriginalFailurePoint::ResumeAppend));
+        assert_eq!(response, "First line\nSecond line");
+        self.events.lock().unwrap().push("resume_append");
+        Err(OriginalExecutionFailure.into())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        operation: &GoalOperationScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        match self.point {
+            OriginalFailurePoint::HostParent | OriginalFailurePoint::HostParentTransition => {
+                self.events.lock().unwrap().push("host_error");
+                Err(OriginalExecutionFailure.into())
+            }
+            OriginalFailurePoint::HostVerifier
+            | OriginalFailurePoint::HostVerifierTransition
+            | OriginalFailurePoint::HostCandidate
+            | OriginalFailurePoint::CandidateWorkerTransition => {
+                Ok(GoalParentTurnResult::from_continuation_prefix(
+                    "parent candidate".into(),
+                    turn.working_history,
+                ))
+            }
+            OriginalFailurePoint::EmptyCandidate => Ok(
+                GoalParentTurnResult::from_continuation_prefix(String::new(), turn.working_history),
+            ),
+            OriginalFailurePoint::ProtocolVerdict => {
+                Ok(GoalParentTurnResult::from_continuation_prefix(
+                    "parent candidate".into(),
+                    turn.working_history,
+                ))
+            }
+            OriginalFailurePoint::AccountingVerdict | OriginalFailurePoint::PricingVerdict => {
+                use zeroclaw_goal::accounting::{
+                    GOAL_OPERATION_ACCOUNTING, GoalOperationRequest, GoalOperationSettlement,
+                    GoalUsageEvent,
+                };
+                let accountant = GOAL_OPERATION_ACCOUNTING.with(Clone::clone).unwrap();
+                accountant
+                    .admit(GoalOperationRequest::new("configured", "model"))
+                    .await?;
+                let missing = matches!(self.point, OriginalFailurePoint::AccountingVerdict);
+                accountant
+                    .settle(GoalOperationSettlement {
+                        accounting_state: if missing {
+                            GoalAccountingState::Missing
+                        } else {
+                            GoalAccountingState::Complete
+                        },
+                        events: if missing {
+                            Vec::new()
+                        } else {
+                            vec![GoalUsageEvent {
+                                provider_ref: "unpriced-fallback".into(),
+                                model: "unpriced-model".into(),
+                                usage: zeroclaw_api::model_provider::TokenUsage {
+                                    input_tokens: Some(5),
+                                    output_tokens: Some(2),
+                                    cached_input_tokens: Some(0),
+                                    cache_creation_input_tokens: Some(0),
+                                },
+                                priceable: true,
+                            }]
+                        },
+                    })
+                    .await?;
+                Ok(GoalParentTurnResult::from_continuation_prefix(
+                    "parent candidate".into(),
+                    turn.working_history,
+                ))
+            }
+            OriginalFailurePoint::CancelledParent | OriginalFailurePoint::ParentFencedPending => {
+                if matches!(self.point, OriginalFailurePoint::ParentFencedPending) {
+                    let scope = operation.execution();
+                    assert_eq!(
+                        self.store
+                            .admit_pending_operation(
+                                scope.task_id(),
+                                scope.session_id(),
+                                scope.execution_epoch(),
+                                "unsettled-parent-operation",
+                            )
+                            .await?,
+                        GoalTransitionResult::Applied,
+                    );
+                }
+                let gate = self.parent_gate.as_ref().unwrap();
+                gate.observed.notify_one();
+                gate.released.notified().await;
+                self.events.lock().unwrap().push("host_error");
+                Err(OriginalExecutionFailure.into())
+            }
+            _ => panic!("a pre-parent failure must not admit a parent operation"),
+        }
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<GoalVerifierResult> {
+        if matches!(self.point, OriginalFailurePoint::ProtocolVerdict) {
+            return Ok(GoalVerifierResult {
+                response: "not a verifier response".into(),
+                attribution: None,
+            });
+        }
+        assert!(matches!(
+            self.point,
+            OriginalFailurePoint::HostVerifier | OriginalFailurePoint::HostVerifierTransition
+        ));
+        self.events.lock().unwrap().push("host_error");
+        Err(OriginalExecutionFailure.into())
+    }
+
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        match self.point {
+            OriginalFailurePoint::HostCandidate
+            | OriginalFailurePoint::CandidateWorkerTransition => {
+                self.events.lock().unwrap().push("host_error");
+                Err(OriginalExecutionFailure.into())
+            }
+            OriginalFailurePoint::HostVerifier
+            | OriginalFailurePoint::HostVerifierTransition
+            | OriginalFailurePoint::ProtocolVerdict
+            | OriginalFailurePoint::AccountingVerdict
+            | OriginalFailurePoint::PricingVerdict => Ok(()),
+            _ => panic!("a pre-parent failure must not persist a candidate"),
+        }
+    }
+
+    async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
+        if matches!(
+            self.point,
+            OriginalFailurePoint::HostParentTransition
+                | OriginalFailurePoint::HostVerifierTransition
+                | OriginalFailurePoint::CandidateWorkerTransition
+        ) {
+            assert!(error.downcast_ref::<OriginalTransitionFailure>().is_some());
+            assert!(error.downcast_ref::<OriginalExecutionFailure>().is_none());
+            assert_eq!(
+                error.to_string(),
+                "distinctive original Goal transition failure"
+            );
+        } else if matches!(self.point, OriginalFailurePoint::ParentFencedPending) {
+            assert_eq!(error.to_string(), "Goal failure lost its execution fence");
+            assert!(error.downcast_ref::<OriginalExecutionFailure>().is_none());
+        } else if matches!(self.point, OriginalFailurePoint::IncompleteBeforeExecution) {
+            assert_eq!(
+                error.to_string(),
+                "Goal execution begins with incomplete accounting"
+            );
+        } else {
+            assert!(error.downcast_ref::<OriginalExecutionFailure>().is_some());
+            assert_eq!(error.to_string(), "distinctive original execution failure");
+        }
+        self.events.lock().unwrap().push("original_error");
+        if matches!(self.point, OriginalFailurePoint::HistoryDeliveryFailure) {
+            anyhow::bail!("injected original-error delivery failure");
+        }
+        Ok(())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            notice,
+            zeroclaw_goal::GoalExecutionNotice::Failed(self.point.reason().1)
+        );
+        self.events.lock().unwrap().push("failure_notice");
+        self.published.notify_one();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GoalSessionDriver for OriginalErrorDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        let attempt = self.acquires.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.point, OriginalFailurePoint::ReacquisitionFailure)
+            || matches!(self.point, OriginalFailurePoint::Acquisition) && attempt == 0
+        {
+            return Err(OriginalExecutionFailure.into());
+        }
+        Ok(Box::new(OriginalErrorLease {
+            session_key: self.binding.session_key().clone(),
+            point: self.point,
+            events: Arc::clone(&self.events),
+            published: Arc::clone(&self.published),
+            store: Arc::clone(&self.store),
+            parent_gate: self.parent_gate.clone(),
+        }))
+    }
+}
+
+async fn assert_original_execution_error_precedes_failure_notice(point: OriginalFailurePoint) {
+    assert_original_execution_error_for_ingress(point, matrix_ingress()).await;
+}
+
+async fn assert_original_execution_error_for_ingress(
+    point: OriginalFailurePoint,
+    ingress: GoalIngressContext,
+) {
+    static LOG_INIT: Once = Once::new();
+    LOG_INIT.call_once(|| {
+        zeroclaw_log::try_install_capture_subscriber();
+        drop(zeroclaw_log::subscribe_or_install());
+    });
+    let mut log_events = zeroclaw_log::subscribe().unwrap();
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let pause_gate = matches!(
+        point,
+        OriginalFailurePoint::HistoryWorkerTransition
+            | OriginalFailurePoint::CandidateWorkerTransition
+    )
+    .then(|| Arc::new(FinishFaultPauseGate::default()));
+    let fault_registry = point.transition_fault().map(|reason| {
+        let registry = FinishFaultRegistry::new(Arc::clone(&store), reason);
+        Arc::new(match &pause_gate {
+            Some(gate) => registry.with_pause_gate(Arc::clone(gate)),
+            None => registry,
+        })
+    });
+    let registry: Arc<dyn GoalTaskRegistry> = match &fault_registry {
+        Some(registry) => registry.clone(),
+        None => store.clone(),
+    };
+    let runtime = GoalRuntime::new(Arc::clone(&registry));
+    let settings = host_settings(true);
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            registry,
+            Arc::clone(&tracker),
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
+                std::collections::HashMap::from([(
+                    "configured".into(),
+                    std::collections::HashMap::from([
+                        ("model.input".into(), 1.0),
+                        ("model.output".into(), 2.0),
+                        ("model.cached_input".into(), 0.5),
+                        ("model.cache_write".into(), 1.5),
+                    ]),
+                )]),
+            ))),
+        )
+        .unwrap(),
+    );
+    let supervisor = GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(factory)));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::new(Notify::new());
+    let parent_gate = matches!(
+        point,
+        OriginalFailurePoint::CancelledParent | OriginalFailurePoint::ParentFencedPending
+    )
+    .then(|| Arc::new(OriginalParentGate::default()));
+    let driver = Arc::new(OriginalErrorDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        point,
+        acquires: AtomicUsize::new(0),
+        events: Arc::clone(&events),
+        published: Arc::clone(&published),
+        store: Arc::clone(&store),
+        parent_gate: parent_gate.clone(),
+    });
+    let mut started = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the admitted task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let task_id = match started.response() {
+        GoalResponse::Started(projection) => projection.task_id.clone(),
+        response => panic!("expected start response, got {response:?}"),
+    };
+    if matches!(point, OriginalFailurePoint::ResumeAppend) {
+        let paused = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Pause { immediate: false },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(paused.response(), GoalResponse::Paused(_)));
+        started = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Resume {
+                    response: Some("First line\nSecond line".into()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let epoch = match started.response() {
+        GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
+            assert_eq!(projection.task_id, task_id);
+            projection.execution_epoch
+        }
+        response => panic!("expected admitted execution, got {response:?}"),
+    };
+    let scope =
+        GoalExecutionScope::new(&task_id, ingress.session_key().durable_id(), epoch).unwrap();
+    if matches!(point, OriginalFailurePoint::IncompleteBeforeExecution) {
+        assert_eq!(
+            store
+                .admit_pending_operation(&task_id, scope.session_id(), epoch, "precheck-operation")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    &task_id,
+                    scope.session_id(),
+                    epoch,
+                    "precheck-operation",
+                    GoalAccountingState::Missing
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+    supervisor
+        .launch_after_response(settings.clone(), &mut started)
+        .await
+        .unwrap();
+    let completion = if let Some(gate) = parent_gate {
+        timeout(Duration::from_secs(5), gate.observed.notified())
+            .await
+            .expect("the admitted parent must reach its error gate");
+        let mut control = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                if matches!(point, OriginalFailurePoint::CancelledParent) {
+                    GoalCommand::Cancel
+                } else {
+                    GoalCommand::Pause { immediate: true }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            control.response(),
+            GoalResponse::TransitionPending(_)
+        ));
+        gate.released.notify_one();
+        let (completion, transition) = timeout(Duration::from_secs(5), async {
+            tokio::join!(biased;
+                supervisor.drain(&scope),
+                supervisor.launch_after_response(settings, &mut control),
+            )
+        })
+        .await
+        .expect("the fenced parent error must drain without a deadlock");
+        transition.unwrap();
+        completion
+    } else if matches!(point, OriginalFailurePoint::ReacquisitionFailure) {
+        timeout(Duration::from_secs(5), supervisor.drain(&scope))
+            .await
+            .expect("failed reacquisition must not strand the worker")
+    } else if let Some(gate) = &pause_gate {
+        timeout(Duration::from_secs(5), gate.observed.notified())
+            .await
+            .expect("the named worker terminal transition must reach the fault gate");
+        let mut pause = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Pause { immediate: true },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            pause.response(),
+            GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Pause)
+        ));
+        let (completion, transition) = timeout(Duration::from_secs(5), async {
+            // Capture the worker completion before the command's drainer
+            // can retire it. Both drainers exercise the same finalization.
+            tokio::join!(biased;
+                supervisor.drain(&scope),
+                supervisor.launch_after_response(settings, &mut pause),
+            )
+        })
+        .await
+        .expect("a pause-fenced error must settle without a drain deadlock");
+        transition.unwrap();
+        timeout(Duration::from_secs(5), published.notified())
+            .await
+            .expect("the pause drainer must publish the unchanged failure notice");
+        completion
+    } else {
+        timeout(Duration::from_secs(5), published.notified())
+            .await
+            .expect("the failed worker must publish its lifecycle notice");
+        supervisor.drain(&scope).await
+    };
+    let session_id = ingress.session_key().durable_id();
+    let task = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.id, task_id);
+    assert_eq!(
+        task.status,
+        if matches!(point, OriginalFailurePoint::CancelledParent) {
+            TaskStatus::Cancelled
+        } else {
+            TaskStatus::Failed
+        }
+    );
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(&task_id, &session_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        if matches!(point, OriginalFailurePoint::CancelledParent) {
+            None
+        } else {
+            Some(point.reason().0)
+        }
+    );
+    let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        goal.accounting_state,
+        if matches!(
+            point,
+            OriginalFailurePoint::IncompleteBeforeExecution
+                | OriginalFailurePoint::AccountingVerdict
+        ) {
+            GoalAccountingState::Missing
+        } else if matches!(point, OriginalFailurePoint::ParentFencedPending) {
+            GoalAccountingState::OutcomeUnknown
+        } else {
+            GoalAccountingState::Complete
+        }
+    );
+    assert!(goal.pending_call_id.is_none());
+    if matches!(point, OriginalFailurePoint::PricingVerdict) {
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(&task_id)
+                .unwrap(),
+            (7, 0.0, false)
+        );
+    }
+    let expected_acquires = if matches!(point, OriginalFailurePoint::ReacquisitionFailure) {
+        3
+    } else if matches!(
+        point,
+        OriginalFailurePoint::HostParent
+            | OriginalFailurePoint::HostVerifier
+            | OriginalFailurePoint::EmptyCandidate
+            | OriginalFailurePoint::IncompleteBeforeExecution
+            | OriginalFailurePoint::ProtocolVerdict
+            | OriginalFailurePoint::AccountingVerdict
+            | OriginalFailurePoint::PricingVerdict
+            | OriginalFailurePoint::CancelledParent
+    ) {
+        1
+    } else {
+        2
+    };
+    assert_eq!(driver.acquires.load(Ordering::SeqCst), expected_acquires);
+    let completion = completion.unwrap_err();
+    let expected_completion = match point {
+        OriginalFailurePoint::Acquisition | OriginalFailurePoint::ReacquisitionFailure => {
+            "acquire Goal session execution lease: distinctive original execution failure"
+        }
+        OriginalFailurePoint::HostParent => {
+            "Goal parent operation failed: distinctive original execution failure"
+        }
+        OriginalFailurePoint::HostVerifier => {
+            "Goal verifier operation failed: distinctive original execution failure"
+        }
+        OriginalFailurePoint::HostCandidate => {
+            "publish Goal parent candidate before verification: distinctive original execution failure"
+        }
+        OriginalFailurePoint::EmptyCandidate => "Goal parent returned an empty candidate",
+        OriginalFailurePoint::HostParentTransition
+        | OriginalFailurePoint::HostVerifierTransition => {
+            "distinctive original Goal transition failure"
+        }
+        OriginalFailurePoint::HistoryWorkerTransition
+        | OriginalFailurePoint::CandidateWorkerTransition => {
+            "failed to terminalize Goal executor failure: distinctive original Goal transition failure"
+        }
+        OriginalFailurePoint::IncompleteBeforeExecution => {
+            "Goal execution begins with incomplete accounting"
+        }
+        OriginalFailurePoint::ProtocolVerdict => {
+            "Goal verifier response is invalid: verifier response is not strict JSON: expected ident at line 1 column 2"
+        }
+        OriginalFailurePoint::AccountingVerdict => "Goal accounting is incomplete",
+        OriginalFailurePoint::PricingVerdict => {
+            "Goal cost budget lacks complete pricing for actual provider usage"
+        }
+        OriginalFailurePoint::CancelledParent | OriginalFailurePoint::ParentFencedPending => {
+            "Goal failure lost its execution fence"
+        }
+        _ => "distinctive original execution failure",
+    };
+    assert_eq!(format!("{completion:#}"), expected_completion);
+    if let Some(registry) = fault_registry {
+        assert_eq!(
+            registry.failures(),
+            1,
+            "the named transition must fail exactly once"
+        );
+    }
+    let expected_events = match point {
+        OriginalFailurePoint::ResumeAppend => {
+            vec!["resume_append", "original_error", "failure_notice"]
+        }
+        OriginalFailurePoint::HostParent
+        | OriginalFailurePoint::HostVerifier
+        | OriginalFailurePoint::HostCandidate => vec!["host_error", "failure_notice"],
+        OriginalFailurePoint::EmptyCandidate
+        | OriginalFailurePoint::ProtocolVerdict
+        | OriginalFailurePoint::AccountingVerdict
+        | OriginalFailurePoint::PricingVerdict => vec!["failure_notice"],
+        OriginalFailurePoint::HostParentTransition
+        | OriginalFailurePoint::HostVerifierTransition
+        | OriginalFailurePoint::CandidateWorkerTransition
+        | OriginalFailurePoint::ParentFencedPending => {
+            vec!["host_error", "original_error", "failure_notice"]
+        }
+        OriginalFailurePoint::ReacquisitionFailure => Vec::new(),
+        OriginalFailurePoint::CancelledParent => vec!["host_error"],
+        _ => vec!["original_error", "failure_notice"],
+    };
+    assert_eq!(*events.lock().unwrap(), expected_events,);
+    let mut delivery_warnings = Vec::new();
+    loop {
+        match log_events.try_recv() {
+            Ok(event) => {
+                if event["attributes"]["task_id"] == task_id && event["severity_text"] == "WARN" {
+                    delivery_warnings.push(event);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("canonical log capture lost evidence: {error}"),
+        }
+    }
+    let expected_warning = match point {
+        OriginalFailurePoint::HistoryDeliveryFailure => Some(("core_error_delivery", 1)),
+        OriginalFailurePoint::ReacquisitionFailure => Some(("failure_notice_delivery", 2)),
+        _ => None,
+    };
+    if let Some((phase, count)) = expected_warning {
+        assert_eq!(delivery_warnings.len(), count);
+        for event in delivery_warnings {
+            let attributes = &event["attributes"];
+            assert_eq!(attributes.as_object().unwrap().len(), 5);
+            assert_eq!(attributes["task_id"], task_id);
+            assert_eq!(attributes["execution_epoch"], epoch);
+            assert_eq!(attributes["phase"], phase);
+            // The canonical capture layer adds source navigation metadata;
+            // the failure producer adds no raw error, prompt or payload.
+            assert_eq!(
+                attributes["_file"],
+                "crates/zeroclaw-goal/src/control/goal_execution.rs"
+            );
+            assert!(attributes["_line"].as_u64().is_some_and(|line| line > 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn original_history_error_precedes_failure_notice() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::History).await;
+}
+
+#[tokio::test]
+async fn original_acquisition_error_precedes_failure_notice() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::Acquisition)
+        .await;
+}
+
+#[tokio::test]
+async fn original_resume_append_error_precedes_failure_notice() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::ResumeAppend)
+        .await;
+}
+
+#[tokio::test]
+async fn original_error_delivery_failure_still_publishes_notice_without_retry_on_drain() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::HistoryDeliveryFailure,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_host_parent_error_is_not_handed_again() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::HostParent).await;
+}
+
+#[tokio::test]
+async fn original_host_verifier_error_is_not_handed_again() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::HostVerifier)
+        .await;
+}
+
+#[tokio::test]
+async fn original_host_candidate_error_is_not_handed_again() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::HostCandidate)
+        .await;
+}
+
+#[tokio::test]
+async fn original_empty_candidate_verdict_is_not_handed_as_core_error() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::EmptyCandidate)
+        .await;
+}
+
+#[tokio::test]
+async fn original_host_parent_transition_error_is_handed_after_host_error() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::HostParentTransition,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_host_verifier_transition_error_is_handed_after_host_error() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::HostVerifierTransition,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_history_error_wins_over_later_worker_transition_failure() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::HistoryWorkerTransition,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_worker_transition_error_is_handed_after_host_candidate_error() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::CandidateWorkerTransition,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_incomplete_accounting_precheck_error_precedes_failure_notice() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::IncompleteBeforeExecution,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_reacquisition_failure_publishes_nothing_and_logs_delivery_failures() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::ReacquisitionFailure,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_protocol_verdict_is_not_handed_as_core_error() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::ProtocolVerdict)
+        .await;
+}
+
+#[tokio::test]
+async fn original_accounting_verdict_is_not_handed_as_core_error() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::AccountingVerdict,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn original_pricing_verdict_preserves_known_usage_without_core_error_handoff() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::PricingVerdict)
+        .await;
+}
+
+#[tokio::test]
+async fn original_cancelled_epoch_error_publishes_no_handoff_or_failure_notice() {
+    assert_original_execution_error_precedes_failure_notice(OriginalFailurePoint::CancelledParent)
+        .await;
+}
+
+#[tokio::test]
+async fn original_fence_lost_error_precedes_outcome_unknown_notice() {
+    assert_original_execution_error_precedes_failure_notice(
+        OriginalFailurePoint::ParentFencedPending,
+    )
+    .await;
+}
+
+// Separate ingress cases ensure an expected Matrix failure cannot prevent
+// execution of the equivalent ZeroCode control-plane fixture.
+macro_rules! original_error_zerocode_case {
+    ($name:ident, $point:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_original_execution_error_for_ingress(
+                OriginalFailurePoint::$point,
+                zerocode_ingress("main"),
+            )
+            .await;
+        }
+    };
+}
+
+original_error_zerocode_case!(original_zerocode_history_error, History);
+original_error_zerocode_case!(original_zerocode_acquisition_error, Acquisition);
+original_error_zerocode_case!(original_zerocode_resume_append_error, ResumeAppend);
+original_error_zerocode_case!(original_zerocode_delivery_failure, HistoryDeliveryFailure);
+original_error_zerocode_case!(original_zerocode_host_parent_error, HostParent);
+original_error_zerocode_case!(original_zerocode_host_verifier_error, HostVerifier);
+original_error_zerocode_case!(original_zerocode_host_candidate_error, HostCandidate);
+original_error_zerocode_case!(original_zerocode_empty_candidate_verdict, EmptyCandidate);
+original_error_zerocode_case!(
+    original_zerocode_parent_transition_error,
+    HostParentTransition
+);
+original_error_zerocode_case!(
+    original_zerocode_verifier_transition_error,
+    HostVerifierTransition
+);
+original_error_zerocode_case!(
+    original_zerocode_earliest_history_error,
+    HistoryWorkerTransition
+);
+original_error_zerocode_case!(
+    original_zerocode_worker_transition_error,
+    CandidateWorkerTransition
+);
+original_error_zerocode_case!(
+    original_zerocode_accounting_precheck_error,
+    IncompleteBeforeExecution
+);
+original_error_zerocode_case!(
+    original_zerocode_reacquisition_failure,
+    ReacquisitionFailure
+);
+original_error_zerocode_case!(original_zerocode_protocol_verdict, ProtocolVerdict);
+original_error_zerocode_case!(original_zerocode_accounting_verdict, AccountingVerdict);
+original_error_zerocode_case!(original_zerocode_pricing_verdict, PricingVerdict);
+original_error_zerocode_case!(original_zerocode_cancelled_epoch_error, CancelledParent);
+original_error_zerocode_case!(original_zerocode_fence_lost_error, ParentFencedPending);
+
+async fn assert_public_run_preserves_original_errors(ingress: GoalIngressContext) {
+    for (point, expected, transition_error) in [
+        (
+            OriginalFailurePoint::History,
+            "distinctive original execution failure",
+            false,
+        ),
+        (
+            OriginalFailurePoint::Acquisition,
+            "acquire Goal session execution lease: distinctive original execution failure",
+            false,
+        ),
+        (
+            OriginalFailurePoint::HostParent,
+            "Goal parent operation failed: distinctive original execution failure",
+            false,
+        ),
+        (
+            OriginalFailurePoint::HostVerifier,
+            "Goal verifier operation failed: distinctive original execution failure",
+            false,
+        ),
+        (
+            OriginalFailurePoint::HostCandidate,
+            "publish Goal parent candidate before verification: distinctive original execution failure",
+            false,
+        ),
+        (
+            OriginalFailurePoint::HostParentTransition,
+            "distinctive original Goal transition failure",
+            true,
+        ),
+        (
+            OriginalFailurePoint::HostVerifierTransition,
+            "distinctive original Goal transition failure",
+            true,
+        ),
+    ] {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let registry: Arc<dyn GoalTaskRegistry> = match point.transition_fault() {
+            Some(reason) => Arc::new(FinishFaultRegistry::new(Arc::clone(&store), reason)),
+            None => store.clone(),
+        };
+        let runtime = GoalRuntime::new(Arc::clone(&registry));
+        let settings = host_settings(true);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(OriginalErrorDriver {
+            binding: GoalSessionBinding::new(ingress.session_key().clone()),
+            point,
+            acquires: AtomicUsize::new(0),
+            events: Arc::clone(&events),
+            published: Arc::new(Notify::new()),
+            store,
+            parent_gate: None,
+        });
+        let request = runtime
+            .submit(
+                &settings,
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the admitted task".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .1
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let engine = runtime.execution_engine(Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                registry,
+                tracker,
+                "main",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        ));
+        let error = engine
+            .run(&settings, request, GoalParentTurnCheckpoint::new())
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(
+            error.downcast_ref::<OriginalTransitionFailure>().is_some(),
+            transition_error
+        );
+        assert_eq!(
+            error.downcast_ref::<OriginalExecutionFailure>().is_some(),
+            !transition_error
+        );
+        assert_eq!(driver.acquires.load(Ordering::SeqCst), 1);
+        let expected_events = if matches!(
+            point,
+            OriginalFailurePoint::History | OriginalFailurePoint::Acquisition
+        ) {
+            Vec::new()
+        } else {
+            vec!["host_error"]
+        };
+        assert_eq!(
+            *events.lock().unwrap(),
+            expected_events,
+            "the public run path must not acquire a supervisor publication latch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn original_public_run_keeps_error_identity_and_completion_text() {
+    assert_public_run_preserves_original_errors(matrix_ingress()).await;
+}
+
+#[tokio::test]
+async fn original_zerocode_public_run_keeps_error_identity_and_completion_text() {
+    assert_public_run_preserves_original_errors(zerocode_ingress("main")).await;
+}
+
 struct LaunchRebindFailureDriver {
     inner: Arc<RecordingDriver>,
     refuse_bind: AtomicBool,
+    notices: Arc<Mutex<Vec<zeroclaw_goal::GoalExecutionNotice>>>,
+    parent_calls: Arc<AtomicUsize>,
+}
+
+struct LaunchRebindFailureLease {
+    inner: RecordingExecutionLease,
+    notices: Arc<Mutex<Vec<zeroclaw_goal::GoalExecutionNotice>>>,
+    parent_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for LaunchRebindFailureLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.inner.session_key()
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        self.inner.canonical_history()
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        operation: &GoalOperationScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        self.parent_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.run_parent_turn(operation, turn).await
+    }
+
+    async fn run_verifier(
+        &mut self,
+        operation: &GoalOperationScope,
+        turn: GoalVerifierTurn,
+    ) -> anyhow::Result<GoalVerifierResult> {
+        self.inner.run_verifier(operation, turn).await
+    }
+
+    async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        self.inner.append_parent_candidate(candidate).await
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        self.notices.lock().unwrap().push(notice);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -57,13 +1169,19 @@ impl GoalSessionDriver for LaunchRebindFailureDriver {
 
     async fn acquire_execution(
         &self,
-        ingress: &GoalIngressContext,
-        scope: &GoalExecutionScope,
-        checkpoint: &GoalParentTurnCheckpoint,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
-        self.inner
-            .acquire_execution(ingress, scope, checkpoint)
-            .await
+        self.inner.execution_acquires.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(LaunchRebindFailureLease {
+            inner: RecordingExecutionLease {
+                session_key: self.inner.session_key().clone(),
+                delivered: Arc::new(AtomicUsize::new(0)),
+            },
+            notices: Arc::clone(&self.notices),
+            parent_calls: Arc::clone(&self.parent_calls),
+        }))
     }
 }
 
@@ -167,12 +1285,14 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
         if self.continue_once {
             self.continue_once = false;
             Ok(GoalVerifierResult {
-                response: r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned(),
+                response:
+                    r#"{"decision":"continue","reason":"add the missing detail","blockers":[]}"#
+                        .to_owned(),
                 attribution: None,
             })
         } else {
             Ok(GoalVerifierResult {
-                response: r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
+                response: r#"{"decision":"complete","reason":"candidate satisfies the objective","blockers":[]}"#
                     .to_owned(),
                 attribution: None,
             })
@@ -2793,6 +3913,8 @@ async fn assert_launch_rebind_failure_outcome(cancel_before_launch: bool) {
         let driver = Arc::new(LaunchRebindFailureDriver {
             inner: Arc::clone(&inner),
             refuse_bind: AtomicBool::new(false),
+            notices: Arc::new(Mutex::new(Vec::new())),
+            parent_calls: Arc::new(AtomicUsize::new(0)),
         });
         let mut started = supervisor
             .submit(
@@ -2824,7 +3946,7 @@ async fn assert_launch_rebind_failure_outcome(cancel_before_launch: bool) {
         }
         driver.refuse_bind.store(true, Ordering::SeqCst);
         let error = supervisor
-            .launch_after_response(settings, &mut started)
+            .launch_after_response(settings.clone(), &mut started)
             .await
             .unwrap_err();
         assert!(
@@ -2853,7 +3975,28 @@ async fn assert_launch_rebind_failure_outcome(cancel_before_launch: bool) {
         } else {
             assert_ne!(reason.as_deref(), Some("executor_start_failed"));
         }
-        assert_eq!(inner.execution_acquires.load(Ordering::SeqCst), 0);
+        let expected_notices = if cancel_before_launch {
+            Vec::new()
+        } else {
+            vec![zeroclaw_goal::GoalExecutionNotice::Failed(
+                zeroclaw_goal::GoalFailureReason::ExecutorStartFailed,
+            )]
+        };
+        assert_eq!(*driver.notices.lock().unwrap(), expected_notices);
+        assert_eq!(
+            inner.execution_acquires.load(Ordering::SeqCst),
+            usize::from(!cancel_before_launch),
+            "only failure-notice delivery may acquire a lease"
+        );
+        assert_eq!(driver.parent_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            supervisor
+                .launch_after_response(settings, &mut started)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*driver.notices.lock().unwrap(), expected_notices);
     }
 }
 

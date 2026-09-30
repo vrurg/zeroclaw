@@ -4030,16 +4030,38 @@ fn append_sender_turn_inner(
         }
     };
 
-    let mut histories = ctx
-        .conversation_histories
+    let owned_breadcrumb = ctx
+        .history_crumb_flags
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
-    turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .copied()
+        == Some(true);
+    let (retained, front_evicted) = {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
+        turns.push(turn);
+        let front_evicted = turns.len() > max_history;
+        while turns.len() > max_history {
+            turns.remove(0);
+        }
+        (turns.clone(), front_evicted)
+    };
+    // The durable transcript still owns its breadcrumb; only the capped
+    // cache lost it. Do not infer ownership from a successor's matching text.
+    if owned_breadcrumb && front_evicted {
+        let mut flags = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(flag) = flags.peek_mut(sender_key) {
+            *flag = false;
+        }
     }
-    Some(turns.clone())
+    Some(retained)
 }
 
 /// Return `retained_turns` with its last message's content replaced by
@@ -16564,9 +16586,97 @@ struct HydratedSession {
     orphan_closed: bool,
 }
 
-/// Marker for a [`hydrate_session_transcript`] attempt that loaded a durable
-/// transcript but could not reconcile it with the store (cap truncation or
-/// flag correction failed to persist). Distinct from `Ok(None)`, which means
+/// Verified, capped read before ordinary hydration performs any writes.
+struct ReadSessionTranscript {
+    messages: Vec<ChatMessage>,
+    crumb_present: bool,
+    durable_crumb: Option<bool>,
+    truncated: bool,
+    trailing_orphan: bool,
+}
+
+/// Read a coherent canonical prefix and its ordinary owner's provenance.
+fn read_goal_canonical_history(
+    ctx: &ChannelRuntimeContext,
+    session_key: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
+    let persist_lock = acquire_persist_lock(ctx, session_key);
+    let _lock = persist_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .peek(session_key)
+        .cloned();
+    if let Some(messages) = cached {
+        let owner_flag = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .peek(session_key)
+            .copied();
+        let crumb_present = match owner_flag {
+            Some(flag) => flag,
+            None => resolve_cold_crumb_provenance_result(
+                ctx.session_store.as_deref(),
+                session_key,
+                &messages,
+            )
+            .map_err(|()| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Goal canonical-history restore failed: breadcrumb provenance is unavailable"
+                );
+                anyhow::Error::msg(
+                    "Goal canonical-history restore failed: breadcrumb provenance is unavailable",
+                )
+            })?,
+        };
+        return Ok((messages, crumb_present));
+    }
+    let Some(store) = ctx.session_store.as_deref() else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(mut read) = read_session_transcript(store, session_key)
+        .map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Goal canonical-history restore failed: transcript or breadcrumb provenance is unavailable"
+            );
+            anyhow::Error::msg("Goal canonical-history restore failed: transcript or breadcrumb provenance is unavailable")
+        })?
+    else {
+        return Ok((Vec::new(), false));
+    };
+    if read.trailing_orphan {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"session_key": session_key})),
+            "Goal canonical-history restore retained a trailing user turn without closing it"
+        );
+    }
+    let configured = ctx.agent_cfg.resolved.max_history_messages;
+    let max_history = if configured > 0 {
+        configured
+    } else {
+        MAX_CHANNEL_HISTORY
+    };
+    if read.messages.len() > max_history {
+        read.messages.drain(..read.messages.len() - max_history);
+        // The owner-flagged first row was removed; correct only this snapshot.
+        read.crumb_present = false;
+    }
+    Ok((read.messages, read.crumb_present))
+}
+
+/// Marker for an unavailable transcript/provenance read or a
+/// [`hydrate_session_transcript`] reconciliation that failed to persist.
+/// Distinct from `Ok(None)`, which means
 /// there is no durable transcript at all: callers must not treat a failed
 /// reconciliation like an empty session, or the next inbound turn would seed
 /// an empty cache over an existing transcript — and, once the cache exists,
@@ -16574,31 +16684,26 @@ struct HydratedSession {
 #[derive(Debug)]
 struct HydrationFailed;
 
-/// Load one session's transcript for startup hydration: apply the
-/// `MAX_CHANNEL_HISTORY` cap, close a trailing orphaned user turn, and
-/// resolve breadcrumb ownership.
+/// Read one session's transcript, apply the `MAX_CHANNEL_HISTORY` cap,
+/// and resolve the ordinary hydration owner's breadcrumb provenance.
 ///
 /// The durable `trim_breadcrumb` flag is authoritative and is never
 /// overridden by comparing message text — an explicit `false` survives even
 /// when a genuine user turn collides with the breadcrumb text. The only
 /// correction applied is structural: if the flag says the marker was
 /// present and the cap actually removed that leading message, ownership
-/// follows it down to `false`, and the truncated transcript is persisted
-/// together with the corrected flag so a later restart does not reload the
-/// untruncated transcript and resurrect the turn this pass already dropped.
+/// follows it down to `false` in the returned snapshot. Persistence of that
+/// correction belongs exclusively to the ordinary hydration wrapper.
 /// Legacy sessions that never recorded a flag (`None`) infer once from
 /// text, matching the per-turn cold-cache fallback in the message path.
 /// Returns `Ok(None)` for an empty/missing session and
-/// `Err(HydrationFailed)` when a transcript was loaded but its
-/// reconciliation write failed — callers must keep those distinct (see
-/// [`HydrationFailed`]). A trailing orphan turn's durable closure append is
-/// part of that reconciliation: publishing a closure that storage never
-/// accepted would leave the live cache ahead of durable storage until the
-/// next authoritative replacement.
-fn hydrate_session_transcript(
+/// `Err(HydrationFailed)` when transcript or provenance is unreadable.
+/// Reports a trailing user turn without closing it; neither the backend nor
+/// the live caches are mutated by this read.
+fn read_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-) -> Result<Option<HydratedSession>, HydrationFailed> {
+) -> Result<Option<ReadSessionTranscript>, HydrationFailed> {
     let mut msgs = match store.try_load(session_key) {
         Ok(v) => v,
         Err(e) => {
@@ -16655,27 +16760,6 @@ fn hydrate_session_transcript(
         msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
     }
 
-    let mut orphan_closed = false;
-    if msgs.last().is_some_and(|msg| msg.role == "user") {
-        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
-        if let Err(e) = store.append(session_key, &closure) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                &format!("Failed to persist orphan closure for {session_key}")
-            );
-            // A closure the store never accepted must not be published in
-            // the returned transcript: the live cache would then hold an
-            // assistant row durable storage does not have, diverging until
-            // the next authoritative replacement. Fail closed instead and
-            // leave the session unreconciled for the next turn to retry.
-            return Err(HydrationFailed);
-        }
-        msgs.push(closure);
-        orphan_closed = true;
-    }
-
     // Legacy inference (no recorded flag) must reflect the transcript
     // actually returned to the caller, not the pre-cap snapshot: if the cap
     // drained the marker off the front, the post-cap transcript no longer
@@ -16695,6 +16779,49 @@ fn hydrate_session_transcript(
         Some(false) => false,
         None => marker_present_post_cap,
     };
+    let trailing_orphan = msgs.last().is_some_and(|msg| msg.role == "user");
+    Ok(Some(ReadSessionTranscript {
+        messages: msgs,
+        crumb_present,
+        durable_crumb,
+        truncated,
+        trailing_orphan,
+    }))
+}
+
+/// Restore ordinary channel history and reconcile its durable state.
+/// Only this wrapper closes trailing user turns and persists cap/provenance
+/// corrections; the shared read core never mutates the backend or caches.
+fn hydrate_session_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+) -> Result<Option<HydratedSession>, HydrationFailed> {
+    let Some(ReadSessionTranscript {
+        messages: mut msgs,
+        crumb_present,
+        durable_crumb,
+        truncated,
+        trailing_orphan,
+    }) = read_session_transcript(store, session_key)?
+    else {
+        return Ok(None);
+    };
+    let mut orphan_closed = false;
+    if trailing_orphan {
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        if let Err(e) = store.append(session_key, &closure) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to persist orphan closure for {session_key}")
+            );
+            // Do not publish a closure that durable storage never accepted.
+            return Err(HydrationFailed);
+        }
+        msgs.push(closure);
+        orphan_closed = true;
+    }
     // Truncation itself must trigger persistence even when ownership is
     // unchanged: the in-memory transcript returned to the caller no longer
     // matches the durable one, and skipping the write here means a later
@@ -23743,6 +23870,525 @@ api_key = "anthropic-key"
 
     fn breadcrumb_text() -> String {
         zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    fn assert_append_front_cap_preserves_provenance(require_durable_store: bool) {
+        let crumb = ChatMessage::user(breadcrumb_text());
+        let question = ChatMessage::assistant("Please choose an option.");
+        let answer = ChatMessage::user("Choose the first option.");
+        for (label, initial, flag, cap, expected_flag) in [
+            (
+                "owned eviction",
+                vec![crumb.clone(), question.clone()],
+                Some(true),
+                2,
+                Some(false),
+            ),
+            (
+                "owned retention",
+                vec![crumb.clone(), question.clone()],
+                Some(true),
+                3,
+                Some(true),
+            ),
+            (
+                "explicit false collision",
+                vec![crumb.clone(), question.clone()],
+                Some(false),
+                2,
+                Some(false),
+            ),
+            (
+                "identical genuine successor",
+                vec![crumb.clone(), crumb.clone()],
+                Some(true),
+                2,
+                Some(false),
+            ),
+            (
+                "absent provenance",
+                vec![crumb.clone(), question.clone()],
+                None,
+                2,
+                None,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            let key = "matrix_front_cap_test";
+            for row in &initial {
+                store.append(key, row).unwrap();
+            }
+            if let Some(flag) = flag {
+                store.set_session_trim_breadcrumb(key, flag).unwrap();
+            }
+            let mut ctx = test_channel_ctx_with_backend(store.clone());
+            let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+            agent_cfg.resolved.max_history_messages = cap;
+            Arc::get_mut(&mut ctx).unwrap().agent_cfg = Arc::new(agent_cfg);
+            ctx.conversation_histories
+                .lock()
+                .unwrap()
+                .put(key.to_string(), initial.clone());
+            if let Some(flag) = flag {
+                ctx.history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .put(key.to_string(), flag);
+            }
+
+            let returned = if require_durable_store {
+                append_sender_turn_durably(&ctx, key, answer.clone())
+            } else {
+                append_sender_turn(&ctx, key, answer.clone())
+            }
+            .expect("authorized append must succeed");
+            let mut durable = initial;
+            durable.push(answer.clone());
+            let expected = durable[durable.len().saturating_sub(cap)..].to_vec();
+            assert_eq!(
+                serde_json::to_value(&returned).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{label}: configured cap/order"
+            );
+            assert_eq!(
+                serde_json::to_value(ctx.conversation_histories.lock().unwrap().peek(key)).unwrap(),
+                serde_json::to_value(Some(&expected)).unwrap(),
+                "{label}: published cache"
+            );
+            assert_eq!(
+                ctx.history_crumb_flags.lock().unwrap().peek(key).copied(),
+                expected_flag,
+                "{label}: ownership must follow eviction, not matching text"
+            );
+            assert_eq!(
+                serde_json::to_value(store.try_load(key).unwrap()).unwrap(),
+                serde_json::to_value(&durable).unwrap(),
+                "{label}: append once"
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb(key).unwrap(),
+                flag,
+                "{label}: live eviction must not rewrite durable ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_append_front_cap_preserves_provenance() {
+        assert_append_front_cap_preserves_provenance(false);
+    }
+
+    #[test]
+    fn durable_append_front_cap_preserves_provenance() {
+        assert_append_front_cap_preserves_provenance(true);
+    }
+
+    #[test]
+    fn goal_canonical_read_applies_caps_without_reconciliation() {
+        let marker = ChatMessage::user(breadcrumb_text());
+        let question = ChatMessage::assistant("question");
+        let answer = ChatMessage::user("answer");
+        for (rows, cap, flag, expected_flag) in [
+            (
+                vec![marker.clone(), question.clone(), answer.clone()],
+                3,
+                true,
+                true,
+            ),
+            (
+                vec![marker.clone(), question.clone(), answer.clone()],
+                2,
+                true,
+                false,
+            ),
+            (
+                vec![marker.clone(), question, answer.clone()],
+                2,
+                false,
+                false,
+            ),
+            (
+                {
+                    let mut rows = vec![marker];
+                    rows.extend(vec![answer; MAX_CHANNEL_HISTORY + 2]);
+                    rows
+                },
+                0,
+                true,
+                false,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            for row in &rows {
+                store.append("fixture", row).unwrap();
+            }
+            store.set_session_trim_breadcrumb("fixture", flag).unwrap();
+            let mut context = test_channel_ctx_with_backend(store.clone());
+            let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+            config.resolved.max_history_messages = cap;
+            Arc::get_mut(&mut context).unwrap().agent_cfg = Arc::new(config);
+            let (prefix, owned) = read_goal_canonical_history(&context, "fixture").unwrap();
+            let limit = if cap > 0 {
+                cap.min(MAX_CHANNEL_HISTORY)
+            } else {
+                MAX_CHANNEL_HISTORY
+            };
+            assert_eq!(
+                serde_json::to_value(prefix).unwrap(),
+                serde_json::to_value(&rows[rows.len().saturating_sub(limit)..]).unwrap()
+            );
+            assert_eq!(owned, expected_flag);
+            assert_eq!(
+                serde_json::to_value(store.try_load("fixture").unwrap()).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb("fixture").unwrap(),
+                Some(flag)
+            );
+            assert!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn goal_canonical_read_keeps_missing_and_storeless_sessions_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let mut context = test_channel_ctx_with_backend(store);
+        for without_store in [false, true] {
+            if without_store {
+                Arc::get_mut(&mut context).unwrap().session_store = None;
+            }
+            let (prefix, owned) = read_goal_canonical_history(&context, "missing").unwrap();
+            assert!(prefix.is_empty());
+            assert!(!owned);
+            assert!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("missing")
+                    .is_none()
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("missing")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn goal_canonical_read_fails_closed_on_unreadable_state() {
+        struct UnreadableBackend {
+            fail_transcript: bool,
+        }
+        impl SessionBackend for UnreadableBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                panic!("must use fallible read")
+            }
+            fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                if self.fail_transcript {
+                    Err(std::io::Error::other("unreadable transcript"))
+                } else {
+                    Ok(vec![ChatMessage::assistant("question")])
+                }
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other("unreadable provenance"))
+            }
+            fn append(&self, _key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                panic!("restore cannot write")
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                panic!("restore cannot write")
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn set_session_trim_breadcrumb(&self, _key: &str, _flag: bool) -> std::io::Result<()> {
+                panic!("restore cannot write provenance")
+            }
+        }
+        for (warm, fail_transcript) in [(false, true), (false, false), (true, false)] {
+            let context =
+                test_channel_ctx_with_backend(Arc::new(UnreadableBackend { fail_transcript }));
+            if warm {
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .put("fixture".into(), vec![ChatMessage::assistant("question")]);
+            }
+            let error = read_goal_canonical_history(&context, "fixture").unwrap_err();
+            assert!(error.to_string().contains("Goal canonical-history restore"));
+            assert_eq!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_some(),
+                warm
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+        }
+        for flag in [false, true] {
+            let context = test_channel_ctx_with_backend(Arc::new(UnreadableBackend {
+                fail_transcript: true,
+            }));
+            let rows = vec![
+                ChatMessage::user(breadcrumb_text()),
+                ChatMessage::assistant("question"),
+            ];
+            context
+                .conversation_histories
+                .lock()
+                .unwrap()
+                .put("fixture".into(), rows.clone());
+            context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .put("fixture".into(), flag);
+            let (prefix, owned) = read_goal_canonical_history(&context, "fixture").unwrap();
+            assert_eq!(
+                serde_json::to_value(prefix).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+            assert_eq!(
+                owned, flag,
+                "explicit warm provenance precedes the unreadable backend"
+            );
+            assert_eq!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .copied(),
+                Some(flag)
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_read_core_is_read_only_and_reports_orphans() {
+        struct ReadOnlyBackend {
+            rows: Vec<ChatMessage>,
+            flag: Option<bool>,
+            reads: Mutex<Vec<&'static str>>,
+            fail_load: bool,
+            fail_provenance: bool,
+        }
+        impl SessionBackend for ReadOnlyBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                panic!("must use fallible transcript read")
+            }
+            fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                self.reads.lock().unwrap().push("transcript");
+                if self.fail_load {
+                    Err(std::io::Error::other("unavailable transcript"))
+                } else {
+                    Ok(self.rows.clone())
+                }
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                self.reads.lock().unwrap().push("provenance");
+                if self.fail_provenance {
+                    Err(std::io::Error::other("unavailable provenance"))
+                } else {
+                    Ok(self.flag)
+                }
+            }
+            fn append(&self, _key: &str, _row: &ChatMessage) -> std::io::Result<()> {
+                panic!("read core must not append an orphan closure")
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                panic!("read core must not mutate history")
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                panic!("read core is bound to exactly one key")
+            }
+            fn set_session_trim_breadcrumb(&self, _key: &str, _flag: bool) -> std::io::Result<()> {
+                panic!("read core must not persist provenance")
+            }
+        }
+        let marker = ChatMessage::user(breadcrumb_text());
+        for (rows, flag, expected_flag, truncated) in [
+            (vec![marker.clone()], Some(false), false, false),
+            (vec![marker.clone()], Some(true), true, false),
+            (vec![marker.clone()], None, true, false),
+            (
+                {
+                    let mut rows = vec![marker];
+                    rows.extend(vec![ChatMessage::user("answer"); MAX_CHANNEL_HISTORY]);
+                    rows
+                },
+                Some(true),
+                false,
+                true,
+            ),
+        ] {
+            let backend = ReadOnlyBackend {
+                rows: rows.clone(),
+                flag,
+                reads: Mutex::new(Vec::new()),
+                fail_load: false,
+                fail_provenance: false,
+            };
+            let read = read_session_transcript(&backend, "fixture")
+                .unwrap()
+                .unwrap();
+            let expected = &rows[rows.len().saturating_sub(MAX_CHANNEL_HISTORY)..];
+            assert_eq!(
+                serde_json::to_value(read.messages).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(read.crumb_present, expected_flag);
+            assert_eq!(read.durable_crumb, flag);
+            assert_eq!(read.truncated, truncated);
+            assert!(read.trailing_orphan);
+            assert_eq!(*backend.reads.lock().unwrap(), ["transcript", "provenance"]);
+        }
+        for (rows, fail_load, fail_provenance, expected_reads) in [
+            (Vec::new(), false, true, vec!["transcript"]),
+            (
+                vec![ChatMessage::user("answer")],
+                true,
+                false,
+                vec!["transcript"],
+            ),
+            (
+                vec![ChatMessage::user(breadcrumb_text())],
+                false,
+                true,
+                vec!["transcript", "provenance"],
+            ),
+        ] {
+            let empty = rows.is_empty();
+            let backend = ReadOnlyBackend {
+                rows,
+                flag: Some(false),
+                reads: Mutex::new(Vec::new()),
+                fail_load,
+                fail_provenance,
+            };
+            let result = read_session_transcript(&backend, "fixture");
+            if empty {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(
+                    result.is_err(),
+                    "unavailable is not legitimate empty history"
+                );
+            }
+            assert_eq!(*backend.reads.lock().unwrap(), expected_reads);
+        }
+    }
+
+    #[test]
+    fn hydration_preserves_exact_read_and_reconciliation_contract() {
+        let marker = ChatMessage::user(breadcrumb_text());
+        let assistant = ChatMessage::assistant("question");
+        let answer = ChatMessage::user("answer");
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        let capped_tail = vec![assistant.clone(); MAX_CHANNEL_HISTORY];
+        let mut capped = vec![marker.clone()];
+        capped.extend(capped_tail.clone());
+        for (initial, flag, expected, expected_flag, orphan_closed) in [
+            (
+                vec![marker.clone(), assistant.clone()],
+                Some(true),
+                vec![marker.clone(), assistant.clone()],
+                true,
+                false,
+            ),
+            (
+                vec![marker.clone(), assistant.clone()],
+                Some(false),
+                vec![marker.clone(), assistant.clone()],
+                false,
+                false,
+            ),
+            (
+                vec![marker.clone(), assistant.clone()],
+                None,
+                vec![marker.clone(), assistant.clone()],
+                true,
+                false,
+            ),
+            (capped, Some(true), capped_tail, false, false),
+            (
+                vec![assistant.clone(), answer.clone()],
+                Some(false),
+                vec![assistant.clone(), answer, closure],
+                false,
+                true,
+            ),
+            (
+                vec![assistant.clone()],
+                Some(true),
+                vec![assistant],
+                true,
+                false,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+            for row in &initial {
+                store.append("fixture", row).unwrap();
+            }
+            if let Some(flag) = flag {
+                store.set_session_trim_breadcrumb("fixture", flag).unwrap();
+            }
+            let hydrated = hydrate_session_transcript(&store, "fixture")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(hydrated.messages).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(hydrated.crumb_present, expected_flag);
+            assert_eq!(hydrated.orphan_closed, orphan_closed);
+            assert_eq!(
+                serde_json::to_value(store.try_load("fixture").unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb("fixture").unwrap(),
+                Some(expected_flag)
+            );
+        }
     }
 
     #[test]
