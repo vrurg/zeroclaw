@@ -115,6 +115,14 @@ Preparation happens before the executor runs a tool:
 6. Duplicate-call guards remove repeated identical calls unless the tool is
    exempt.
 
+Direct `session_prompt_list`, `session_prompt_set`, and `session_prompt_delete`
+calls bypass `before_tool_call` hooks: their opaque content and exact approval
+binding must not be exposed or rewritten through that extension point. Ordinary
+calls rewritten into a session-prompt tool are still checked at dispatch; the
+rewrite does not grant access to an unsupported or stale session context.
+Alternative hook policies require a separate architectural decision rather than
+an implicit exception to this feature's contract.
+
 Approval has different front doors:
 
 - CLI managers prompt the operator and support `yes`, `no`, and `always`.
@@ -191,6 +199,16 @@ Tool results are not long-term memory unless a memory write occurs. They may be
 current-turn context, persisted session history, a streamed UI event, an
 observer/log record, or a receipt-bearing result. Name the surface precisely in
 PRs and reviews.
+
+[Persistent session prompts](../agents/session-prompts.md) are an explicit
+privacy exception to the generic result path above. Their opaque arguments and
+results do not enter generic tool events, receipts, progress, or observer
+records. Direct prompt calls also bypass `after_tool_call` hooks; an ordinary
+call rewritten into a prompt tool exposes only redacted metadata to that hook.
+The provider request, explicit list result, and dedicated operator confirmation
+remain content-bearing surfaces. Retained transcripts replace the prompt-tool
+exchange with a redaction marker; the owning SQLite attachment rows, not that
+hidden exchange, supply continuity on later turns.
 
 ## What this page does not own
 
