@@ -7217,9 +7217,12 @@ mod tests {
             ),
             "a drained reload must still reload"
         );
-        assert_eq!(
-            settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1)).unwrap(),
-            DaemonExit::Shutdown,
+        assert!(
+            matches!(
+                settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1))
+                    .unwrap(),
+                DaemonExit::Shutdown
+            ),
             "a shutdown is unaffected by the drain verdict"
         );
         assert!(
