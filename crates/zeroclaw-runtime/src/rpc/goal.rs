@@ -1371,14 +1371,19 @@ mod tests {
         ));
         let context = RpcContext::minimal(config, sessions);
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let dispatcher = super::super::dispatch::RpcDispatcher::new(
+            Arc::clone(&context),
+            outbound_tx.clone(),
+            "goal-help-test".to_owned(),
+        );
         let driver = Arc::new(ZeroCodeGoalSessionDriver {
             context: Arc::clone(&context),
-            authorization: super::super::dispatch::GoalSessionAuthorization::new(
-                Arc::clone(&context),
-                None,
+            authorization: Arc::new(super::super::dispatch::GoalSessionAuthorization::new(
+                dispatcher,
+                super::super::dispatch::GoalCommandPurpose::Control,
                 "disabled-goal-help".to_owned(),
                 None,
-            ),
+            )),
             outbound: Arc::new(RpcOutbound::new(outbound_tx)),
             connection_activity: None,
             session_key: GoalSessionKey::zero_code("disabled-goal-help").unwrap(),
