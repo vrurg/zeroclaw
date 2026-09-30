@@ -3740,6 +3740,21 @@ fn append_sender_turn(
     sender_key: &str,
     turn: ChatMessage,
 ) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_admitted(ctx, sender_key, turn, false).map(|admitted| admitted.history)
+}
+
+/// The history prefix and owner captured by the same inbound persistence write.
+struct AdmittedSenderTurn {
+    history: Vec<ChatMessage>,
+    prompt_owner: Option<zeroclaw_infra::session_backend::SessionPromptOwner>,
+}
+
+fn append_sender_turn_admitted(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    admit_prompt_owner: bool,
+) -> Option<AdmittedSenderTurn> {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -3870,16 +3885,30 @@ fn append_sender_turn(
     }
 
     // Persist to JSONL before adding to in-memory history.
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.append(sender_key, &turn)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to persist session turn"
-        );
+    let mut prompt_owner = None;
+    if let Some(ref store) = ctx.session_store {
+        let persisted = if admit_prompt_owner && ctx.prompt_config.channels.session_prompts_enabled
+        {
+            store
+                .append_with_session_prompt_owner(sender_key, &turn)
+                .map(|owner| {
+                    prompt_owner = Some(owner);
+                })
+        } else {
+            store.append(sender_key, &turn)
+        };
+        if let Err(e) = persisted {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to persist session turn"
+            );
+            if admit_prompt_owner && ctx.prompt_config.channels.session_prompts_enabled {
+                return None;
+            }
+        }
     }
 
     // Use the user-configured max_history_messages (fall back to
@@ -3902,7 +3931,10 @@ fn append_sender_turn(
     while turns.len() > max_history {
         turns.remove(0);
     }
-    Some(turns.clone())
+    Some(AdmittedSenderTurn {
+        history: turns.clone(),
+        prompt_owner,
+    })
 }
 
 /// Return `retained_turns` with its last message's content replaced by
@@ -9219,10 +9251,11 @@ async fn process_channel_message_body(
     // write that landed in between and silently shifting what "this turn's
     // own prefix" means once the post-loop resync tries to reconcile against
     // it (see `turns_appended_after`).
-    let Some(known_prefix) = append_sender_turn(
+    let Some(admitted_turn) = append_sender_turn_admitted(
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&timestamped_content),
+        true,
     ) else {
         // The durable transcript and its breadcrumb provenance could not both
         // be verified (see `append_sender_turn`). Running this turn anyway
@@ -9243,6 +9276,8 @@ async fn process_channel_message_body(
         );
         return;
     };
+    let known_prefix = admitted_turn.history;
+    let session_prompt_owner = admitted_turn.prompt_owner;
 
     // Build history from per-sender conversation cache.
     let mut prior_turns = normalize_cached_channel_turns(known_prefix.clone());
@@ -9330,9 +9365,9 @@ async fn process_channel_message_body(
         per_turn_native_tool_specs_present,
     );
     let session_prompt_attachments = if ctx.prompt_config.channels.session_prompts_enabled {
-        let prompt_result = match ctx.session_store.as_ref() {
-            Some(backend) => backend.list_session_prompts(&history_key),
-            None => Err(std::io::Error::other(
+        let prompt_result = match (ctx.session_store.as_ref(), session_prompt_owner.as_ref()) {
+            (Some(backend), Some(owner)) => backend.list_session_prompts_for_owner(owner),
+            _ => Err(std::io::Error::other(
                 "persistent session prompts are enabled but the session backend is unavailable",
             )),
         };
@@ -10142,6 +10177,8 @@ async fn process_channel_message_body(
             );
             let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
                 .scope(Some(session_prompt_budget), tool_loop);
+            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER
+                .scope(session_prompt_owner.clone(), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
@@ -22588,6 +22625,46 @@ api_key = "anthropic-key"
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
+    }
+
+    #[test]
+    fn channel_session_prompt_owner_is_captured_with_the_inbound_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let base = test_channel_ctx_with_backend(backend.clone());
+        let mut config = (*base.prompt_config).clone();
+        config.channels.session_prompts_enabled = true;
+        let ctx = ChannelRuntimeContext {
+            prompt_config: Arc::new(config),
+            ..(*base).clone()
+        };
+        let admitted =
+            append_sender_turn_admitted(&ctx, "channel-owner", ChatMessage::user("original"), true)
+                .unwrap();
+        assert_eq!(admitted.history.last().unwrap().content, "original");
+        let owner = admitted.prompt_owner.unwrap();
+        backend
+            .set_session_prompt_for_owner(&owner, "task", "original prompt", None)
+            .unwrap();
+        backend.delete_session("channel-owner").unwrap();
+        let successor = backend
+            .append_with_session_prompt_owner("channel-owner", &ChatMessage::user("replacement"))
+            .unwrap();
+        backend
+            .set_session_prompt_for_owner(&successor, "task", "replacement prompt", None)
+            .unwrap();
+        assert!(backend.list_session_prompts_for_owner(&owner).is_err());
+        assert!(
+            backend
+                .set_session_prompt_for_owner(&owner, "task", "stale", None)
+                .is_err()
+        );
+        assert_eq!(
+            backend.list_session_prompts_for_owner(&successor).unwrap()[0].content,
+            "replacement prompt"
+        );
     }
 
     #[test]

@@ -8,6 +8,13 @@ They are session-scoped, not agent-scoped: another chat session never sees
 them. Resetting or deleting the session removes them atomically with its chat
 history. They are stored only by the SQLite session backend.
 
+Each admitted primary turn is bound to the durable owner's incarnation, not
+just its reusable session key. Reset or deletion invalidates that binding. A
+late prompt read or mutation from the old turn fails instead of recreating a
+deleted owner or accessing a replacement session with the same key. An empty
+session may acquire its owner at admission before its first message; daemon
+restart preserves the stored owner and attachments.
+
 `/new` attempts that same durable cleanup even when prompt injection is
 currently disabled, provided a durable session backend is attached. If that
 backend cannot prove that cleanup completed, the command reports failure and

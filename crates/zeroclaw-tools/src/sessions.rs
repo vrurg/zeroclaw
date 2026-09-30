@@ -74,6 +74,23 @@ fn current_session_prompt_budget() -> Option<zeroclaw_infra::session_backend::Se
         .flatten()
 }
 
+fn current_session_prompt_owner(
+    key: &str,
+) -> Result<zeroclaw_infra::session_backend::SessionPromptOwner, ToolResult> {
+    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|owner| owner.belongs_to(key))
+        .ok_or_else(|| ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(session_prompt_tool_msg(
+                "tool-session-prompt-error-no-context",
+            )),
+        })
+}
+
 /// Agent-scoped access to the durable ACP session store.
 ///
 /// The handle is attached by ACP server and RPC ACP Agent construction. Each tool
@@ -907,7 +924,11 @@ impl Tool for SessionPromptListTool {
             Ok(backend) => backend,
             Err(result) => return Ok(result),
         };
-        match backend.list_session_prompts(&key) {
+        let owner = match current_session_prompt_owner(&key) {
+            Ok(owner) => owner,
+            Err(result) => return Ok(result),
+        };
+        match backend.list_session_prompts_for_owner(&owner) {
             Ok(prompts) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string(
@@ -1000,8 +1021,12 @@ impl Tool for SessionPromptSetTool {
                 });
             }
         };
-        match backend.set_session_prompt_with_budget(
-            &key,
+        let owner = match current_session_prompt_owner(&key) {
+            Ok(owner) => owner,
+            Err(result) => return Ok(result),
+        };
+        match backend.set_session_prompt_for_owner(
+            &owner,
             &id,
             &content,
             current_session_prompt_budget(),
@@ -1084,7 +1109,11 @@ impl Tool for SessionPromptDeleteTool {
             Ok(backend) => backend,
             Err(result) => return Ok(result),
         };
-        match backend.delete_session_prompt(&key, id) {
+        let owner = match current_session_prompt_owner(&key) {
+            Ok(owner) => owner,
+            Err(result) => return Ok(result),
+        };
+        match backend.delete_session_prompt_for_owner(&owner, id) {
             Ok(true) => Ok(ToolResult {
                 success: true,
                 output: session_prompt_tool_msg_with_args(
@@ -1904,7 +1933,10 @@ mod tests {
                     )),
                     zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
                         Some("first".to_string()),
-                        set.execute(json!({"id": "task", "content": "keep first"})),
+                        zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                            Some(backend.admit_session_prompt_owner("first").unwrap()),
+                            set.execute(json!({"id": "task", "content": "keep first"})),
+                        ),
                     ),
                 ),
             )
@@ -1921,8 +1953,13 @@ mod tests {
                     Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
                         backend.clone(),
                     )),
-                    zeroclaw_api::TOOL_LOOP_SESSION_KEY
-                        .scope(Some("first".to_string()), list.execute(json!({}))),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("first".to_string()),
+                        zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                            Some(backend.admit_session_prompt_owner("first").unwrap()),
+                            list.execute(json!({})),
+                        ),
+                    ),
                 ),
             )
             .await
@@ -1940,7 +1977,10 @@ mod tests {
                     )),
                     zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
                         Some("first".to_string()),
-                        delete.execute(json!({"id": "task"})),
+                        zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                            Some(backend.admit_session_prompt_owner("first").unwrap()),
+                            delete.execute(json!({"id": "task"})),
+                        ),
                     ),
                 ),
             )
@@ -1948,6 +1988,59 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(backend.list_session_prompts("first").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_set_cannot_recreate_an_owner_deleted_during_the_turn() {
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        backend
+            .append("channel-session", &ChatMessage::user("start task"))
+            .unwrap();
+        let set = SessionPromptSetTool::new(test_security());
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("channel-session".to_string()),
+                        zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                            Some(
+                                backend
+                                    .admit_session_prompt_owner("channel-session")
+                                    .unwrap(),
+                            ),
+                            async {
+                                // Deletion wins after turn admission but before a
+                                // late model-selected mutation reaches storage.
+                                backend.delete_session("channel-session").unwrap();
+                                set.execute(json!({"id": "task", "content": "obsolete task"}))
+                                    .await
+                            },
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a deleted owner must reject the stale write"
+        );
+        assert!(!backend.session_exists("channel-session"));
+        assert!(
+            backend
+                .list_session_prompts("channel-session")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1978,7 +2071,10 @@ mod tests {
                         Some(budget),
                         zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
                             Some("first".to_string()),
-                            set.execute(json!({"id": "task", "content": "would make the collection too large"})),
+                            zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                                Some(backend.admit_session_prompt_owner("first").unwrap()),
+                                set.execute(json!({"id": "task", "content": "would make the collection too large"})),
+                            ),
                         ),
                     ),
                 ),
@@ -1991,6 +2087,64 @@ mod tests {
         let prompts = backend.list_session_prompts("first").unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].content, "keep current");
+    }
+
+    #[tokio::test]
+    async fn session_prompt_tools_cannot_access_a_same_key_successor() {
+        use zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER;
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let owner = backend.admit_session_prompt_owner("chat").unwrap();
+        backend
+            .set_session_prompt_for_owner(&owner, "task", "original", None)
+            .unwrap();
+        backend.delete_session("chat").unwrap();
+        let successor = backend.admit_session_prompt_owner("chat").unwrap();
+        backend
+            .set_session_prompt_for_owner(&successor, "task", "replacement", None)
+            .unwrap();
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("chat".to_owned()),
+                        TOOL_LOOP_SESSION_PROMPT_OWNER.scope(Some(owner), async {
+                            assert!(
+                                !SessionPromptListTool::new(test_security())
+                                    .execute(json!({}))
+                                    .await
+                                    .unwrap()
+                                    .success
+                            );
+                            assert!(
+                                !SessionPromptSetTool::new(test_security())
+                                    .execute(json!({"id":"task","content":"stale"}))
+                                    .await
+                                    .unwrap()
+                                    .success
+                            );
+                            assert!(
+                                !SessionPromptDeleteTool::new(test_security())
+                                    .execute(json!({"id":"task"}))
+                                    .await
+                                    .unwrap()
+                                    .success
+                            );
+                        }),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            backend.list_session_prompts("chat").unwrap()[0].content,
+            "replacement"
+        );
     }
 
     #[tokio::test]

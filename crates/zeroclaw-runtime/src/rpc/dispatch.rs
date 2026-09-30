@@ -5927,10 +5927,16 @@ impl RpcDispatcher {
         } else {
             None
         };
+        let mut session_prompt_owner = None;
         let attachments = if session_prompts_enabled {
             let prompts = match session_prompt_backend.as_ref() {
                 Some(backend) => backend
-                    .list_session_prompts(&tool_loop_session_key)
+                    .admit_session_prompt_owner(&tool_loop_session_key)
+                    .and_then(|owner| {
+                        let prompts = backend.list_session_prompts_for_owner(&owner)?;
+                        session_prompt_owner = Some(owner);
+                        Ok(prompts)
+                    })
                     .map_err(|error| {
                         rpc_err(
                             INTERNAL_ERROR,
@@ -6085,6 +6091,7 @@ impl RpcDispatcher {
             },
             cost_context,
             session_prompt_backend,
+            session_prompt_owner,
             self.connection_activity.clone(),
             move |event| {
                 let rpc = rpc.clone();
@@ -33837,6 +33844,20 @@ mod tests {
         }
 
         impl zeroclaw_infra::session_backend::SessionBackend for PromptLoadFailingBackend {
+            fn admit_session_prompt_owner(
+                &self,
+                session_key: &str,
+            ) -> std::io::Result<zeroclaw_infra::session_backend::SessionPromptOwner> {
+                self.inner.admit_session_prompt_owner(session_key)
+            }
+
+            fn list_session_prompts_for_owner(
+                &self,
+                _owner: &zeroclaw_infra::session_backend::SessionPromptOwner,
+            ) -> std::io::Result<Vec<zeroclaw_infra::session_prompts::SessionPrompt>> {
+                Err(std::io::Error::other("injected prompt-load failure"))
+            }
+
             fn list_session_prompts(
                 &self,
                 _session_key: &str,

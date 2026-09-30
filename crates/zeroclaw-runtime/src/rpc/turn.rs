@@ -79,6 +79,7 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     session_prompt_backend: Option<Arc<dyn SessionBackend>>,
+    session_prompt_owner: Option<zeroclaw_infra::session_backend::SessionPromptOwner>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
@@ -90,6 +91,19 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
     let session_id = attribution.session_id.clone();
+    // The caller captures this before loading attachments. Resolving it here
+    // could adopt a replacement owner after deletion during turn preparation.
+    if session_prompt_backend.is_some() != session_prompt_owner.is_some()
+        || session_prompt_owner.as_ref().is_some_and(|owner| {
+            !session_key
+                .as_deref()
+                .is_some_and(|key| owner.belongs_to(key))
+        })
+    {
+        return Err(TurnError::AgentError(
+            "invalid session prompt admission".to_owned(),
+        ));
+    }
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
@@ -113,42 +127,45 @@ where
         } else {
             None
         };
-        zeroclaw_api::TOOL_LOOP_SESSION_ID
+        zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER
             .scope(
-                session_id,
-                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
-                    session_prompt_tools_allowed,
-                    TOOL_LOOP_SESSION_BACKEND.scope(
-                        session_prompt_backend.map(ScopedSessionBackend),
-                        TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
-                            session_prompt_budget,
-                            crate::agent::loop_::scope_session_key(
-                                attribution.session_key,
-                                async move {
-                                    use ::zeroclaw_log::Instrument as _;
-                                    let span = ::zeroclaw_log::info_span!(
-                                        target: "zeroclaw_log_internal_scope",
-                                        "zeroclaw_scope",
-                                        session_key = %sk.as_deref().unwrap_or(""),
-                                        agent_alias = %attribution.agent_alias,
-                                        model_provider = %attribution.model_provider,
-                                        model = %attribution.model,
-                                        channel = %attribution.channel,
-                                    );
-                                    TOOL_LOOP_COST_TRACKING_CONTEXT
-                                        .scope(
-                                            cost_context,
-                                            guard
-                                                .turn_streamed_with_steering_state(
-                                                    &prompt,
-                                                    event_tx,
-                                                    Some(cancel_clone),
-                                                    None,
-                                                )
-                                                .instrument(span),
-                                        )
-                                        .await
-                                },
+                session_prompt_owner,
+                zeroclaw_api::TOOL_LOOP_SESSION_ID.scope(
+                    session_id,
+                    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                        session_prompt_tools_allowed,
+                        TOOL_LOOP_SESSION_BACKEND.scope(
+                            session_prompt_backend.map(ScopedSessionBackend),
+                            TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                                session_prompt_budget,
+                                crate::agent::loop_::scope_session_key(
+                                    attribution.session_key,
+                                    async move {
+                                        use ::zeroclaw_log::Instrument as _;
+                                        let span = ::zeroclaw_log::info_span!(
+                                            target: "zeroclaw_log_internal_scope",
+                                            "zeroclaw_scope",
+                                            session_key = %sk.as_deref().unwrap_or(""),
+                                            agent_alias = %attribution.agent_alias,
+                                            model_provider = %attribution.model_provider,
+                                            model = %attribution.model,
+                                            channel = %attribution.channel,
+                                        );
+                                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                                            .scope(
+                                                cost_context,
+                                                guard
+                                                    .turn_streamed_with_steering_state(
+                                                        &prompt,
+                                                        event_tx,
+                                                        Some(cancel_clone),
+                                                        None,
+                                                    )
+                                                    .instrument(span),
+                                            )
+                                            .await
+                                    },
+                                ),
                             ),
                         ),
                     ),
@@ -1092,6 +1109,7 @@ mod tests {
             Some(cost_context),
             None,
             None,
+            None,
             noop,
         )
         .await
@@ -1261,6 +1279,7 @@ mod tests {
             },
             None,
             Some(backend.clone()),
+            Some(backend.admit_session_prompt_owner("rpc_alpha").unwrap()),
             None,
             noop,
         )
@@ -1409,6 +1428,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -1584,6 +1604,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 None,
@@ -1850,6 +1871,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -2129,6 +2151,7 @@ mod tests {
                     model: "test-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 Some(activity),

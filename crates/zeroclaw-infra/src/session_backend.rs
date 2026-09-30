@@ -9,6 +9,28 @@ use zeroclaw_api::model_provider::ChatMessage;
 #[derive(Clone)]
 pub struct ScopedSessionBackend(pub Arc<dyn SessionBackend>);
 
+/// Opaque identity of the durable owner admitted for one primary turn.
+///
+/// The SQLite metadata row creates this fact. A reset rotates it, and deletion
+/// removes it; a later session using the same key cannot inherit this handle.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionPromptOwner {
+    pub(crate) session_key: String,
+    pub(crate) incarnation: String,
+}
+
+impl SessionPromptOwner {
+    /// Whether this owner was admitted for the caller's canonical session key.
+    pub fn belongs_to(&self, session_key: &str) -> bool {
+        self.session_key == session_key
+    }
+}
+
+tokio::task_local! {
+    /// Durable owner captured at admission, never reconstructed by a tool.
+    pub static TOOL_LOOP_SESSION_PROMPT_OWNER: Option<SessionPromptOwner>;
+}
+
 tokio::task_local! {
     /// Canonical durable chat backend for the active primary turn. Session
     /// prompt tools use this instead of opening an independent SQLite handle.
@@ -127,6 +149,67 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Admit prompt access, creating an empty owner before its first message
+    /// when necessary. Only a primary-turn/session admission may call this.
+    fn admit_session_prompt_owner(
+        &self,
+        _session_key: &str,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Persist an inbound message and capture its prompt owner atomically.
+    fn append_with_session_prompt_owner(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Read only while the originally admitted owner is still current.
+    fn list_session_prompts_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+    ) -> std::io::Result<Vec<SessionPrompt>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Validate the admitted owner in the same transaction as the write.
+    fn set_session_prompt_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+        _id: &str,
+        _content: &str,
+        _budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Delete only from the originally admitted owner, never its successor.
+    fn delete_session_prompt_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+        _id: &str,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
     /// List prompt attachments belonging to exactly one durable session.
     fn list_session_prompts(&self, _session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
         Err(std::io::Error::new(

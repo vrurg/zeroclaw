@@ -53,17 +53,21 @@ async fn scope_websocket_session_prompt_context<T>(
     session_prompt_tools_allowed: bool,
     session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     session_prompt_budget: Option<zeroclaw_infra::session_backend::SessionPromptBudget>,
+    session_prompt_owner: Option<zeroclaw_infra::session_backend::SessionPromptOwner>,
     session_key: Option<String>,
     future: impl Future<Output = T>,
 ) -> T {
-    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER
         .scope(
-            session_prompt_tools_allowed,
-            zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
-                session_backend.map(zeroclaw_infra::session_backend::ScopedSessionBackend),
-                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
-                    session_prompt_budget,
-                    zeroclaw_runtime::agent::loop_::scope_session_key(session_key, future),
+            session_prompt_owner,
+            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                session_prompt_tools_allowed,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    session_backend.map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                        session_prompt_budget,
+                        zeroclaw_runtime::agent::loop_::scope_session_key(session_key, future),
+                    ),
                 ),
             ),
         )
@@ -1855,6 +1859,7 @@ async fn process_chat_message(
         }
     }
     let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
+    let mut session_prompt_owner = None;
     let attachments = if session_prompts_enabled {
         let Some(backend) = state.session_backend.as_ref() else {
             let _ = sender
@@ -1870,7 +1875,14 @@ async fn process_chat_message(
                 .await;
             return false;
         };
-        match backend.list_session_prompts(session_key) {
+        let prompts = backend
+            .admit_session_prompt_owner(session_key)
+            .and_then(|owner| {
+                let prompts = backend.list_session_prompts_for_owner(&owner)?;
+                session_prompt_owner = Some(owner);
+                Ok(prompts)
+            });
+        match prompts {
             Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
             Err(error) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": error.to_string(), "session_key": session_key})), "Failed to load persistent session prompts");
@@ -1965,6 +1977,7 @@ async fn process_chat_message(
             session_prompt_tools_allowed,
             canonical_session_backend,
             session_prompt_budget,
+            session_prompt_owner,
             Some(session_key_owned.clone()),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
                 turn_usage.clone(),
@@ -2675,6 +2688,11 @@ mod tests {
             true,
             Some(backend.clone()),
             Some(budget),
+            Some(
+                backend
+                    .admit_session_prompt_owner("gw-budget")
+                    .expect("admitted owner"),
+            ),
             Some("gw-budget".to_string()),
             SessionPromptSetTool::new(Arc::new(zeroclaw_config::policy::SecurityPolicy::default()))
                 .execute(json!({
@@ -2717,6 +2735,36 @@ mod tests {
         })
         .expect("disabled WebSocket session prompts should skip budget derivation");
         assert!(disabled.is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_prompt_context_keeps_the_admitted_owner_after_reset() {
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        let temp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(temp.path()).unwrap(),
+        );
+        let owner = backend.admit_session_prompt_owner("gw-owner").unwrap();
+        let result = scope_websocket_session_prompt_context(
+            true,
+            Some(backend.clone()),
+            None,
+            Some(owner),
+            Some("gw-owner".to_owned()),
+            async {
+                backend.reset_session("gw-owner").unwrap();
+                zeroclaw_runtime::tools::SessionPromptSetTool::new(Arc::new(
+                    zeroclaw_config::policy::SecurityPolicy::default(),
+                ))
+                .execute(serde_json::json!({"id":"task","content":"stale"}))
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+        assert!(!result.success);
+        assert!(backend.list_session_prompts("gw-owner").unwrap().is_empty());
     }
 
     #[test]
