@@ -1858,6 +1858,24 @@ fn build_done_frame_json(
     done
 }
 
+/// Attribute pre-turn storage failures without holding a span across an await.
+fn record_session_prompt_load_failure(session_key: &str, error: &std::io::Error) {
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        session_key = %session_key,
+        channel = WS_CHANNEL_KEY,
+    );
+    let _guard = span.entered();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+        "Failed to load persistent session prompts"
+    );
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1946,7 +1964,7 @@ async fn process_chat_message(
         match prompts {
             Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
             Err(error) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": error.to_string(), "session_key": session_key})), "Failed to load persistent session prompts");
+                record_session_prompt_load_failure(session_key, &error);
                 let _ = sender
                     .send(Message::Text(
                         serde_json::json!({
@@ -2710,6 +2728,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_prompt_load_failure_uses_span_attribution() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let key = "gw_load_failure_test";
+        super::record_session_prompt_load_failure(
+            key,
+            &std::io::Error::other("synthetic storage failure"),
+        );
+        let event = loop {
+            match receiver.try_recv() {
+                Ok(value)
+                    if value["message"].as_str()
+                        == Some("Failed to load persistent session prompts") =>
+                {
+                    break value;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("load failure log was not broadcast: {error}"),
+            }
+        };
+        zeroclaw_log::clear_broadcast_hook();
+        assert_eq!(event["zeroclaw"]["session_key"], key);
+        assert_eq!(event["zeroclaw"]["channel_type"], WS_CHANNEL_KEY);
+        assert!(event["attributes"].get("session_key").is_none());
+        assert_eq!(event["attributes"]["error"], "synthetic storage failure");
+    }
+
     use super::*;
     use axum::{
         Json, Router,
