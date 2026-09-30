@@ -443,12 +443,18 @@ impl GoalExecutionSupervisor {
                 return Ok(None);
             };
             let scope = request.scope().clone();
-            let lease = submission.driver.bind(&submission.ingress).await?;
+            let lease = match submission.driver.bind(&submission.ingress).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.reconcile_launch_failure(&scope).await?;
+                    return Err(error).context("revalidate Goal session before executor launch");
+                }
+            };
             if !self.execution_is_current(&scope).await? {
                 return Ok(None);
             }
             if let Err(error) = self.launch(settings, request).await {
-                self.engine.fail(&scope, "executor_start_failed").await?;
+                self.reconcile_launch_failure(&scope).await?;
                 return Err(error).context("Goal executor launch failed");
             }
             drop(lease);
@@ -460,6 +466,13 @@ impl GoalExecutionSupervisor {
         // submission around while finishing its request handler.
         submission._admission.take();
         result
+    }
+
+    async fn reconcile_launch_failure(&self, scope: &GoalExecutionScope) -> Result<()> {
+        if self.execution_is_current(scope).await? {
+            self.engine.fail(scope, "executor_start_failed").await?;
+        }
+        Ok(())
     }
 
     /// Pause a newly admitted Goal without running its first model call when
