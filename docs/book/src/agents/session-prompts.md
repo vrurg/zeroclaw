@@ -36,6 +36,21 @@ session_persistence = true
 session_prompts_enabled = true
 ```
 
+Gateway WebSocket chat also requires gateway session persistence:
+
+```toml
+[gateway]
+session_persistence = true
+```
+
+If `channels.session_prompts_enabled = true` but
+`gateway.session_persistence = false`, WebSocket chat turns fail closed with
+`SESSION_PROMPT_LOAD_FAILED` before provider dispatch; they do not proceed
+without the attached prompts. This combination is not rejected globally:
+channel-only deployments, such as Matrix, can use persistent session prompts
+without gateway session persistence. Enable gateway persistence and restart
+the gateway before using the feature through WebSocket chat.
+
 An enabled configuration with another session backend is rejected. Prompt
 attachments are not available to cron jobs, delegates, subagents, one-shot
 requests, or auxiliary calls.
