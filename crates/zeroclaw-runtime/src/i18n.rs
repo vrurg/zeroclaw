@@ -1420,6 +1420,33 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_approval_messages_format_in_every_locale() {
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
+            for key in [
+                "session-prompt-approval-description",
+                "session-prompt-approval-binding-failed",
+                "session-prompt-approval-manager-unavailable",
+                "session-prompt-approval-channel-unavailable",
+                "session-prompt-approval-runtime-denial",
+                "session-prompt-approval-not-granted",
+            ] {
+                let text = format_cli_string_with_args(&sources, key, &[])
+                    .unwrap_or_else(|| panic!("{key} missing in {}", locale.code));
+                assert!(!text.trim().is_empty());
+            }
+            let reason = "synthetic-denial-reason";
+            let output = format_cli_string_with_args(
+                &sources,
+                "session-prompt-approval-denied",
+                &[("reason", reason)],
+            )
+            .unwrap();
+            assert!(output.contains(reason));
+        }
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (

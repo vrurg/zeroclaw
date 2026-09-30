@@ -210,7 +210,8 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// List prompt attachments belonging to exactly one durable session.
+    /// Unbound storage inspection for quiescent setup and tests. Turn callers
+    /// must use `list_session_prompts_for_owner` to fence same-key successors.
     fn list_session_prompts(&self, _session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -218,6 +219,8 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Unbound storage setup; may create a missing owner. Turn callers must
+    /// use `set_session_prompt_for_owner`, never this key-only operation.
     fn set_session_prompt(
         &self,
         _session_key: &str,
@@ -235,6 +238,8 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// SQLite is the only supported durable prompt backend. Backends that do
     /// not implement this operation must not silently skip budget admission.
+    /// This is an unbound setup operation: turn callers must use
+    /// `set_session_prompt_for_owner` for incarnation fencing as well as budget.
     fn set_session_prompt_with_budget(
         &self,
         session_key: &str,
@@ -251,6 +256,8 @@ pub trait SessionBackend: Send + Sync {
         self.set_session_prompt(session_key, id, content)
     }
 
+    /// Unbound storage cleanup for quiescent setup and tests. Turn callers must
+    /// use `delete_session_prompt_for_owner` so a successor remains untouched.
     fn delete_session_prompt(&self, _session_key: &str, _id: &str) -> std::io::Result<bool> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

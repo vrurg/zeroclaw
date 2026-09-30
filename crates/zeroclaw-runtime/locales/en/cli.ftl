@@ -1437,3 +1437,11 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+session-prompt-approval-description = Approve this one persistent session-prompt mutation. This approval cannot be remembered.
+session-prompt-approval-denied = Session prompt mutation not executed: { $reason }
+session-prompt-approval-binding-failed = the runtime could not bind an exact session confirmation
+session-prompt-approval-manager-unavailable = no approval manager is available
+session-prompt-approval-channel-unavailable = no approval-capable channel is available
+session-prompt-approval-runtime-denial = no operator decision was available, so the runtime denied it by policy. This was not a user's decision.
+session-prompt-approval-not-granted = a one-time operator approval was not granted

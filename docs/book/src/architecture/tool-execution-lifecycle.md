@@ -209,6 +209,10 @@ The provider request, explicit list result, and dedicated operator confirmation
 remain content-bearing surfaces. Retained transcripts replace the prompt-tool
 exchange with a redaction marker; the owning SQLite attachment rows, not that
 hidden exchange, supply continuity on later turns.
+The host result envelope carries sensitivity from the final executed tool
+identity, so export redaction also covers a hook-rewritten prompt call whose
+original model envelope named an ordinary tool. Provider history retains its
+explicit result; retained and generic export copies do not.
 
 ## What this page does not own
 

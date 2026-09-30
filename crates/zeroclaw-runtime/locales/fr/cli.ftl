@@ -1177,3 +1177,11 @@ channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
 tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.
+
+session-prompt-approval-description = Approuvez cette modification des instructions persistantes de session une seule fois. Cette approbation ne peut pas être mémorisée.
+session-prompt-approval-denied = Modification des instructions de session non exécutée : { $reason }
+session-prompt-approval-binding-failed = le système n’a pas pu lier une confirmation exacte à la session
+session-prompt-approval-manager-unavailable = aucun gestionnaire d’approbation n’est disponible
+session-prompt-approval-channel-unavailable = aucun canal permettant l’approbation n’est disponible
+session-prompt-approval-runtime-denial = aucune décision de l’opérateur n’était disponible ; le système a donc refusé selon la politique. Ce n’était pas une décision de l’utilisateur.
+session-prompt-approval-not-granted = aucune approbation ponctuelle n’a été accordée

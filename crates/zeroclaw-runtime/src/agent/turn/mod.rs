@@ -980,7 +980,7 @@ impl<'a> TurnState<'a> {
         &mut self,
         assistant_history_content: String,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
-        individual_results: &[(Option<String>, String)],
+        individual_results: &[results_collect::CollectedToolResult],
         tool_results: &str,
         use_native_tools: bool,
     ) {

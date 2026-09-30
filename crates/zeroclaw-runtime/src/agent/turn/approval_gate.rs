@@ -366,9 +366,8 @@ fn session_prompt_approval_summary(
     } else {
         "delete"
     };
-    let mut summary = String::from(
-        "Approve this one persistent session-prompt mutation. This approval cannot be remembered.\n",
-    );
+    let mut summary = crate::i18n::get_required_cli_string("session-prompt-approval-description");
+    summary.push('\n');
     let _ = writeln!(summary, "action: {action}");
     let _ = writeln!(summary, "storage_domain: sqlite chat session prompts");
     let _ = writeln!(
@@ -437,7 +436,10 @@ async fn gate_session_prompt_approval(
 ) -> ApprovalGateOutcome {
     let denied = |reason: &str| {
         ApprovalGateOutcome::Deny(ToolExecutionOutcome {
-            output: format!("Session prompt mutation not executed: {reason}"),
+            output: crate::i18n::get_required_cli_string_with_args(
+                "session-prompt-approval-denied",
+                &[("reason", reason)],
+            ),
             success: false,
             error_reason: Some("session prompt mutation denied".to_string()),
             duration: Duration::ZERO,
@@ -446,17 +448,23 @@ async fn gate_session_prompt_approval(
         })
     };
     let Ok(summary) = session_prompt_approval_summary(tool_name, tool_args) else {
-        return denied("the runtime could not bind an exact session confirmation");
+        return denied(&crate::i18n::get_required_cli_string(
+            "session-prompt-approval-binding-failed",
+        ));
     };
     let Some(mgr) = ctx.approval else {
-        return denied("no approval manager is available");
+        return denied(&crate::i18n::get_required_cli_string(
+            "session-prompt-approval-manager-unavailable",
+        ));
     };
 
     let (approved, decision_channel, denial_reason_key, runtime_denial) = if mgr
         .is_non_interactive()
     {
         let Some(channel) = ctx.channel else {
-            return denied("no approval-capable channel is available");
+            return denied(&crate::i18n::get_required_cli_string(
+                "session-prompt-approval-channel-unavailable",
+            ));
         };
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: tool_name.to_string(),
@@ -526,15 +534,17 @@ async fn gate_session_prompt_approval(
     } else if runtime_denial {
         // A timeout may follow successful delivery; report the absent decision,
         // not an invented operator refusal or a claim that nobody was asked.
-        denied(
-            "no operator decision was available, so the runtime denied it by policy. This was not a user's decision.",
-        )
+        denied(&crate::i18n::get_required_cli_string(
+            "session-prompt-approval-runtime-denial",
+        ))
     } else if let Some(key) = denial_reason_key {
         // Keep runtime delivery failures distinct from an operator refusal,
         // while recording the same content-free denial audit above.
         denied(&crate::i18n::get_required_cli_string(key))
     } else {
-        denied("a one-time operator approval was not granted")
+        denied(&crate::i18n::get_required_cli_string(
+            "session-prompt-approval-not-granted",
+        ))
     }
 }
 

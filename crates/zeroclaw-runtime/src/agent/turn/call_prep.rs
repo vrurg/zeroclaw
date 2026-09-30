@@ -681,6 +681,7 @@ mod tests {
 
     struct RewriteToSessionPromptRecorder {
         observations: Arc<std::sync::Mutex<Vec<String>>>,
+        target: &'static str,
     }
 
     #[async_trait]
@@ -742,11 +743,14 @@ mod tests {
             &self,
             _context: &zeroclaw_api::hook::ToolCallHookContext,
             _name: String,
-            _args: serde_json::Value,
+            args: serde_json::Value,
         ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
             crate::hooks::HookResult::Continue((
-                "session_prompt_set".to_string(),
-                serde_json::json!({"id": "task", "content": "private attachment"}),
+                self.target.to_string(),
+                serde_json::json!({
+                    "id": "task",
+                    "content": args.get("content").cloned().unwrap_or_else(|| serde_json::json!("private attachment")),
+                }),
             ))
         }
 
@@ -910,6 +914,7 @@ mod tests {
         let mut runner = crate::hooks::HookRunner::new();
         runner.register(Box::new(RewriteToSessionPromptRecorder {
             observations: Arc::clone(&observations),
+            target: "session_prompt_set",
         }));
         let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
         // This test isolates terminal-hook pairing. Dedicated prompt approval
@@ -967,6 +972,99 @@ mod tests {
         assert!(observations[0].contains("session_prompt_payload"));
         assert!(!observations[0].contains("private attachment"));
         assert!(!observations[0].contains("private result"));
+    }
+
+    #[tokio::test]
+    async fn rewritten_session_prompt_result_is_redacted_from_history_exports() {
+        for (target, use_native_tools) in [
+            ("session_prompt_list", false),
+            ("session_prompt_list", true),
+            ("session_prompt_set", false),
+            ("session_prompt_set", true),
+        ] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut runner = crate::hooks::HookRunner::new();
+            runner.register(Box::new(RewriteToSessionPromptRecorder {
+                observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+                target,
+            }));
+            let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+            ctx.session_prompt_approval_required = false;
+            let marker = "synthetic-session-prompt-result";
+            let arguments = serde_json::json!({"content": marker});
+            let calls = [parsed_call("ordinary_tool", arguments.clone(), "call-1")];
+            let mut prepared = prepare_tool_calls(
+                &ctx,
+                &[],
+                None,
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared.executable_calls[0].name, target);
+            record_executed_outcomes(
+                &ctx,
+                &prepared.executable_indices,
+                &prepared.executable_calls,
+                &prepared.hook_contexts,
+                &prepared.stream_calls,
+                vec![ToolExecutionOutcome {
+                    output: marker.to_string(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                }],
+                &mut prepared.ordered_results,
+                0,
+            )
+            .await;
+            let mut history = Vec::new();
+            let results = super::super::results_collect::collect_tool_results(
+                prepared.ordered_results,
+                &calls,
+                &mut history,
+                &mut crate::agent::loop_detector::LoopDetector::new(Default::default()),
+                &HashSet::new(),
+                10_000,
+                None,
+                "test-model",
+                0,
+                "test-turn",
+            )
+            .unwrap();
+            super::super::history_append::append_tool_round_to_history(
+                &mut history,
+                serde_json::json!({"tool_calls": [{"name": "ordinary_tool", "arguments": arguments}]}).to_string(),
+                &[],
+                &results.individual_results,
+                &results.tool_results,
+                use_native_tools,
+            );
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains(marker))
+            );
+            assert!(history[0].content.contains("ordinary_tool"));
+            let exported =
+                crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&history);
+            assert!(
+                exported
+                    .iter()
+                    .all(|message| !message.content.contains(marker)),
+                "executed identity must govern export redaction in both history modes"
+            );
+            assert!(exported[0].content.contains("omitted from export"));
+            assert!(exported[1].content.contains("omitted from export"));
+        }
     }
 
     #[tokio::test]

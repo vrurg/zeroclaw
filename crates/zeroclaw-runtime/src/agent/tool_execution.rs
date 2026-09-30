@@ -2414,7 +2414,8 @@ mod tests {
             "prompt-mode <tool_result> block must be scrubbed: {}",
             collected.tool_results
         );
-        for (_, result) in &collected.individual_results {
+        for collected_result in &collected.individual_results {
+            let result = &collected_result.output;
             assert!(
                 !result.contains(secret) && result.contains("[REDACTED]"),
                 "native role=tool content must be scrubbed: {result}"
@@ -2442,7 +2443,11 @@ mod tests {
             "the native tool-result message must carry the scrubbed body"
         );
 
-        let prompt_results = vec![(None, collected.individual_results[0].1.clone())];
+        let prompt_results = vec![crate::agent::turn::results_collect::CollectedToolResult {
+            tool_call_id: None,
+            output: collected.individual_results[0].output.clone(),
+            sensitive_session_prompt: collected.individual_results[0].sensitive_session_prompt,
+        }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,

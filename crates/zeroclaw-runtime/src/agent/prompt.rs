@@ -103,6 +103,8 @@ pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversat
 const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omitted from export]";
 const SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER: &str =
     "[Session-prompt tool exchange omitted from export]";
+/// Reserved host result-envelope metadata, derived from the executed identity.
+pub(crate) const SESSION_PROMPT_HISTORY_RESULT_KEY: &str = "session_prompt_tool_result";
 
 /// Return an observability-safe view of a host system prompt.
 ///
@@ -134,59 +136,91 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     // next-turn input and must not be swallowed by export redaction.
     let mut redact_native_tool_results = false;
     let mut redact_text_protocol_result = false;
+    let mut host_text_result_pending = false;
+    let mut exported: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut assistant_index: Option<usize> = None;
+    for message in messages {
+        let is_sensitive_call = message.role == "assistant"
+            && session_prompt_tool_call_envelope_mentioned(&message.content);
+        let is_native_result = message.role == "tool";
+        let is_text_protocol_result = message.role == "user";
+        let host_marked_result = (is_native_result
+            || (is_text_protocol_result && host_text_result_pending))
+            && serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|value| {
+                value
+                    .get(SESSION_PROMPT_HISTORY_RESULT_KEY)
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| {
+                            is_native_result || content.starts_with("[Tool results]")
+                        })
+            });
+        let has_text_protocol_result_prefix =
+            is_text_protocol_result && message.content.starts_with("[Tool results]");
+        let redact = host_marked_result
+            || is_sensitive_call
+            || (redact_native_tool_results && is_native_result)
+            || (redact_text_protocol_result && has_text_protocol_result_prefix);
 
-    messages
-        .iter()
-        .map(|message| {
-            let is_sensitive_call = message.role == "assistant"
-                && session_prompt_tool_call_envelope_mentioned(&message.content);
-            let is_native_result = message.role == "tool";
-            let is_text_protocol_result = message.role == "user";
-            let has_text_protocol_result_prefix =
-                is_text_protocol_result && message.content.starts_with("[Tool results]");
-            let redact = is_sensitive_call
-                || (redact_native_tool_results && is_native_result)
-                || (redact_text_protocol_result && has_text_protocol_result_prefix);
+        if host_marked_result && let Some(index) = assistant_index {
+            // A rewritten set may have reused text from the original call
+            // as its opaque body. The executed result's host provenance
+            // redacts that assistant record too, without changing provider
+            // history or relying on the original model-selected tool name.
+            exported[index].content = SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string();
+        }
 
-            if message.role == "assistant" {
-                // The result record is the authoritative execution-mode
-                // evidence at this export boundary. A native-capable provider
-                // can fall back to tagged text calls yet still append `tool`
-                // records after the runtime assigns call IDs, so envelope
-                // shape is not a safe discriminator. Redact every immediately
-                // following native result until the next assistant record.
-                redact_native_tool_results = is_sensitive_call;
-                // Text fallback stores its result as the reserved `[Tool
-                // results]` user message. The pending state is consumed only
-                // by that immediate reserved record, never ordinary user input
-                // following native results.
-                redact_text_protocol_result = is_sensitive_call;
-            } else if is_native_result {
-                // Native results prove that the text-protocol result cannot
-                // follow this call. Consume its pending state so a later
-                // genuine user message beginning `[Tool results]` remains
-                // ordinary user input at export boundaries.
-                redact_text_protocol_result = false;
-            } else if message.role == "user" {
-                redact_text_protocol_result = false;
+        if message.role == "assistant" {
+            assistant_index = Some(exported.len());
+            // This only binds the host's text-result carrier to an
+            // accepted call round; sensitivity comes from the result flag,
+            // not from the model's choice of tool name.
+            host_text_result_pending = !parse_tool_calls(&message.content).1.is_empty();
+            // The result record is the authoritative execution-mode
+            // evidence at this export boundary. A native-capable provider
+            // can fall back to tagged text calls yet still append `tool`
+            // records after the runtime assigns call IDs, so envelope
+            // shape is not a safe discriminator. Redact every immediately
+            // following native result until the next assistant record.
+            redact_native_tool_results = is_sensitive_call;
+            // Text fallback stores its result as the reserved `[Tool
+            // results]` user message. The pending state is consumed only
+            // by that immediate reserved record, never ordinary user input
+            // following native results.
+            redact_text_protocol_result = is_sensitive_call;
+        } else if is_native_result {
+            host_text_result_pending = false;
+            // Native results prove that the text-protocol result cannot
+            // follow this call. Consume its pending state so a later
+            // genuine user message beginning `[Tool results]` remains
+            // ordinary user input at export boundaries.
+            redact_text_protocol_result = false;
+        } else if message.role == "user" {
+            host_text_result_pending = false;
+            redact_text_protocol_result = false;
+            assistant_index = None;
+        }
+
+        let projected = if redact {
+            ChatMessage {
+                role: message.role.clone(),
+                content: SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string(),
             }
-
-            if redact {
-                ChatMessage {
-                    role: message.role.clone(),
-                    content: SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string(),
-                }
-            } else if message.role == "system" {
-                ChatMessage {
-                    role: message.role.clone(),
-                    content: redact_session_prompt_attachments_for_export(&message.content)
-                        .into_owned(),
-                }
-            } else {
-                message.clone()
+        } else if message.role == "system" {
+            ChatMessage {
+                role: message.role.clone(),
+                content: redact_session_prompt_attachments_for_export(&message.content)
+                    .into_owned(),
             }
-        })
-        .collect()
+        } else {
+            message.clone()
+        };
+        exported.push(projected);
+    }
+    exported
 }
 
 /// Redact a text-protocol provider response before it crosses an export
@@ -2116,6 +2150,27 @@ mod tests {
         // A shell-less runtime keeps the POSIX wording it rendered before.
         let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
         assert!(none.contains("trash"), "{none}");
+    }
+
+    #[test]
+    fn session_prompt_host_metadata_preserves_ordinary_followup_input() {
+        let ordinary_json = serde_json::json!({
+            "session_prompt_tool_result": true,
+            "content": "[Tool results] ordinary user data",
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::assistant(r#"{"tool_calls":[{"name":"ordinary_tool","arguments":{}}]}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"ordinary-id","content":"ordinary result"}"#),
+            ChatMessage::user(&ordinary_json),
+            ChatMessage::assistant("ordinary response"),
+            ChatMessage::user(r#"{"session_prompt_tool_result":true,"content":"business data"}"#),
+        ];
+        let exported = redact_session_prompt_tool_exchanges_for_export(&messages);
+        for (exported, original) in exported.iter().zip(&messages) {
+            assert_eq!(exported.role, original.role);
+            assert_eq!(exported.content, original.content);
+        }
     }
 
     #[test]

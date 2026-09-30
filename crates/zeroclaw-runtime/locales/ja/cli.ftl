@@ -1172,3 +1172,11 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+session-prompt-approval-description = この永続セッション指示の変更を一度だけ承認してください。この承認は記憶できません。
+session-prompt-approval-denied = セッション指示の変更は実行されませんでした: { $reason }
+session-prompt-approval-binding-failed = セッションの正確な確認内容を関連付けることができませんでした
+session-prompt-approval-manager-unavailable = 承認マネージャーを利用できません
+session-prompt-approval-channel-unavailable = 承認に対応したチャネルを利用できません
+session-prompt-approval-runtime-denial = 操作担当者の判断が得られなかったため、システムがポリシーに基づいて拒否しました。ユーザーによる判断ではありません。
+session-prompt-approval-not-granted = 一度限りの承認が得られませんでした

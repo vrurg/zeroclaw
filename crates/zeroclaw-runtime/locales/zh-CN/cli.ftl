@@ -1176,3 +1176,11 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+session-prompt-approval-description = 请仅批准这一次持久会话提示修改。此批准不能被记住。
+session-prompt-approval-denied = 会话提示修改未执行：{ $reason }
+session-prompt-approval-binding-failed = 系统无法绑定准确的会话确认内容
+session-prompt-approval-manager-unavailable = 没有可用的批准管理器
+session-prompt-approval-channel-unavailable = 没有支持批准的可用渠道
+session-prompt-approval-runtime-denial = 未获得操作人员的决定，因此系统根据策略拒绝了操作。这不是用户的决定。
+session-prompt-approval-not-granted = 未获得一次性批准

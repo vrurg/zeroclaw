@@ -94,6 +94,12 @@ plugins cannot currently guarantee that literal preview and therefore deny
 mutations when this policy is required. This does not disable ordinary tool
 approval or change the separately configurable policy below.
 
+For Matrix, this guarantee covers the daemon's plain-text message: it does not
+expand file markers, upload attachments, or format proposed text as rich text.
+Client-side URL preview fetching is controlled by the Matrix client, not by
+ZeroClaw. Disable link previews in the reviewing client if proposed URLs must
+not be fetched before a decision.
+
 The global setting is:
 
 ```toml
@@ -111,6 +117,16 @@ session_prompt_approval = "disabled"
 Read/Act authorization and ordinary risk-profile approval rules still apply.
 This is an operator configuration decision; an agent cannot change the active
 policy during a turn.
+
+Approval-policy changes follow the existing configuration-generation boundary:
+RPC sessions refresh their configuration at turn entry; existing WebSocket
+connections retain their construction generation until reconnect, and channel
+runtimes require restart. Reconnect or restart the affected surface after
+tightening this policy. WebSocket feature availability is checked separately
+on each turn; that check does not refresh its approval policy. Update Web and
+ZeroCode clients together with the daemon so strict requests do not display an
+obsolete "always approve" action. The daemon rejects that action from older
+clients without granting or consuming the pending one-time confirmation.
 
 ## Privacy boundary
 
