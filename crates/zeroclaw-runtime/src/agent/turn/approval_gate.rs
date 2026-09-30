@@ -452,7 +452,9 @@ async fn gate_session_prompt_approval(
         return denied("no approval manager is available");
     };
 
-    let (approved, decision_channel, denial_reason_key) = if mgr.is_non_interactive() {
+    let (approved, decision_channel, denial_reason_key, runtime_denial) = if mgr
+        .is_non_interactive()
+    {
         let Some(channel) = ctx.channel else {
             return denied("no approval-capable channel is available");
         };
@@ -476,12 +478,25 @@ async fn gate_session_prompt_approval(
                 .request_approval_attributed(ctx.channel_reply_target.unwrap_or_default(), &request)
                 .await
         };
-        let (approved, denial_reason_key) = match response {
-            Ok(Some(attributed)) => (is_one_time_session_prompt_approval(&attributed), None),
-            Ok(None) => (false, Some("session-prompt-approval-unavailable")),
-            Err(_) => (false, Some("session-prompt-approval-delivery-failed")),
+        let (approved, denial_reason_key, runtime_denial) = match response {
+            Ok(Some(attributed)) => (
+                is_one_time_session_prompt_approval(&attributed),
+                None,
+                attributed.source.is_runtime_fail_closed(),
+            ),
+            Ok(None) => (false, Some("session-prompt-approval-unavailable"), false),
+            Err(_) => (
+                false,
+                Some("session-prompt-approval-delivery-failed"),
+                false,
+            ),
         };
-        (approved, ctx.channel_name, denial_reason_key)
+        (
+            approved,
+            ctx.channel_name,
+            denial_reason_key,
+            runtime_denial,
+        )
     } else {
         (
             mgr.prompt_cli_once(
@@ -490,6 +505,7 @@ async fn gate_session_prompt_approval(
             ),
             ctx.channel_name,
             None,
+            false,
         )
     };
 
@@ -507,6 +523,12 @@ async fn gate_session_prompt_approval(
 
     if approved {
         ApprovalGateOutcome::Proceed { approved: true }
+    } else if runtime_denial {
+        // A timeout may follow successful delivery; report the absent decision,
+        // not an invented operator refusal or a claim that nobody was asked.
+        denied(
+            "no operator decision was available, so the runtime denied it by policy. This was not a user's decision.",
+        )
     } else if let Some(key) = denial_reason_key {
         // Keep runtime delivery failures distinct from an operator refusal,
         // while recording the same content-free denial audit above.
@@ -555,6 +577,7 @@ mod tests {
 
     struct CapturingApprovalChannel {
         response: Option<ChannelApprovalResponse>,
+        source: ApprovalSource,
         delivery_error: bool,
         requests: Mutex<Vec<ChannelApprovalRequest>>,
     }
@@ -870,10 +893,11 @@ mod tests {
             if self.delivery_error {
                 anyhow::bail!("synthetic approval delivery failure");
             }
-            Ok(self
-                .response
-                .clone()
-                .map(AttributedApprovalResponse::operator))
+            Ok(self.response.clone().map(|response| {
+                let mut attributed = AttributedApprovalResponse::operator(response);
+                attributed.source = self.source;
+                attributed
+            }))
         }
     }
 
@@ -886,6 +910,7 @@ mod tests {
         ] {
             let channel = CapturingApprovalChannel {
                 response: None,
+                source: ApprovalSource::Operator,
                 delivery_error,
                 requests: Mutex::new(Vec::new()),
             };
@@ -935,6 +960,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_prompt_gate_preserves_runtime_denial_provenance() {
+        let marker = "session-prompt-private-marker";
+        for source in [
+            ApprovalSource::Operator,
+            ApprovalSource::Unavailable,
+            ApprovalSource::Unreachable,
+            ApprovalSource::TimedOut,
+        ] {
+            for response in [
+                ChannelApprovalResponse::Approve,
+                ChannelApprovalResponse::Deny,
+            ] {
+                let should_approve = source == ApprovalSource::Operator
+                    && matches!(response, ChannelApprovalResponse::Approve);
+                let channel = CapturingApprovalChannel {
+                    response: Some(response),
+                    source,
+                    delivery_error: false,
+                    requests: Mutex::new(Vec::new()),
+                };
+                let approval =
+                    ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
+                let outcome = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                    .scope(Some("approval-test-session".into()), async {
+                        gate_tool_approval(
+                            &ctx,
+                            "session_prompt_set",
+                            &serde_json::json!({"id": "task", "content": marker}),
+                            0,
+                            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                        )
+                        .await
+                    })
+                    .await;
+                if should_approve {
+                    assert!(matches!(
+                        outcome,
+                        ApprovalGateOutcome::Proceed { approved: true }
+                    ));
+                } else {
+                    let ApprovalGateOutcome::Deny(result) = outcome else {
+                        panic!("only an explicit one-time operator approval may proceed");
+                    };
+                    assert!(!result.success);
+                    assert!(!result.output.contains(marker));
+                    assert_eq!(
+                        result.output.contains("no operator decision was available"),
+                        source.is_runtime_fail_closed(),
+                    );
+                    assert_eq!(
+                        result
+                            .output
+                            .contains("one-time operator approval was not granted"),
+                        !source.is_runtime_fail_closed(),
+                    );
+                }
+                let audit = approval.audit_log();
+                assert_eq!(audit.len(), 1);
+                assert!(!audit[0].arguments_summary.contains(marker));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn generic_approval_exports_metadata_not_prompt_body_for_every_decision() {
         let marker = "session-prompt-private-marker";
         for response in [
@@ -947,6 +1039,7 @@ mod tests {
         ] {
             let channel = CapturingApprovalChannel {
                 response,
+                source: ApprovalSource::Operator,
                 delivery_error: false,
                 requests: Mutex::new(Vec::new()),
             };
