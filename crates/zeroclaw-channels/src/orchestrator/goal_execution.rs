@@ -51,9 +51,9 @@ struct MatrixGoalSessionDriver {
     route: String,
     message: ChannelMessage,
     /// The per-session lifecycle boundary is acquired before selecting a
-    /// resident supervisor. `bind` transfers it to the runtime submission so
-    /// selection, durable transition, worker launch, and retirement remain
-    /// one serialized operation.
+    /// resident supervisor. The first `bind` transfers it to submission;
+    /// subsequent bindings reacquire the same canonical lock after delivery
+    /// releases submission serialization for the launch handoff.
     command_lease: Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
 }
 
@@ -727,12 +727,19 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
         self.assert_ingress(ingress)?;
-        let guard = self
+        let admitted = self
             .command_lease
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .context("Matrix Goal command lease was already consumed")?;
+            .take();
+        let guard = match admitted {
+            Some(guard) => guard,
+            None => {
+                goal_command_lock(&self.context.persist_locks, &self.session_key.durable_id())
+                    .lock_owned()
+                    .await
+            }
+        };
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
@@ -1413,6 +1420,62 @@ fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn matrix_goal_rebinds_the_canonical_command_lock_after_delivery() {
+        let context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        let key = "matrix_goal_binding_test";
+        let lock = goal_command_lock(&context.persist_locks, key);
+        let message = ChannelMessage::new("event", "sender", "room", "/goal start", "matrix", 1);
+        let driver = MatrixGoalSessionDriver::new(
+            context,
+            key.into(),
+            "sender".into(),
+            "matrix:test:room".into(),
+            message,
+            lock.clone().lock_owned().await,
+        )
+        .unwrap();
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "sender".into(),
+            },
+        )
+        .unwrap();
+        let first = driver.bind(&ingress).await.unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(first);
+        let intervening = lock.clone().lock_owned().await;
+        let mut next = Box::pin(driver.bind(&ingress));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut next)
+                .await
+                .is_err(),
+            "the launch binding must wait for competing command serialization"
+        );
+        drop(intervening);
+        let rebound = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(rebound);
+        assert!(lock.try_lock().is_ok());
+        let stale = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "other-sender".into(),
+            },
+        )
+        .unwrap();
+        assert!(driver.bind(&stale).await.is_err());
+    }
 
     #[test]
     fn every_goal_failure_reason_uses_a_fluent_key() {
