@@ -1252,6 +1252,36 @@ impl RpcDispatcher {
         self
     }
 
+    async fn ensure_transport_can_use_session_agent(
+        &self,
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Result<(), JsonRpcError> {
+        if self.access_policy == RpcAccessPolicy::TrustedLocal {
+            return Ok(());
+        }
+        let guard = agent.lock().await;
+        self.ensure_session_agent_channel_access(&guard)
+    }
+
+    fn ensure_session_agent_channel_access(
+        &self,
+        agent: &crate::agent::agent::Agent,
+    ) -> Result<(), JsonRpcError> {
+        let has_local_session_channels = agent
+            .channel_handles()
+            .reaction
+            .read()
+            .keys()
+            .any(|name| name != "rpc");
+        if has_local_session_channels {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Remote caller cannot use this session's local capabilities",
+            ));
+        }
+        Ok(())
+    }
+
     /// Per-operation authorization: credential expiry, revalidation
     /// deadline, native pairing liveness, authorization-generation
     /// re-resolution, then the method's required grant. Fail-closed on
@@ -4028,11 +4058,11 @@ impl RpcDispatcher {
         self.process_line(line).await;
     }
 
-    fn rebind_rpc_approval_channel(
+    async fn rebind_rpc_approval_channel(
         &self,
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
-    ) {
+    ) -> Result<(), JsonRpcError> {
         let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             session_id,
@@ -4040,12 +4070,23 @@ impl RpcDispatcher {
             Arc::clone(&self.ctx.approval_pending),
             self.client_elicitation_caps,
         ));
+        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+            // Live channel refresh uses this mutex, not session admission.
+            // Keep eligibility and registration under the same Agent guard.
+            let mut guard = agent.lock().await;
+            self.ensure_session_agent_channel_access(&guard)?;
+            guard.set_channel_name("rpc".to_string());
+            guard
+                .channel_handles()
+                .register_channel("rpc", approval_channel);
+            return Ok(());
+        }
         if let Ok(mut guard) = agent.try_lock() {
             guard.set_channel_name("rpc".to_string());
             guard
                 .channel_handles()
                 .register_channel("rpc", approval_channel);
-            return;
+            return Ok(());
         }
 
         // An active turn owns the Agent mutex. Rebinding must not make the
@@ -4058,6 +4099,7 @@ impl RpcDispatcher {
                 .channel_handles()
                 .register_channel("rpc", approval_channel);
         });
+        Ok(())
     }
 
     async fn finish_existing_session_resume(
@@ -4065,8 +4107,20 @@ impl RpcDispatcher {
         session_id: String,
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
+        admission: Option<zeroclaw_infra::session_queue::SessionGuard>,
     ) -> RpcResult {
-        self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
+        // Recheck the exact Agent returned by the atomic resume lookup before
+        // replacing its RPC approval back-channel. The pre-resume check below
+        // rejects the ordinary case before store mutation; this closes the
+        // replacement race without letting WSS capture the back-channel.
+        self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone())
+            .await?;
+        // The permit fences authority refresh, exact-Agent validation, and
+        // environment and approval-channel rebinding. Do not retain it while
+        // plan forwarding or hooks await external consumers: those are
+        // post-admission effects and must not block later prompt, close, or
+        // replacement operations.
+        drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
             && let Some(notification) = plan_replay_notification(&session_id, &plan)
@@ -4149,6 +4203,7 @@ impl RpcDispatcher {
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
+        let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
         // durable owner used for restoration is selected again after admission,
         // so a queued request cannot stamp a session from a stale first read.
@@ -4163,12 +4218,13 @@ impl RpcDispatcher {
                 .await?
                 .is_some()
             {
-                self.authorize_session_owner_for_mode(
-                    existing,
-                    Method::SessionNew,
-                    Some(&chat_mode),
-                )
-                .await?;
+                authorized_resume = self
+                    .authorize_session_owner_for_mode(
+                        existing,
+                        Method::SessionNew,
+                        Some(&chat_mode),
+                    )
+                    .await?;
             }
         }
         let session_id = req
@@ -4201,15 +4257,55 @@ impl RpcDispatcher {
         // A caller-supplied ID is a resume selector. The live RpcSession is
         // the canonical in-process incarnation, including provider history;
         // same-mode reconnects only rebind the existing canonical session.
-        // Resolve them before queue admission so an active turn can retain its
-        // real permit while the reattach completes. New sessions and
-        // cross-mode replacements remain serialized below.
+        // Local reconnects resolve before queue admission so an active turn can
+        // retain its real permit while the reattach completes. A non-local
+        // reconnect takes the permit first: that fences capability-changing
+        // replacement while transport eligibility is checked, without making
+        // the ordinary local reconnect blocking. New sessions and cross-mode
+        // replacements remain serialized below.
         // Ownership of the live incarnation is decided inside `resume_existing`,
         // under the store lock, against the record being rebound: the read
         // above authorized whatever existed then, this authorizes what exists
         // now. A scoped mismatch surfaces as the uniform ownership denial.
         let resume_scope = self.scoped_principal_id();
+        let mut retained_remote_admission = None;
         if resuming {
+            let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
+            if non_local {
+                let guard = self
+                    .ctx
+                    .sessions
+                    .session_queue
+                    .acquire(&session_id)
+                    .await
+                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                if let Some(grants) = grants.as_ref() {
+                    self.selector_session_agent_with_grants(
+                        Method::SessionNew,
+                        grants,
+                        &req.agent_alias,
+                    )?;
+                }
+                self.revalidate_admitted_session(&session_id, authorized_resume.as_ref())
+                    .await?;
+                if let Some(has_environment) = self
+                    .ctx
+                    .sessions
+                    .has_forwarded_environment(&session_id)
+                    .await
+                {
+                    self.authorize_session_environment(
+                        Method::SessionNew,
+                        grants.as_ref(),
+                        has_environment,
+                    )?;
+                }
+                if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
+                    self.ensure_transport_can_use_session_agent(&agent).await?;
+                }
+                retained_remote_admission = Some(guard);
+            }
             match self
                 .resume_existing_session(
                     &session_id,
@@ -4222,7 +4318,12 @@ impl RpcDispatcher {
             {
                 Ok(Some(Ok(existing))) => {
                     return self
-                        .finish_existing_session_resume(session_id, &chat_mode, existing)
+                        .finish_existing_session_resume(
+                            session_id,
+                            &chat_mode,
+                            existing,
+                            retained_remote_admission,
+                        )
                         .await;
                 }
                 Ok(Some(Err(denied))) => return Err(denied),
@@ -4247,13 +4348,16 @@ impl RpcDispatcher {
         // place. Publishing goes through `insert_admitted_if_absent` (which does NOT
         // re-acquire the permit) rather than `insert`, so the permit-1
         // per-session semaphore is never acquired twice.
-        let _admission = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _admission = if let Some(guard) = retained_remote_admission {
+            guard
+        } else {
+            self.ctx
+                .sessions
+                .session_queue
+                .acquire(&session_id)
+                .await
+                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+        };
 
         // A durable row can appear while admission is queued. Resolve its
         // owner again before building or stamping a replacement session.
@@ -4310,7 +4414,7 @@ impl RpcDispatcher {
         {
             let existing = existing?;
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing)
+                .finish_existing_session_resume(session_id, &chat_mode, existing, None)
                 .await;
         }
         if admitted_mode.is_some() {
@@ -6506,6 +6610,12 @@ impl RpcDispatcher {
             .get_agent(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        if let Err(denied) = self.ensure_transport_can_use_session_agent(&agent).await {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
 
         // The grants were re-resolved after admission, so apply that posture
         // to this session's static and already-activated deferred tools. It is
@@ -13170,6 +13280,377 @@ fn replace_rpc_chat_conversation_state(
 #[cfg(test)]
 mod tests {
     use zeroclaw_api::model_provider::ChatMessage;
+
+    struct SessionFactoryStubChannel;
+
+    impl zeroclaw_api::attribution::Attributable for SessionFactoryStubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+
+        fn alias(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SessionFactoryStubChannel {
+        fn name(&self) -> &str {
+            "git"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
+        std::sync::Arc::new(|_, _| {
+            let mut channels = std::collections::HashMap::new();
+            channels.insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+            channels
+        })
+    }
+
+    #[tokio::test]
+    async fn local_session_factory_populates_channels_and_resume_preserves_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.local_session_channel_factory = Some(session_factory_stub());
+        dispatcher.set_tui_id_for_test(Some("tui-local".into()));
+
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": "local-factory-session",
+        });
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("session/new should succeed");
+
+        let before = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("session should be live");
+        {
+            let agent = before.lock().await;
+            let reaction = agent.channel_handles().reaction.read();
+            assert_eq!(reaction.len(), 2);
+            assert!(reaction.contains_key("git.main"));
+            assert!(reaction.contains_key("rpc"));
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("same-mode resume should succeed");
+        let after = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("resumed session should remain live");
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "same-mode resume must rebind the existing session rather than rebuilding it"
+        );
+        assert!(
+            after
+                .lock()
+                .await
+                .channel_handles()
+                .reaction
+                .read()
+                .contains_key("git.main"),
+            "same-mode resume must preserve local channel handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_prompt_rejects_same_principal_local_capability_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, _sessions) = make_acp_test_dispatcher(config);
+        local.local_session_channel_factory = Some(session_factory_stub());
+        local.set_tui_id_for_test(Some("tui-shared".into()));
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let original_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("local session should remain live")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("local session should have an RPC approval channel");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-shared".into()));
+
+        let resume_error = remote
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect_err("WSS resume must not capture the local session back-channel");
+        assert_eq!(
+            resume_error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        let retained_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("refused resume must retain the local session")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("refused resume must preserve the local RPC approval channel");
+        assert!(
+            std::sync::Arc::ptr_eq(&original_rpc_channel, &retained_rpc_channel),
+            "refused WSS resume must not replace the local approval back-channel"
+        );
+        assert_eq!(
+            local
+                .ctx
+                .sessions
+                .session_owner_tui_id("local-capability-session")
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-shared"),
+            "refused WSS resume must not change the session's TUI owner"
+        );
+
+        let error = remote
+            .handle_session_prompt(&serde_json::json!({
+                "session_id": "local-capability-session",
+                "prompt": "must be rejected before tool execution",
+                "client_turn_generation": 17,
+            }))
+            .await
+            .expect_err("WSS prompt must not inherit local capabilities");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "master rejects local capabilities before provider reconciliation or turn emission"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_resume_rechecks_local_capabilities_under_admission_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, sessions) = make_acp_test_dispatcher(config);
+        local.set_tui_id_for_test(Some("tui-local".into()));
+        let sid = "local-capability-race";
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let permit = sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("test owns the session admission permit");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-local".into()));
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+        let resume =
+            zeroclaw_spawn::spawn!(
+                async move { remote.handle_session_new_for_test(&request).await }
+            );
+        wait_for_session_admission_waiter(&local.ctx, sid).await;
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("session remains live while resume waits");
+        agent
+            .lock()
+            .await
+            .channel_handles()
+            .reaction
+            .write()
+            .insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+        drop(permit);
+
+        let error = resume
+            .await
+            .expect("resume task must not panic")
+            .expect_err("post-admission capability recheck must refuse WSS resume");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-local"),
+            "refused WSS resume must not take the local session's TUI ownership stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_owned_cross_mode_resume_reuses_first_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (local, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-remote".into()));
+
+        let created = remote
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("remote creation must use a server-generated session ID");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let initial_generation = sessions.get_generation(&sid).await.unwrap();
+
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            remote.handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+                "chat_mode": "acp",
+            })),
+        )
+        .await
+        .expect("cross-mode fallback must not reacquire its retained admission permit")
+        .expect("an owned RPC-only session must support cross-mode resume");
+        assert_eq!(resumed["session_id"].as_str(), Some(sid.as_str()));
+        assert_eq!(
+            sessions.chat_mode(&sid).await,
+            Some(crate::rpc::types::ChatMode::Acp)
+        );
+        assert_eq!(
+            sessions.get_generation(&sid).await,
+            Some(initial_generation.wrapping_add(1))
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(&sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-remote"),
+        );
+        let agent = sessions.get_agent(&sid).await.unwrap();
+        let agent = agent.lock().await;
+        let channels = agent.channel_handles().reaction.read();
+        assert_eq!(channels.len(), 1);
+        assert!(channels.contains_key("rpc"));
+    }
+
+    #[tokio::test]
+    async fn local_acp_rehydration_restores_session_channels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.local_session_channel_factory = Some(session_factory_stub());
+        let sid = "acp-rehydrated-factory";
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(sessions.remove(sid).await, "reap must remove live state");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("rehydration should not fail")
+            .expect("restorable ACP session must rehydrate");
+        let agent = recovered.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert_eq!(reaction.len(), 2);
+        assert!(reaction.contains_key("git.main"));
+        assert!(reaction.contains_key("rpc"));
+    }
 
     /// The personality filename allowlist constrains the name, not its target.
     /// Both sides must therefore refuse an allowlisted name planted as a link
