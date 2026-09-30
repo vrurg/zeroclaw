@@ -14634,6 +14634,295 @@ pub(crate) mod connection_test_support {
         dropped: Arc<AtomicBool>,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum OrdinaryCostLimitGoalCase {
+        Parent,
+        Verifier,
+    }
+
+    struct OrdinaryCostLimitProvider {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OrdinaryCostLimitProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("ordinary cost-limit fixture requires structured chat")
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some("bounded candidate".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for OrdinaryCostLimitProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "fixture-parent"
+        }
+    }
+
+    pub(crate) struct OrdinaryCostLimitGoalFixture {
+        pub(crate) ctx: Arc<RpcContext>,
+        pub(crate) tracker: Arc<crate::cost::CostTracker>,
+        pub(crate) registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        pub(crate) provider_requests: Arc<AtomicUsize>,
+        verifier: wiremock::MockServer,
+        case: OrdinaryCostLimitGoalCase,
+    }
+
+    impl OrdinaryCostLimitGoalFixture {
+        pub(crate) async fn assert_paused(
+            &self,
+            task_id: &str,
+            minimum_epoch: i64,
+            expected_parent_requests: usize,
+        ) -> zeroclaw_api::task::TaskRecord {
+            use zeroclaw_goal::{GoalAccountingState, GoalBlockerKind, GoalPauseReason};
+
+            let session_id = zeroclaw_goal::GoalSessionKey::zero_code("ordinary-cost-limit")
+                .unwrap()
+                .durable_id();
+            let task = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let task = self
+                        .registry
+                        .current_goal_for_session(&session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if task.status != zeroclaw_api::task::TaskStatus::Running
+                        && task.execution_epoch >= minimum_epoch
+                    {
+                        break task;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ordinary cost refusal must settle its Goal state");
+            assert_eq!(task.id, task_id, "a refusal cannot admit a successor");
+            let goal = self.registry.get_goal_task(task_id).await.unwrap().unwrap();
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .expect("the ordinary cost-limit fixture persists its session");
+            let transcript = zeroclaw_infra::session_backend::SessionBackend::load(
+                backend.as_ref(),
+                "rpc_ordinary-cost-limit",
+            );
+            let verifier_requests = self.verifier.received_requests().await.unwrap().len();
+            let ledger = self.tracker.get_summary().unwrap();
+            // Name the facts that separate candidate persistence, parent pricing
+            // and the verifier's admission check when the Goal does not pause.
+            assert_eq!(
+                task.status,
+                zeroclaw_api::task::TaskStatus::Paused,
+                "pause={:?} accounting={:?} parent={} verifier={} rows={} daily={} transcript={}",
+                goal.pause_reason,
+                goal.accounting_state,
+                self.provider_requests.load(Ordering::SeqCst),
+                verifier_requests,
+                ledger.request_count,
+                ledger.daily_cost_usd,
+                transcript.len(),
+            );
+            assert_eq!(goal.pause_reason, Some(GoalPauseReason::BudgetExhausted));
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
+            assert!(goal.pending_tool_batch_id.is_none() && goal.pending_tool_epoch.is_none());
+            assert_eq!(goal.blockers.len(), 1);
+            assert_eq!(goal.blockers[0].kind, GoalBlockerKind::Budget);
+            assert_eq!(
+                self.provider_requests.load(Ordering::SeqCst),
+                expected_parent_requests
+            );
+            assert!(self.verifier.received_requests().await.unwrap().is_empty());
+
+            let seeded_rows = usize::from(self.case == OrdinaryCostLimitGoalCase::Parent);
+            let total = self.tracker.get_summary().unwrap();
+            assert_eq!(
+                total.request_count,
+                seeded_rows + expected_parent_requests,
+                "a refusal must not add a ledger row or duplicate the Goal row",
+            );
+            let goal_usage = self.tracker.get_summary_for_task(task_id).unwrap();
+            assert_eq!(
+                goal_usage.request_count, expected_parent_requests,
+                "the Goal accountant must remain the only writer",
+            );
+            // A refusal keeps a delivered parent candidate durable exactly once,
+            // and a refused parent persists nothing.
+            assert_eq!(
+                transcript
+                    .iter()
+                    .map(|message| (message.role.as_str(), message.content.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("assistant", "bounded candidate"); expected_parent_requests],
+            );
+            task
+        }
+    }
+
+    pub(crate) async fn prepare_ordinary_cost_limit_goal_fixture(
+        path: &Path,
+        owner_tui_id: &str,
+        case: OrdinaryCostLimitGoalCase,
+        remote: bool,
+    ) -> OrdinaryCostLimitGoalFixture {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let verifier = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ordinary-cost-limit-verifier",
+                "object": "chat.completion",
+                "model": "fixture-verifier",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": serde_json::json!({
+                            "decision": "complete",
+                            "reason": "The declared criterion is satisfied.",
+                            "blockers": [],
+                        }).to_string(),
+                    },
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            })))
+            .mount(&verifier)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: path.to_path_buf(),
+            config_path: path.join("config.toml"),
+            ..Default::default()
+        };
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.fixture".into();
+        config.cost.enabled = true;
+        config.cost.daily_limit_usd = 1.0;
+        config.cost.monthly_limit_usd = 100.0;
+        if remote {
+            config.gateway.paired_tokens = vec!["zc_tok".to_owned()];
+        }
+        let parent = config.providers.models.ensure("openai", "parent").unwrap();
+        parent.live_pricing = false;
+        parent.pricing = std::collections::HashMap::from([
+            ("fixture-parent.input".into(), 1_000_000.0),
+            ("fixture-parent.output".into(), 1_000_000.0),
+        ]);
+        let verifier_profile = config.providers.models.ensure("openai", "fixture").unwrap();
+        verifier_profile.api_key = Some("synthetic-key".into());
+        verifier_profile.uri = Some(verifier.uri());
+        verifier_profile.kind = Some("openai-compatible".into());
+        verifier_profile.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        verifier_profile.model = Some("fixture-verifier".into());
+        verifier_profile.live_pricing = false;
+        verifier_profile.pricing = std::collections::HashMap::from([
+            ("fixture-verifier.input".into(), 1.0),
+            ("fixture-verifier.output".into(), 1.0),
+        ]);
+
+        let tracker =
+            crate::cost::CostTracker::get_or_init_global_required(config.cost.clone(), path)
+                .unwrap();
+        if case == OrdinaryCostLimitGoalCase::Parent {
+            tracker
+                .record_usage(crate::cost::TokenUsage::new(
+                    "ordinary-seed",
+                    2,
+                    0,
+                    0,
+                    1_000_000.0,
+                    0.0,
+                    0.0,
+                ))
+                .unwrap();
+        }
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            64,
+            Arc::new(SessionActorQueue::new(4, 30, 60)),
+        ));
+        let mut ctx = RpcContext::minimal_with_cost_tracker(config, sessions, Arc::clone(&tracker));
+        // A successful Goal parent persists its candidate before verification
+        // (`append_parent_candidate`), so the session needs durable history.
+        Arc::get_mut(&mut ctx).unwrap().session_backend = Some(Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(path).unwrap(),
+        ));
+        if remote {
+            std::fs::write(path.join(".secret_key"), "42".repeat(32)).unwrap();
+            Arc::get_mut(&mut ctx).unwrap().tui_registry =
+                Arc::new(crate::rpc::tui_identity::TuiRegistry::new(path));
+        }
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        insert_session_with_owner(
+            &ctx,
+            path,
+            "ordinary-cost-limit",
+            Box::new(OrdinaryCostLimitProvider {
+                requests: Arc::clone(&provider_requests),
+            }),
+            Some(owner_tui_id),
+        )
+        .await;
+        {
+            let agent = ctx.sessions.get_agent("ordinary-cost-limit").await.unwrap();
+            let mut agent = agent.lock().await;
+            agent.set_model_provider_name("openai.parent".into());
+            agent.set_model_name("fixture-parent".into());
+            // The builder's resolver still reports `<unconfigured>`. Bind the
+            // route so the parent's attempts are priced as `openai.parent`.
+            agent.set_model_route_resolver(Arc::new(
+                zeroclaw_providers::router::ModelRouteResolver::new(
+                    Vec::new(),
+                    "openai.parent".into(),
+                    "fixture-parent".into(),
+                ),
+            ));
+        }
+        let handle = crate::control_plane::ControlPlaneHandle::open(path).unwrap();
+        let registry = handle.goal_store().unwrap();
+        ctx.goal_runtime.install_test_control_plane(handle);
+
+        OrdinaryCostLimitGoalFixture {
+            ctx,
+            tracker,
+            registry,
+            provider_requests,
+            verifier,
+            case,
+        }
+    }
+
     #[async_trait]
     impl ModelProvider for PendingProvider {
         async fn chat_with_system(

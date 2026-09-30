@@ -1,6 +1,6 @@
 //! Goal continuity through the ordinary Matrix command and draft pipeline.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -22,6 +22,17 @@ const QUESTION: &str = "Please choose option A or B before I continue.";
 const ANSWER: &str = "Choose A.\nKeep the second line unchanged.";
 const COMPLETION: &str = "Option A is applied; the declared Goal is complete.";
 const PREVIOUS_RESPONSE: &str = "The earlier request is complete.";
+
+const CHILD_ENV: &str = "ZEROCLAW_MATRIX_GOAL_CONFORMANCE_CHILD";
+const PHASE_ENV: &str = "ZEROCLAW_MATRIX_GOAL_CONFORMANCE_PHASE";
+const PHASE_DATA_DIR_ENV: &str = "ZEROCLAW_MATRIX_GOAL_CONFORMANCE_DATA_DIR";
+const PHASE_MOCK_URI_ENV: &str = "ZEROCLAW_MATRIX_GOAL_CONFORMANCE_MOCK_URI";
+
+#[path = "goal_diagnostic_conformance_tests.rs"]
+mod diagnostics;
+
+#[path = "goal_cold_restore_tests.rs"]
+mod cold_restore;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionScenario {
@@ -185,27 +196,44 @@ impl Respond for ModelResponses {
         } else {
             QUESTION.to_owned()
         };
-        let usage = json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12});
-        if body["stream"] == true {
-            let chunk =
-                json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
-            let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
-            let totals = json!({"choices":[],"usage":usage});
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(format!(
-                    "data: {chunk}\n\ndata: {finish}\n\ndata: {totals}\n\ndata: [DONE]\n\n"
-                ))
+        model_response(&text, body["stream"] == true)
+    }
+}
+
+struct BudgetModelResponses;
+
+impl Respond for BudgetModelResponses {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let text = if body["model"] == "goal-verifier" {
+            json!({"decision":"complete","reason":"The declared criterion is met.","blockers":[]})
+                .to_string()
         } else {
-            ResponseTemplate::new(200).set_body_json(json!({
+            COMPLETION.to_owned()
+        };
+        model_response(&text, body["stream"] == true)
+    }
+}
+
+fn model_response(text: &str, streaming: bool) -> ResponseTemplate {
+    let usage = json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12});
+    if streaming {
+        let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
+        let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let totals = json!({"choices":[],"usage":usage});
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!(
+                "data: {chunk}\n\ndata: {finish}\n\ndata: {totals}\n\ndata: [DONE]\n\n"
+            ))
+    } else {
+        ResponseTemplate::new(200).set_body_json(json!({
                 "choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":usage
             }))
-        }
     }
 }
 
 async fn isolated(test_name: &str) -> bool {
-    const CHILD_ENV: &str = "ZEROCLAW_MATRIX_GOAL_CONFORMANCE_CHILD";
     if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
         return false;
     }
@@ -226,6 +254,47 @@ async fn isolated(test_name: &str) -> bool {
         "isolated Matrix conformance failed: {status}"
     );
     true
+}
+
+/// Re-execute one named phase while the parent retains the durable directory
+/// and mock-provider server. `parent_work` supplies deterministic cross-process
+/// handshakes without weakening the shared 60-second child bound.
+async fn isolated_phase<F>(
+    test_name: &str,
+    phase: &str,
+    data_dir: &Path,
+    mock_uri: &str,
+    parent_work: F,
+) where
+    F: Future<Output = ()>,
+{
+    assert_ne!(
+        std::env::var(CHILD_ENV).as_deref(),
+        Ok(test_name),
+        "phase coordinator must run only in the parent test process"
+    );
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env(CHILD_ENV, test_name)
+        .env(PHASE_ENV, phase)
+        .env(PHASE_DATA_DIR_ENV, data_dir)
+        .env(PHASE_MOCK_URI_ENV, mock_uri)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(60), async {
+        let (status, ()) = tokio::join!(child.wait(), parent_work);
+        status
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        status.success(),
+        "isolated Matrix phase {phase} failed: {status}"
+    );
 }
 
 async fn wait_for_notice(channel: &RecordingMatrix, key: &str) {
@@ -270,7 +339,7 @@ async fn boot_daemon(
     config: Config,
 ) -> tokio::task::JoinHandle<anyhow::Result<zeroclaw_runtime::daemon::DaemonExit>> {
     let mut registry = zeroclaw_runtime::daemon::DaemonRegistry::new();
-    registry.register_gateway(Box::new(|_, _, _, _, controls, _, _, _| {
+    registry.register_gateway(Box::new(|_, _, _, _, _, controls, _, _, _| {
         Box::pin(async move {
             let mut shutdown = controls.unwrap().shutdown_tx.subscribe();
             while !*shutdown.borrow_and_update() {
@@ -680,4 +749,632 @@ async fn matrix_goal_preserves_an_answer_equal_to_the_objective() {
 #[tokio::test]
 async fn matrix_goal_preserves_a_canonical_user_prefix_equal_to_the_objective() {
     scenario("orchestrator::goal_conformance_tests::matrix_goal_preserves_a_canonical_user_prefix_equal_to_the_objective", MatrixStreamMode::SingleMessage, SessionScenario::PrefixMatchesObjective).await;
+}
+
+#[derive(Default)]
+struct UsageRecordingObserver {
+    events: std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>,
+}
+
+impl UsageRecordingObserver {
+    fn take_events(&self) -> Vec<zeroclaw_api::observability_traits::ObserverEvent> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
+impl zeroclaw_api::observability_traits::Observer for UsageRecordingObserver {
+    fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+
+    fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+    fn name(&self) -> &str {
+        "matrix-goal-usage"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn single_matrix_turn_usage(
+    events: &[zeroclaw_api::observability_traits::ObserverEvent],
+) -> (u64, u64) {
+    use zeroclaw_api::observability_traits::ObserverEvent;
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::AgentStart {
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => Some((channel, agent_alias, turn_id)),
+            _ => None,
+        })
+        .collect();
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => Some((tokens_used, channel, agent_alias, turn_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 1, "expected one AgentStart: {events:?}");
+    assert_eq!(ends.len(), 1, "expected one AgentEnd: {events:?}");
+    let (start_channel, start_alias, start_turn_id) = starts[0];
+    let (usage, end_channel, end_alias, end_turn_id) = ends[0];
+    assert_eq!(start_channel.as_deref(), Some("matrix"));
+    assert_eq!(end_channel, start_channel);
+    assert_eq!(start_alias.as_deref(), Some("test"));
+    assert_eq!(end_alias, start_alias);
+    assert!(start_turn_id.is_some(), "AgentStart must carry a turn id");
+    assert_eq!(end_turn_id, start_turn_id, "turn brackets must match");
+    let usage = usage
+        .as_ref()
+        .expect("Matrix AgentEnd must report real provider usage");
+    (usage.input_tokens, usage.output_tokens)
+}
+
+fn read_cost_records(data_dir: &Path) -> Vec<zeroclaw_config::cost::CostRecord> {
+    std::fs::read_to_string(data_dir.join("state/costs.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn matrix_goal_parent_turn_reports_agent_end_usage_like_ordinary() {
+    const TEST: &str = "orchestrator::goal_conformance_tests::matrix_goal_parent_turn_reports_agent_end_usage_like_ordinary";
+    if isolated(TEST).await {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ModelResponses)
+        .mount(&server)
+        .await;
+    let mut config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    };
+    config.goal.enabled = true;
+    config.cost.enabled = true;
+    config.heartbeat.enabled = false;
+    config.scheduler.enabled = false;
+    config.goal.verifier.model_provider = "openai.goal-test".into();
+    config.goal.verifier.model = Some("goal-verifier".into());
+    let profile = config
+        .providers
+        .models
+        .ensure("openai", "goal-test")
+        .unwrap();
+    profile.api_key = Some("test-key".into());
+    profile.uri = Some(server.uri());
+    profile.kind = Some("openai-compatible".into());
+    profile.wire_api = Some(WireApi::ChatCompletions);
+    profile.model = Some("goal-worker".into());
+    profile.live_pricing = false;
+    for model in ["goal-worker", "goal-verifier"] {
+        profile.pricing.insert(format!("{model}.input"), 1.0);
+        profile.pricing.insert(format!("{model}.output"), 2.0);
+    }
+    let agent_config = AliasedAgentConfig {
+        enabled: true,
+        model_provider: "openai.goal-test".into(),
+        ..Default::default()
+    };
+    config.agents.insert("test".into(), agent_config.clone());
+    config.channels.matrix.insert(
+        "goal-test".into(),
+        MatrixConfig {
+            enabled: true,
+            stream_mode: MatrixStreamMode::Off,
+            ..Default::default()
+        },
+    );
+
+    let daemon = boot_daemon(config.clone()).await;
+    let tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global_required(
+        config.cost.clone(),
+        &config.data_dir,
+    )
+    .unwrap();
+    let pricing =
+        Arc::new(zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config));
+    let (provider, provider_ref, model, _) =
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            &config,
+            "openai.goal-test",
+            Some("goal-worker"),
+        )
+        .unwrap();
+    let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+    let channel = Arc::new(RecordingMatrix {
+        mode: MatrixStreamMode::Off,
+        events: Default::default(),
+    });
+    let observer = Arc::new(UsageRecordingObserver::default());
+    let mut context = super::test_channel_ctx_with_backend_channel_and_provider(
+        backend,
+        channel.clone(),
+        provider.into(),
+        0,
+    );
+    let ctx = Arc::get_mut(&mut context).unwrap();
+    ctx.model_provider_ref = Arc::new(provider_ref);
+    ctx.model = Arc::new(model);
+    ctx.agent_cfg = Arc::new(agent_config);
+    ctx.workspace_dir = Arc::new(tmp.path().to_path_buf());
+    ctx.prompt_config = Arc::new(config.clone());
+    ctx.live_config = zeroclaw_config::live::LiveConfig::new(config).handle();
+    ctx.observer = observer.clone();
+    ctx.cost_tracking = Some(super::ChannelCostTrackingState {
+        tracker,
+        model_provider_pricing: pricing,
+        agent_alias: Arc::clone(&ctx.agent_alias),
+    });
+
+    let start = message(
+        "usage-goal",
+        &format!("/goal start --unlimited {OBJECTIVE}"),
+    );
+    let history_key = super::runtime_conversation_history_key(&context, &start);
+    super::process_channel_message(context.clone(), start, CancellationToken::new()).await;
+    wait_for_notice(&channel, "goal-mode-paused-blocked").await;
+    let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+    let paused = plane
+        .goal_store()
+        .unwrap()
+        .current_goal_for_session(&history_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.status, TaskStatus::Paused);
+    let goal = plane
+        .goal_store()
+        .unwrap()
+        .get_goal_task(&paused.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+
+    let goal_usage = single_matrix_turn_usage(&observer.take_events());
+    assert_eq!(goal_usage, (10, 2));
+    let goal_records = read_cost_records(tmp.path());
+    assert_eq!(
+        goal_records.len(),
+        2,
+        "Goal attempts must record exactly once"
+    );
+    assert!(
+        goal_records
+            .iter()
+            .all(|record| record.task_id.as_deref() == Some(paused.id.as_str())),
+        "Goal records must be task-attributed: {goal_records:?}"
+    );
+    for model in ["goal-worker", "goal-verifier"] {
+        assert_eq!(
+            goal_records
+                .iter()
+                .filter(|record| record.usage.model == model)
+                .count(),
+            1,
+            "each billable Goal attempt must have one canonical row"
+        );
+    }
+    assert!(
+        goal_records
+            .iter()
+            .all(|record| { record.usage.input_tokens == 10 && record.usage.output_tokens == 2 })
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+    super::process_channel_message(
+        context,
+        message("usage-ordinary", "ordinary parity request"),
+        CancellationToken::new(),
+    )
+    .await;
+    let ordinary_usage = single_matrix_turn_usage(&observer.take_events());
+    assert_eq!(ordinary_usage, goal_usage);
+    let all_records = read_cost_records(tmp.path());
+    assert_eq!(all_records.len(), 3);
+    assert_eq!(
+        all_records
+            .iter()
+            .filter(|record| record.task_id.as_deref() == Some(paused.id.as_str()))
+            .count(),
+        2
+    );
+    let ordinary_records: Vec<_> = all_records
+        .iter()
+        .filter(|record| record.task_id.is_none())
+        .collect();
+    assert_eq!(ordinary_records.len(), 1);
+    assert_eq!(ordinary_records[0].usage.model, "goal-worker");
+    // An ordinary Matrix message that is not explicitly addressed first sends
+    // the reply-intent precheck, then its parent request.
+    let precheck_marker = "Decide whether the assistant should send any visible reply";
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        4,
+        "two Goal requests, then the ordinary reply-intent precheck and parent request"
+    );
+    let precheck: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    let precheck_prompt = precheck["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        precheck_prompt.starts_with(precheck_marker),
+        "the ordinary turn must send its reply-intent precheck first"
+    );
+    let parent: Value = serde_json::from_slice(&requests[3].body).unwrap();
+    assert_eq!(parent["model"], "goal-worker");
+    assert!(
+        !parent["messages"].to_string().contains(precheck_marker),
+        "the ordinary turn's last request must be its parent request"
+    );
+
+    let status = tokio::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    let exit = tokio::time::timeout(Duration::from_secs(10), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        exit,
+        zeroclaw_runtime::daemon::DaemonExit::Shutdown
+    ));
+}
+
+/// Exercise the Matrix Goal boundary against the process-global ordinary cost
+/// tracker.  Each case runs in the existing child process so the canonical
+/// tracker identity and daemon control plane are fresh and isolated.
+struct MatrixCostBudgetCase {
+    test_name: &'static str,
+    cost_enabled: bool,
+    daily_limit_usd: f64,
+    seed_cost_usd: Option<f64>,
+    resume_after_raise: bool,
+    expected_requests: usize,
+    expected_goal_rows: usize,
+    expected_status: TaskStatus,
+    expected_pause: Option<GoalPauseReason>,
+}
+
+async fn matrix_goal_cost_budget_case(case: MatrixCostBudgetCase) {
+    if isolated(case.test_name).await {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(BudgetModelResponses)
+        .mount(&server)
+        .await;
+    let mut config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    };
+    config.goal.enabled = true;
+    config.cost.enabled = case.cost_enabled;
+    config.cost.daily_limit_usd = case.daily_limit_usd;
+    config.cost.monthly_limit_usd = 1.0;
+    config.heartbeat.enabled = false;
+    config.scheduler.enabled = false;
+    config.goal.verifier.model_provider = "openai.goal-test".into();
+    config.goal.verifier.model = Some("goal-verifier".into());
+    let profile = config
+        .providers
+        .models
+        .ensure("openai", "goal-test")
+        .unwrap();
+    profile.api_key = Some("test-key".into());
+    profile.uri = Some(server.uri());
+    profile.kind = Some("openai-compatible".into());
+    profile.wire_api = Some(WireApi::ChatCompletions);
+    profile.model = Some("goal-worker".into());
+    profile.live_pricing = false;
+    for model in ["goal-worker", "goal-verifier"] {
+        profile.pricing.insert(format!("{model}.input"), 1.0);
+        profile.pricing.insert(format!("{model}.output"), 2.0);
+    }
+    let agent_config = AliasedAgentConfig {
+        enabled: true,
+        model_provider: "openai.goal-test".into(),
+        ..Default::default()
+    };
+    config.agents.insert("test".into(), agent_config.clone());
+    config.channels.matrix.insert(
+        "goal-test".into(),
+        MatrixConfig {
+            enabled: true,
+            stream_mode: MatrixStreamMode::Off,
+            ..Default::default()
+        },
+    );
+
+    // Seed an over-limit ordinary ledger row before disabling tracking for the
+    // control case.  The tracker remains the canonical process-global owner.
+    let tracker_config = zeroclaw_config::schema::CostConfig {
+        enabled: true,
+        daily_limit_usd: case.daily_limit_usd,
+        monthly_limit_usd: 1.0,
+        ..config.cost.clone()
+    };
+    let tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global_required(
+        tracker_config,
+        &config.data_dir,
+    )
+    .unwrap();
+    if let Some(seed_cost_usd) = case.seed_cost_usd {
+        tracker
+            .record_usage_with_agent(
+                zeroclaw_config::cost::TokenUsage::new(
+                    "seed",
+                    1_000_000,
+                    0,
+                    0,
+                    seed_cost_usd,
+                    0.0,
+                    0.0,
+                ),
+                Some("test"),
+            )
+            .unwrap();
+    }
+    tracker.update_config(config.cost.clone());
+
+    let daemon = boot_daemon(config.clone()).await;
+    let (provider, provider_ref, model, _) =
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            &config,
+            "openai.goal-test",
+            Some("goal-worker"),
+        )
+        .unwrap();
+    let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+    let channel = Arc::new(RecordingMatrix {
+        mode: MatrixStreamMode::Off,
+        events: Default::default(),
+    });
+    let mut context = super::test_channel_ctx_with_backend_channel_and_provider(
+        backend,
+        channel.clone(),
+        provider.into(),
+        0,
+    );
+    let ctx = Arc::get_mut(&mut context).unwrap();
+    ctx.model_provider_ref = Arc::new(provider_ref);
+    ctx.model = Arc::new(model);
+    ctx.agent_cfg = Arc::new(agent_config);
+    ctx.workspace_dir = Arc::new(tmp.path().to_path_buf());
+    ctx.prompt_config = Arc::new(config.clone());
+    ctx.live_config = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+    let pricing =
+        Arc::new(zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config));
+    if case.cost_enabled {
+        ctx.cost_tracking = Some(super::ChannelCostTrackingState {
+            tracker: Arc::clone(&tracker),
+            model_provider_pricing: pricing,
+            agent_alias: Arc::clone(&ctx.agent_alias),
+        });
+    }
+
+    let start = message(
+        "budget-goal",
+        &format!("/goal start --unlimited {OBJECTIVE}"),
+    );
+    let history_key = super::runtime_conversation_history_key(&context, &start);
+    super::process_channel_message(context.clone(), start, CancellationToken::new()).await;
+    let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+    let first_state = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(task) = plane
+                .goal_store()
+                .unwrap()
+                .current_goal_for_session(&history_key)
+                .await
+                .unwrap()
+                && task.status != TaskStatus::Running
+            {
+                break task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Goal must reach a terminal or paused state");
+    if case.resume_after_raise {
+        assert_eq!(first_state.status, TaskStatus::Paused);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        let initial_goal = plane
+            .goal_store()
+            .unwrap()
+            .get_goal_task(&first_state.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial_goal.pause_reason,
+            Some(GoalPauseReason::BudgetExhausted)
+        );
+        super::process_channel_message(
+            context.clone(),
+            message("resume-over-limit", "/goal resume"),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        let initial_epoch = first_state.execution_epoch;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let current_task = plane
+                    .goal_store()
+                    .unwrap()
+                    .current_goal_for_session(&history_key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current_task.status == TaskStatus::Paused
+                    && current_task.execution_epoch > initial_epoch
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("over-limit resume must commit a fresh paused execution");
+        let mut raised = config.cost.clone();
+        raised.daily_limit_usd = 1.0;
+        tracker.update_config(raised);
+        super::process_channel_message(
+            context.clone(),
+            message("resume-after-raise", "/goal resume"),
+            CancellationToken::new(),
+        )
+        .await;
+    }
+    let final_state = if case.resume_after_raise {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(task) = plane
+                    .goal_store()
+                    .unwrap()
+                    .current_goal_for_session(&history_key)
+                    .await
+                    .unwrap()
+                    && task.status != TaskStatus::Running
+                {
+                    break task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resumed Goal must reach a terminal or paused state")
+    } else {
+        first_state
+    };
+    assert_eq!(final_state.status, case.expected_status);
+    let goal = plane
+        .goal_store()
+        .unwrap()
+        .get_goal_task(&final_state.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    assert_eq!(goal.pause_reason, case.expected_pause);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), case.expected_requests);
+    let records = read_cost_records(tmp.path());
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.task_id.as_deref() == Some(final_state.id.as_str()))
+            .count(),
+        case.expected_goal_rows
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.task_id.is_none())
+            .count(),
+        if case.seed_cost_usd.is_some() { 1 } else { 0 }
+    );
+    let candidate_count = channel
+        .events
+        .lock()
+        .await
+        .iter()
+        .filter(|(kind, text)| *kind == DeliveryKind::Final && text == COMPLETION)
+        .count();
+    assert_eq!(candidate_count, 1, "Goal candidate must be delivered once");
+
+    let status = tokio::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    let exit = tokio::time::timeout(Duration::from_secs(10), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        exit,
+        zeroclaw_runtime::daemon::DaemonExit::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn matrix_goal_parent_respects_the_ordinary_daily_limit_without_a_request() {
+    matrix_goal_cost_budget_case(MatrixCostBudgetCase {
+        test_name: "orchestrator::goal_conformance_tests::matrix_goal_parent_respects_the_ordinary_daily_limit_without_a_request",
+        cost_enabled: true,
+        daily_limit_usd: 0.00001,
+        seed_cost_usd: Some(0.00002),
+        resume_after_raise: true,
+        expected_requests: 2,
+        expected_goal_rows: 2,
+        expected_status: TaskStatus::Completed,
+        expected_pause: None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_verifier_respects_the_ordinary_daily_limit_after_parent_spend() {
+    matrix_goal_cost_budget_case(MatrixCostBudgetCase {
+        test_name: "orchestrator::goal_conformance_tests::matrix_goal_verifier_respects_the_ordinary_daily_limit_after_parent_spend",
+        cost_enabled: true,
+        daily_limit_usd: 0.00001,
+        seed_cost_usd: None,
+        resume_after_raise: false,
+        expected_requests: 1,
+        expected_goal_rows: 1,
+        expected_status: TaskStatus::Paused,
+        expected_pause: Some(GoalPauseReason::BudgetExhausted),
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_ignores_ordinary_limits_when_cost_tracking_is_disabled() {
+    matrix_goal_cost_budget_case(MatrixCostBudgetCase {
+        test_name: "orchestrator::goal_conformance_tests::matrix_goal_ignores_ordinary_limits_when_cost_tracking_is_disabled",
+        cost_enabled: false,
+        daily_limit_usd: 0.00001,
+        seed_cost_usd: Some(0.00002),
+        resume_after_raise: false,
+        expected_requests: 2,
+        expected_goal_rows: 2,
+        expected_status: TaskStatus::Completed,
+        expected_pause: None,
+    })
+    .await;
 }

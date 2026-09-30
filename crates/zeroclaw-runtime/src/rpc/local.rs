@@ -2069,6 +2069,248 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn goal_parent_respects_the_ordinary_daily_limit_over_local_ipc() {
+        exercise_ordinary_daily_limit_over_local_ipc(
+            "rpc::local::tests::goal_parent_respects_the_ordinary_daily_limit_over_local_ipc",
+            crate::rpc::dispatch::connection_test_support::OrdinaryCostLimitGoalCase::Parent,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_verifier_respects_the_ordinary_daily_limit_over_local_ipc() {
+        exercise_ordinary_daily_limit_over_local_ipc(
+            "rpc::local::tests::goal_verifier_respects_the_ordinary_daily_limit_over_local_ipc",
+            crate::rpc::dispatch::connection_test_support::OrdinaryCostLimitGoalCase::Verifier,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_ordinary_daily_limit_over_local_ipc(
+        test_name: &str,
+        case: crate::rpc::dispatch::connection_test_support::OrdinaryCostLimitGoalCase,
+    ) {
+        use crate::rpc::dispatch::connection_test_support::{
+            OrdinaryCostLimitGoalCase, prepare_ordinary_cost_limit_goal_fixture,
+        };
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate, SessionUpdateEvent};
+        use zeroclaw_goal::control::GoalResponse;
+
+        if crate::rpc::goal_transport_test_support::run_isolated(test_name).await {
+            return;
+        }
+        const SESSION_ID: &str = "ordinary-cost-limit";
+        const TUI_ID: &str = "ordinary-cost-limit-local";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture =
+            prepare_ordinary_cost_limit_goal_fixture(tmp.path(), TUI_ID, case, false).await;
+        let sock_path = fixture.ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&fixture.ctx);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        writer
+            .write_all(
+                rpc_request(
+                    Method::Initialize,
+                    &InitializeParams {
+                        protocol_version: 1,
+                        tui_id: Some(TUI_ID.into()),
+                        tui_sig: None,
+                        env: Default::default(),
+                        client_capabilities: None,
+                        auth_token: None,
+                        auth_provider: None,
+                    },
+                    1,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({
+                        "session_id": SESSION_ID,
+                        "command": "/goal start --unlimited complete the bounded fixture",
+                    }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, started): (_, SessionGoalResult) = read_result(&mut reader).await;
+        let GoalResponse::Started(started) = started.response else {
+            panic!("ordinary limit fixture must start a Goal");
+        };
+        let expected_parent_requests = usize::from(case == OrdinaryCostLimitGoalCase::Verifier);
+        let paused = fixture
+            .assert_paused(
+                &started.task_id,
+                started.execution_epoch,
+                expected_parent_requests,
+            )
+            .await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({"session_id": SESSION_ID, "command": "/goal status"}),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut core_errors = 0;
+        let mut failure_notices = 0;
+        let mut candidates = 0;
+        let status = loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if frame["id"] == 3 {
+                let result: SessionGoalResult =
+                    serde_json::from_value(frame["result"].clone()).unwrap();
+                break result;
+            }
+            if frame["method"] == "session/update" {
+                let event: SessionUpdateEvent =
+                    serde_json::from_value(frame["params"].clone()).unwrap();
+                if let SessionUpdateEvent::TurnComplete {
+                    outcome, content, ..
+                } = event
+                    && outcome == crate::rpc::types::TurnCompletionOutcome::Failed
+                {
+                    assert!(content.contains("Budget exceeded"), "{content}");
+                    core_errors += 1;
+                }
+            } else if frame["method"] == "session/goal_update" {
+                match serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone()).unwrap()
+                {
+                    SessionGoalUpdate::VerifiedCandidate { .. } => candidates += 1,
+                    SessionGoalUpdate::Failed { .. } => failure_notices += 1,
+                    _ => {}
+                }
+            }
+        };
+        let GoalResponse::Status(status) = status.response else {
+            panic!("status must project the paused Goal");
+        };
+        assert_eq!(status.task_id, started.task_id);
+        assert_eq!(status.status, zeroclaw_api::task::TaskStatus::Paused);
+        assert_eq!(core_errors, 1);
+        assert_eq!(failure_notices, 0);
+        assert_eq!(candidates, expected_parent_requests);
+
+        if case == OrdinaryCostLimitGoalCase::Parent {
+            writer
+                .write_all(
+                    rpc_request(
+                        Method::SessionGoal,
+                        &serde_json::json!({"session_id": SESSION_ID, "command": "/goal resume"}),
+                        4,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (_, resumed): (_, SessionGoalResult) = read_result(&mut reader).await;
+            let GoalResponse::Resumed(resumed) = resumed.response else {
+                panic!("an ordinary-limit pause must remain explicitly resumable");
+            };
+            assert_eq!(resumed.task_id, started.task_id);
+            assert!(resumed.execution_epoch > paused.execution_epoch);
+            fixture
+                .assert_paused(&started.task_id, resumed.execution_epoch, 0)
+                .await;
+
+            writer
+                .write_all(
+                    rpc_request(
+                        Method::SessionGoal,
+                        &serde_json::json!({"session_id": SESSION_ID, "command": "/goal status"}),
+                        5,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut repeated_core_errors = 0;
+            let mut repeated_failure_notices = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if frame["id"] == 5 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Status(_)));
+                    break;
+                }
+                if frame["method"] == "session/update" {
+                    let event: SessionUpdateEvent =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    if let SessionUpdateEvent::TurnComplete {
+                        outcome, content, ..
+                    } = event
+                        && outcome == crate::rpc::types::TurnCompletionOutcome::Failed
+                    {
+                        assert!(content.contains("Budget exceeded"), "{content}");
+                        repeated_core_errors += 1;
+                    }
+                } else if frame["method"] == "session/goal_update"
+                    && matches!(
+                        serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone())
+                            .unwrap(),
+                        SessionGoalUpdate::Failed { .. }
+                    )
+                {
+                    repeated_failure_notices += 1;
+                }
+            }
+            assert_eq!(repeated_core_errors, 1);
+            assert_eq!(repeated_failure_notices, 0);
+        }
+
+        cancel.cancel();
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("local IPC listener should stop after cancellation")
+            .expect("local IPC listener task should not panic")
+            .expect("local IPC listener should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_diagnostics_guard_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_diagnostics_guard_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Diagnostics,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn goal_budget_control_waits_for_the_turn_over_local_ipc() {
         exercise_goal_boundary_over_local_ipc("/goal budget set --tokens 100", None).await;
     }
@@ -4402,10 +4644,69 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_with_local_capability_completes_over_local_ipc() {
+        goal_local_fixture(
+            "rpc::local::tests::active_goal_with_local_capability_completes_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
     async fn active_goal_local_fixture(
         test_name: &str,
         objective: &str,
         scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+    ) {
+        goal_local_fixture(test_name, objective, scenario, false).await;
+    }
+
+    #[cfg(unix)]
+    async fn goal_local_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+        with_local_capability: bool,
+    ) {
+        goal_local_fault_fixture(test_name, objective, scenario, with_local_capability, None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_answer_append_failure_precedes_notice_over_local_ipc() {
+        goal_local_fault_fixture(
+            "rpc::local::tests::goal_answer_append_failure_precedes_notice_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            false,
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_prefix_projection_failure_precedes_notice_over_local_ipc() {
+        goal_local_fault_fixture(
+            "rpc::local::tests::goal_prefix_projection_failure_precedes_notice_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            false,
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn goal_local_fault_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+        with_local_capability: bool,
+        failure: Option<crate::rpc::goal_transport_test_support::GoalTransportFailure>,
     ) {
         use crate::rpc::goal_transport_test_support::{
             ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
@@ -4416,7 +4717,23 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let fixture = match failure {
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend) => {
+                ActiveGoalFixture::with_answer_append_failure(tmp.path()).await
+            }
+            Some(
+                crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection,
+            ) => ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await,
+            None if scenario
+                == crate::rpc::goal_transport_test_support::ResumeScenario::Diagnostics =>
+            {
+                ActiveGoalFixture::with_diagnostics(tmp.path()).await
+            }
+            None => ActiveGoalFixture::new(tmp.path()).await,
+        };
+        if with_local_capability {
+            fixture.add_local_capability().await;
+        }
         let sock_path = tmp.path().join("daemon.sock");
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
@@ -4428,14 +4745,93 @@ mod tests {
         let socket = tokio::net::UnixStream::connect(sock_path).await.unwrap();
         let (reader, writer) = socket.into_split();
         let mut transport = GoalTestTransport::Local(tokio::io::BufReader::new(reader), writer);
-        assert_active_goal_scenario_with_objective(
-            &fixture,
-            &mut transport,
-            false,
-            objective,
-            scenario,
+        match failure {
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend) => {
+                crate::rpc::goal_transport_test_support::assert_answer_append_failure(
+                    &fixture,
+                    &mut transport,
+                    false,
+                )
+                .await;
+            }
+            Some(
+                crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection,
+            ) => {
+                crate::rpc::goal_transport_test_support::assert_prefix_projection_failure(
+                    &fixture,
+                    &mut transport,
+                    false,
+                )
+                .await;
+            }
+            None => {
+                assert_active_goal_scenario_with_objective(
+                    &fixture,
+                    &mut transport,
+                    false,
+                    objective,
+                    scenario,
+                )
+                .await;
+            }
+        }
+        if with_local_capability {
+            let agent = fixture
+                .context
+                .sessions
+                .get_agent(crate::rpc::goal_transport_test_support::SESSION_ID)
+                .await
+                .unwrap();
+            assert!(
+                agent
+                    .lock()
+                    .await
+                    .channel_handles()
+                    .reaction
+                    .read()
+                    .contains_key("git.main")
+            );
+        }
+        drop(transport);
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(8), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_resume_surfaces_late_grant_refusal_without_persisting_answer_over_local_ipc() {
+        use crate::rpc::goal_transport_test_support::{
+            ActiveGoalFixture, GoalTestTransport, assert_admitted_goal_grant_refusal, run_isolated,
+        };
+        if run_isolated(
+            "rpc::local::tests::goal_resume_surfaces_late_grant_refusal_without_persisting_answer_over_local_ipc",
         )
-        .await;
+        .await
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid is a parameter-free query of this test process.
+        let uid = unsafe { libc::geteuid() };
+        let fixture = ActiveGoalFixture::with_local_execute_grant(tmp.path(), uid).await;
+        let sock_path = tmp.path().join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let ctx = Arc::clone(&fixture.context);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+        let (reader, writer) = tokio::net::UnixStream::connect(sock_path)
+            .await
+            .unwrap()
+            .into_split();
+        let mut transport = GoalTestTransport::Local(tokio::io::BufReader::new(reader), writer);
+        assert_admitted_goal_grant_refusal(&fixture, &mut transport).await;
         drop(transport);
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(8), server)

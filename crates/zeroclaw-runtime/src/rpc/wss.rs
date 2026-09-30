@@ -2144,6 +2144,254 @@ mod accept_error_tests {
     }
 
     #[tokio::test]
+    async fn goal_parent_respects_the_ordinary_daily_limit_over_wss() {
+        use crate::rpc::dispatch::connection_test_support::{
+            OrdinaryCostLimitGoalCase, prepare_ordinary_cost_limit_goal_fixture,
+        };
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate, SessionUpdateEvent};
+        use zeroclaw_goal::control::GoalResponse;
+
+        const TEST_NAME: &str =
+            "rpc::wss::accept_error_tests::goal_parent_respects_the_ordinary_daily_limit_over_wss";
+        if crate::rpc::goal_transport_test_support::run_isolated(TEST_NAME).await {
+            return;
+        }
+        const SESSION_ID: &str = "ordinary-cost-limit";
+        const TUI_ID: &str = "ordinary-cost-limit-wss";
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = prepare_ordinary_cost_limit_goal_fixture(
+            tmp.path(),
+            TUI_ID,
+            OrdinaryCostLimitGoalCase::Parent,
+            true,
+        )
+        .await;
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
+        let client =
+            zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key, "ordinary-cost-limit").unwrap();
+        let acceptor = super::build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&fixture.ctx);
+        let server = zeroclaw_spawn::spawn!(super::serve_wss_listener(
+            server_ctx,
+            server_cancel,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acceptor,
+            listener,
+            super::WssLimits::default(),
+        ));
+
+        let connector = test_client_connector(&client.cert_pem, &client.key_pem);
+        let (websocket, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &format!("wss://{addr}/"),
+                None,
+                false,
+                Some(connector),
+            ),
+        )
+        .await
+        .expect("WSS listener should accept the loopback test connection")
+        .expect("WSS handshake should succeed");
+        let (mut sink, mut stream) = websocket.split();
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(TUI_ID.into()),
+            tui_sig: Some(fixture.ctx.tui_registry.sign(TUI_ID).unwrap()),
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: Some("zc_tok".into()),
+            auth_provider: None,
+        };
+        sink.send(Message::Text(
+            rpc_request(Method::Initialize, &init, 1).into(),
+        ))
+        .await
+        .unwrap();
+        let initialized = read_response_with_id(&mut stream, 1).await;
+        assert!(initialized["error"].is_null(), "{initialized}");
+
+        sink.send(Message::Text(
+            rpc_request(
+                Method::SessionGoal,
+                &serde_json::json!({
+                    "session_id": SESSION_ID,
+                    "command": "/goal start --unlimited complete the bounded fixture",
+                }),
+                2,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let frame = read_response_with_id(&mut stream, 2).await;
+        assert!(frame["error"].is_null(), "{frame}");
+        let started: SessionGoalResult = serde_json::from_value(frame["result"].clone()).unwrap();
+        let GoalResponse::Started(started) = started.response else {
+            panic!("ordinary limit fixture must start a Goal");
+        };
+        let paused = fixture
+            .assert_paused(&started.task_id, started.execution_epoch, 0)
+            .await;
+
+        sink.send(Message::Text(
+            rpc_request(
+                Method::SessionGoal,
+                &serde_json::json!({"session_id": SESSION_ID, "command": "/goal status"}),
+                3,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let mut core_errors = 0;
+        let mut failure_notices = 0;
+        let mut candidates = 0;
+        let status = loop {
+            let message = stream.next().await.unwrap().unwrap();
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(text).unwrap();
+            if frame["id"] == 3 {
+                let result: SessionGoalResult =
+                    serde_json::from_value(frame["result"].clone()).unwrap();
+                break result;
+            }
+            if frame["method"] == "session/update" {
+                let event: SessionUpdateEvent =
+                    serde_json::from_value(frame["params"].clone()).unwrap();
+                if let SessionUpdateEvent::TurnComplete {
+                    outcome, content, ..
+                } = event
+                    && outcome == crate::rpc::types::TurnCompletionOutcome::Failed
+                {
+                    assert!(content.contains("Budget exceeded"), "{content}");
+                    core_errors += 1;
+                }
+            } else if frame["method"] == "session/goal_update" {
+                match serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone()).unwrap()
+                {
+                    SessionGoalUpdate::VerifiedCandidate { .. } => candidates += 1,
+                    SessionGoalUpdate::Failed { .. } => failure_notices += 1,
+                    _ => {}
+                }
+            }
+        };
+        let GoalResponse::Status(status) = status.response else {
+            panic!("status must project the paused Goal");
+        };
+        assert_eq!(status.task_id, started.task_id);
+        assert_eq!(status.status, zeroclaw_api::task::TaskStatus::Paused);
+        assert_eq!(core_errors, 1);
+        assert_eq!(failure_notices, 0);
+        assert_eq!(candidates, 0);
+
+        sink.send(Message::Text(
+            rpc_request(
+                Method::SessionGoal,
+                &serde_json::json!({"session_id": SESSION_ID, "command": "/goal resume"}),
+                4,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let frame = read_response_with_id(&mut stream, 4).await;
+        assert!(frame["error"].is_null(), "{frame}");
+        let resumed: SessionGoalResult = serde_json::from_value(frame["result"].clone()).unwrap();
+        let GoalResponse::Resumed(resumed) = resumed.response else {
+            panic!("an ordinary-limit pause must remain explicitly resumable");
+        };
+        assert_eq!(resumed.task_id, started.task_id);
+        assert!(resumed.execution_epoch > paused.execution_epoch);
+        fixture
+            .assert_paused(&started.task_id, resumed.execution_epoch, 0)
+            .await;
+
+        sink.send(Message::Text(
+            rpc_request(
+                Method::SessionGoal,
+                &serde_json::json!({"session_id": SESSION_ID, "command": "/goal status"}),
+                5,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let mut repeated_core_errors = 0;
+        let mut repeated_failure_notices = 0;
+        loop {
+            let message = stream.next().await.unwrap().unwrap();
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(text).unwrap();
+            if frame["id"] == 5 {
+                let result: SessionGoalResult =
+                    serde_json::from_value(frame["result"].clone()).unwrap();
+                assert!(matches!(result.response, GoalResponse::Status(_)));
+                break;
+            }
+            if frame["method"] == "session/update" {
+                let event: SessionUpdateEvent =
+                    serde_json::from_value(frame["params"].clone()).unwrap();
+                if let SessionUpdateEvent::TurnComplete {
+                    outcome, content, ..
+                } = event
+                    && outcome == crate::rpc::types::TurnCompletionOutcome::Failed
+                {
+                    assert!(content.contains("Budget exceeded"), "{content}");
+                    repeated_core_errors += 1;
+                }
+            } else if frame["method"] == "session/goal_update"
+                && matches!(
+                    serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone()).unwrap(),
+                    SessionGoalUpdate::Failed { .. }
+                )
+            {
+                repeated_failure_notices += 1;
+            }
+        }
+        assert_eq!(repeated_core_errors, 1);
+        assert_eq!(repeated_failure_notices, 0);
+
+        cancel.cancel();
+        drop(sink);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("WSS listener should stop after cancellation")
+            .expect("WSS listener task should not panic")
+            .expect("WSS listener should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn active_goal_diagnostics_guard_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_diagnostics_guard_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Diagnostics,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn goal_budget_control_waits_for_the_turn_over_wss() {
         exercise_goal_boundary_over_wss("/goal budget set --tokens 100", None).await;
     }
@@ -5228,11 +5476,90 @@ mod accept_error_tests {
         ).await;
     }
 
+    #[tokio::test]
+    async fn goal_start_refuses_local_capabilities_without_waiting_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_start_refuses_local_capabilities_without_waiting_over_wss",
+            GoalWssScenario::Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario::Start),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_resume_refuses_local_capabilities_and_preserves_pause_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_resume_refuses_local_capabilities_and_preserves_pause_over_wss",
+            GoalWssScenario::Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario::AnsweredResume),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_start_surfaces_late_capability_refusal_before_failure_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_start_surfaces_late_capability_refusal_before_failure_over_wss",
+            GoalWssScenario::AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario::Start),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_resume_surfaces_late_refusal_without_persisting_answer_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_resume_surfaces_late_refusal_without_persisting_answer_over_wss",
+            GoalWssScenario::AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario::AnsweredResume),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_controls_preserve_rpc_only_outcomes_with_local_capabilities_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_controls_preserve_rpc_only_outcomes_with_local_capabilities_over_wss",
+            GoalWssScenario::ControlParity,
+        )
+        .await;
+    }
+
+    enum GoalWssScenario<'a> {
+        Continuity(
+            &'a str,
+            crate::rpc::goal_transport_test_support::ResumeScenario,
+        ),
+        Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario),
+        AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario),
+        ControlParity,
+        AnswerAppendFailure,
+        PrefixProjectionFailure,
+    }
+
+    #[tokio::test]
+    async fn goal_answer_append_failure_precedes_notice_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_answer_append_failure_precedes_notice_over_wss",
+            GoalWssScenario::AnswerAppendFailure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_prefix_projection_failure_precedes_notice_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_prefix_projection_failure_precedes_notice_over_wss",
+            GoalWssScenario::PrefixProjectionFailure,
+        )
+        .await;
+    }
+
     async fn active_goal_wss_fixture(
         test_name: &str,
         objective: &str,
         scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
     ) {
+        goal_wss_fixture(test_name, GoalWssScenario::Continuity(objective, scenario)).await;
+    }
+
+    async fn goal_wss_fixture(test_name: &str, scenario: GoalWssScenario<'_>) {
         use crate::rpc::goal_transport_test_support::{
             ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
             run_isolated,
@@ -5243,7 +5570,19 @@ mod accept_error_tests {
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
-        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let fixture = match &scenario {
+            GoalWssScenario::AnswerAppendFailure => {
+                ActiveGoalFixture::with_answer_append_failure(tmp.path()).await
+            }
+            GoalWssScenario::PrefixProjectionFailure => {
+                ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await
+            }
+            GoalWssScenario::Continuity(
+                _,
+                crate::rpc::goal_transport_test_support::ResumeScenario::Diagnostics,
+            ) => ActiveGoalFixture::with_diagnostics(tmp.path()).await,
+            _ => ActiveGoalFixture::new(tmp.path()).await,
+        };
         let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
         let ca = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
         let key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
@@ -5278,15 +5617,58 @@ mod accept_error_tests {
         )
         .await
         .unwrap();
-        let mut transport = GoalTestTransport::Wss(socket);
-        assert_active_goal_scenario_with_objective(
-            &fixture,
-            &mut transport,
-            true,
-            objective,
-            scenario,
-        )
-        .await;
+        let mut transport = GoalTestTransport::Wss(Box::new(socket));
+        match scenario {
+            GoalWssScenario::PrefixProjectionFailure => {
+                crate::rpc::goal_transport_test_support::assert_prefix_projection_failure(
+                    &fixture,
+                    &mut transport,
+                    true,
+                )
+                .await;
+            }
+            GoalWssScenario::AnswerAppendFailure => {
+                crate::rpc::goal_transport_test_support::assert_answer_append_failure(
+                    &fixture,
+                    &mut transport,
+                    true,
+                )
+                .await;
+            }
+            GoalWssScenario::ControlParity => {
+                crate::rpc::goal_transport_test_support::assert_remote_goal_control_parity(
+                    &fixture,
+                    &mut transport,
+                )
+                .await;
+            }
+            GoalWssScenario::Continuity(objective, scenario) => {
+                assert_active_goal_scenario_with_objective(
+                    &fixture,
+                    &mut transport,
+                    true,
+                    objective,
+                    scenario,
+                )
+                .await;
+            }
+            GoalWssScenario::Refused(scenario) => {
+                crate::rpc::goal_transport_test_support::assert_remote_goal_command_refusal(
+                    &fixture,
+                    &mut transport,
+                    scenario,
+                )
+                .await;
+            }
+            GoalWssScenario::AdmissionFenced(scenario) => {
+                crate::rpc::goal_transport_test_support::assert_admitted_goal_capability_refusal(
+                    &fixture,
+                    &mut transport,
+                    scenario,
+                )
+                .await;
+            }
+        }
         drop(transport);
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(8), server)
