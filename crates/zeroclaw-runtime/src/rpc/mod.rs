@@ -8,6 +8,8 @@ pub mod dispatch;
 pub mod fs;
 pub mod git;
 pub mod goal;
+#[cfg(test)]
+pub(crate) mod goal_transport_test_support;
 pub mod local;
 pub mod locales;
 pub mod session;
