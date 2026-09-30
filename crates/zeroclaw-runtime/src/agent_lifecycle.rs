@@ -627,6 +627,8 @@ mod tests {
                 delivered: true,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-08-26T00:00:00Z".into(),
                 finished_at: Some("2026-08-26T00:00:01Z".into()),
             })
