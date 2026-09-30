@@ -1674,6 +1674,94 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn active_goal_preserves_question_and_multiline_resume_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_preserves_question_and_multiline_resume_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_preserves_answer_equal_to_objective_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_preserves_answer_equal_to_objective_over_local_ipc",
+            crate::rpc::goal_transport_test_support::ANSWER,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_preserves_plain_resume_without_answer_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_preserves_plain_resume_without_answer_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::PlainThenAnswered,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_preserves_user_prefix_equal_to_objective_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_preserves_user_prefix_equal_to_objective_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::PrefixMatchesObjective,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn active_goal_local_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+    ) {
+        use crate::rpc::goal_transport_test_support::{
+            ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
+            run_isolated,
+        };
+
+        if run_isolated(test_name).await {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let sock_path = tmp.path().join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let ctx = Arc::clone(&fixture.context);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+        let socket = tokio::net::UnixStream::connect(sock_path).await.unwrap();
+        let (reader, writer) = socket.into_split();
+        let mut transport = GoalTestTransport::Local(tokio::io::BufReader::new(reader), writer);
+        assert_active_goal_scenario_with_objective(
+            &fixture,
+            &mut transport,
+            false,
+            objective,
+            scenario,
+        )
+        .await;
+        drop(transport);
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(8), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn socket_rejects_before_initialize() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
