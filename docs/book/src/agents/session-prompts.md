@@ -151,3 +151,8 @@ retained/export copies still redact host-marked results and their associated
 assistant record. Ordinary unmarked conversation remains intact. Disabling the
 feature stops subsequent attachment injection, but does not rewrite the active
 provider's working history or retroactively remove earlier exchanges from it.
+
+Export redaction can also omit ordinary tool results that share a result carrier
+or call batch with a sensitive prompt tool. Restored transcripts do not recover
+that omitted tool plumbing. The active provider history remains intact; this
+conservative masking does not reconstruct a separate transcript for each tool.
