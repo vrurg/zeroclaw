@@ -145,3 +145,9 @@ the opaque arguments or results. This redaction is the restart boundary: after
 loading a retained transcript, the model does not recover the hidden tool
 exchange from history, but the attached prompt collection itself remains
 available through the session metadata and the next injected system prompt.
+
+Disabling prompt injection does not make previously sensitive exchanges public:
+retained/export copies still redact host-marked results and their associated
+assistant record. Ordinary unmarked conversation remains intact. Disabling the
+feature stops subsequent attachment injection, but does not rewrite the active
+provider's working history or retroactively remove earlier exchanges from it.

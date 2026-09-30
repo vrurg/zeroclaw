@@ -132,6 +132,17 @@ pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<
 pub fn redact_session_prompt_tool_exchanges_for_export(
     messages: &[ChatMessage],
 ) -> Vec<ChatMessage> {
+    redact_session_prompt_history_for_export(messages, true)
+}
+
+/// Project retained history at a non-provider boundary using current feature
+/// exposure only for invocation inference. Host-marked sensitive exchanges
+/// remain private after disablement; provider history is never mutated.
+/// Unmarked invocation-like conversation is preserved when the feature is off.
+pub fn redact_session_prompt_history_for_export(
+    messages: &[ChatMessage],
+    session_prompts_enabled: bool,
+) -> Vec<ChatMessage> {
     // Native execution produces one or more `tool` messages, while the XML
     // text protocol uses one following `user` message for all results. Keep
     // those states separate: a user message after native results is ordinary
@@ -141,7 +152,8 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     let mut exported: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     let mut assistant_index: Option<usize> = None;
     for message in messages {
-        let is_sensitive_call = message.role == "assistant"
+        let is_sensitive_call = session_prompts_enabled
+            && message.role == "assistant"
             && session_prompt_tool_call_envelope_mentioned(&message.content);
         let is_native_result = message.role == "tool";
         let is_text_protocol_result = message.role == "user";
@@ -2205,6 +2217,42 @@ mod tests {
         // A shell-less runtime keeps the POSIX wording it rendered before.
         let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
         assert!(none.contains("trash"), "{none}");
+    }
+
+    #[test]
+    fn disabled_history_export_honors_host_markers_without_invocation_inference() {
+        let secret = "privatepromptmarker";
+        let ordinary_call = ChatMessage::assistant(
+            r#"<tool_call>{"name":"session_prompt_set","arguments":{"content":"ordinary"}}</tool_call>"#,
+        );
+        for result in [
+            ChatMessage::tool(format!(
+                r#"{{"session_prompt_tool_result":true,"content":"{secret}"}}"#
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\n[Session-prompt tool result]\n{secret}"
+            )),
+        ] {
+            let messages = vec![
+                ChatMessage::assistant(format!("rewritten ordinary call {secret}")),
+                result.clone(),
+                ChatMessage::user("ordinary follow-up"),
+                ordinary_call.clone(),
+                ChatMessage::user("[Tool results]\nordinary result"),
+            ];
+            let exported = redact_session_prompt_history_for_export(&messages, false);
+            assert!(exported[..2].iter().all(|m| !m.content.contains(secret)));
+            for (projected, original) in exported[2..].iter().zip(&messages[2..]) {
+                assert_eq!(projected.role, original.role);
+                assert_eq!(projected.content, original.content);
+            }
+            assert!(messages[0].content.contains(secret));
+            assert!(messages[1].content.contains(secret));
+
+            // A trimmed export must remain safe without its assistant record.
+            let orphan = redact_session_prompt_history_for_export(&[result], false);
+            assert!(!orphan[0].content.contains(secret));
+        }
     }
 
     #[test]

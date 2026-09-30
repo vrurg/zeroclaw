@@ -13246,14 +13246,13 @@ fn replace_rpc_chat_conversation_state(
 ) -> bool {
     // RPC Chat is also a non-provider export boundary: its durable transcript
     // is exposed through session-history APIs and searchable SQLite storage.
-    // Keep opaque session-prompt bodies out of that durable copy while the
-    // provider-facing history remains unchanged for the active turn, but do
-    // not apply the feature-specific heuristic when the feature is disabled.
-    let export = if session_prompts_enabled {
-        crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(durable)
-    } else {
-        durable.to_vec()
-    };
+    // Host-marked exchanges stay private across live disablement. Only
+    // unmarked invocation inference is feature-gated; the provider's working
+    // history remains unchanged, as does ordinary disabled-mode conversation.
+    let export = crate::agent::prompt::redact_session_prompt_history_for_export(
+        durable,
+        session_prompts_enabled,
+    );
 
     // Guarded replacement, not check-then-act: a delete committing between a
     // separate existence probe and the write would be silently undone by the
@@ -14225,6 +14224,100 @@ mod tests {
             *self.rewritten.lock().unwrap() = messages.to_vec();
             Ok(())
         }
+    }
+
+    #[test]
+    fn rpc_prompt_history_stays_private_after_live_disable() {
+        use zeroclaw_infra::session_backend::{SessionBackend, SessionQuery};
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        let temp = tempfile::tempdir().expect("isolated session storage");
+        let backend = SqliteSessionBackend::new(temp.path()).expect("SQLite backend");
+        let key = "rpc_disable_privacy";
+        let secret = "privatepromptmarker";
+        let ordinary =
+            "documentation <tool_call>session_prompt_set ordinarypromptmarker</tool_call>";
+        let mut history = vec![
+            ChatMessage::user("set task"),
+            ChatMessage::assistant(format!(
+                "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{secret}\"}}}}</tool_call>"
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\n[Session-prompt tool result]\nstored {secret}"
+            )),
+            ChatMessage::assistant("first turn complete"),
+        ];
+        backend.append(key, &history[0]).expect("existing session");
+        backend
+            .set_session_prompt(key, "task", secret)
+            .expect("attachment");
+        assert!(replace_rpc_chat_conversation_state(
+            &backend,
+            "disable_privacy",
+            key,
+            &history,
+            false,
+            true,
+        ));
+        assert!(
+            backend
+                .load(key)
+                .iter()
+                .all(|message| !message.content.contains(secret))
+        );
+
+        // The provider retains its private working copy across the live toggle.
+        history.push(ChatMessage::user(ordinary));
+        history.push(ChatMessage::assistant("next turn complete"));
+        assert!(replace_rpc_chat_conversation_state(
+            &backend,
+            "disable_privacy",
+            key,
+            &history,
+            false,
+            false,
+        ));
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::new(temp.path()).expect("reopen session storage");
+        let saved = reopened.load(key);
+        assert_eq!(saved.len(), history.len());
+        assert_eq!(saved[4].content, ordinary);
+        assert_eq!(
+            reopened
+                .list_session_prompts(key)
+                .expect("retained attachment")[0]
+                .content,
+            secret
+        );
+        assert!(
+            saved
+                .iter()
+                .all(|message| !message.content.contains(secret)),
+            "a disabled next-turn save must not reintroduce private tool exchanges"
+        );
+        assert!(
+            reopened
+                .search(&SessionQuery {
+                    keyword: Some(secret.into()),
+                    limit: None,
+                })
+                .is_empty(),
+            "private history must remain absent from FTS after reopen"
+        );
+        assert!(
+            !reopened
+                .search(&SessionQuery {
+                    keyword: Some("ordinarypromptmarker".into()),
+                    limit: None,
+                })
+                .is_empty(),
+            "ordinary history remains searchable"
+        );
+        assert!(
+            history[1].content.contains(secret),
+            "provider history remains unchanged"
+        );
     }
 
     #[test]
