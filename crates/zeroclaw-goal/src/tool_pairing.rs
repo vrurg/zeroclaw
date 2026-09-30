@@ -16,6 +16,18 @@ use uuid::Uuid;
 use crate::control::GoalExecutionScope;
 use crate::task::{GoalTaskRegistry, GoalTransitionResult};
 
+/// Identifies only a store failure while settling a paired parent transcript.
+/// Its display preserves the pre-existing error context; invariant failures
+/// must not acquire this marker.
+#[derive(Debug)]
+pub(crate) struct GoalToolSettlementStoreContext;
+
+impl std::fmt::Display for GoalToolSettlementStoreContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("settle Goal tool batch after parent-turn pairing")
+    }
+}
+
 tokio::task_local! {
     static GOAL_TOOL_PAIRING: Arc<GoalToolPairing>;
 }
@@ -220,7 +232,7 @@ pub async fn finalize_goal_tool_pairing() -> Result<()> {
             &batch_id,
         )
         .await
-        .context("settle Goal tool batch after parent-turn pairing")?;
+        .context(GoalToolSettlementStoreContext)?;
     ensure!(
         result == GoalTransitionResult::Applied,
         "Goal tool batch settlement lost its durable pairing fence"
@@ -237,4 +249,318 @@ pub async fn finalize_goal_tool_pairing() -> Result<()> {
     );
     *active = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use zeroclaw_api::task::{TaskRecord, TaskStatus};
+
+    use super::*;
+    use crate::task::{
+        GoalAccountingState, GoalPauseState, GoalPolicyTarget, GoalTaskRecord,
+        TaskContinuationContext,
+    };
+
+    #[derive(Debug)]
+    struct SettlementStoreFailure;
+
+    impl std::fmt::Display for SettlementStoreFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("fixture settlement store failure")
+        }
+    }
+
+    impl std::error::Error for SettlementStoreFailure {}
+
+    #[derive(Default)]
+    struct SettlementRegistry {
+        admitted_batch: Mutex<Option<String>>,
+        settlement_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalTaskRegistry for SettlementRegistry {
+        async fn latest_active_goal_for_agent(&self, _: &str) -> Result<Option<TaskRecord>> {
+            panic!("unexpected registry lookup")
+        }
+
+        async fn latest_active_goal_for_context(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Option<TaskRecord>> {
+            panic!("unexpected registry lookup")
+        }
+
+        async fn latest_active_goal_id_for_context(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Option<String>> {
+            panic!("unexpected registry lookup")
+        }
+
+        async fn get_goal_task(&self, _: &str) -> Result<Option<GoalTaskRecord>> {
+            panic!("unexpected registry lookup")
+        }
+
+        async fn update_goal_limits(&self, _: &str, _: Option<u64>, _: Option<f64>) -> Result<()> {
+            panic!("unexpected budget mutation")
+        }
+
+        async fn update_goal_pause(&self, _: &str, _: Option<GoalPauseState>) -> Result<()> {
+            panic!("unexpected pause mutation")
+        }
+
+        async fn set_continuation_context(
+            &self,
+            _: &str,
+            _: Option<TaskContinuationContext>,
+        ) -> Result<()> {
+            panic!("unexpected continuation mutation")
+        }
+
+        async fn get_continuation_context(
+            &self,
+            _: &str,
+        ) -> Result<Option<TaskContinuationContext>> {
+            panic!("unexpected continuation lookup")
+        }
+
+        async fn current_goal_for_session(&self, _: &str) -> Result<Option<TaskRecord>> {
+            panic!("unexpected session lookup")
+        }
+
+        async fn list_nonterminal_session_goals(&self) -> Result<Vec<TaskRecord>> {
+            panic!("unexpected policy lookup")
+        }
+
+        async fn cancel_policy_targets(
+            &self,
+            _: &[GoalPolicyTarget],
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected policy revocation")
+        }
+
+        async fn terminal_reason_for_session_goal(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<String>> {
+            panic!("unexpected terminal lookup")
+        }
+
+        async fn create_or_replace_session_goal(
+            &self,
+            _: TaskRecord,
+            _: GoalTaskRecord,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected creation")
+        }
+
+        async fn pause_session_goal(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: GoalPauseState,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected pause")
+        }
+
+        async fn resume_session_goal(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: u32,
+            _: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected resume")
+        }
+
+        async fn finish_session_goal(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: TaskStatus,
+            _: Option<String>,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected lifecycle transition")
+        }
+
+        async fn admit_pending_operation(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected model admission")
+        }
+
+        async fn settle_pending_operation(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &str,
+            _: GoalAccountingState,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected model settlement")
+        }
+
+        async fn admit_pending_tool_batch(
+            &self,
+            task: &str,
+            session: &str,
+            epoch: i64,
+            batch: &str,
+        ) -> Result<GoalTransitionResult> {
+            assert_eq!(
+                (task, session, epoch),
+                ("fixture-task", "fixture-session", 1)
+            );
+            assert!(self.admitted_batch.lock().replace(batch.into()).is_none());
+            Ok(GoalTransitionResult::Applied)
+        }
+
+        async fn settle_pending_tool_batch(
+            &self,
+            task: &str,
+            session: &str,
+            epoch: i64,
+            batch: &str,
+        ) -> Result<GoalTransitionResult> {
+            assert_eq!(
+                (task, session, epoch),
+                ("fixture-task", "fixture-session", 1)
+            );
+            assert_eq!(self.admitted_batch.lock().as_deref(), Some(batch));
+            assert_eq!(self.settlement_calls.fetch_add(1, Ordering::SeqCst), 0);
+            Err(SettlementStoreFailure.into())
+        }
+
+        async fn update_session_goal_limits(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: Option<u64>,
+            _: Option<f64>,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected budget mutation")
+        }
+
+        async fn fail_unpaired_tool_batch(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+            _: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected unpaired lifecycle transition")
+        }
+
+        async fn clear_terminal_tool_batch(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected terminal batch clearing")
+        }
+
+        async fn delete_session_goal(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected deletion")
+        }
+    }
+
+    fn scope() -> GoalExecutionScope {
+        GoalExecutionScope::new("fixture-task", "fixture-session", 1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settlement_store_error_keeps_chain_and_private_marker() {
+        let registry = Arc::new(SettlementRegistry::default());
+        let error = scope_goal_tool_pairing(registry.clone(), scope(), async {
+            admit_goal_tool_batch(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .settle()
+                .unwrap();
+            finalize_goal_tool_pairing().await.unwrap_err()
+        })
+        .await;
+        assert_eq!(registry.settlement_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.to_string(),
+            "settle Goal tool batch after parent-turn pairing"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "settle Goal tool batch after parent-turn pairing: fixture settlement store failure"
+        );
+        assert!(error.downcast_ref::<SettlementStoreFailure>().is_some());
+        assert!(
+            error
+                .downcast_ref::<GoalToolSettlementStoreContext>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_batch_is_an_unmarked_invariant_without_store_settlement() {
+        let registry = Arc::new(SettlementRegistry::default());
+        let error = scope_goal_tool_pairing(registry.clone(), scope(), async {
+            let batch = admit_goal_tool_batch(1).await.unwrap().unwrap();
+            let error = finalize_goal_tool_pairing().await.unwrap_err();
+            drop(batch);
+            error
+        })
+        .await;
+        assert_eq!(
+            error.to_string(),
+            "Goal parent turn returned with an unfinished tool batch"
+        );
+        assert!(
+            error
+                .downcast_ref::<GoalToolSettlementStoreContext>()
+                .is_none()
+        );
+        assert_eq!(registry.settlement_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_batch_is_an_unmarked_invariant_without_store_settlement() {
+        let registry = Arc::new(SettlementRegistry::default());
+        let error = scope_goal_tool_pairing(registry.clone(), scope(), async {
+            drop(admit_goal_tool_batch(1).await.unwrap().unwrap());
+            finalize_goal_tool_pairing().await.unwrap_err()
+        })
+        .await;
+        assert_eq!(
+            error.to_string(),
+            "Goal parent turn returned with an unpaired tool batch"
+        );
+        assert!(
+            error
+                .downcast_ref::<GoalToolSettlementStoreContext>()
+                .is_none()
+        );
+        assert_eq!(registry.settlement_calls.load(Ordering::SeqCst), 0);
+    }
 }
