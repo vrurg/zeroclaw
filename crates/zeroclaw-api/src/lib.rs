@@ -63,7 +63,8 @@ tokio::task_local! {
     /// Scoped by gateway and channel turns, read by session-scoped tools.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 
-    /// Caller-visible session ID for child-process environment forwarding.
+    /// Caller-visible session ID for child-process environment forwarding,
+    /// external conversation attribution, and provider session affinity.
     /// This remains distinct from `TOOL_LOOP_SESSION_KEY` when a storage
     /// backend namespaces its keys.
     pub static TOOL_LOOP_SESSION_ID: Option<String>;
