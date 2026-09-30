@@ -9,9 +9,10 @@ use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
     channel::{Channel, ChannelMessage, SendMessage},
-    model_provider::{ChatMessage, ChatRequest},
+    model_provider::{ChatMessage, ChatRequest, ModelProvider},
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
+use zeroclaw_config::schema::Config;
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
@@ -37,9 +38,8 @@ use super::{
     build_channel_system_prompt_for_message_with_signal,
     callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
     get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
-    turn_execution::resolved_channel_execution,
+    runtime_defaults_snapshot, sanitize_channel_response_for_format_with_leak_detection,
+    system_prompt_for_channel_turn, turn_execution::resolved_channel_execution,
 };
 
 /// Immutable Matrix facts captured before mutable inbound hooks run.
@@ -51,9 +51,9 @@ struct MatrixGoalSessionDriver {
     route: String,
     message: ChannelMessage,
     /// The per-session lifecycle boundary is acquired before selecting a
-    /// resident supervisor. `bind` transfers it to the runtime submission so
-    /// selection, durable transition, worker launch, and retirement remain
-    /// one serialized operation.
+    /// resident supervisor. The first `bind` transfers it to submission;
+    /// subsequent bindings reacquire the same canonical lock after delivery
+    /// releases submission serialization for the launch handoff.
     command_lease: Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
 }
 
@@ -727,12 +727,19 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
         self.assert_ingress(ingress)?;
-        let guard = self
+        let admitted = self
             .command_lease
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .context("Matrix Goal command lease was already consumed")?;
+            .take();
+        let guard = match admitted {
+            Some(guard) => guard,
+            None => {
+                goal_command_lock(&self.context.persist_locks, &self.session_key.durable_id())
+                    .lock_owned()
+                    .await
+            }
+        };
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
@@ -1112,40 +1119,20 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     ) -> Result<GoalVerifierResult> {
         let result: Result<GoalVerifierResult> = async {
             let defaults = runtime_defaults_snapshot(self.context.as_ref());
-            let provider_ref = defaults.config.goal.verifier.model_provider.as_str();
-            let (provider_name, entry) =
-                model_provider_entry_for_ref(defaults.config.as_ref(), provider_ref)?;
-            let model = defaults.config.goal.verifier.model.as_deref().unwrap_or(
-                entry
-                    .model
-                    .as_deref()
-                    .context("Goal verifier has no model")?,
-            );
-            let verifier_defaults =
-                runtime_defaults_from_config(defaults.config.as_ref(), &provider_name)?;
-            let provider = get_or_create_provider(
-                self.context.as_ref(),
-                &provider_name,
-                entry.api_key.as_deref(),
-                &defaults,
-            )
-            .await?;
+            let (provider, route, temperature) =
+                matrix_goal_verifier_provider(defaults.config).await?;
             let messages = turn.to_chat_messages();
             let mut settled_attempts = Vec::new();
             let approval_manager = self.context.approval_manager.for_new_turn();
             let response = resolved_channel_execution(
                 self.context.as_ref(),
                 provider.as_ref(),
-                &ChannelRouteSelection {
-                    model_provider: provider_name,
-                    model: model.to_owned(),
-                    api_key: entry.api_key.clone(),
-                },
+                &route,
                 self.context.observer.as_ref(),
                 &approval_manager,
                 &LoopKnobs::default(),
                 &[],
-                verifier_defaults.temperature,
+                temperature,
             )
             .model_access
             .run_model_query(
@@ -1394,6 +1381,35 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 }
 
+async fn matrix_goal_verifier_provider(
+    config: Arc<Config>,
+) -> Result<(Box<dyn ModelProvider>, ChannelRouteSelection, Option<f64>)> {
+    let (provider_ref, entry) =
+        model_provider_entry_for_ref(&config, &config.goal.verifier.model_provider)?;
+    let api_key = entry.api_key.clone();
+    let temperature = entry.temperature;
+    // Reliable pins its primary model during construction. The ordinary worker
+    // cache cannot serve a verifier override on the same provider alias.
+    let (provider, model_provider, model, _resolver) = tokio::task::spawn_blocking(move || {
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            &config,
+            &provider_ref,
+            config.goal.verifier.model.as_deref(),
+        )
+    })
+    .await
+    .context("Goal verifier provider construction task failed")??;
+    Ok((
+        provider,
+        ChannelRouteSelection {
+            model_provider,
+            model,
+            api_key,
+        },
+        temperature,
+    ))
+}
+
 fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
     match reason {
         GoalFailureReason::AgentOperationFailed => "goal-mode-failure-agent-operation",
@@ -1413,6 +1429,164 @@ fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_matrix_goal_verifier_wire_model(
+        alias_model: Option<&str>,
+        verifier_model: Option<&str>,
+        expected_model: &str,
+    ) {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::WireApi;
+        use zeroclaw_providers::dispatch::ProviderDispatch;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({"model": expected_model})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "verdict"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        config.goal.verifier.model_provider = "openai.verifier-test".into();
+        config.goal.verifier.model = verifier_model.map(str::to_owned);
+        let slot = config
+            .providers
+            .models
+            .ensure("openai", "verifier-test")
+            .unwrap();
+        slot.api_key = Some("test-key".into());
+        slot.uri = Some(server.uri());
+        slot.kind = Some("openai-compatible".into());
+        slot.wire_api = Some(WireApi::ChatCompletions);
+        slot.model = alias_model.map(str::to_owned);
+        slot.temperature = Some(0.2);
+        slot.live_pricing = false;
+        let (provider, route, temperature) = matrix_goal_verifier_provider(Arc::new(config))
+            .await
+            .unwrap();
+        assert_eq!(route.model_provider, "openai.verifier-test");
+        assert_eq!(route.model, expected_model);
+        assert_eq!(temperature, Some(0.2));
+        let messages = [ChatMessage::user("Verify the candidate.")];
+        let response = ProviderDispatch::from_ref(provider.as_ref())
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &route.model,
+                temperature,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("verdict"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_constructs_the_explicit_model_override() {
+        assert_matrix_goal_verifier_wire_model(
+            Some("goal-worker"),
+            Some("goal-verifier"),
+            "goal-verifier",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_uses_the_alias_default_without_override() {
+        assert_matrix_goal_verifier_wire_model(Some("goal-worker"), None, "goal-worker").await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_override_does_not_require_an_alias_default() {
+        assert_matrix_goal_verifier_wire_model(None, Some("goal-verifier"), "goal-verifier").await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_rejects_a_missing_model_without_override() {
+        let mut config = Config::default();
+        config.goal.verifier.model_provider = "openai.verifier-test".into();
+        config.goal.verifier.model = None;
+        config
+            .providers
+            .models
+            .ensure("openai", "verifier-test")
+            .unwrap()
+            .model = None;
+        let error = match matrix_goal_verifier_provider(Arc::new(config)).await {
+            Ok(_) => panic!("a missing verifier model must fail construction"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no `model` configured"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_rebinds_the_canonical_command_lock_after_delivery() {
+        let context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        let key = "matrix_goal_binding_test";
+        let lock = goal_command_lock(&context.persist_locks, key);
+        let message = ChannelMessage::new("event", "sender", "room", "/goal start", "matrix", 1);
+        let driver = MatrixGoalSessionDriver::new(
+            context,
+            key.into(),
+            "sender".into(),
+            "matrix:test:room".into(),
+            message,
+            lock.clone().lock_owned().await,
+        )
+        .unwrap();
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "sender".into(),
+            },
+        )
+        .unwrap();
+        let first = driver.bind(&ingress).await.unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(first);
+        let intervening = lock.clone().lock_owned().await;
+        let mut next = Box::pin(driver.bind(&ingress));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut next)
+                .await
+                .is_err(),
+            "the launch binding must wait for competing command serialization"
+        );
+        drop(intervening);
+        let rebound = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(rebound);
+        assert!(lock.try_lock().is_ok());
+        let stale = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "other-sender".into(),
+            },
+        )
+        .unwrap();
+        assert!(driver.bind(&stale).await.is_err());
+    }
 
     #[test]
     fn every_goal_failure_reason_uses_a_fluent_key() {
