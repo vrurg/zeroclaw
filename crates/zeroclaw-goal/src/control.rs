@@ -614,18 +614,11 @@ impl fmt::Debug for GoalVerifierTurn {
 
 /// Build the mandatory Goal verifier request.
 ///
-/// The verifier receives only the admitted objective and exact candidate. The
-/// system message carries the runtime-owned response protocol.
+/// The verifier receives only the admitted objective and exact candidate.
+/// This compatibility entry point uses the same Goal-owned decision policy and
+/// JSON data boundary as [`GoalVerifierTurn::to_chat_messages`].
 pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage::system(
-            "Return only strict JSON. Schema: {\"decision\":\"complete|continue|blocked\",\"reason\":\"nonempty bounded explanation\",\"blockers\":[{\"kind\":\"needs_user_input|human_escalation|external_dependency\",\"message\":\"nonempty bounded explanation\",\"payload\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Do not emit any other keys or blocker kinds.",
-        ),
-        ChatMessage::user(format!(
-            "Objective:\n{}\n\nCandidate:\n{}",
-            turn.objective, turn.candidate
-        )),
-    ]
+    turn.to_chat_messages().into()
 }
 
 /// A lifecycle result which occurs after the synchronous Goal command reply.
@@ -1950,10 +1943,18 @@ mod tests {
     fn goal_verifier_messages_carry_only_objective_and_candidate() {
         let objective = "ship goal mode";
         let candidate = "the implementation is ready";
-        let messages = goal_verifier_messages(&GoalVerifierTurn {
+        let turn = GoalVerifierTurn {
             objective: objective.to_owned(),
             candidate: candidate.to_owned(),
-        });
+        };
+        let messages = goal_verifier_messages(&turn);
+        let canonical = turn.to_chat_messages();
+
+        // Both entry points must preserve the same policy and data boundary.
+        for (actual, expected) in messages.iter().zip(&canonical) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -1964,10 +1965,8 @@ mod tests {
         );
         assert!(!messages[0].content.contains("\\\""));
         assert_eq!(messages[1].role, "user");
-        assert_eq!(
-            messages[1].content,
-            format!("Objective:\n{objective}\n\nCandidate:\n{candidate}")
-        );
+        assert!(messages[1].content.contains(objective));
+        assert!(messages[1].content.contains(candidate));
     }
 
     #[test]
