@@ -753,7 +753,11 @@ impl GoalDeferredReady {
                 if let Some(scope) = submission.launch_guard.scope() {
                     control
                         .supervisor
-                        .reconcile_launch_failure(scope)
+                        .reconcile_launch_failure(
+                            scope,
+                            control.driver.as_ref(),
+                            &control.ingress,
+                        )
                         .await
                         .context("reconcile unlaunched Goal after control audit failure")?;
                 }
