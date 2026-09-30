@@ -1733,10 +1733,69 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_with_local_capability_completes_over_local_ipc() {
+        goal_local_fixture(
+            "rpc::local::tests::active_goal_with_local_capability_completes_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
     async fn active_goal_local_fixture(
         test_name: &str,
         objective: &str,
         scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+    ) {
+        goal_local_fixture(test_name, objective, scenario, false).await;
+    }
+
+    #[cfg(unix)]
+    async fn goal_local_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+        with_local_capability: bool,
+    ) {
+        goal_local_fault_fixture(test_name, objective, scenario, with_local_capability, None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_answer_append_failure_precedes_notice_over_local_ipc() {
+        goal_local_fault_fixture(
+            "rpc::local::tests::goal_answer_append_failure_precedes_notice_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            false,
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_prefix_projection_failure_precedes_notice_over_local_ipc() {
+        goal_local_fault_fixture(
+            "rpc::local::tests::goal_prefix_projection_failure_precedes_notice_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+            false,
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn goal_local_fault_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+        with_local_capability: bool,
+        failure: Option<crate::rpc::goal_transport_test_support::GoalTransportFailure>,
     ) {
         use crate::rpc::goal_transport_test_support::{
             ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
@@ -1747,7 +1806,18 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let fixture = match failure {
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend) => {
+                ActiveGoalFixture::with_answer_append_failure(tmp.path()).await
+            }
+            Some(
+                crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection,
+            ) => ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await,
+            None => ActiveGoalFixture::new(tmp.path()).await,
+        };
+        if with_local_capability {
+            fixture.add_local_capability().await;
+        }
         let sock_path = tmp.path().join("daemon.sock");
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
@@ -1759,14 +1829,93 @@ mod tests {
         let socket = tokio::net::UnixStream::connect(sock_path).await.unwrap();
         let (reader, writer) = socket.into_split();
         let mut transport = GoalTestTransport::Local(tokio::io::BufReader::new(reader), writer);
-        assert_active_goal_scenario_with_objective(
-            &fixture,
-            &mut transport,
-            false,
-            objective,
-            scenario,
+        match failure {
+            Some(crate::rpc::goal_transport_test_support::GoalTransportFailure::AnswerAppend) => {
+                crate::rpc::goal_transport_test_support::assert_answer_append_failure(
+                    &fixture,
+                    &mut transport,
+                    false,
+                )
+                .await;
+            }
+            Some(
+                crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection,
+            ) => {
+                crate::rpc::goal_transport_test_support::assert_prefix_projection_failure(
+                    &fixture,
+                    &mut transport,
+                    false,
+                )
+                .await;
+            }
+            None => {
+                assert_active_goal_scenario_with_objective(
+                    &fixture,
+                    &mut transport,
+                    false,
+                    objective,
+                    scenario,
+                )
+                .await;
+            }
+        }
+        if with_local_capability {
+            let agent = fixture
+                .context
+                .sessions
+                .get_agent(crate::rpc::goal_transport_test_support::SESSION_ID)
+                .await
+                .unwrap();
+            assert!(
+                agent
+                    .lock()
+                    .await
+                    .channel_handles()
+                    .reaction
+                    .read()
+                    .contains_key("git.main")
+            );
+        }
+        drop(transport);
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(8), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_resume_surfaces_late_grant_refusal_without_persisting_answer_over_local_ipc() {
+        use crate::rpc::goal_transport_test_support::{
+            ActiveGoalFixture, GoalTestTransport, assert_admitted_goal_grant_refusal, run_isolated,
+        };
+        if run_isolated(
+            "rpc::local::tests::goal_resume_surfaces_late_grant_refusal_without_persisting_answer_over_local_ipc",
         )
-        .await;
+        .await
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid is a parameter-free query of this test process.
+        let uid = unsafe { libc::geteuid() };
+        let fixture = ActiveGoalFixture::with_local_execute_grant(tmp.path(), uid).await;
+        let sock_path = tmp.path().join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let ctx = Arc::clone(&fixture.context);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+        let (reader, writer) = tokio::net::UnixStream::connect(sock_path)
+            .await
+            .unwrap()
+            .into_split();
+        let mut transport = GoalTestTransport::Local(tokio::io::BufReader::new(reader), writer);
+        assert_admitted_goal_grant_refusal(&fixture, &mut transport).await;
         drop(transport);
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(8), server)

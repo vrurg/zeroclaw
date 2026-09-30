@@ -23,6 +23,9 @@ const ANSWER: &str = "Choose A.\nKeep the second line unchanged.";
 const COMPLETION: &str = "Option A is applied; the declared Goal is complete.";
 const PREVIOUS_RESPONSE: &str = "The earlier request is complete.";
 
+#[path = "goal_cold_restore_tests.rs"]
+mod cold_restore;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionScenario {
     Answered,
@@ -185,22 +188,25 @@ impl Respond for ModelResponses {
         } else {
             QUESTION.to_owned()
         };
-        let usage = json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12});
-        if body["stream"] == true {
-            let chunk =
-                json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
-            let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
-            let totals = json!({"choices":[],"usage":usage});
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(format!(
-                    "data: {chunk}\n\ndata: {finish}\n\ndata: {totals}\n\ndata: [DONE]\n\n"
-                ))
-        } else {
-            ResponseTemplate::new(200).set_body_json(json!({
+        model_response(&text, body["stream"] == true)
+    }
+}
+
+fn model_response(text: &str, streaming: bool) -> ResponseTemplate {
+    let usage = json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12});
+    if streaming {
+        let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
+        let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let totals = json!({"choices":[],"usage":usage});
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!(
+                "data: {chunk}\n\ndata: {finish}\n\ndata: {totals}\n\ndata: [DONE]\n\n"
+            ))
+    } else {
+        ResponseTemplate::new(200).set_body_json(json!({
                 "choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":usage
             }))
-        }
     }
 }
 
@@ -270,7 +276,7 @@ async fn boot_daemon(
     config: Config,
 ) -> tokio::task::JoinHandle<anyhow::Result<zeroclaw_runtime::daemon::DaemonExit>> {
     let mut registry = zeroclaw_runtime::daemon::DaemonRegistry::new();
-    registry.register_gateway(Box::new(|_, _, _, _, controls, _, _, _| {
+    registry.register_gateway(Box::new(|_, _, _, _, _, controls, _, _, _| {
         Box::pin(async move {
             let mut shutdown = controls.unwrap().shutdown_tx.subscribe();
             while !*shutdown.borrow_and_update() {

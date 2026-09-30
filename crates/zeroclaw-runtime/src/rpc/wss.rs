@@ -2172,11 +2172,90 @@ mod accept_error_tests {
         ).await;
     }
 
+    #[tokio::test]
+    async fn goal_start_refuses_local_capabilities_without_waiting_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_start_refuses_local_capabilities_without_waiting_over_wss",
+            GoalWssScenario::Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario::Start),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_resume_refuses_local_capabilities_and_preserves_pause_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_resume_refuses_local_capabilities_and_preserves_pause_over_wss",
+            GoalWssScenario::Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario::AnsweredResume),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_start_surfaces_late_capability_refusal_before_failure_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_start_surfaces_late_capability_refusal_before_failure_over_wss",
+            GoalWssScenario::AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario::Start),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_resume_surfaces_late_refusal_without_persisting_answer_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_resume_surfaces_late_refusal_without_persisting_answer_over_wss",
+            GoalWssScenario::AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario::AnsweredResume),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_controls_preserve_rpc_only_outcomes_with_local_capabilities_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_controls_preserve_rpc_only_outcomes_with_local_capabilities_over_wss",
+            GoalWssScenario::ControlParity,
+        )
+        .await;
+    }
+
+    enum GoalWssScenario<'a> {
+        Continuity(
+            &'a str,
+            crate::rpc::goal_transport_test_support::ResumeScenario,
+        ),
+        Refused(crate::rpc::goal_transport_test_support::GoalRefusalScenario),
+        AdmissionFenced(crate::rpc::goal_transport_test_support::GoalRefusalScenario),
+        ControlParity,
+        AnswerAppendFailure,
+        PrefixProjectionFailure,
+    }
+
+    #[tokio::test]
+    async fn goal_answer_append_failure_precedes_notice_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_answer_append_failure_precedes_notice_over_wss",
+            GoalWssScenario::AnswerAppendFailure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_prefix_projection_failure_precedes_notice_over_wss() {
+        goal_wss_fixture(
+            "rpc::wss::accept_error_tests::goal_prefix_projection_failure_precedes_notice_over_wss",
+            GoalWssScenario::PrefixProjectionFailure,
+        )
+        .await;
+    }
+
     async fn active_goal_wss_fixture(
         test_name: &str,
         objective: &str,
         scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
     ) {
+        goal_wss_fixture(test_name, GoalWssScenario::Continuity(objective, scenario)).await;
+    }
+
+    async fn goal_wss_fixture(test_name: &str, scenario: GoalWssScenario<'_>) {
         use crate::rpc::goal_transport_test_support::{
             ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
             run_isolated,
@@ -2187,7 +2266,15 @@ mod accept_error_tests {
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
-        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let fixture = match &scenario {
+            GoalWssScenario::AnswerAppendFailure => {
+                ActiveGoalFixture::with_answer_append_failure(tmp.path()).await
+            }
+            GoalWssScenario::PrefixProjectionFailure => {
+                ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await
+            }
+            _ => ActiveGoalFixture::new(tmp.path()).await,
+        };
         let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
         let ca = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
         let key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
@@ -2222,15 +2309,58 @@ mod accept_error_tests {
         )
         .await
         .unwrap();
-        let mut transport = GoalTestTransport::Wss(socket);
-        assert_active_goal_scenario_with_objective(
-            &fixture,
-            &mut transport,
-            true,
-            objective,
-            scenario,
-        )
-        .await;
+        let mut transport = GoalTestTransport::Wss(Box::new(socket));
+        match scenario {
+            GoalWssScenario::PrefixProjectionFailure => {
+                crate::rpc::goal_transport_test_support::assert_prefix_projection_failure(
+                    &fixture,
+                    &mut transport,
+                    true,
+                )
+                .await;
+            }
+            GoalWssScenario::AnswerAppendFailure => {
+                crate::rpc::goal_transport_test_support::assert_answer_append_failure(
+                    &fixture,
+                    &mut transport,
+                    true,
+                )
+                .await;
+            }
+            GoalWssScenario::ControlParity => {
+                crate::rpc::goal_transport_test_support::assert_remote_goal_control_parity(
+                    &fixture,
+                    &mut transport,
+                )
+                .await;
+            }
+            GoalWssScenario::Continuity(objective, scenario) => {
+                assert_active_goal_scenario_with_objective(
+                    &fixture,
+                    &mut transport,
+                    true,
+                    objective,
+                    scenario,
+                )
+                .await;
+            }
+            GoalWssScenario::Refused(scenario) => {
+                crate::rpc::goal_transport_test_support::assert_remote_goal_command_refusal(
+                    &fixture,
+                    &mut transport,
+                    scenario,
+                )
+                .await;
+            }
+            GoalWssScenario::AdmissionFenced(scenario) => {
+                crate::rpc::goal_transport_test_support::assert_admitted_goal_capability_refusal(
+                    &fixture,
+                    &mut transport,
+                    scenario,
+                )
+                .await;
+            }
+        }
         drop(transport);
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(8), server)
