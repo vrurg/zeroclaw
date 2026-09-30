@@ -89,6 +89,11 @@ Strict confirmations use literal previews on CLI, Matrix, Slack, Telegram,
 Signal, Web and ZeroCode. They do not interpret proposed content as attachment
 markers or rich-text instructions. Slack and Telegram deny a confirmation that
 cannot fit their message limit rather than truncating the proposed content.
+Slack escapes mention/link control characters in strict previews. Telegram
+uses preformatted text for proposed content, including an explicit preformatted
+entity on its HTML-failure fallback. These are display encodings only: the
+approved content and its digest remain unchanged. Ordinary approvals retain
+their existing presentation.
 Discord, Lark, Mattermost, WhatsApp Cloud, WhatsApp Web, ACP clients and channel
 plugins cannot currently guarantee that literal preview and therefore deny
 mutations when this policy is required. This does not disable ordinary tool

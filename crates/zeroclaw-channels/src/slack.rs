@@ -5004,6 +5004,14 @@ impl SlackChannel {
     }
 }
 
+// Slack decodes these entities for display without interpreting their contents
+// as mention/link control syntax. Encode ampersands first to preserve literals.
+fn escape_strict_approval_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// `chat.postMessage` body for a Socket Mode approval card.
 ///
 /// Split out from the send so the rendered card can be asserted directly.
@@ -5036,13 +5044,15 @@ fn build_socket_mode_approval_body(
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
     if strict_session_prompt_approval {
-        let text = format!(
+        let text = escape_strict_approval_text(&format!(
             "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
-        );
+        ));
         return serde_json::json!({
             "channel": recipient,
             "text": text,
             "mrkdwn": false,
+            "parse": "none",
+            "link_names": false,
             "unfurl_links": false,
             "unfurl_media": false,
             "blocks": [{
@@ -6098,8 +6108,10 @@ impl Channel for SlackChannel {
                 );
                 let mut body = serde_json::json!({
                     "channel": recipient,
-                    "text": message.content,
+                    "text": escape_strict_approval_text(&message.content),
                     "mrkdwn": false,
+                    "parse": "none",
+                    "link_names": false,
                     "unfurl_links": false,
                     "unfurl_media": false,
                 });
@@ -6248,7 +6260,7 @@ mod tests {
             let mut channel =
                 test_slack_channel(&server, workspace.path()).with_approval_timeout_secs(0);
             channel.app_token = socket_mode.then(|| "test-app-token".into());
-            let summary = "[FILE:report.txt] *literal* <!channel> <https://example.invalid|text>";
+            let summary = "[FILE:report.txt] *literal* <!channel> <@U_SYNTHETIC> <https://example.invalid|text> & &lt; 😀";
             let mut request = ChannelApprovalRequest {
                 tool_name: "session_prompt_set".into(),
                 arguments_summary: summary.into(),
@@ -6270,9 +6282,24 @@ mod tests {
             assert_eq!(requests.len(), 1, "no attachment expansion calls");
             let body: serde_json::Value = requests[0].body_json().expect("Slack payload");
             assert!(
-                body["text"]
-                    .as_str()
-                    .expect("fallback text")
+                body["text"].as_str().expect("fallback text").contains(
+                    &summary
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                )
+            );
+            assert_eq!(request.arguments_summary, summary);
+            assert_eq!(body["parse"], "none");
+            assert_eq!(body["link_names"], false);
+            let encoded = body["text"].as_str().expect("encoded preview");
+            assert!(!encoded.contains("<!channel>"));
+            assert!(!encoded.contains("<@U_SYNTHETIC>"));
+            assert!(
+                encoded
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
                     .contains(summary)
             );
             for field in ["mrkdwn", "unfurl_links", "unfurl_media"] {

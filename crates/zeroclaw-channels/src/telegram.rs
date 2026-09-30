@@ -8510,6 +8510,13 @@ impl TelegramChannel {
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // An escaped HTML body still permits automatic mention entities. A
+        // preformatted span displays proposed content without interpreting it.
+        let args = if strict_session_prompt_approval {
+            format!("<pre>{args}</pre>")
+        } else {
+            args
+        };
         // Back-to-back cards from one message are otherwise indistinguishable
         // before the operator taps, so say which call this is.
         let position = Self::escape_html(&crate::util::approval_position_line(
@@ -8614,6 +8621,14 @@ impl TelegramChannel {
                     if strict_session_prompt_approval {
                         plain_body["link_preview_options"] =
                             serde_json::json!({"is_disabled": true});
+                        // Keep the HTML failure fallback literal too. Explicit
+                        // pre entities exclude auto-detected mentions/links;
+                        // Telegram measures their ranges in UTF-16 code units.
+                        plain_body["entities"] = serde_json::json!([{
+                            "type": "pre",
+                            "offset": 0,
+                            "length": plain_text.encode_utf16().count(),
+                        }]);
                     }
                     if let Some(tid) = thread_id {
                         plain_body["message_thread_id"] =
@@ -8767,7 +8782,7 @@ mod tests {
                         "shell"
                     }
                     .into(),
-                    arguments_summary: "[FILE:report.txt] <b>literal</b> & https://example.invalid"
+                    arguments_summary: "[FILE:report.txt] <b>literal</b> & https://example.invalid @synthetic_user 😀"
                         .into(),
                     raw_arguments: None,
                     position: None,
@@ -8800,8 +8815,32 @@ mod tests {
                     );
                     if strict {
                         assert_eq!(body["link_preview_options"]["is_disabled"], true);
+                        let text = body["text"].as_str().expect("preview text");
+                        if body.get("parse_mode").is_some() {
+                            assert!(text.contains(&format!(
+                                "<pre>{}</pre>",
+                                TelegramChannel::escape_html(&request.arguments_summary)
+                            )));
+                        } else {
+                            assert!(text.contains(&request.arguments_summary));
+                            assert_eq!(
+                                body["entities"],
+                                serde_json::json!([{
+                                    "type": "pre", "offset": 0,
+                                    "length": text.encode_utf16().count()
+                                }])
+                            );
+                            assert_ne!(text.encode_utf16().count(), text.chars().count());
+                        }
                     } else {
                         assert!(body.get("link_preview_options").is_none());
+                        assert!(body.get("entities").is_none());
+                        assert!(
+                            !body["text"]
+                                .as_str()
+                                .expect("ordinary text")
+                                .contains("<pre>")
+                        );
                     }
                     assert_eq!(
                         body["reply_markup"]["inline_keyboard"][0]
