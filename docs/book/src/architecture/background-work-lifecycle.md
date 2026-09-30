@@ -61,6 +61,170 @@ Legacy delegate result files that contain status remain readable when no task ro
 
 A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
 
+The following describes the RFC V1 candidate boundary; it does not change the
+implementation-status statement above. That statement remains until the
+production integration and cross-surface validation gates pass.
+
+### Ownership and accounting
+
+`zeroclaw-goal` owns Goal-specific control, execution, verifier, recovery, and
+operation-accounting policy. Canonical task records remain in
+`zeroclaw-api`; the runtime's existing SQLite task store persists Goal task
+state and its session binding. The runtime adapts the existing session and
+provider-pricing owners, while ordinary provider routing, fallback, tool
+dispatch, agent-loop execution, and canonical session history remain with
+their existing owners. Goal mode adds no parallel task store, session store,
+provider router, or usage ledger.
+
+Every Goal-owned model operation must settle actual-attempt usage through the
+canonical ledger before another Goal-owned model call is admitted. Known usage
+is retained before completeness is classified. Genuinely missing, invalid, or
+outcome-unknown accounting is terminal under V1; an unlimited budget does not
+make uncertain usage safe to retry.
+
+Goal parent and verifier calls also pass the ordinary `[cost]` daily and
+monthly pre-call check against the same canonical ledger, before sending a
+request. Foreground children retain their ordinary checks. These limits apply
+alongside the Goal budget; `--unlimited` removes only the Goal budget. A refused
+call sends no request and records no usage. With accounting complete, the Goal
+pauses as `budget_exhausted` rather than failing, and an explicit resume repeats
+the same check. The Goal accountant remains the only ledger writer.
+
+### Turn, session, and recovery boundaries
+
+When a parent turn is active, ordinary start, resume, pause, and budget changes
+are acknowledged promptly and applied at its next shared checkpoint. That
+checkpoint follows ordinary event delivery and session persistence, tool
+result pairing, and usage settlement. Status and other read-only commands do
+not interrupt the turn. Cancel, `pause now`, and `/stop` fence Goal execution
+immediately; they do not roll back an already-admitted external side effect.
+
+An immediate pause during a Goal turn leaves the Goal paused and resumable
+when that turn's usage and tool results have settled. The interrupted
+operation's error may be shown once. Work the interrupted turn performed
+after its last delivered reply is not carried into the resumed turn. A pause
+with unsettled usage or unpaired tool results still fails the Goal.
+
+Resume continues the same durable session and history. An optional, including
+multiline, response is appended once as a user message before the next Goal
+turn; plain resume adds no synthetic answer. Reload and graceful shutdown fence
+a running Goal, let its admitted operation settle, and record the resumable
+`daemon_restarted` pause. If the daemon is killed before settlement, restart
+recovery pauses the Goal only when its accounting and tool results are settled;
+otherwise it fails the Goal. Restart never automatically launches it again.
+
+### Parent-turn prompt assembly
+
+Both Goal hosts use `zeroclaw-goal`'s `GoalParentTurnInput` to compose a
+transient working transcript. Its single leading system row retains the
+ordinary base policy and states the controller-owned turn kind: start, resume,
+or continue. All Goal-authored authority statements precede the opening
+delimiter. At composition, the row ends with a delimited, verbatim copy of the
+user-declared objective, treated as untrusted data rather than permission or
+control input.
+Runtime notes merged after the row's final Goal delimiter retain their
+ordinary authority; the objective between the first and final delimiters
+remains untrusted. This framing is not a prompt-injection guarantee.
+The system row is recomposed for every parent turn, including after vision
+provider selection in the isolated Agent path.
+
+Each start or resume epoch also composes one user-role message containing the
+verbatim objective. The two projections serve different purposes: the user
+message admits an otherwise empty session through ordinary turn validation;
+the leading system row retains the objective through ordinary history trimming
+and provider context truncation, including fallback attempts that reuse the
+truncated request. Both derive from the same durable Goal task, not from a
+second objective store. Neither engine-composed projection enters canonical
+session history.
+
+Assembly preserves the canonical prefix's bytes and relative order, including
+the agent's previous question and the optional resume answer. It removes only
+a leading orphan tool-message span. The epoch objective follows an existing
+leading user row, including a history-trim breadcrumb; otherwise it precedes
+the body. A genuine user message may equal the objective without being moved,
+rejected, or deduplicated.
+
+Continuation refreshes the leading system row and preserves the body when its
+first row is already user-role. Otherwise it inserts a user-role objective at
+that position. It does not search message content to recognize engine-owned
+rows or restore an objective user message removed by ordinary trimming. A
+surviving genuine user row or breadcrumb satisfies the same structural rule.
+This follows the ordinary owners' provenance discipline: breadcrumb ownership
+comes from its recorded flag, and volatile memory preambles are handled by
+position, not by matching user text. The Goal assembler does not change the
+breadcrumb flag.
+
+A valid verifier continuation adds the previous candidate followed by an
+untrusted user-role feedback message to the working transcript. Feedback is
+not a system instruction or an authoritative user reply and is never persisted
+as canonical user history. Each later epoch re-derives its Goal projections
+from the task and obtains its prefix from the bound session owner.
+
+#### Context-retention limits
+
+- Static delimiters describe message structure, not prompt-injection immunity.
+  Objective and feedback bytes can contain the same delimiters or text that
+  resembles runtime instructions. Framing does not escape or normalize those
+  bytes, confer permissions, or replace ordinary authorization and tool policy.
+- Ordinary Matrix memory injection can prepend recalled context to the last
+  user-role working message. Its wire content can therefore contain a preamble
+  before the verbatim objective or user input. The candidate's Matrix Goal
+  path still has an unresolved parity gap in cleaning this volatile preamble
+  from the carried working transcript; this is not a durability guarantee.
+- Within one continuation chain, ordinary context recovery can remove the
+  earlier candidate while retaining the newer verifier-feedback boundary.
+  Preserving both at assembly does not promise that both reach every request
+  under overflow. The ordinary session path still persists the candidate.
+- Role-and-position assembly deliberately does not distinguish a genuine user
+  row from an engine objective by its bytes. A surviving user row can occupy
+  the leading body slot; the leading system row still carries the objective.
+  A consumer requiring finer provenance would need an explicit owner contract,
+  not content matching.
+
+### Verification, events, and presentation
+
+The verifier is the sole normal authority for Goal completion, continuation,
+or an input-related pause. Its strict structured result is `Complete`,
+`Continue`, or `Blocked`: completion checks the declared Goal's success
+criteria (not broader work), continuation requires concrete unmet work within
+that Goal, and a blocker requires user input, human escalation, or an external
+dependency. A valid `Blocked` result pauses execution; ordinary progress prose
+does not. Invalid or inconsistent verifier output follows V1's terminal
+protocol-failure path and is never rewritten into a successful decision.
+Provider and verifier-operation failures and genuinely incomplete accounting
+are also terminal under V1, not user-input pauses. Explicit operator pauses
+and daemon-restart recovery remain resumable; restart never auto-launches work.
+
+The agent's full response and ordinary visible events, including thinking,
+tool calls/results, drafts, text, and core errors, remain on their normal
+representation path.
+A failed Goal shows the original core error through the surface's ordinary
+error display before its Goal failure notice, which separately explains the
+lifecycle transition.
+Goal lifecycle notices supplement that output: start/resume precedes execution,
+and a blocker pause follows the agent's complete request. The pause rationale
+describes why execution stopped rather than replacing or paraphrasing the
+request. Matrix and ZeroCode share Goal decisions and transitions while using
+their native streaming, rendering, localization, and egress protections; the
+surfaces must not classify blockers or completion independently.
+Fluent catalogs and native rendering may differ, but status and transition
+semantics do not. Known accounting totals remain visible before a qualification
+that usage may be incomplete, and the status icon reflects the reported status.
+
+Verifier diagnostics correlate the task and execution epoch, candidate
+fingerprint, actual verifier provider/model when available, validation result,
+validated decision, bounded reason, and controller action. Verifier reasons
+are model output: the runtime applies the same credential leak scrub used for
+other log text before truncating them. An engine without that guard logs a
+withheld marker instead; engine-authored reasons are fixed text. These
+diagnostics distinguish a model verdict from the transition actually committed
+without logging unrestricted prompts, candidate text, blocker payloads, raw
+invalid verifier output, or hidden reasoning. These logs
+support diagnosis; they do not make verifier judgments deterministic. Repeated
+agent text remains visible and is not suppressed or treated as an automatic
+stagnation pause. A validated completion ends the loop; `Continue` is reserved
+for concrete unmet work within the declared Goal.
+
 ## Change checklist
 
 For background-work changes, answer these before reviewer sign-off:
@@ -80,4 +244,14 @@ For background-work changes, answer these before reviewer sign-off:
 - Delegation and subagent behavior: [Delegation & SubAgents](../agents/delegation.md), `crates/zeroclaw-runtime/src/tools/delegate.rs`, `crates/zeroclaw-runtime/src/tools/spawn_subagent.rs`, `crates/zeroclaw-runtime/src/subagent/mod.rs`
 - Durable task control plane and recovery: `crates/zeroclaw-runtime/src/control_plane/`
 - Goal-mode decision: [ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
+- Goal policy, verifier, and execution supervision: `crates/zeroclaw-goal/src/control/`
+- Goal parent-turn assembly: `crates/zeroclaw-goal/src/control/parent_input.rs`
+- Goal task contracts: `crates/zeroclaw-goal/src/task.rs`,
+  `crates/zeroclaw-api/src/task.rs`
+- Goal SQLite, ZeroCode session, pricing and diagnostic-guard adapters:
+  `crates/zeroclaw-runtime/src/control_plane/task_store_sqlite/goal.rs`,
+  `crates/zeroclaw-runtime/src/rpc/goal.rs`,
+  `crates/zeroclaw-runtime/src/goal_accounting.rs`
+- Matrix Goal adapter: `crates/zeroclaw-channels/src/orchestrator/goal_execution.rs`
+- Goal command grammar: `crates/zeroclaw-commands/src/goal.rs`
 - SOP operator guide: [How SOPs run](../sop/how-it-works.md)

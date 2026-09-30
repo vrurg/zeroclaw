@@ -42,6 +42,9 @@ On Windows, `zeroclaw service install` registers a Task Scheduler task triggered
 
 On Unix the daemon traps `SIGINT` and `SIGTERM`; on Windows it traps Ctrl+C (`ctrl_c`). Any of these triggers a clean shutdown: the daemon stops its channel server and the gateway listener and exits.
 
+Before transport teardown, a graceful shutdown waits for each admitted Goal
+operation to settle, as a reload does.
+
 `SIGHUP` is ignored (the daemon stays running). A reload requested via the `/admin/reload` endpoint restarts the daemon loop in place rather than exiting.
 
 An in-place reload starts a replacement generation over the same durable sessions, so it waits for the RPC connections the retiring generation accepted to finish, including any agent turn still unwinding after a forced teardown. If that wait runs out of budget, the reload is refused and the daemon shuts down instead. The refusal is deliberate: exiting is what keeps a replacement generation from overlapping work that the old one never retired.

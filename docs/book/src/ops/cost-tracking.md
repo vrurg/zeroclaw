@@ -203,6 +203,13 @@ assurance while the current month contains unpriced tokens. Configure the
 missing rate dimensions and generate a new request before relying on cap
 enforcement; existing ledger rows are never retroactively repriced.
 
+Goal Mode parent and verifier calls use the same daily and monthly pre-call
+check as ordinary turns. Their usage is recorded once, with Goal task
+attribution, by the Goal accountant. When that check refuses a call with
+accounting complete, the Goal pauses as `budget_exhausted` instead of failing.
+Resuming it explicitly repeats the check; `--unlimited` removes the Goal budget,
+not these ordinary cost limits.
+
 ## Per-agent attribution
 
 When `cost.track_per_agent` is true (default) every recorded
