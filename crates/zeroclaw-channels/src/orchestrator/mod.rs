@@ -5,6 +5,8 @@ pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 mod foreground;
+#[cfg(all(test, unix))]
+mod goal_conformance_tests;
 pub(crate) mod goal_execution;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
