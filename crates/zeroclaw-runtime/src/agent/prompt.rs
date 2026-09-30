@@ -165,8 +165,10 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 .strip_prefix(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
                 .is_some_and(|body| body.starts_with(SESSION_PROMPT_TEXT_RESULT_MARKER));
         let host_marked_result = host_marked_native_result || host_marked_text_result;
-        let has_text_protocol_result_prefix =
-            is_text_protocol_result && message.content.starts_with("[Tool results]");
+        let has_text_protocol_result_prefix = is_text_protocol_result
+            && message
+                .content
+                .starts_with(crate::agent::history_trim::TOOL_RESULTS_PREFIX);
         let redact = host_marked_result
             || is_sensitive_call
             || (redact_native_tool_results && is_native_result)
@@ -252,14 +254,6 @@ pub(crate) fn redact_session_prompt_text_protocol_for_export(content: &str) -> C
 /// call formats. Export redaction requires a recovered session-prompt identity
 /// so unrelated malformed tool diagnostics and retained history stay intact.
 pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool {
-    let malformed_xml_session_prompt_envelope = {
-        let lower = content.to_ascii_lowercase();
-        let names_session_prompt_tool = zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
-            .iter()
-            .any(|name| lower.contains(name));
-        names_session_prompt_tool && contains_malformed_tool_call_tag_lower(&lower)
-    };
-
     // The runtime accepts multiple provider text protocols, including MiniMax
     // invoke blocks, Perl-style TOOL_CALL blocks, and GLM shorthand. Export
     // redaction must track that accepted-call identity rather than a subset of
@@ -271,11 +265,12 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
                 || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
         })
-        || malformed_xml_session_prompt_envelope
+        || malformed_xml_session_prompt_call(content)
         || looks_like_malformed_json_tool_invocation(content, session_prompt_tool_names())
         || transport_escaped_json_candidate(content).is_some_and(|decoded| {
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
                 || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
+                || malformed_xml_session_prompt_call(&decoded)
                 || looks_like_malformed_json_tool_invocation(&decoded, session_prompt_tool_names())
         })
 }
@@ -290,8 +285,57 @@ fn session_prompt_tool_names() -> &'static HashSet<String> {
     &SESSION_PROMPT_TOOL_NAMES
 }
 
-fn contains_malformed_tool_call_tag_lower(lower: &str) -> bool {
-    lower.contains("<tool_call") || lower.contains("<toolcall") || lower.contains("<tool-call")
+fn malformed_xml_session_prompt_call(content: &str) -> bool {
+    struct CallName<'a>(&'a mut Option<bool>);
+
+    impl<'de> serde::de::Visitor<'de> for CallName<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a tool-call object with a top-level name")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "name" {
+                    let name = map.next_value::<String>()?;
+                    *self.0 =
+                        Some(session_prompt_tool_names().contains(&name.to_ascii_lowercase()));
+                    return Ok(());
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+
+    // Inspect original rejected/truncated tags: the execution parser consumes
+    // some rejected envelopes from its visible-text projection. Recover only
+    // the outer name, not an unrelated name mentioned in ordinary arguments.
+    let lower = content.to_ascii_lowercase();
+    ["<tool_call", "<toolcall", "<tool-call"].iter().any(|tag| {
+        lower.match_indices(tag).any(|(start, _)| {
+            let rest = &content[start + tag.len()..];
+            let body = rest
+                .trim_start()
+                .strip_prefix('>')
+                .unwrap_or(rest)
+                .trim_start();
+            if !body.starts_with('{') {
+                return false;
+            }
+            let mut decoder = serde_json::Deserializer::from_str(body);
+            let mut recovered = None;
+            // serde_json checks the remaining map after the visitor exits.
+            // That can fail for this intentionally incomplete envelope;
+            // keep the already recovered identity solely for export, never
+            // as proof that the call is valid or executable.
+            let _ = serde::Deserializer::deserialize_map(&mut decoder, CallName(&mut recovered));
+            recovered.unwrap_or_else(|| {
+                looks_like_malformed_json_tool_invocation(body, session_prompt_tool_names())
+            })
+        })
+    })
 }
 
 fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
@@ -2630,12 +2674,57 @@ mod tests {
     }
 
     #[test]
+    fn export_copy_preserves_tagged_ordinary_calls_mentioning_prompt_tools() {
+        let call = r#"<tool_call>{"name":"shell","arguments":{"command":"rg -n session_prompt_set crates/"}}</tool_call>"#;
+        let messages = vec![
+            ChatMessage::assistant(call),
+            ChatMessage::tool("ordinary search result"),
+        ];
+        assert!(!session_prompt_tool_call_envelope_mentioned(call));
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        for (actual, expected) in export.iter().zip(&messages) {
+            assert_eq!(actual.content, expected.content);
+        }
+        assert_eq!(crate::agent::loop_::scrub_for_export(call), call);
+        let malformed = r#"<tool_call {"name":"shell","command":"rg session_prompt_set""#;
+        assert!(!session_prompt_tool_call_envelope_mentioned(malformed));
+        assert_eq!(crate::agent::loop_::scrub_for_export(malformed), malformed);
+    }
+
+    #[test]
+    fn export_copy_preserves_host_tool_protocol_and_catalog() {
+        let host = format!(
+            "{}\n### Available Tools\n- session_prompt_set\n- session_prompt_list\n- session_prompt_delete\n",
+            crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS
+        );
+        assert_eq!(crate::agent::loop_::scrub_for_export(&host), host);
+        let with_attachment = format!(
+            r#"{host}
+
+{}<tool_call>{{"name":"session_prompt_set","arguments":{{"content":"private-attachment-marker"}}}}</tool_call>"#,
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        );
+        assert_eq!(
+            crate::agent::loop_::scrub_for_export(&with_attachment),
+            format!("{host}{SESSION_PROMPTS_EXPORT_MARKER}")
+        );
+    }
+
+    #[test]
     fn text_protocol_export_redactor_covers_malformed_prompt_envelopes() {
         let marker = "session-prompt-private-marker";
         let malformed =
             format!(r#"<tool_call {{\"name\":\"session_prompt_set\",\"content\":\"{marker}\""#);
+        let decoded = transport_escaped_json_candidate(&malformed).unwrap();
+        assert!(malformed_xml_session_prompt_call(&decoded));
         let export = redact_session_prompt_text_protocol_for_export(&malformed);
         assert!(!export.contains(marker));
         assert!(export.contains("omitted from export"));
+        let rejected =
+            format!(r#"<tool_call>{{"name":"session_prompt_set", BROKEN {marker}</tool_call>"#);
+        assert!(
+            !redact_session_prompt_text_protocol_for_export(&rejected).contains(marker),
+            "a rejected closed tag must retain its recovered sensitive identity"
+        );
     }
 }
