@@ -323,6 +323,13 @@ work is still unwinding. An ordinary client disconnect still retains the
 session and its Goal; explicit session lifecycle operations remain responsible
 for Goal disposal.
 
+Goal start and resume use the same post-admission session authority checks as
+ordinary prompts. Remote WSS execution refuses sessions with local channel or
+other non-RPC capabilities. If those capabilities appear before a later Goal
+parent turn, execution fails before that turn begins. Status, budget, pause,
+cancel, and stop controls remain available subject to ordinary authorization;
+they do not grant permission to execute the session.
+
 The `RpcTransport` trait is designed so that additional transports (vsock,
 custom IPC) slot in without touching the dispatch or session logic. The
 `local.rs` module wraps the Unix and Windows primitives behind a single
