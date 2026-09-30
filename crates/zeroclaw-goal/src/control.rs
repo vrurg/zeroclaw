@@ -559,7 +559,7 @@ enum GoalSubmissionState {
         /// must retain this object rather than resolving a new driver from
         /// route or session text after the durable lifecycle transition.
         driver: Arc<dyn GoalSessionDriver>,
-        lease: GoalSessionLease,
+        lease: Option<GoalSessionLease>,
     },
 }
 
@@ -615,7 +615,14 @@ impl GoalSubmission {
     pub(super) fn into_admission_lease(self) -> Option<GoalSessionLease> {
         match self.0 {
             GoalSubmissionState::Unavailable { .. } => None,
-            GoalSubmissionState::Bound { lease, .. } => Some(lease),
+            GoalSubmissionState::Bound { lease, .. } => lease,
+        }
+    }
+
+    fn take_admission_lease(&mut self) -> Option<GoalSessionLease> {
+        match &mut self.0 {
+            GoalSubmissionState::Unavailable { .. } => None,
+            GoalSubmissionState::Bound { lease, .. } => lease.take(),
         }
     }
 }
@@ -661,7 +668,7 @@ impl GoalExecutionHost {
             ingress,
             command,
             driver,
-            lease,
+            lease: Some(lease),
         }))
     }
 
@@ -730,13 +737,21 @@ impl GoalRuntimeSubmission {
     }
 
     pub(super) fn into_parts_with_lease(
-        self,
+        mut self,
     ) -> (
         GoalResponse,
         Option<GoalExecutionRequest>,
         Option<GoalSessionLease>,
     ) {
-        (self.response, self.execution, self.lease)
+        // A running request retains the exact driver but must transfer command
+        // serialization to the supervisor. Otherwise launch revalidation tries
+        // to bind while the request still owns that same session lock.
+        let lease = self.lease.take().or_else(|| {
+            self.execution
+                .as_mut()
+                .and_then(|request| request.submission.take_admission_lease())
+        });
+        (self.response, self.execution, lease)
     }
 }
 
@@ -1505,6 +1520,88 @@ fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn supervisor_handoff_transfers_the_running_request_command_lease() {
+        struct SerializedDriver {
+            key: GoalSessionKey,
+            command: Arc<tokio::sync::Mutex<()>>,
+        }
+
+        #[async_trait]
+        impl GoalSessionDriver for SerializedDriver {
+            fn session_key(&self) -> &GoalSessionKey {
+                &self.key
+            }
+
+            async fn bind(&self, _ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
+                Ok(GoalSessionLease::new(
+                    GoalSessionBinding::new(self.key.clone()),
+                    self.command.clone().lock_owned().await,
+                ))
+            }
+
+            async fn acquire_execution(
+                &self,
+                _ingress: &GoalIngressContext,
+                _scope: &GoalExecutionScope,
+                _checkpoint: &GoalParentTurnCheckpoint,
+            ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+                bail!("this fixture only exercises command lease transfer")
+            }
+        }
+
+        let key = GoalSessionKey::zero_code("serialized-launch").unwrap();
+        let command = Arc::new(tokio::sync::Mutex::new(()));
+        let driver = Arc::new(SerializedDriver {
+            key: key.clone(),
+            command: command.clone(),
+        });
+        let ingress = GoalIngressContext::trusted(
+            key.clone(),
+            "test-agent",
+            "test-route",
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: "test-client".into(),
+            },
+        )
+        .unwrap();
+        let admitted = GoalSubmission(GoalSubmissionState::Bound {
+            ingress: ingress.clone(),
+            command: GoalCommand::Resume { response: None },
+            driver: driver.clone(),
+            lease: Some(driver.bind(&ingress).await.unwrap()),
+        });
+        let submission = GoalRuntimeSubmission {
+            response: GoalResponse::Help,
+            execution: Some(GoalExecutionRequest {
+                submission: admitted,
+                scope: GoalExecutionScope::new("test-goal", key.durable_id(), 1).unwrap(),
+                resume_response: None,
+            }),
+            lease: None,
+        };
+        let (_, request, lease) = submission.into_parts_with_lease();
+        assert!(
+            lease.is_some(),
+            "the supervisor must own the retained guard"
+        );
+        assert!(
+            command.try_lock().is_err(),
+            "handoff must not release admission early"
+        );
+        drop(lease);
+        let rebound =
+            tokio::time::timeout(std::time::Duration::from_secs(1), driver.bind(&ingress))
+                .await
+                .expect("launch revalidation must not reacquire its own retained lock")
+                .unwrap();
+        assert!(
+            request.is_some(),
+            "revalidation must retain the original request"
+        );
+        drop(rebound);
+    }
 
     #[test]
     fn typed_budget_update_cannot_smuggle_configured_defaults() {
