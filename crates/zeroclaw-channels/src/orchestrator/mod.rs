@@ -24154,6 +24154,136 @@ api_key = "anthropic-key"
     }
 
     #[test]
+    fn goal_canonical_read_waits_for_same_key_append_and_provenance_publication() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct PausedAppendBackend {
+            store: Arc<zeroclaw_infra::session_store::SessionStore>,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl SessionBackend for PausedAppendBackend {
+            fn load(&self, key: &str) -> Vec<ChatMessage> {
+                self.store.load(key)
+            }
+            fn try_load(&self, key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                self.store.try_load(key)
+            }
+            fn append(&self, key: &str, row: &ChatMessage) -> std::io::Result<()> {
+                self.store.append(key, row)?;
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            }
+            fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+                self.store.remove_last(key)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.store.list_sessions()
+            }
+            fn get_session_trim_breadcrumb(&self, key: &str) -> std::io::Result<Option<bool>> {
+                self.store.get_session_trim_breadcrumb(key)
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let key = "goal_append_capture_race";
+        let initial = vec![
+            ChatMessage::user(breadcrumb_text()),
+            ChatMessage::assistant("Please choose an option."),
+        ];
+        let answer = ChatMessage::user("Choose the first option.");
+        for row in &initial {
+            store.append(key, row).unwrap();
+        }
+        store.set_session_trim_breadcrumb(key, true).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut ctx = test_channel_ctx_with_backend(Arc::new(PausedAppendBackend {
+            store: store.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        cfg.resolved.max_history_messages = 2;
+        Arc::get_mut(&mut ctx).unwrap().agent_cfg = Arc::new(cfg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .put(key.to_owned(), initial.clone());
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap()
+            .put(key.to_owned(), true);
+        let (before, owned) = read_goal_canonical_history(&ctx, key).unwrap();
+        assert!(owned);
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(&initial).unwrap()
+        );
+
+        let writer_ctx = ctx.clone();
+        let writer_answer = answer.clone();
+        let writer = std::thread::spawn(move || {
+            append_sender_turn_durably(&writer_ctx, key, writer_answer).unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let persistence_gate = acquire_persist_lock(&ctx, key);
+        let gate_is_held = matches!(
+            persistence_gate.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let reader_ctx = ctx.clone();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            captured_tx
+                .send(read_goal_canonical_history(&reader_ctx, key))
+                .unwrap();
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(5));
+        let during_append = captured_rx.recv_timeout(Duration::from_millis(100));
+        // Release before assertions so a failing observation cannot strand the writer.
+        release_tx.send(()).unwrap();
+        let appended = writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(gate_is_held);
+        started.unwrap();
+        assert!(matches!(
+            during_append,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (after, owned) = captured_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let expected = vec![initial[1].clone(), answer.clone()];
+        assert!(!owned);
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(appended).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let mut durable = initial;
+        durable.push(answer);
+        assert_eq!(
+            serde_json::to_value(store.try_load(key).unwrap()).unwrap(),
+            serde_json::to_value(durable).unwrap()
+        );
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), Some(true));
+    }
+
+    #[test]
     fn goal_canonical_read_applies_caps_without_reconciliation() {
         let marker = ChatMessage::user(breadcrumb_text());
         let question = ChatMessage::assistant("question");
@@ -24482,6 +24612,92 @@ api_key = "anthropic-key"
             }
             assert_eq!(*backend.reads.lock().unwrap(), expected_reads);
         }
+    }
+
+    #[test]
+    fn goal_provenance_keeps_cold_hydration_and_warm_resolver_rules_distinct() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let key = "goal_legacy_system_prefix";
+        let rows = vec![
+            ChatMessage::system("ordinary policy"),
+            ChatMessage::user(breadcrumb_text()),
+            ChatMessage::assistant("question"),
+        ];
+        for row in &rows {
+            store.append(key, row).unwrap();
+        }
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), None);
+        let read = read_session_transcript(store.as_ref(), key)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !read.crumb_present,
+            "cold hydration checks the first physical row"
+        );
+        assert!(
+            resolve_cold_crumb_provenance_result(Some(store.as_ref()), key, &rows).unwrap(),
+            "the existing legacy resolver skips leading system rows"
+        );
+        let context = test_channel_ctx_with_backend(store.clone());
+        let (cold, cold_owned) = read_goal_canonical_history(&context, key).unwrap();
+        assert!(!cold_owned);
+        assert_eq!(
+            serde_json::to_value(cold).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert!(
+            context
+                .conversation_histories
+                .lock()
+                .unwrap()
+                .peek(key)
+                .is_none()
+        );
+        assert!(
+            context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(key)
+                .is_none()
+        );
+        context
+            .conversation_histories
+            .lock()
+            .unwrap()
+            .put(key.to_owned(), rows.clone());
+        let (warm, warm_owned) = read_goal_canonical_history(&context, key).unwrap();
+        assert!(
+            warm_owned,
+            "warm legacy state uses its existing resolver owner"
+        );
+        assert_eq!(
+            serde_json::to_value(warm).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert!(
+            context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(key)
+                .is_none()
+        );
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), None);
+        let hydrated = hydrate_session_transcript(store.as_ref(), key)
+            .unwrap()
+            .unwrap();
+        assert!(!hydrated.crumb_present);
+        assert_eq!(
+            serde_json::to_value(hydrated.messages).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), Some(false));
+        assert_eq!(
+            serde_json::to_value(store.try_load(key).unwrap()).unwrap(),
+            serde_json::to_value(rows).unwrap()
+        );
     }
 
     #[test]
