@@ -45,6 +45,7 @@ use crate::turn_status::TurnStatus;
 // its largest supported footprint in the transcript so the full binding never
 // obscures conversation content beneath the modal.
 const APPROVAL_OVERLAY_MAX_HEIGHT: u16 = 16;
+const ORDINARY_APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -4394,20 +4395,34 @@ impl Chat {
             }
             Some(
                 ChatTabAction::BrowseUp | ChatTabAction::BrowseUpVim | ChatTabAction::ScrollUp,
-            ) if state.pending_approval().is_some() => {
+            ) if state
+                .pending_approval()
+                .is_some_and(PendingApproval::is_strict_session_prompt) =>
+            {
                 state.scroll_pending_approval(-1);
             }
             Some(
                 ChatTabAction::BrowseDown
                 | ChatTabAction::BrowseDownVim
                 | ChatTabAction::ScrollDown,
-            ) if state.pending_approval().is_some() => {
+            ) if state
+                .pending_approval()
+                .is_some_and(PendingApproval::is_strict_session_prompt) =>
+            {
                 state.scroll_pending_approval(1);
             }
-            Some(ChatTabAction::PageUp) if state.pending_approval().is_some() => {
+            Some(ChatTabAction::PageUp)
+                if state
+                    .pending_approval()
+                    .is_some_and(PendingApproval::is_strict_session_prompt) =>
+            {
                 state.scroll_pending_approval(-5);
             }
-            Some(ChatTabAction::PageDown) if state.pending_approval().is_some() => {
+            Some(ChatTabAction::PageDown)
+                if state
+                    .pending_approval()
+                    .is_some_and(PendingApproval::is_strict_session_prompt) =>
+            {
                 state.scroll_pending_approval(5);
             }
             Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
@@ -8027,16 +8042,20 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
         "zc-chat-approval-title",
         &[("tool", &pa.tool_name), ("secs", &secs)],
     );
-    let text = if summary.is_empty() {
+    let text = if !pa.is_strict_session_prompt() {
+        if summary.is_empty() {
+            format!("{title}\n\n  {keys}")
+        } else {
+            format!("{title}\n\n  {summary}\n\n  {keys}")
+        }
+    } else if summary.is_empty() {
         title
     } else {
         format!("{title}\n\n{summary}")
     };
 
-    // Size ordinary approvals to their content while keeping a fixed maximum
-    // for long exact bindings. The transcript still reserves the maximum
-    // footprint below, so changing the modal height never moves conversation
-    // content underneath it.
+    // Only required session-prompt previews own a scrollable body. Ordinary
+    // approvals keep their existing footprint and transcript navigation.
     let overlay_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -8060,9 +8079,13 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // Anchor to the bottom of the given area. The action footer remains visible
     // while a long exact approval binding scrolls in the body above it.
     let max_height = area.height.saturating_sub(2).max(3);
-    let overlay_height = desired_height
-        .clamp(3, APPROVAL_OVERLAY_MAX_HEIGHT)
-        .min(max_height);
+    let overlay_height = if pa.is_strict_session_prompt() {
+        desired_height
+            .clamp(3, APPROVAL_OVERLAY_MAX_HEIGHT)
+            .min(max_height)
+    } else {
+        ORDINARY_APPROVAL_OVERLAY_HEIGHT
+    };
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(overlay_height)])
@@ -8079,6 +8102,22 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     f.render_widget(Clear, overlay_area);
 
     let fill = theme::fill_style();
+    if !pa.is_strict_session_prompt() {
+        f.render_widget(
+            Paragraph::new(text)
+                .style(fill)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(Span::styled(" Approval Required ", theme::warn_style()))
+                        .border_style(theme::approval_border_style())
+                        .style(fill),
+                )
+                .wrap(Wrap { trim: true }),
+            overlay_area,
+        );
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(" Approval Required ", theme::warn_style()))
@@ -9002,6 +9041,24 @@ pub struct PendingApproval {
     /// Ephemeral viewport offset for the approval details. It is client-local:
     /// the daemon owns the approval request and never needs presentation state.
     pub scroll_offset: u16,
+}
+
+impl PendingApproval {
+    fn is_strict_session_prompt(&self) -> bool {
+        !self.allow_always
+            && matches!(
+                self.tool_name.as_str(),
+                "session_prompt_set" | "session_prompt_delete"
+            )
+    }
+
+    fn reserved_height(&self) -> u16 {
+        if self.is_strict_session_prompt() {
+            APPROVAL_OVERLAY_MAX_HEIGHT
+        } else {
+            ORDINARY_APPROVAL_OVERLAY_HEIGHT
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10825,8 +10882,8 @@ impl ChatState {
                 Span::styled(self.streaming_thought.clone(), theme::dim_style()),
             ]));
         }
-        if self.pending_approval.is_some() {
-            for _ in 0..APPROVAL_OVERLAY_MAX_HEIGHT {
+        if let Some(approval) = &self.pending_approval {
+            for _ in 0..approval.reserved_height() {
                 lines.push(Line::default());
             }
         }
@@ -16025,7 +16082,7 @@ mod tests {
             "overlay-only history renders the overlay verbatim"
         );
         assert_eq!(local_scroll, 0);
-        assert!(total_rows >= APPROVAL_OVERLAY_MAX_HEIGHT);
+        assert!(total_rows >= ORDINARY_APPROVAL_OVERLAY_HEIGHT);
     }
 
     #[test]
@@ -24967,6 +25024,75 @@ mod tests {
         assert_eq!(pa.tool_name, "shell");
     }
 
+    // Key overrides are process-global; keep default bindings stable while
+    // exercising the production asynchronous key dispatcher.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn approval_scroll_keys_preserve_ordinary_transcript_navigation() {
+        use crossterm::event::KeyCode;
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+
+        for (tool_name, allow_always, strict) in [
+            ("file_edit", true, false),
+            ("shell", false, false),
+            ("session_prompt_set", true, false),
+            ("session_prompt_set", false, true),
+            ("session_prompt_delete", false, true),
+        ] {
+            for (code, transcript_delta, approval_delta) in [
+                (KeyCode::Up, -1_i16, -1_i16),
+                (KeyCode::Down, 1, 1),
+                (KeyCode::PageUp, -10, -5),
+                (KeyCode::PageDown, 10, 5),
+            ] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+                let mut chat = Chat::new(client, PaneKind::Chat);
+                let mut active = state();
+                active.scroll_offset = 30;
+                active.last_total_rows = 100;
+                active.last_inner_height = 10;
+                active.pinned_to_bottom = false;
+                active.pending_approval = Some(PendingApproval {
+                    tool_name: tool_name.into(),
+                    allow_always,
+                    scroll_offset: 10,
+                    ..approval()
+                });
+                chat.phase = ChatPhase::Active(Box::new(active));
+                chat.handle_key(KeyEvent::from(code), &mut key_term()).await;
+
+                let active = active_state(&mut chat);
+                assert_eq!(
+                    active.scroll_offset,
+                    if strict {
+                        30
+                    } else {
+                        (30_i16 + transcript_delta) as u16
+                    },
+                    "transcript route for {tool_name}, always={allow_always}, {code:?}"
+                );
+                assert_eq!(
+                    active.pending_approval().unwrap().scroll_offset,
+                    if strict {
+                        (10_i16 + approval_delta) as u16
+                    } else {
+                        10
+                    },
+                    "approval route for {tool_name}, always={allow_always}, {code:?}"
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "scrolling must not resolve approval"
+                );
+            }
+        }
+    }
+
     #[test]
     fn approval_overlay_uses_theme_background_after_clear() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -25007,7 +25133,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_approval_overlay_uses_content_height() {
+    fn ordinary_approval_overlay_preserves_its_fixed_height_and_footer() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut s = state();
@@ -25030,9 +25156,19 @@ mod tests {
         let top_border = (0..area.height)
             .find(|&y| (0..area.width).any(|x| terminal.backend().buffer()[(x, y)].symbol() == "┌"))
             .expect("approval overlay has a top border");
-        assert!(
-            top_border > area.height - APPROVAL_OVERLAY_MAX_HEIGHT,
-            "a short ordinary approval should not reserve the fixed maximum height"
+        assert_eq!(top_border, area.height - ORDINARY_APPROVAL_OVERLAY_HEIGHT);
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("a=Always"));
+        assert!(!rendered.contains("↑/↓"));
+        assert_eq!(
+            s.build_overlay_lines(100).len(),
+            ORDINARY_APPROVAL_OVERLAY_HEIGHT as usize
         );
     }
 
