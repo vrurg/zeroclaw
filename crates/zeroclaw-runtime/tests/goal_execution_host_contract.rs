@@ -36,6 +36,36 @@ struct RecordingDriver {
     execution_acquires: AtomicUsize,
 }
 
+struct LaunchRebindFailureDriver {
+    inner: Arc<RecordingDriver>,
+    refuse_bind: AtomicBool,
+}
+
+#[async_trait]
+impl GoalSessionDriver for LaunchRebindFailureDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.inner.session_key()
+    }
+
+    async fn bind(&self, ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        if self.refuse_bind.load(Ordering::SeqCst) {
+            anyhow::bail!("session binding revoked after acknowledgement");
+        }
+        self.inner.bind(ingress).await
+    }
+
+    async fn acquire_execution(
+        &self,
+        ingress: &GoalIngressContext,
+        scope: &GoalExecutionScope,
+        checkpoint: &GoalParentTurnCheckpoint,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        self.inner
+            .acquire_execution(ingress, scope, checkpoint)
+            .await
+    }
+}
+
 struct RecordingExecutionLease {
     session_key: GoalSessionKey,
     delivered: Arc<AtomicUsize>,
@@ -2485,6 +2515,111 @@ async fn supervisor_pauses_without_starting_when_the_surface_cannot_acknowledge(
     assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
     assert!(goal.pending_call_id.is_none());
     assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+}
+
+async fn assert_launch_rebind_failure_outcome(cancel_before_launch: bool) {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let settings = host_settings(true);
+        let directory = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let accounting_factory = Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                store.clone() as Arc<dyn GoalTaskRegistry>,
+                tracker,
+                "main",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        );
+        let supervisor =
+            GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting_factory)));
+        let inner = recording_driver(&ingress);
+        let driver = Arc::new(LaunchRebindFailureDriver {
+            inner: Arc::clone(&inner),
+            refuse_bind: AtomicBool::new(false),
+        });
+        let mut started = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the admitted task".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let task_id = match started.response() {
+            GoalResponse::Started(projection) => projection.task_id.clone(),
+            response => panic!("expected start response, got {response:?}"),
+        };
+        if cancel_before_launch {
+            let cancelled = supervisor
+                .submit(
+                    settings.clone(),
+                    ingress.clone(),
+                    recording_driver(&ingress),
+                    GoalCommand::Cancel,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(cancelled.response(), GoalResponse::Cancelled(_)));
+        }
+        driver.refuse_bind.store(true, Ordering::SeqCst);
+        let error = supervisor
+            .launch_after_response(settings, &mut started)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session binding revoked after acknowledgement"),
+            "the original bind error must be retained: {error:#}"
+        );
+        let session_id = ingress.session_key().durable_id();
+        let current = store
+            .current_goal_for_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, task_id);
+        let expected_status = if cancel_before_launch {
+            TaskStatus::Cancelled
+        } else {
+            TaskStatus::Failed
+        };
+        assert_eq!(current.status, expected_status);
+        let reason = store
+            .terminal_reason_for_session_goal(&task_id, &session_id)
+            .await
+            .unwrap();
+        if !cancel_before_launch {
+            assert_eq!(reason.as_deref(), Some("executor_start_failed"));
+        } else {
+            assert_ne!(reason.as_deref(), Some("executor_start_failed"));
+        }
+        assert_eq!(inner.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn launch_rebind_failure_settles_the_admitted_goal_before_returning() {
+    assert_launch_rebind_failure_outcome(false).await;
+}
+
+#[tokio::test]
+async fn launch_rebind_failure_preserves_a_competing_cancellation() {
+    assert_launch_rebind_failure_outcome(true).await;
 }
 
 #[tokio::test]
