@@ -1766,6 +1766,7 @@ mod tests {
                 submission: admitted,
                 scope: GoalExecutionScope::new("test-goal", key.durable_id(), 1).unwrap(),
                 resume_response: None,
+                initial_turn_kind: GoalParentTurnKind::Resume,
             }),
             lease: None,
         };
