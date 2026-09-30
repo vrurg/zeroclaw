@@ -9,9 +9,10 @@ use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
     channel::{Channel, ChannelMessage, SendMessage},
-    model_provider::{ChatMessage, ChatRequest},
+    model_provider::{ChatMessage, ChatRequest, ModelProvider},
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
+use zeroclaw_config::schema::Config;
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
@@ -38,7 +39,7 @@ use super::{
     build_channel_system_prompt_for_message_with_signal,
     callable_protocol_exposed_for_channel_turn, channel_ingress_context, find_channel_for_message,
     get_or_create_provider, get_route_selection, model_provider_entry_for_ref,
-    outbound_content_format_for_channel, runtime_defaults_from_config, runtime_defaults_snapshot,
+    outbound_content_format_for_channel, read_goal_canonical_history, runtime_defaults_snapshot,
     sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
@@ -52,9 +53,9 @@ struct MatrixGoalSessionDriver {
     route: String,
     message: ChannelMessage,
     /// The per-session lifecycle boundary is acquired before selecting a
-    /// resident supervisor. `bind` transfers it to the runtime submission so
-    /// selection, durable transition, worker launch, and retirement remain
-    /// one serialized operation.
+    /// resident supervisor. The first `bind` transfers it to submission;
+    /// subsequent bindings reacquire the same canonical lock after delivery
+    /// releases submission serialization for the launch handoff.
     command_lease: Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
 }
 
@@ -728,12 +729,19 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
         self.assert_ingress(ingress)?;
-        let guard = self
+        let admitted = self
             .command_lease
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .context("Matrix Goal command lease was already consumed")?;
+            .take();
+        let guard = match admitted {
+            Some(guard) => guard,
+            None => {
+                goal_command_lock(&self.context.persist_locks, &self.session_key.durable_id())
+                    .lock_owned()
+                    .await
+            }
+        };
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
@@ -790,14 +798,8 @@ impl MatrixGoalExecutionLease {
         }
     }
 
-    fn history(&self) -> Vec<ChatMessage> {
-        self.context
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .peek(&self.session_key.durable_id())
-            .cloned()
-            .unwrap_or_default()
+    fn history(&self) -> Result<(Vec<ChatMessage>, bool)> {
+        read_goal_canonical_history(self.context.as_ref(), &self.session_key.durable_id())
     }
 
     fn base_system_prompt(
@@ -862,7 +864,30 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 
     fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-        Ok(self.history())
+        Ok(self.history()?.0)
+    }
+
+    async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(error) {
+            return Ok(());
+        }
+        // These engine-handed errors arise outside provider calls. Preserve
+        // the ordinary safe error text, without a provider-transient hint
+        // that could hide the actual session or accounting failure.
+        let error_text = zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+            .map(|message| format!("⚠️ Error: {message}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "⚠️ Error: {}",
+                    zeroclaw_providers::sanitize_api_error(&error.to_string())
+                )
+            });
+        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
+            .context("Matrix Goal channel is no longer available")?;
+        channel
+            .send(&SendMessage::reply_to(&self.message, &error_text).suppress_voice())
+            .await
+            .context("publish Matrix Goal original execution error")
     }
 
     async fn append_resume_response(&mut self, response: String) -> Result<()> {
@@ -894,31 +919,47 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &self.session_key.durable_id(),
             &defaults,
         );
-        let provider = get_or_create_provider(
-            self.context.as_ref(),
-            &route.model_provider,
-            route.api_key.as_deref(),
-            &defaults,
-        )
-        .await?;
-        let input = goal_parent_turn_input(&turn);
-        let base_system_prompt = self.base_system_prompt(provider.as_ref(), &route);
-        let mut history = match turn.kind {
-            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
-                input.goal_start_transcript(&base_system_prompt, turn.working_history)?
-            }
-            GoalParentTurnKind::Continue => {
-                let mut history = turn.working_history;
-                input.refresh_goal_continuation(&base_system_prompt, &mut history)?;
-                history
+        let preparation = async {
+            let provider = get_or_create_provider(
+                self.context.as_ref(),
+                &route.model_provider,
+                route.api_key.as_deref(),
+                &defaults,
+            )
+            .await?;
+            let input = goal_parent_turn_input(&turn);
+            let base_system_prompt = self.base_system_prompt(provider.as_ref(), &route);
+            let history = match turn.kind {
+                GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
+                    input.goal_start_transcript(&base_system_prompt, turn.working_history)?
+                }
+                GoalParentTurnKind::Continue => {
+                    let mut history = turn.working_history;
+                    input.refresh_goal_continuation(&base_system_prompt, &mut history)?;
+                    history
+                }
+            };
+            ensure!(
+                self.pending_delivery.is_none() && self.pending_receipts.is_none(),
+                "Matrix Goal parent delivery was not settled before the next turn"
+            );
+            let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
+                .context("Matrix Goal channel is no longer available")?;
+            Ok::<_, anyhow::Error>((provider, history, Arc::clone(channel)))
+        }
+        .await;
+        let (provider, mut history, prepared_channel) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(channel) =
+                    find_channel_for_message(&self.context.channels_by_name, &self.message)
+                {
+                    publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+                }
+                return Err(error);
             }
         };
-        ensure!(
-            self.pending_delivery.is_none() && self.pending_receipts.is_none(),
-            "Matrix Goal parent delivery was not settled before the next turn"
-        );
-        let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
-            .context("Matrix Goal channel is no longer available")?;
+        let channel = &prepared_channel;
         let draft_stream = start_matrix_goal_draft_stream(
             self.context.as_ref(),
             &self.message,
@@ -1126,40 +1167,20 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     ) -> Result<GoalVerifierResult> {
         let result: Result<GoalVerifierResult> = async {
             let defaults = runtime_defaults_snapshot(self.context.as_ref());
-            let provider_ref = defaults.config.goal.verifier.model_provider.as_str();
-            let (provider_name, entry) =
-                model_provider_entry_for_ref(defaults.config.as_ref(), provider_ref)?;
-            let model = defaults.config.goal.verifier.model.as_deref().unwrap_or(
-                entry
-                    .model
-                    .as_deref()
-                    .context("Goal verifier has no model")?,
-            );
-            let verifier_defaults =
-                runtime_defaults_from_config(defaults.config.as_ref(), &provider_name)?;
-            let provider = get_or_create_provider(
-                self.context.as_ref(),
-                &provider_name,
-                entry.api_key.as_deref(),
-                &defaults,
-            )
-            .await?;
+            let (provider, route, temperature) =
+                matrix_goal_verifier_provider(defaults.config).await?;
             let messages = turn.to_chat_messages();
             let mut settled_attempts = Vec::new();
             let approval_manager = self.context.approval_manager.for_new_turn();
             let response = resolved_channel_execution(
                 self.context.as_ref(),
                 provider.as_ref(),
-                &ChannelRouteSelection {
-                    model_provider: provider_name,
-                    model: model.to_owned(),
-                    api_key: entry.api_key.clone(),
-                },
+                &route,
                 self.context.observer.as_ref(),
                 &approval_manager,
                 &LoopKnobs::default(),
                 &[],
-                verifier_defaults.temperature,
+                temperature,
             )
             .model_access
             .run_model_query(
@@ -1196,10 +1217,21 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
-        let delivery = self
+        let delivery = match self
             .pending_delivery
             .take()
-            .context("Matrix Goal parent output has no matching delivery session")?;
+            .context("Matrix Goal parent output has no matching delivery session")
+        {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                if let Some(channel) =
+                    find_channel_for_message(&self.context.channels_by_name, &self.message)
+                {
+                    publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
+                }
+                return Err(error);
+            }
+        };
         let channel = delivery.channel;
         let mut outbound_response = candidate;
         if let Some(hooks) = self.context.hooks.as_ref() {
@@ -1408,6 +1440,35 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 }
 
+async fn matrix_goal_verifier_provider(
+    config: Arc<Config>,
+) -> Result<(Box<dyn ModelProvider>, ChannelRouteSelection, Option<f64>)> {
+    let (provider_ref, entry) =
+        model_provider_entry_for_ref(&config, &config.goal.verifier.model_provider)?;
+    let api_key = entry.api_key.clone();
+    let temperature = entry.temperature;
+    // Reliable pins its primary model during construction. The ordinary worker
+    // cache cannot serve a verifier override on the same provider alias.
+    let (provider, model_provider, model, _resolver) = tokio::task::spawn_blocking(move || {
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            &config,
+            &provider_ref,
+            config.goal.verifier.model.as_deref(),
+        )
+    })
+    .await
+    .context("Goal verifier provider construction task failed")??;
+    Ok((
+        provider,
+        ChannelRouteSelection {
+            model_provider,
+            model,
+            api_key,
+        },
+        temperature,
+    ))
+}
+
 fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
     match reason {
         GoalFailureReason::AgentOperationFailed => "goal-mode-failure-agent-operation",
@@ -1427,6 +1488,219 @@ fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn matrix_goal_restores_cold_canonical_history_without_installing_cache() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let session_key = GoalSessionKey::matrix("matrix_goal_cold_fixture").unwrap();
+        let key = session_key.durable_id();
+        let rows = vec![
+            ChatMessage::assistant("Please choose an option."),
+            ChatMessage::user("Choose the first option."),
+        ];
+        for row in &rows {
+            store.append(&key, row).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&key, false).unwrap();
+        let context = super::super::test_channel_ctx_with_backend(store.clone());
+        let lease = MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context: context.clone(),
+            session_key,
+            message: ChannelMessage::new("event", "user", "room", "work", "matrix", 1),
+            pending_delivery: None,
+            pending_receipts: None,
+            history_has_trim_breadcrumb: false,
+        };
+        assert_eq!(
+            serde_json::to_value(lease.canonical_history().unwrap()).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert!(
+            context
+                .conversation_histories
+                .lock()
+                .unwrap()
+                .peek(&key)
+                .is_none()
+        );
+        assert!(
+            context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(&key)
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(store.try_load(&key).unwrap()).unwrap(),
+            serde_json::to_value(rows).unwrap()
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&key).unwrap(),
+            Some(false)
+        );
+    }
+
+    async fn assert_matrix_goal_verifier_wire_model(
+        alias_model: Option<&str>,
+        verifier_model: Option<&str>,
+        expected_model: &str,
+    ) {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::WireApi;
+        use zeroclaw_providers::dispatch::ProviderDispatch;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({"model": expected_model})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "verdict"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        config.goal.verifier.model_provider = "openai.verifier-test".into();
+        config.goal.verifier.model = verifier_model.map(str::to_owned);
+        let slot = config
+            .providers
+            .models
+            .ensure("openai", "verifier-test")
+            .unwrap();
+        slot.api_key = Some("test-key".into());
+        slot.uri = Some(server.uri());
+        slot.kind = Some("openai-compatible".into());
+        slot.wire_api = Some(WireApi::ChatCompletions);
+        slot.model = alias_model.map(str::to_owned);
+        slot.temperature = Some(0.2);
+        slot.live_pricing = false;
+        let (provider, route, temperature) = matrix_goal_verifier_provider(Arc::new(config))
+            .await
+            .unwrap();
+        assert_eq!(route.model_provider, "openai.verifier-test");
+        assert_eq!(route.model, expected_model);
+        assert_eq!(temperature, Some(0.2));
+        let messages = [ChatMessage::user("Verify the candidate.")];
+        let response = ProviderDispatch::from_ref(provider.as_ref())
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &route.model,
+                temperature,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("verdict"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_constructs_the_explicit_model_override() {
+        assert_matrix_goal_verifier_wire_model(
+            Some("goal-worker"),
+            Some("goal-verifier"),
+            "goal-verifier",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_uses_the_alias_default_without_override() {
+        assert_matrix_goal_verifier_wire_model(Some("goal-worker"), None, "goal-worker").await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_override_does_not_require_an_alias_default() {
+        assert_matrix_goal_verifier_wire_model(None, Some("goal-verifier"), "goal-verifier").await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_verifier_rejects_a_missing_model_without_override() {
+        let mut config = Config::default();
+        config.goal.verifier.model_provider = "openai.verifier-test".into();
+        config.goal.verifier.model = None;
+        config
+            .providers
+            .models
+            .ensure("openai", "verifier-test")
+            .unwrap()
+            .model = None;
+        let error = match matrix_goal_verifier_provider(Arc::new(config)).await {
+            Ok(_) => panic!("a missing verifier model must fail construction"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no `model` configured"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_rebinds_the_canonical_command_lock_after_delivery() {
+        let context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        let key = "matrix_goal_binding_test";
+        let lock = goal_command_lock(&context.persist_locks, key);
+        let message = ChannelMessage::new("event", "sender", "room", "/goal start", "matrix", 1);
+        let driver = MatrixGoalSessionDriver::new(
+            context,
+            key.into(),
+            "sender".into(),
+            "matrix:test:room".into(),
+            message,
+            lock.clone().lock_owned().await,
+        )
+        .unwrap();
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "sender".into(),
+            },
+        )
+        .unwrap();
+        let first = driver.bind(&ingress).await.unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(first);
+        let intervening = lock.clone().lock_owned().await;
+        let mut next = Box::pin(driver.bind(&ingress));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut next)
+                .await
+                .is_err(),
+            "the launch binding must wait for competing command serialization"
+        );
+        drop(intervening);
+        let rebound = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(rebound);
+        assert!(lock.try_lock().is_ok());
+        let stale = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "other-sender".into(),
+            },
+        )
+        .unwrap();
+        assert!(driver.bind(&stale).await.is_err());
+    }
 
     #[test]
     fn every_goal_failure_reason_uses_a_fluent_key() {
@@ -1468,6 +1742,7 @@ mod tests {
     #[derive(Default)]
     struct MatrixGoalErrorRecordingChannel {
         messages: tokio::sync::Mutex<Vec<String>>,
+        fail_sends: bool,
     }
 
     impl zeroclaw_api::attribution::Attributable for MatrixGoalErrorRecordingChannel {
@@ -1488,6 +1763,9 @@ mod tests {
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.messages.lock().await.push(message.content.clone());
+            if self.fail_sends {
+                bail!("synthetic Matrix delivery failure");
+            }
             Ok(())
         }
 
@@ -1580,6 +1858,193 @@ mod tests {
         publish_matrix_goal_core_error(&channel, &message, &error).await;
 
         assert_eq!(channel.messages.lock().await.as_slice(), [expected]);
+    }
+
+    async fn matrix_original_error_lease(
+        channel: Arc<MatrixGoalErrorRecordingChannel>,
+    ) -> MatrixGoalExecutionLease {
+        let mut context =
+            super::super::test_channel_ctx_with_backend(Arc::new(FailingAppendSessionBackend));
+        Arc::get_mut(&mut context).unwrap().channels_by_name = Arc::new(
+            std::collections::HashMap::from([("matrix".into(), channel as Arc<dyn Channel>)]),
+        );
+        MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context,
+            session_key: GoalSessionKey::matrix("matrix_goal_error_fixture").unwrap(),
+            message: ChannelMessage::new(
+                "fixture-event",
+                "fixture-user",
+                "fixture-room",
+                "work",
+                "matrix",
+                1,
+            ),
+            pending_delivery: None,
+            pending_receipts: None,
+            history_has_trim_breadcrumb: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_unavailable_error_is_not_a_provider_hint() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let error = anyhow::Error::msg("Goal canonical transcript is unavailable");
+        lease.publish_goal_core_error(&error).await.unwrap();
+        assert_eq!(
+            channel.messages.lock().await.as_slice(),
+            ["⚠️ Error: Goal canonical transcript is unavailable",]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_error_uses_existing_secret_scrub() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let secret = "sk-fixturecredential012345678901234567890123456789";
+        let error = anyhow::Error::msg(format!("Goal persistence failed with credential {secret}"));
+        let safe = zeroclaw_providers::sanitize_api_error(&error.to_string());
+        assert!(
+            !safe.contains(secret),
+            "fixture must exercise an actual scrub rule"
+        );
+        lease.publish_goal_core_error(&error).await.unwrap();
+        assert_eq!(
+            channel.messages.lock().await.as_slice(),
+            [format!("⚠️ Error: {safe}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_tool_loop_cancellation_is_not_sent() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let error = anyhow::Error::new(zeroclaw_runtime::agent::loop_::ToolLoopCancelled);
+        lease.publish_goal_core_error(&error).await.unwrap();
+        assert!(channel.messages.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_typed_terminal_cause_precedes_outer_hint() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+        let expected =
+            zeroclaw_runtime::agent::terminal_completion_error_message(&error, None).unwrap();
+        lease.publish_goal_core_error(&error).await.unwrap();
+        assert_eq!(
+            channel.messages.lock().await.as_slice(),
+            [format!("⚠️ Error: {expected}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_error_reports_delivery_failure() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel {
+            fail_sends: true,
+            ..Default::default()
+        });
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let error = anyhow::Error::msg("Goal canonical transcript is unavailable");
+        let failure = lease.publish_goal_core_error(&error).await.unwrap_err();
+        assert!(format!("{failure:#}").contains("synthetic Matrix delivery failure"));
+        assert_eq!(
+            channel.messages.lock().await.as_slice(),
+            ["⚠️ Error: Goal canonical transcript is unavailable",]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_missing_candidate_delivery_is_rendered() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let error = lease
+            .append_parent_candidate("candidate".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Matrix Goal parent output has no matching delivery session"
+        );
+        let expected = matrix_goal_core_error_text(&error).unwrap();
+        assert_eq!(channel.messages.lock().await.as_slice(), [expected]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_parent_assembly_error_is_rendered() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("fixture-task", lease.session_key.durable_id(), 1).unwrap(),
+        );
+        let error = lease
+            .run_parent_turn(
+                &operation,
+                GoalParentTurn {
+                    kind: GoalParentTurnKind::Start,
+                    objective: "finish the admitted task".into(),
+                    working_history: vec![ChatMessage::system("invalid canonical prefix")],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Goal turn assembly: canonical prefix contains a system row"
+        );
+        let expected = matrix_goal_core_error_text(&error).unwrap();
+        assert_eq!(channel.messages.lock().await.as_slice(), [expected]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_provider_construction_error_is_rendered() {
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut lease = matrix_original_error_lease(channel.clone()).await;
+        lease.context.route_overrides.lock().unwrap().insert(
+            lease.session_key.durable_id(),
+            ChannelRouteSelection {
+                model_provider: "unknown-fixture-provider.missing".into(),
+                model: "fixture-model".into(),
+                api_key: None,
+            },
+        );
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("fixture-task", lease.session_key.durable_id(), 1).unwrap(),
+        );
+        let error = lease
+            .run_parent_turn(
+                &operation,
+                GoalParentTurn {
+                    kind: GoalParentTurnKind::Start,
+                    objective: "finish the admitted task".into(),
+                    working_history: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown-fixture-provider"));
+        let expected = matrix_goal_core_error_text(&error).unwrap();
+        assert_eq!(channel.messages.lock().await.as_slice(), [expected]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_original_error_fix_does_not_change_ordinary_503_hint() {
+        let channel = MatrixGoalErrorRecordingChannel::default();
+        let message = ChannelMessage::new(
+            "fixture-event",
+            "fixture-user",
+            "fixture-room",
+            "work",
+            "matrix",
+            1,
+        );
+        let error = anyhow::Error::msg("HTTP 503 unavailable");
+        let hint = zeroclaw_providers::reliable::transient_error_hint(&error).unwrap();
+        publish_matrix_goal_core_error(&channel, &message, &error).await;
+        assert_eq!(channel.messages.lock().await.as_slice(), [hint]);
     }
 
     #[tokio::test]
