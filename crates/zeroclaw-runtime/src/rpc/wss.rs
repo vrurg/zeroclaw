@@ -4970,6 +4970,110 @@ mod accept_error_tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn active_goal_preserves_question_and_multiline_resume_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_preserves_question_and_multiline_resume_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn active_goal_preserves_answer_equal_to_objective_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_preserves_answer_equal_to_objective_over_wss",
+            crate::rpc::goal_transport_test_support::ANSWER,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Answered,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn active_goal_preserves_plain_resume_without_answer_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_preserves_plain_resume_without_answer_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::PlainThenAnswered,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn active_goal_preserves_user_prefix_equal_to_objective_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_preserves_user_prefix_equal_to_objective_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::PrefixMatchesObjective,
+        ).await;
+    }
+
+    async fn active_goal_wss_fixture(
+        test_name: &str,
+        objective: &str,
+        scenario: crate::rpc::goal_transport_test_support::ResumeScenario,
+    ) {
+        use crate::rpc::goal_transport_test_support::{
+            ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
+            run_isolated,
+        };
+
+        if run_isolated(test_name).await {
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = ActiveGoalFixture::new(tmp.path()).await;
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
+        let key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(&ca, &key, "goal-test-client").unwrap();
+        let acceptor = super::build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server_context = Arc::clone(&fixture.context);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(super::serve_wss_listener(
+            server_context,
+            server_cancel,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acceptor,
+            listener,
+            super::WssLimits::default()
+        ));
+        let connector = test_client_connector(&client.cert_pem, &client.key_pem);
+        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            format!("wss://{addr}/"),
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        .unwrap();
+        let mut transport = GoalTestTransport::Wss(socket);
+        assert_active_goal_scenario_with_objective(
+            &fixture,
+            &mut transport,
+            true,
+            objective,
+            scenario,
+        )
+        .await;
+        drop(transport);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(8), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     /// When the retiring generation releases its cleanup, relative to the
     /// listener's forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`).
     #[derive(Clone, Copy, PartialEq, Eq)]
