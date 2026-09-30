@@ -8708,6 +8708,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_goal_cold_breadcrumb_provenance_survives_context_recovery() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let session_key = GoalSessionKey::matrix("matrix_goal_cold_recovery_fixture").unwrap();
+        let key = session_key.durable_id();
+        let breadcrumb = zeroclaw_runtime::agent::history_trim::breadcrumb();
+        let rows = vec![
+            breadcrumb.clone(),
+            ChatMessage::user("old ".repeat(20_000)),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent response"),
+            ChatMessage::user("continue the repair"),
+        ];
+        for row in &rows {
+            store.append(&key, row).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&key, true).unwrap();
+        let provider = Arc::new(RecoveryRecordingProvider::default());
+        let context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            store.clone(),
+            Arc::new(MatrixGoalErrorRecordingChannel::default()),
+            provider.clone(),
+            0,
+        );
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("goal-cold-recovery-fixture", key.clone(), 1).unwrap(),
+        );
+        let mut lease = MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context,
+            session_key,
+            message: ChannelMessage::new("event", "user", "room", "work", "matrix", 1),
+            pending_delivery: None,
+            pending_receipts: None,
+            pending_route: None,
+            pending_fallback: None,
+            history_has_trim_breadcrumb: false,
+        };
+        let captured = lease.take_canonical_history().unwrap();
+        assert!(lease.history_has_trim_breadcrumb);
+        assert_eq!(
+            serde_json::to_value(&captured).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert!(
+            lease
+                .context
+                .conversation_histories
+                .lock()
+                .unwrap()
+                .peek(&key)
+                .is_none()
+        );
+        assert!(
+            lease
+                .context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(&key)
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(store.try_load(&key).unwrap()).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        assert_eq!(store.get_session_trim_breadcrumb(&key).unwrap(), Some(true));
+
+        let result = lease
+            .run_parent_turn(
+                &operation,
+                GoalParentTurn {
+                    kind: GoalParentTurnKind::Start,
+                    objective: "bounded repair".to_owned(),
+                    working_history: captured,
+                },
+            )
+            .await
+            .expect("restored ownership must survive ordinary context recovery");
+        let history = result.working_history();
+        assert!(lease.history_has_trim_breadcrumb);
+        assert_eq!(history[1].content, breadcrumb.content);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|row| row.content == breadcrumb.content)
+                .count(),
+            1
+        );
+        assert!(!history.iter().any(|row| row.content == rows[1].content));
+        assert_eq!(result.candidate(), "candidate after recovery");
+        assert_eq!(history.last().unwrap().role, "user");
+        assert_eq!(
+            history.last().unwrap().content,
+            rows.last().unwrap().content
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].iter().any(|row| row.content == rows[1].content));
+        assert!(!requests[1].iter().any(|row| row.content == rows[1].content));
+        for request in requests.iter() {
+            assert_eq!(request[1].content, breadcrumb.content);
+            assert_eq!(
+                request
+                    .iter()
+                    .filter(|row| row.content == breadcrumb.content)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(store.try_load(&key).unwrap()).unwrap(),
+            serde_json::to_value(rows).unwrap()
+        );
+        assert_eq!(store.get_session_trim_breadcrumb(&key).unwrap(), Some(true));
+    }
+
+    #[tokio::test]
     async fn matrix_goal_keeps_one_breadcrumb_across_two_continuation_recoveries() {
         let provider = Arc::new(RecoveryRecordingProvider::default());
         let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
