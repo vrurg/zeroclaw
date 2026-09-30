@@ -375,9 +375,9 @@ mod tests {
         assert_eq!(body["params"]["arguments_summary"], summary);
         assert_eq!(body["params"]["allow_always"], false);
         let id = body["params"]["request_id"].as_str().expect("request ID");
-        assert!(!pending.resolve(id, ChannelApprovalResponse::AlwaysApprove));
+        assert!(!pending.resolve(id, "sess-1", ChannelApprovalResponse::AlwaysApprove));
         assert!(pending.contains(id));
-        assert!(pending.resolve(id, ChannelApprovalResponse::Approve));
+        assert!(pending.resolve(id, "sess-1", ChannelApprovalResponse::Approve));
         let response = task
             .await
             .expect("approval task")
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(v["params"]["tool_name"], "shell");
 
         let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
-        pending_for_resolve.resolve(&request_id, ChannelApprovalResponse::Approve);
+        pending_for_resolve.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve);
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
@@ -451,7 +451,7 @@ mod tests {
             "timed-out approval request must be removed from the pending map"
         );
         assert!(
-            !pending.resolve(&request_id, ChannelApprovalResponse::Approve),
+            !pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve),
             "late approval after timeout must be a no-op"
         );
     }
