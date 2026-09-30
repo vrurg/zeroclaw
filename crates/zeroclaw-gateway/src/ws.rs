@@ -5362,11 +5362,12 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             appended: std::sync::Mutex::new(Vec::new()),
         };
         let messages = vec![
+            ChatMessage::user("set task"),
             ChatMessage::assistant(format!(
                 "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{marker}\"}}}}</tool_call>"
             )),
             ChatMessage::user(format!(
-                "[Tool results]\\n<tool_result name=\"session_prompt_set\">stored {marker}</tool_result>"
+                "[Tool results]\n<tool_result name=\"session_prompt_set\">stored {marker}</tool_result>"
             )),
             ChatMessage::assistant("done"),
         ];
@@ -5380,22 +5381,28 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         ));
 
         let appended = backend.appended.lock().unwrap();
-        assert_eq!(appended.len(), 3);
-        assert_eq!(
-            appended[0].content,
-            "[Session-prompt tool exchange omitted from export]"
-        );
+        assert_eq!(appended.len(), 4);
+        assert_eq!(appended[0].content, "set task");
         assert_eq!(
             appended[1].content,
             "[Session-prompt tool exchange omitted from export]"
         );
-        assert_eq!(appended[2].content, "done");
+        assert_eq!(
+            appended[2].content,
+            "[Tool results]\n[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(appended[3].content, "done");
         assert!(
             appended
                 .iter()
                 .all(|message| !message.content.contains(marker)),
             "retained transcripts must not include opaque session-prompt bodies"
         );
+        let replayed =
+            zeroclaw_runtime::agent::history_trim::trim_to_recent_turns(appended.clone(), 1);
+        assert_eq!(replayed.kept_turns, 1);
+        assert!(!replayed.trimmed);
+        assert_eq!(replayed.history[0].content, "set task");
     }
 
     #[test]

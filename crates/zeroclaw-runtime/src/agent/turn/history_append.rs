@@ -5,7 +5,8 @@
 use zeroclaw_providers::{ChatMessage, ToolCall};
 
 use super::results_collect::CollectedToolResult;
-use crate::agent::prompt::SESSION_PROMPT_HISTORY_RESULT_KEY;
+use crate::agent::history_trim::TOOL_RESULTS_PREFIX;
+use crate::agent::prompt::{SESSION_PROMPT_HISTORY_RESULT_KEY, SESSION_PROMPT_TEXT_RESULT_MARKER};
 
 pub(crate) fn append_tool_round_to_history(
     history: &mut Vec<ChatMessage>,
@@ -30,20 +31,18 @@ pub(crate) fn append_tool_round_to_history(
                 ));
             }
         } else {
-            let content = format!("[Tool results]\n{tool_results}");
-            let content = if individual_results
+            let sensitive = individual_results
                 .iter()
-                .any(|result| result.sensitive_session_prompt)
-            {
-                // The host owns this result envelope. Keep the provider's full
-                // explicit result, but carry executed-identity sensitivity to
-                // every later export even when the assistant named another tool.
-                let mut envelope = serde_json::json!({"content": content});
-                envelope[SESSION_PROMPT_HISTORY_RESULT_KEY] = serde_json::json!(true);
-                envelope.to_string()
+                .any(|result| result.sensitive_session_prompt);
+            // Preserve the canonical prefix used by turn trimming, provider
+            // windows and multimodal consumers. A JSON wrapper would turn this
+            // result into a false user-turn boundary and detach its provenance.
+            let marker = if sensitive {
+                SESSION_PROMPT_TEXT_RESULT_MARKER
             } else {
-                content
+                "\n"
             };
+            let content = format!("{TOOL_RESULTS_PREFIX}{marker}{tool_results}");
             history.push(ChatMessage::user(content));
         }
     } else {
@@ -170,5 +169,59 @@ mod tests {
             assert_eq!(exported.role, original.role);
             assert_eq!(exported.content, original.content);
         }
+    }
+
+    #[test]
+    fn session_prompt_text_result_survives_whole_turn_trim_and_slice_export() {
+        let marker = "synthetic-trim-private-prompt";
+        let mut history = vec![
+            ChatMessage::system("host"),
+            ChatMessage::user("older turn"),
+            ChatMessage::assistant("older answer"),
+            ChatMessage::user("current turn"),
+        ];
+        append_tool_round_to_history(
+            &mut history,
+            r#"{"tool_calls":[{"name":"ordinary_tool","arguments":{}}]}"#.into(),
+            &[],
+            &[CollectedToolResult {
+                tool_call_id: None,
+                output: marker.into(),
+                sensitive_session_prompt: true,
+            }],
+            marker,
+            false,
+        );
+        let trimmed = crate::agent::history_trim::trim_to_recent_turns(history, 1);
+        assert_eq!(trimmed.dropped_turns, 1);
+        assert_eq!(trimmed.kept_turns, 1);
+        assert_eq!(trimmed.history[1].content, "current turn");
+        assert_eq!(trimmed.history.len(), 4);
+        let result = trimmed.history.last().unwrap();
+        assert!(result.content.starts_with("[Tool results]"));
+        assert!(result.content.contains(marker));
+        for slice in [trimmed.history.as_slice(), std::slice::from_ref(result)] {
+            let exported = redact_session_prompt_tool_exchanges_for_export(slice);
+            assert!(exported.iter().all(|row| !row.content.contains(marker)));
+        }
+        // Durable replay and the owner's user-role trim breadcrumb must not
+        // discard or reinterpret the carried sensitivity fact.
+        let serialized = serde_json::to_string(&trimmed.history).unwrap();
+        let mut restored: Vec<ChatMessage> = serde_json::from_str(&serialized).unwrap();
+        restored.insert(1, ChatMessage::user("older history was trimmed"));
+        let exported = redact_session_prompt_tool_exchanges_for_export(&restored);
+        assert!(exported.iter().all(|row| !row.content.contains(marker)));
+        assert_eq!(exported[1].content, "older history was trimmed");
+        assert_eq!(exported[2].content, "current turn");
+        let persisted = serde_json::to_string(&exported).unwrap();
+        let replayed: Vec<ChatMessage> = serde_json::from_str(&persisted).unwrap();
+        let replayed =
+            crate::agent::history_trim::trim_to_recent_turns_with_crumb(replayed, 1, true);
+        assert_eq!(replayed.kept_turns, 1);
+        assert!(
+            !replayed.trimmed,
+            "the hidden result is not a new user turn"
+        );
+        assert_eq!(replayed.history[2].content, "current turn");
     }
 }

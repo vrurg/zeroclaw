@@ -213,6 +213,11 @@ The host result envelope carries sensitivity from the final executed tool
 identity, so export redaction also covers a hook-rewritten prompt call whose
 original model envelope named an ordinary tool. Provider history retains its
 explicit result; retained and generic export copies do not.
+Text-mode results retain the existing `[Tool results]` prefix for whole-turn
+selection and carry a reserved sensitivity marker inside that host carrier.
+Redaction does not require the preceding call to remain in a sliced history.
+Redacted transcript carriers keep that prefix too, so replay and later trimming
+still treat the hidden result as part of its original turn.
 
 ## What this page does not own
 

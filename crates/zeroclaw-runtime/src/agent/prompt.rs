@@ -105,6 +105,8 @@ const SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER: &str =
     "[Session-prompt tool exchange omitted from export]";
 /// Reserved host result-envelope metadata, derived from the executed identity.
 pub(crate) const SESSION_PROMPT_HISTORY_RESULT_KEY: &str = "session_prompt_tool_result";
+/// Reserved metadata inside the existing host-authored text-result carrier.
+pub(crate) const SESSION_PROMPT_TEXT_RESULT_MARKER: &str = "\n[Session-prompt tool result]\n";
 
 /// Return an observability-safe view of a host system prompt.
 ///
@@ -136,7 +138,6 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     // next-turn input and must not be swallowed by export redaction.
     let mut redact_native_tool_results = false;
     let mut redact_text_protocol_result = false;
-    let mut host_text_result_pending = false;
     let mut exported: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     let mut assistant_index: Option<usize> = None;
     for message in messages {
@@ -144,8 +145,7 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
             && session_prompt_tool_call_envelope_mentioned(&message.content);
         let is_native_result = message.role == "tool";
         let is_text_protocol_result = message.role == "user";
-        let host_marked_result = (is_native_result
-            || (is_text_protocol_result && host_text_result_pending))
+        let host_marked_native_result = is_native_result
             && serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|value| {
                 value
                     .get(SESSION_PROMPT_HISTORY_RESULT_KEY)
@@ -154,10 +154,17 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                     && value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .is_some_and(|content| {
-                            is_native_result || content.starts_with("[Tool results]")
-                        })
+                        .is_some()
             });
+        // Keep sensitivity on the carrier itself: whole-turn selection and
+        // partial export must not depend on a preceding assistant surviving.
+        // This is reserved host protocol, not a flag in arbitrary user JSON.
+        let host_marked_text_result = is_text_protocol_result
+            && message
+                .content
+                .strip_prefix(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
+                .is_some_and(|body| body.starts_with(SESSION_PROMPT_TEXT_RESULT_MARKER));
+        let host_marked_result = host_marked_native_result || host_marked_text_result;
         let has_text_protocol_result_prefix =
             is_text_protocol_result && message.content.starts_with("[Tool results]");
         let redact = host_marked_result
@@ -175,10 +182,6 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
 
         if message.role == "assistant" {
             assistant_index = Some(exported.len());
-            // This only binds the host's text-result carrier to an
-            // accepted call round; sensitivity comes from the result flag,
-            // not from the model's choice of tool name.
-            host_text_result_pending = !parse_tool_calls(&message.content).1.is_empty();
             // The result record is the authoritative execution-mode
             // evidence at this export boundary. A native-capable provider
             // can fall back to tagged text calls yet still append `tool`
@@ -192,22 +195,30 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
             // following native results.
             redact_text_protocol_result = is_sensitive_call;
         } else if is_native_result {
-            host_text_result_pending = false;
             // Native results prove that the text-protocol result cannot
             // follow this call. Consume its pending state so a later
             // genuine user message beginning `[Tool results]` remains
             // ordinary user input at export boundaries.
             redact_text_protocol_result = false;
         } else if message.role == "user" {
-            host_text_result_pending = false;
             redact_text_protocol_result = false;
             assistant_index = None;
         }
 
         let projected = if redact {
+            let content = if has_text_protocol_result_prefix {
+                // Retained transcripts may be replayed and trimmed again.
+                // Redaction removes opaque text, not the carrier's turn role.
+                format!(
+                    "{}\n{SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER}",
+                    crate::agent::history_trim::TOOL_RESULTS_PREFIX
+                )
+            } else {
+                SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string()
+            };
             ChatMessage {
                 role: message.role.clone(),
-                content: SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string(),
+                content,
             }
         } else if message.role == "system" {
             ChatMessage {
@@ -2295,7 +2306,7 @@ mod tests {
         );
         assert_eq!(
             export[1].content,
-            SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
+            format!("[Tool results]\n{SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER}")
         );
         assert_eq!(export[2].content, "ordinary next-turn input");
         assert_eq!(
