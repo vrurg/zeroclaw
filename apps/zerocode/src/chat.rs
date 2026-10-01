@@ -41,10 +41,11 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
-// The approval body scrolls while its decision footer stays visible. Reserve
+// The strict approval body scrolls while its decision footer stays visible. Reserve
 // its largest supported footprint in the transcript so the full binding never
 // obscures conversation content beneath the modal.
 const APPROVAL_OVERLAY_MAX_HEIGHT: u16 = 16;
+// Ordinary approvals retain the existing compact, non-scrolling presentation.
 const ORDINARY_APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 
 /// How often the cwd line re-polls the daemon for the current git branch.
@@ -8056,30 +8057,29 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Only required session-prompt previews own a scrollable body. Ordinary
     // approvals keep their existing footprint and transcript navigation.
-    let overlay_columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(5),
-            Constraint::Min(60),
-            Constraint::Percentage(5),
-        ])
-        .split(Rect::new(area.x, area.y, area.width, 1));
-    let estimated_inner_width = overlay_columns[1].width.saturating_sub(2).max(1);
-    let estimated_footer_height = Paragraph::new(footer.as_str())
-        .wrap(Wrap { trim: true })
-        .line_count(estimated_inner_width)
-        .max(1) as u16;
-    let content_height = Paragraph::new(text.as_str())
-        .wrap(Wrap { trim: true })
-        .line_count(estimated_inner_width) as u16;
-    let desired_height = content_height
-        .saturating_add(estimated_footer_height)
-        .saturating_add(2);
-
-    // Anchor to the bottom of the given area. The action footer remains visible
-    // while a long exact approval binding scrolls in the body above it.
-    let max_height = area.height.saturating_sub(2).max(3);
+    // Anchor both presentations to the bottom of the given area. Strict
+    // approvals keep their action footer visible above a scrollable binding.
     let overlay_height = if pa.is_strict_session_prompt() {
+        let overlay_columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(5),
+                Constraint::Min(60),
+                Constraint::Percentage(5),
+            ])
+            .split(Rect::new(area.x, area.y, area.width, 1));
+        let estimated_inner_width = overlay_columns[1].width.saturating_sub(2).max(1);
+        let estimated_footer_height = Paragraph::new(footer.as_str())
+            .wrap(Wrap { trim: true })
+            .line_count(estimated_inner_width)
+            .max(1) as u16;
+        let content_height = Paragraph::new(text.as_str())
+            .wrap(Wrap { trim: true })
+            .line_count(estimated_inner_width) as u16;
+        let desired_height = content_height
+            .saturating_add(estimated_footer_height)
+            .saturating_add(2);
+        let max_height = area.height.saturating_sub(2).max(3);
         desired_height
             .clamp(3, APPROVAL_OVERLAY_MAX_HEIGHT)
             .min(max_height)
@@ -9044,12 +9044,11 @@ pub struct PendingApproval {
 }
 
 impl PendingApproval {
+    // The tool family identifies the strict preview format, while the daemon
+    // marker excludes disabled-policy prompts and unrelated ordinary approvals.
     fn is_strict_session_prompt(&self) -> bool {
         !self.allow_always
-            && matches!(
-                self.tool_name.as_str(),
-                "session_prompt_set" | "session_prompt_delete"
-            )
+            && zeroclaw_api::SESSION_PROMPT_MUTATION_TOOL_NAMES.contains(&self.tool_name.as_str())
     }
 
     fn reserved_height(&self) -> u16 {
@@ -15932,7 +15931,7 @@ mod tests {
             slice.len()
         );
         assert!(
-            local_scroll < height + APPROVAL_OVERLAY_MAX_HEIGHT,
+            local_scroll < height + ORDINARY_APPROVAL_OVERLAY_HEIGHT,
             "local scroll ({local_scroll}) must land inside the visible window"
         );
     }
