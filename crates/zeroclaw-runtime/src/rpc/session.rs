@@ -222,6 +222,7 @@ impl ResumeExistingError {
 /// canonical session store, not a second session registry.
 pub(crate) struct GoalSessionSnapshot {
     pub(crate) agent: Arc<Mutex<Agent>>,
+    pub(crate) reaction_channels: crate::tools::PerToolChannelHandle,
     pub(crate) agent_alias: String,
     pub(crate) chat_mode: crate::rpc::types::ChatMode,
     pub(crate) owner_tui_id: Option<String>,
@@ -1119,6 +1120,7 @@ impl SessionStore {
             .get(id)
             .map(|session| GoalSessionSnapshot {
                 agent: Arc::clone(&session.agent),
+                reaction_channels: Arc::clone(&session.reaction_channels),
                 agent_alias: session.agent_alias.clone(),
                 chat_mode: session.chat_mode.clone(),
                 owner_tui_id: session.owner_tui_id.clone(),
@@ -3579,6 +3581,10 @@ mod tests {
         assert_eq!(first.agent_alias, "first");
         assert_eq!(first.owner_tui_id.as_deref(), Some("tui-first"));
         assert_eq!(first.chat_mode, ChatMode::Chat);
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &first.agent.lock().await.channel_handles().reaction,
+        ));
 
         let first_goal_command = Arc::clone(&first.goal_command);
         let reattached = store
@@ -3589,6 +3595,10 @@ mod tests {
             Arc::ptr_eq(&first_goal_command, &reattached.goal_command),
             "same live session must retain its Goal command lock"
         );
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &reattached.reaction_channels,
+        ));
 
         store
             .insert(
@@ -3606,6 +3616,10 @@ mod tests {
         assert_eq!(second.agent_alias, "second");
         assert_eq!(second.owner_tui_id.as_deref(), Some("tui-second"));
         assert_eq!(second.chat_mode, ChatMode::Acp);
+        assert!(!Arc::ptr_eq(
+            &first.reaction_channels,
+            &second.reaction_channels,
+        ));
         assert!(
             !Arc::ptr_eq(&first_goal_command, &second.goal_command),
             "same-ID replacement must receive a fresh Goal command lock"

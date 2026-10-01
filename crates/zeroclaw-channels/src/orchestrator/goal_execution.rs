@@ -899,6 +899,9 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             pending_receipts: None,
             pending_route: None,
             pending_fallback: None,
+            // Placeholder until take_canonical_history captures the prefix and
+            // provenance together. A resume answer may hydrate or trim history
+            // after lease construction, so resolving provenance here is too early.
             history_has_trim_breadcrumb: false,
         }))
     }
@@ -1047,6 +1050,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .send(&SendMessage::reply_to(&self.message, &error_text).suppress_voice())
             .await
             .context("publish Matrix Goal original execution error")
+    }
+
+    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
+        let (history, history_has_trim_breadcrumb) = self.history()?;
+        self.history_has_trim_breadcrumb = history_has_trim_breadcrumb;
+        Ok(history)
     }
 
     async fn append_resume_response(&mut self, response: String) -> Result<()> {
@@ -2224,6 +2233,99 @@ mod tests {
         assert!(request.get("tools").is_none());
         assert!(request.get("reasoning_effort").is_none());
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_captures_provenance_after_answered_resume() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        for (cap, initial_owned, duplicate, expected_owned) in [
+            (3, true, false, true),
+            (2, true, false, false),
+            (3, false, false, false),
+            (3, true, true, false),
+            (4, true, true, true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            let session_key = GoalSessionKey::matrix("matrix_goal_capture_fixture").unwrap();
+            let key = session_key.durable_id();
+            let mut rows = vec![
+                ChatMessage::user(
+                    zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL,
+                ),
+                ChatMessage::assistant("Please choose an option."),
+            ];
+            if duplicate {
+                rows.insert(
+                    1,
+                    ChatMessage::user(
+                        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL,
+                    ),
+                );
+            }
+            for row in &rows {
+                store.append(&key, row).unwrap();
+            }
+            store
+                .set_session_trim_breadcrumb(&key, initial_owned)
+                .unwrap();
+            let mut context = super::super::test_channel_ctx_with_backend(store.clone());
+            let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+            config.resolved.max_history_messages = cap;
+            Arc::get_mut(&mut context).unwrap().agent_cfg = Arc::new(config);
+            let mut lease = MatrixGoalExecutionLease {
+                _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                context,
+                session_key,
+                message: ChannelMessage::new("event", "user", "room", "work", "matrix", 1),
+                pending_delivery: None,
+                pending_receipts: None,
+                pending_route: None,
+                pending_fallback: None,
+                history_has_trim_breadcrumb: false,
+            };
+            let response = "Choose the first option.\nKeep this second line.";
+            lease.append_resume_response(response.into()).await.unwrap();
+            rows.push(ChatMessage::user(response));
+            let captured = lease.take_canonical_history().unwrap();
+            assert_eq!(
+                serde_json::to_value(captured).unwrap(),
+                serde_json::to_value(&rows[rows.len().saturating_sub(cap)..]).unwrap()
+            );
+            assert_eq!(
+                lease.history_has_trim_breadcrumb, expected_owned,
+                "provenance must describe the captured post-append prefix"
+            );
+            assert_eq!(
+                serde_json::to_value(store.try_load(&key).unwrap()).unwrap(),
+                serde_json::to_value(&rows).unwrap()
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb(&key).unwrap(),
+                Some(initial_owned),
+                "cache eviction must not rewrite durable provenance"
+            );
+
+            // A later ordinary append on the same key may evict the owned
+            // first row. The next capture must replace the previous flag,
+            // including when an identical user row is now at the front.
+            lease
+                .append_resume_response("A later answer.".into())
+                .await
+                .unwrap();
+            rows.push(ChatMessage::user("A later answer."));
+            let captured = lease.take_canonical_history().unwrap();
+            assert_eq!(
+                serde_json::to_value(captured).unwrap(),
+                serde_json::to_value(&rows[rows.len().saturating_sub(cap)..]).unwrap()
+            );
+            assert!(!lease.history_has_trim_breadcrumb);
+            assert_eq!(
+                serde_json::to_value(store.try_load(&key).unwrap()).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+        }
     }
 
     async fn assert_matrix_goal_verifier_wire_model(
