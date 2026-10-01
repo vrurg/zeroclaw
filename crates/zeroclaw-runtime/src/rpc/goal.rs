@@ -170,7 +170,7 @@ impl RpcGoalCommandSubmission {
 /// The immutable, trusted ZeroCode binding for one Goal admission.
 pub struct ZeroCodeGoalSessionDriver {
     context: Arc<RpcContext>,
-    authorization: super::dispatch::GoalSessionAuthorization,
+    authorization: Arc<super::dispatch::GoalSessionAuthorization>,
     outbound: Arc<RpcOutbound>,
     // Held by the worker-owned driver so the RPC generation cannot finish
     // draining while a Goal it admitted is still unwinding.
@@ -212,7 +212,7 @@ impl ZeroCodeGoalSessionDriver {
         );
         Ok(Self {
             context,
-            authorization,
+            authorization: Arc::new(authorization),
             outbound,
             connection_activity,
             session_key,
@@ -261,7 +261,7 @@ impl ZeroCodeGoalSessionDriver {
         }
     }
 
-    async fn revalidate_session(&self) -> Result<Arc<Mutex<Agent>>> {
+    async fn revalidate_session(&self) -> Result<super::session::GoalSessionSnapshot> {
         let snapshot = self
             .context
             .sessions
@@ -284,7 +284,7 @@ impl ZeroCodeGoalSessionDriver {
             matches!(snapshot.chat_mode, crate::rpc::types::ChatMode::Chat),
             "Goal Mode is unavailable for ACP sessions"
         );
-        Ok(snapshot.agent)
+        Ok(snapshot)
     }
 }
 
@@ -302,8 +302,11 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         self.assert_ingress(ingress)?;
         self.revalidate_session().await?;
         let guard = self.command_lock.clone().lock_owned().await;
-        self.revalidate_session().await?;
-        self.authorization.revalidate().await?;
+        let snapshot = self.revalidate_session().await?;
+        let grants = self.authorization.revalidate().await?;
+        self.authorization
+            .admit_execution(grants.as_ref(), &snapshot.reaction_channels)
+            .await?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
@@ -327,8 +330,8 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             checkpoint,
         )
         .await?;
-        let agent = self.revalidate_session().await?;
-        let canonical_history = agent.lock().await.isolated_canonical_prefix().await?;
+        let agent = self.revalidate_session().await?.agent;
+        let canonical_history = agent.lock().await.isolated_canonical_prefix().await;
         Ok(Box::new(ZeroCodeGoalExecutionLease {
             _queue_guard: queue_guard,
             agent,
@@ -337,6 +340,8 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             outbound: Arc::clone(&self.outbound),
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
+            authorization: Arc::clone(&self.authorization),
+            epoch_admission: GoalEpochAdmission::Pending,
         }))
     }
 }
@@ -344,11 +349,20 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
 struct ZeroCodeGoalExecutionLease {
     _queue_guard: zeroclaw_infra::session_queue::SessionGuard,
     agent: Arc<Mutex<Agent>>,
-    canonical_history: Vec<ChatMessage>,
+    // Acquisition proves identity; projection failures belong to the engine's
+    // fenced publication path, not to the acquisition boundary.
+    canonical_history: Result<Vec<ChatMessage>>,
     history_has_trim_breadcrumb: bool,
     outbound: Arc<RpcOutbound>,
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
+    authorization: Arc<super::dispatch::GoalSessionAuthorization>,
+    epoch_admission: GoalEpochAdmission,
+}
+
+enum GoalEpochAdmission {
+    Pending,
+    Admitted,
 }
 
 impl ZeroCodeGoalExecutionLease {
@@ -357,6 +371,50 @@ impl ZeroCodeGoalExecutionLease {
             GoalSessionKey::ZeroCode { raw_session_id } => Ok(raw_session_id),
             GoalSessionKey::Matrix { .. } => bail!("ZeroCode Goal lease has a Matrix session key"),
         }
+    }
+
+    async fn admit_agent_effect(&mut self) -> Result<tokio::sync::OwnedMutexGuard<Agent>> {
+        let result = async {
+            let first_admission = matches!(self.epoch_admission, GoalEpochAdmission::Pending);
+            let grants = if first_admission {
+                let grants = self.authorization.revalidate().await?;
+                let snapshot = self
+                    .context
+                    .sessions
+                    .goal_session_snapshot(self.raw_session_id()?)
+                    .await
+                    .context("ZeroCode Goal session is absent")?;
+                self.authorization
+                    .admit_execution(grants.as_ref(), &snapshot.reaction_channels)
+                    .await?;
+                grants
+            } else {
+                None
+            };
+            let mut agent = Arc::clone(&self.agent).lock_owned().await;
+            self.authorization.ensure_turn_capability(&agent)?;
+            if first_admission {
+                self.authorization
+                    .apply_ceiling(grants.as_ref(), &mut agent);
+                self.epoch_admission = GoalEpochAdmission::Admitted;
+            }
+            Ok::<_, anyhow::Error>(agent)
+        }
+        .await;
+        if let Err(error) = &result
+            && let Some(refusal) = error.downcast_ref::<super::dispatch::GoalRpcRefusal>()
+        {
+            super::dispatch::forward_turn_completion(
+                &self.outbound,
+                self.raw_session_id()?,
+                crate::rpc::types::TurnCompletionOutcome::Failed,
+                format!("turn refused by daemon: {}", refusal.message),
+                None,
+                None,
+            )
+            .await;
+        }
+        result
     }
 
     async fn publish_parent_turn_failure(&self, error: &anyhow::Error) {
@@ -396,10 +454,33 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     }
 
     fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
-        Ok(self.canonical_history.clone())
+        match &self.canonical_history {
+            Ok(history) => Ok(history.clone()),
+            Err(error) => Err(anyhow::Error::msg(format!("{error:#}"))),
+        }
+    }
+
+    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
+        std::mem::replace(
+            &mut self.canonical_history,
+            Err(anyhow::Error::msg(
+                "ZeroCode Goal canonical projection was already taken",
+            )),
+        )
+    }
+
+    async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        if error
+            .downcast_ref::<super::dispatch::GoalRpcRefusal>()
+            .is_none()
+        {
+            self.publish_parent_turn_failure(error).await;
+        }
+        Ok(())
     }
 
     async fn append_resume_response(&mut self, response: String) -> Result<()> {
+        let mut agent = self.admit_agent_effect().await?;
         let session_key = format!("rpc_{}", self.raw_session_id()?);
         let message = ChatMessage::user(&response);
         // Persist before changing the live agent. A successful resume must
@@ -413,13 +494,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         backend
             .append(&session_key, &message)
             .context("persist ZeroCode Goal resume response")?;
-        self.agent
-            .lock()
-            .await
-            .seed_history(std::slice::from_ref(&message));
+        agent.seed_history(std::slice::from_ref(&message));
         // The epoch lease was acquired before the response was persisted.
         // Its parent-turn projection must include that same canonical answer.
-        self.canonical_history.push(message);
+        if let Ok(history) = &mut self.canonical_history {
+            history.push(message);
+        }
         Ok(())
     }
 
@@ -428,6 +508,18 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
+        let mut agent = match self.admit_agent_effect().await {
+            Ok(agent) => agent,
+            Err(error) => {
+                if error
+                    .downcast_ref::<super::dispatch::GoalRpcRefusal>()
+                    .is_none()
+                {
+                    self.publish_parent_turn_failure(&error).await;
+                }
+                return Err(error);
+            }
+        };
         let input = goal_parent_turn_input(&turn);
         let source = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
@@ -442,11 +534,8 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         };
         let session_id = self.raw_session_id()?.to_owned();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-        let agent = Arc::clone(&self.agent);
         let run = async move {
             agent
-                .lock()
-                .await
                 .run_isolated_turn_with_events(source, &input, event_tx)
                 .await
         };
@@ -474,7 +563,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.publish_parent_turn_failure(&error).await;
+                if error
+                    .downcast_ref::<super::dispatch::GoalRpcRefusal>()
+                    .is_none()
+                {
+                    self.publish_parent_turn_failure(&error).await;
+                }
                 return Err(error);
             }
         };
@@ -539,26 +633,41 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
-        let session_key = format!("rpc_{}", self.raw_session_id()?);
+        let preparation = (|| {
+            let session_id = self.raw_session_id()?;
+            let backend = self.context.session_backend.as_ref().context(
+                "cannot publish Goal parent response: ZeroCode session persistence is disabled",
+            )?;
+            Ok::<_, anyhow::Error>((session_id, backend))
+        })();
+        let (session_id, backend) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.publish_parent_turn_failure(&error).await;
+                return Err(error);
+            }
+        };
+        let session_key = format!("rpc_{session_id}");
         let message = ChatMessage::assistant(&candidate);
-        let backend = self.context.session_backend.as_ref().context(
-            "cannot publish Goal parent response: ZeroCode session persistence is disabled",
-        )?;
         if let Err(error) = backend.append(&session_key, &message) {
             let error = error.into();
             self.publish_parent_turn_failure(&error).await;
             return Err(error).context("persist ZeroCode Goal parent response");
         }
         self.agent.lock().await.seed_history(&[message]);
-        self.outbound
-            .notify(
-                GOAL_UPDATE_METHOD,
-                serde_json::to_value(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
-                    session_id: self.raw_session_id()?.to_owned(),
-                    candidate,
-                })?,
-            )
-            .await;
+        let update =
+            match serde_json::to_value(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
+                session_id: session_id.to_owned(),
+                candidate,
+            }) {
+                Ok(update) => update,
+                Err(error) => {
+                    let error = error.into();
+                    self.publish_parent_turn_failure(&error).await;
+                    return Err(error);
+                }
+            };
+        self.outbound.notify(GOAL_UPDATE_METHOD, update).await;
         Ok(())
     }
 
