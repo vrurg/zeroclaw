@@ -1,10 +1,11 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
+use zeroclaw_goal::task::GoalPolicyTarget;
 use zeroclaw_goal::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     TaskContinuationContext,
@@ -33,15 +34,41 @@ impl std::fmt::Display for OriginalCurrentGoalReadFailure {
 
 impl std::error::Error for OriginalCurrentGoalReadFailure {}
 
-/// Delegates lifecycle state to the real store, with one-shot finish and
-/// explicitly armed read failures. Neither failure fabricates a durable row.
+#[derive(Debug)]
+pub(super) struct OriginalSettlementFailure;
+
+impl std::fmt::Display for OriginalSettlementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("distinctive original Goal settlement failure")
+    }
+}
+
+impl std::error::Error for OriginalSettlementFailure {}
+
+/// Delegates all lifecycle state to the real store; named finish, settlement,
+/// pairing-transition or current-row read calls fail once when armed.
+/// Injected failures never mutate or fabricate a durable row.
 pub(super) struct FinishFaultRegistry {
     store: Arc<SqliteTaskStore>,
     remaining_reason: Mutex<Option<&'static str>>,
     failures: AtomicUsize,
     pause_gate: Option<Arc<FinishFaultPauseGate>>,
-    failing_read_session: Mutex<Option<String>>,
-    read_failures: AtomicUsize,
+    pub(super) failing_read_session: Mutex<Option<String>>,
+    pub(super) read_failures: AtomicUsize,
+    settlement_fault: AtomicBool,
+    pairing_transition_fault: AtomicBool,
+    settlement_failures: AtomicUsize,
+    pairing_transition_failures: AtomicUsize,
+    fence_observation: Option<Arc<FenceAdmissionObservation>>,
+}
+
+/// Observe real registry calls and control commits without injecting faults.
+#[derive(Default)]
+pub(super) struct FenceAdmissionObservation {
+    pub(super) tool_admissions: AtomicUsize,
+    pub(super) tool_settlements: AtomicUsize,
+    pub(super) operation_admissions: AtomicUsize,
+    pub(super) control_committed: Notify,
 }
 
 /// Hold the failed worker transition until an explicit pause fence is durable.
@@ -52,37 +79,132 @@ pub(super) struct FinishFaultPauseGate {
 }
 
 impl FinishFaultRegistry {
-    pub(super) fn new(store: Arc<SqliteTaskStore>, reason: &'static str) -> Self {
+    pub(super) fn new(
+        store: Arc<SqliteTaskStore>,
+        reason: &'static str,
+        pause_gate: Option<Arc<FinishFaultPauseGate>>,
+        pairing_fault: Option<bool>,
+    ) -> Self {
         Self {
             store,
             remaining_reason: Mutex::new(Some(reason)),
             failures: AtomicUsize::new(0),
-            pause_gate: None,
+            pause_gate,
             failing_read_session: Mutex::new(None),
             read_failures: AtomicUsize::new(0),
+            settlement_fault: AtomicBool::new(pairing_fault.is_some()),
+            pairing_transition_fault: AtomicBool::new(pairing_fault.unwrap_or(false)),
+            settlement_failures: AtomicUsize::new(0),
+            pairing_transition_failures: AtomicUsize::new(0),
+            fence_observation: None,
         }
     }
 
-    pub(super) fn with_pause_gate(mut self, gate: Arc<FinishFaultPauseGate>) -> Self {
-        self.pause_gate = Some(gate);
-        self
+    #[allow(
+        dead_code,
+        reason = "shared support: fence contract installs observations"
+    )]
+    pub(super) fn observing_fence(
+        store: Arc<SqliteTaskStore>,
+        observation: Arc<FenceAdmissionObservation>,
+    ) -> Self {
+        let mut registry = Self::new(store, "unused-fixture-fault", None, None);
+        *registry.remaining_reason.lock().unwrap() = None;
+        registry.fence_observation = Some(observation);
+        registry
     }
 
-    pub(super) fn failures(&self) -> usize {
-        self.failures.load(Ordering::SeqCst)
-    }
-
-    pub(super) fn fail_next_current_read(&self, session_id: &str) {
-        *self.failing_read_session.lock().unwrap() = Some(session_id.to_owned());
-    }
-
-    pub(super) fn read_failures(&self) -> usize {
-        self.read_failures.load(Ordering::SeqCst)
+    pub(super) fn fault_counts(&self) -> (usize, usize, usize) {
+        (
+            self.failures.load(Ordering::SeqCst),
+            self.settlement_failures.load(Ordering::SeqCst),
+            self.pairing_transition_failures.load(Ordering::SeqCst),
+        )
     }
 }
 
 #[async_trait]
 impl GoalTaskRegistry for FinishFaultRegistry {
+    async fn list_nonterminal_session_goals(&self) -> anyhow::Result<Vec<TaskRecord>> {
+        self.store.list_nonterminal_session_goals().await
+    }
+
+    async fn cancel_policy_targets(
+        &self,
+        targets: &[GoalPolicyTarget],
+    ) -> anyhow::Result<GoalTransitionResult> {
+        self.store.cancel_policy_targets(targets).await
+    }
+
+    async fn admit_pending_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation.tool_admissions.fetch_add(1, Ordering::SeqCst);
+        }
+        self.store
+            .admit_pending_tool_batch(task_id, session_id, expected_epoch, batch_id)
+            .await
+    }
+
+    async fn settle_pending_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation.tool_settlements.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.settlement_fault.swap(false, Ordering::SeqCst) {
+            self.settlement_failures.fetch_add(1, Ordering::SeqCst);
+            return Err(OriginalSettlementFailure.into());
+        }
+        self.store
+            .settle_pending_tool_batch(task_id, session_id, admitted_epoch, batch_id)
+            .await
+    }
+
+    async fn fail_unpaired_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        if self.pairing_transition_fault.swap(false, Ordering::SeqCst) {
+            self.pairing_transition_failures
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(OriginalTransitionFailure.into());
+        }
+        self.store
+            .fail_unpaired_tool_batch(
+                task_id,
+                session_id,
+                expected_epoch,
+                admitted_epoch,
+                batch_id,
+            )
+            .await
+    }
+
+    async fn clear_terminal_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        self.store
+            .clear_terminal_tool_batch(task_id, session_id, admitted_epoch, batch_id)
+            .await
+    }
     async fn latest_active_goal_for_agent(
         &self,
         agent: &str,
@@ -204,6 +326,11 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         {
             gate.paused.notify_one();
         }
+        if result == GoalTransitionResult::Applied
+            && let Some(observation) = &self.fence_observation
+        {
+            observation.control_committed.notify_one();
+        }
         Ok(result)
     }
 
@@ -266,6 +393,11 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         expected_epoch: i64,
         operation_id: &str,
     ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation
+                .operation_admissions
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.store
             .admit_pending_operation(task_id, session_id, expected_epoch, operation_id)
             .await
