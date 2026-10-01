@@ -62,6 +62,7 @@ enum OriginalFailurePoint {
     PricingVerdict,
     CancelledParent,
     ParentFencedPending,
+    ParentPendingUnfenced,
 }
 
 impl OriginalFailurePoint {
@@ -79,7 +80,7 @@ impl OriginalFailurePoint {
     fn reason(self) -> (&'static str, zeroclaw_goal::GoalFailureReason) {
         use zeroclaw_goal::GoalFailureReason;
         match self {
-            Self::HostParent => (
+            Self::HostParent | Self::ParentPendingUnfenced => (
                 "parent_operation_failed",
                 GoalFailureReason::AgentOperationFailed,
             ),
@@ -168,7 +169,8 @@ impl GoalSessionExecutionLease for OriginalErrorLease {
             | OriginalFailurePoint::AccountingVerdict
             | OriginalFailurePoint::PricingVerdict
             | OriginalFailurePoint::CancelledParent
-            | OriginalFailurePoint::ParentFencedPending => Ok(Vec::new()),
+            | OriginalFailurePoint::ParentFencedPending
+            | OriginalFailurePoint::ParentPendingUnfenced => Ok(Vec::new()),
             _ => Err(OriginalExecutionFailure.into()),
         }
     }
@@ -247,8 +249,14 @@ impl GoalSessionExecutionLease for OriginalErrorLease {
                     turn.working_history,
                 ))
             }
-            OriginalFailurePoint::CancelledParent | OriginalFailurePoint::ParentFencedPending => {
-                if matches!(self.point, OriginalFailurePoint::ParentFencedPending) {
+            OriginalFailurePoint::CancelledParent
+            | OriginalFailurePoint::ParentFencedPending
+            | OriginalFailurePoint::ParentPendingUnfenced => {
+                if matches!(
+                    self.point,
+                    OriginalFailurePoint::ParentFencedPending
+                        | OriginalFailurePoint::ParentPendingUnfenced
+                ) {
                     let scope = operation.execution();
                     assert_eq!(
                         self.store
@@ -408,11 +416,12 @@ async fn assert_original_execution_error_for_ingress(
     )
     .then(|| Arc::new(FinishFaultPauseGate::default()));
     let fault_registry = point.transition_fault().map(|reason| {
-        let registry = FinishFaultRegistry::new(Arc::clone(&store), reason);
-        Arc::new(match &pause_gate {
-            Some(gate) => registry.with_pause_gate(Arc::clone(gate)),
-            None => registry,
-        })
+        Arc::new(FinishFaultRegistry::new(
+            Arc::clone(&store),
+            reason,
+            pause_gate.clone(),
+            None,
+        ))
     });
     let registry: Arc<dyn GoalTaskRegistry> = match &fault_registry {
         Some(registry) => registry.clone(),
@@ -699,8 +708,10 @@ async fn assert_original_execution_error_for_ingress(
             "publish Goal parent candidate before verification: distinctive original execution failure"
         }
         OriginalFailurePoint::EmptyCandidate => "Goal parent returned an empty candidate",
-        OriginalFailurePoint::HostParentTransition
-        | OriginalFailurePoint::HostVerifierTransition => {
+        OriginalFailurePoint::HostParentTransition => {
+            "Goal parent operation failed and terminal transition also failed: distinctive original Goal transition failure: distinctive original execution failure"
+        }
+        OriginalFailurePoint::HostVerifierTransition => {
             "distinctive original Goal transition failure"
         }
         OriginalFailurePoint::HistoryWorkerTransition
@@ -718,14 +729,14 @@ async fn assert_original_execution_error_for_ingress(
             "Goal cost budget lacks complete pricing for actual provider usage"
         }
         OriginalFailurePoint::CancelledParent | OriginalFailurePoint::ParentFencedPending => {
-            "Goal failure lost its execution fence"
+            "Goal parent operation failed and terminal transition also failed: Goal failure lost its execution fence: distinctive original execution failure"
         }
         _ => "distinctive original execution failure",
     };
     assert_eq!(format!("{completion:#}"), expected_completion);
     if let Some(registry) = fault_registry {
         assert_eq!(
-            registry.failures(),
+            registry.fault_counts().0,
             1,
             "the named transition must fail exactly once"
         );
@@ -971,6 +982,250 @@ original_error_zerocode_case!(original_zerocode_pricing_verdict, PricingVerdict)
 original_error_zerocode_case!(original_zerocode_cancelled_epoch_error, CancelledParent);
 original_error_zerocode_case!(original_zerocode_fence_lost_error, ParentFencedPending);
 
+#[derive(Clone, Copy)]
+enum PendingParentControl {
+    PauseNow,
+    Restart,
+    ExternalCancellation,
+    Cancel,
+    None,
+}
+
+async fn assert_pending_parent_control(ingress: GoalIngressContext, control: PendingParentControl) {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let registry: Arc<dyn GoalTaskRegistry> = store.clone();
+    let runtime = GoalRuntime::new(registry.clone());
+    let settings = host_settings(true);
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            registry,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime.execution_engine(accounting),
+    )));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(OriginalParentGate::default());
+    let driver = Arc::new(OriginalErrorDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        point: if matches!(control, PendingParentControl::None) {
+            OriginalFailurePoint::ParentPendingUnfenced
+        } else {
+            OriginalFailurePoint::ParentFencedPending
+        },
+        acquires: AtomicUsize::new(0),
+        events: events.clone(),
+        published: Arc::new(Notify::new()),
+        store: store.clone(),
+        parent_gate: Some(gate.clone()),
+    });
+    let mut start = supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the admitted task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let projection = match start.response() {
+        GoalResponse::Started(projection) => projection.clone(),
+        response => panic!("expected start, got {response:?}"),
+    };
+    let session_id = ingress.session_key().durable_id();
+    let scope =
+        GoalExecutionScope::new(&projection.task_id, &session_id, projection.execution_epoch)
+            .unwrap();
+    supervisor
+        .launch_after_response(settings.clone(), &mut start)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), gate.observed.notified())
+        .await
+        .expect("pending parent must reach the gate");
+
+    let drain_supervisor = supervisor.clone();
+    let drain_session = session_id.clone();
+    let drain = match control {
+        PendingParentControl::PauseNow | PendingParentControl::Cancel => {
+            let mut command = supervisor
+                .submit(
+                    settings.clone(),
+                    ingress,
+                    driver.clone(),
+                    if matches!(control, PendingParentControl::Cancel) {
+                        GoalCommand::Cancel
+                    } else {
+                        GoalCommand::Pause { immediate: true }
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                command.response(),
+                GoalResponse::TransitionPending(_)
+            ));
+            ::zeroclaw_spawn::spawn!(async move {
+                drain_supervisor
+                    .launch_after_response(settings, &mut command)
+                    .await
+            })
+        }
+        PendingParentControl::Restart => ::zeroclaw_spawn::spawn!(async move {
+            drain_supervisor.pause_for_restart().await?;
+            Ok(None)
+        }),
+        PendingParentControl::ExternalCancellation => ::zeroclaw_spawn::spawn!(async move {
+            assert_eq!(
+                drain_supervisor
+                    .pause_for_external_cancellation(&drain_session)
+                    .await?,
+                GoalTransitionResult::Applied
+            );
+            Ok(None)
+        }),
+        PendingParentControl::None => ::zeroclaw_spawn::spawn!(async move {
+            drain_supervisor.drain(&scope).await.unwrap_err();
+            Ok(None)
+        }),
+    };
+    if !matches!(control, PendingParentControl::None) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let current = store
+                    .current_goal_for_session(&session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current.status != TaskStatus::Running {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control must commit its fence before releasing the parent");
+    }
+    gate.released.notify_one();
+    let late = timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("the sole drainer must finish without deadlock")
+        .unwrap()
+        .unwrap();
+    let cancelled = matches!(control, PendingParentControl::Cancel);
+    let failed_status = if cancelled {
+        TaskStatus::Cancelled
+    } else {
+        TaskStatus::Failed
+    };
+    let current = store
+        .current_goal_for_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, failed_status);
+    assert_eq!(current.id, projection.task_id);
+    let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+    assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+    assert!(goal.pending_call_id.is_none());
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(&current.id, &session_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        if cancelled {
+            None
+        } else if matches!(control, PendingParentControl::None) {
+            Some("parent_operation_failed")
+        } else {
+            Some("accounting_outcome_unknown")
+        }
+    );
+    if matches!(control, PendingParentControl::PauseNow) {
+        let Some(GoalResponse::Terminal(projection)) = late else {
+            panic!("pause-now sole drainer must return the actual terminal response");
+        };
+        assert_eq!(projection.status, TaskStatus::Failed);
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        if cancelled {
+            vec!["host_error"]
+        } else if matches!(control, PendingParentControl::None) {
+            vec!["host_error", "failure_notice"]
+        } else {
+            vec!["host_error", "original_error", "failure_notice"]
+        }
+    );
+    assert_eq!(
+        driver.acquires.load(Ordering::SeqCst),
+        if cancelled || matches!(control, PendingParentControl::None) {
+            1
+        } else {
+            2
+        }
+    );
+}
+
+macro_rules! pending_parent_control_case {
+    ($matrix:ident, $zerocode:ident, $control:ident) => {
+        #[tokio::test]
+        async fn $matrix() {
+            assert_pending_parent_control(matrix_ingress(), PendingParentControl::$control).await;
+        }
+        #[tokio::test]
+        async fn $zerocode() {
+            assert_pending_parent_control(zerocode_ingress("main"), PendingParentControl::$control)
+                .await;
+        }
+    };
+}
+
+pending_parent_control_case!(
+    pending_parent_pause_now,
+    pending_parent_zerocode_pause_now,
+    PauseNow
+);
+pending_parent_control_case!(
+    pending_parent_restart,
+    pending_parent_zerocode_restart,
+    Restart
+);
+pending_parent_control_case!(
+    pending_parent_external_cancel,
+    pending_parent_zerocode_external_cancel,
+    ExternalCancellation
+);
+pending_parent_control_case!(
+    pending_parent_cancel,
+    pending_parent_zerocode_cancel,
+    Cancel
+);
+pending_parent_control_case!(
+    pending_parent_unfenced_failure,
+    pending_parent_zerocode_unfenced_failure,
+    None
+);
+
 async fn assert_public_run_preserves_original_errors(ingress: GoalIngressContext) {
     for (point, expected, transition_error) in [
         (
@@ -1000,8 +1255,8 @@ async fn assert_public_run_preserves_original_errors(ingress: GoalIngressContext
         ),
         (
             OriginalFailurePoint::HostParentTransition,
-            "distinctive original Goal transition failure",
-            true,
+            "Goal parent operation failed and terminal transition also failed: distinctive original Goal transition failure: distinctive original execution failure",
+            false,
         ),
         (
             OriginalFailurePoint::HostVerifierTransition,
@@ -1011,7 +1266,12 @@ async fn assert_public_run_preserves_original_errors(ingress: GoalIngressContext
     ] {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let registry: Arc<dyn GoalTaskRegistry> = match point.transition_fault() {
-            Some(reason) => Arc::new(FinishFaultRegistry::new(Arc::clone(&store), reason)),
+            Some(reason) => Arc::new(FinishFaultRegistry::new(
+                Arc::clone(&store),
+                reason,
+                None,
+                None,
+            )),
             None => store.clone(),
         };
         let runtime = GoalRuntime::new(Arc::clone(&registry));
