@@ -1396,6 +1396,7 @@ mod tests {
             session_generation: 0,
             tui_id: "test-tui".to_owned(),
             command_lock: Arc::new(Mutex::new(())),
+            recall_query: "/goal help".to_owned(),
         });
 
         let response = Arc::new(RpcGoalRuntime::default())
