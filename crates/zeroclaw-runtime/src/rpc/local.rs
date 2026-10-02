@@ -1685,6 +1685,39 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn active_goal_recall_question_answer_and_continuation_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_recall_question_answer_and_continuation_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::RecallAnswered,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_recall_none_control_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_recall_none_control_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::RecallNoneControl,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_goal_receipts_are_presentation_only_over_local_ipc() {
+        active_goal_local_fixture(
+            "rpc::local::tests::active_goal_receipts_are_presentation_only_over_local_ipc",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Receipts,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn active_goal_preserves_answer_equal_to_objective_over_local_ipc() {
         active_goal_local_fixture(
             "rpc::local::tests::active_goal_preserves_answer_equal_to_objective_over_local_ipc",
@@ -1797,6 +1830,21 @@ mod tests {
             Some(
                 crate::rpc::goal_transport_test_support::GoalTransportFailure::PrefixProjection,
             ) => ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await,
+            None if scenario
+                == crate::rpc::goal_transport_test_support::ResumeScenario::RecallAnswered =>
+            {
+                ActiveGoalFixture::with_recall(tmp.path()).await
+            }
+            None if scenario
+                == crate::rpc::goal_transport_test_support::ResumeScenario::RecallNoneControl =>
+            {
+                ActiveGoalFixture::with_recall_none_control(tmp.path()).await
+            }
+            None if scenario
+                == crate::rpc::goal_transport_test_support::ResumeScenario::Receipts =>
+            {
+                ActiveGoalFixture::with_receipts(tmp.path()).await
+            }
             None => ActiveGoalFixture::new(tmp.path()).await,
         };
         if with_local_capability {

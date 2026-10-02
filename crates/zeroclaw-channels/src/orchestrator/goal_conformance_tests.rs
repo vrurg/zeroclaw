@@ -26,6 +26,9 @@ const PREVIOUS_RESPONSE: &str = "The earlier request is complete.";
 #[path = "goal_cold_restore_tests.rs"]
 mod cold_restore;
 
+#[path = "goal_recall_conformance_tests.rs"]
+mod recall;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionScenario {
     Answered,
