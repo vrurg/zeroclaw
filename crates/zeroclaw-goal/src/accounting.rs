@@ -7,6 +7,49 @@ use zeroclaw_api::model_provider::TokenUsage;
 
 use crate::control::GoalExecutionScope;
 
+/// A Goal operation was refused because its exact execution scope is no longer
+/// running. The committed lifecycle transition, not this refusal, decides the
+/// execution outcome. Other admission failures must not use this marker.
+#[derive(Clone, Copy, Debug)]
+pub struct GoalOperationFenced {
+    message: &'static str,
+}
+
+impl GoalOperationFenced {
+    /// The canonical session no longer has a current Goal task.
+    pub const NO_CURRENT_TASK: Self = Self {
+        message: "Goal session no longer has a current task",
+    };
+
+    /// The current task differs from the task bound to the execution scope.
+    pub const STALE_TASK: Self = Self {
+        message: "Goal task identity is stale",
+    };
+
+    /// The bound Goal has left its running state.
+    pub const NOT_RUNNING: Self = Self {
+        message: "Goal task is not running",
+    };
+
+    /// The bound Goal has moved to a different execution epoch.
+    pub const STALE_EPOCH: Self = Self {
+        message: "Goal execution epoch is stale",
+    };
+
+    /// Durable pending-operation admission rejected the exact execution fence.
+    pub const ADMISSION_FENCE_LOST: Self = Self {
+        message: "Goal operation admission lost its execution fence",
+    };
+}
+
+impl std::fmt::Display for GoalOperationFenced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for GoalOperationFenced {}
+
 /// Configured route at the start of one logical Goal-owned provider operation.
 #[derive(Clone, Debug)]
 pub struct GoalOperationRequest {
@@ -139,6 +182,35 @@ tokio::task_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_fence_errors_preserve_the_five_refusal_texts_without_a_source() {
+        let cases = [
+            (
+                GoalOperationFenced::NO_CURRENT_TASK,
+                "Goal session no longer has a current task",
+            ),
+            (
+                GoalOperationFenced::STALE_TASK,
+                "Goal task identity is stale",
+            ),
+            (GoalOperationFenced::NOT_RUNNING, "Goal task is not running"),
+            (
+                GoalOperationFenced::STALE_EPOCH,
+                "Goal execution epoch is stale",
+            ),
+            (
+                GoalOperationFenced::ADMISSION_FENCE_LOST,
+                "Goal operation admission lost its execution fence",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+            assert!(std::error::Error::source(&error).is_none());
+            let erased = anyhow::Error::new(error);
+            assert!(erased.downcast_ref::<GoalOperationFenced>().is_some());
+        }
+    }
 
     #[test]
     fn a_complete_operation_cannot_contain_an_unpriceable_cache_partition() {

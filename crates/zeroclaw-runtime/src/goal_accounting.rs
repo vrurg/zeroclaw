@@ -11,8 +11,9 @@ use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
     accounting::{
-        GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
-        GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice, GoalUsagePricer,
+        GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationFenced,
+        GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice,
+        GoalUsagePricer,
     },
     task::{GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskGoal},
 };
@@ -148,19 +149,16 @@ impl GoalOperationAccountant {
             .registry
             .current_goal_for_session(self.scope.session_id())
             .await?
-            .context("Goal session no longer has a current task")?;
-        ensure!(
-            task.id == self.scope.task_id(),
-            "Goal task identity is stale"
-        );
-        ensure!(
-            task.status == zeroclaw_api::task::TaskStatus::Running,
-            "Goal task is not running"
-        );
-        ensure!(
-            task.execution_epoch == self.scope.execution_epoch(),
-            "Goal execution epoch is stale"
-        );
+            .ok_or_else(|| anyhow::Error::new(GoalOperationFenced::NO_CURRENT_TASK))?;
+        if task.id != self.scope.task_id() {
+            return Err(anyhow::Error::new(GoalOperationFenced::STALE_TASK));
+        }
+        if task.status != zeroclaw_api::task::TaskStatus::Running {
+            return Err(anyhow::Error::new(GoalOperationFenced::NOT_RUNNING));
+        }
+        if task.execution_epoch != self.scope.execution_epoch() {
+            return Err(anyhow::Error::new(GoalOperationFenced::STALE_EPOCH));
+        }
         let extension = self
             .registry
             .get_goal_task(&task.id)
@@ -349,9 +347,9 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 });
                 Ok(())
             }
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                bail!("Goal operation admission lost its execution fence")
-            }
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => Err(anyhow::Error::new(
+                GoalOperationFenced::ADMISSION_FENCE_LOST,
+            )),
         }
     }
 
@@ -409,6 +407,297 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use zeroclaw_goal::GoalTaskRecord;
+
+    #[derive(Clone, Copy)]
+    enum AdmissionFault {
+        MissingExtension,
+        StaleExtension,
+        ReadFailure,
+        Admission(GoalTransitionResult),
+        StoreFailure,
+    }
+
+    // Only the queried failure boundary is injected. All lifecycle and ledger
+    // operations continue to use the real SQLite control plane.
+    struct AdmissionFaultRegistry {
+        store: Arc<SqliteTaskStore>,
+        fault: AdmissionFault,
+    }
+
+    #[async_trait]
+    impl GoalTaskRegistry for AdmissionFaultRegistry {
+        async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
+            match self.fault {
+                AdmissionFault::MissingExtension => Ok(None),
+                AdmissionFault::ReadFailure => bail!("fixture registry read failed"),
+                AdmissionFault::StaleExtension => {
+                    let mut goal = self.store.get_goal_task(task_id).await?.unwrap();
+                    goal.task_id = "different-task".to_owned();
+                    Ok(Some(goal))
+                }
+                _ => self.store.get_goal_task(task_id).await,
+            }
+        }
+
+        async fn admit_pending_operation(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            pending_call_id: &str,
+        ) -> Result<GoalTransitionResult> {
+            match self.fault {
+                AdmissionFault::Admission(result) => Ok(result),
+                AdmissionFault::StoreFailure => bail!("fixture registry admission failed"),
+                _ => {
+                    self.store
+                        .admit_pending_operation(
+                            task_id,
+                            session_id,
+                            expected_epoch,
+                            pending_call_id,
+                        )
+                        .await
+                }
+            }
+        }
+
+        async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
+            self.store.latest_active_goal_for_agent(agent).await
+        }
+
+        async fn latest_active_goal_for_context(
+            &self,
+            agent: &str,
+            originator_route: Option<&str>,
+            principal_id: Option<&str>,
+        ) -> Result<Option<TaskRecord>> {
+            self.store
+                .latest_active_goal_for_context(agent, originator_route, principal_id)
+                .await
+        }
+
+        async fn latest_active_goal_id_for_context(
+            &self,
+            agent: &str,
+            originator_route: Option<&str>,
+            principal_id: Option<&str>,
+        ) -> Result<Option<String>> {
+            self.store
+                .latest_active_goal_id_for_context(agent, originator_route, principal_id)
+                .await
+        }
+
+        async fn update_goal_limits(
+            &self,
+            task_id: &str,
+            token_limit: Option<u64>,
+            cost_limit_usd: Option<f64>,
+        ) -> Result<()> {
+            self.store
+                .update_goal_limits(task_id, token_limit, cost_limit_usd)
+                .await
+        }
+
+        async fn update_goal_pause(
+            &self,
+            task_id: &str,
+            pause: Option<GoalPauseState>,
+        ) -> Result<()> {
+            self.store.update_goal_pause(task_id, pause).await
+        }
+
+        async fn set_continuation_context(
+            &self,
+            task_id: &str,
+            context: Option<zeroclaw_goal::task::TaskContinuationContext>,
+        ) -> Result<()> {
+            self.store.set_continuation_context(task_id, context).await
+        }
+
+        async fn get_continuation_context(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<zeroclaw_goal::task::TaskContinuationContext>> {
+            self.store.get_continuation_context(task_id).await
+        }
+
+        async fn current_goal_for_session(&self, session_id: &str) -> Result<Option<TaskRecord>> {
+            self.store.current_goal_for_session(session_id).await
+        }
+
+        async fn terminal_reason_for_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+        ) -> Result<Option<String>> {
+            self.store
+                .terminal_reason_for_session_goal(task_id, session_id)
+                .await
+        }
+
+        async fn create_or_replace_session_goal(
+            &self,
+            task: TaskRecord,
+            goal: GoalTaskRecord,
+        ) -> Result<GoalTransitionResult> {
+            self.store.create_or_replace_session_goal(task, goal).await
+        }
+
+        async fn pause_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            pause: GoalPauseState,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .pause_session_goal(task_id, session_id, expected_epoch, pause)
+                .await
+        }
+
+        async fn resume_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            owner_pid: u32,
+            owner_boot_id: &str,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .resume_session_goal(
+                    task_id,
+                    session_id,
+                    expected_epoch,
+                    owner_pid,
+                    owner_boot_id,
+                )
+                .await
+        }
+
+        async fn finish_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            status: zeroclaw_api::task::TaskStatus,
+            error: Option<String>,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .finish_session_goal(task_id, session_id, expected_epoch, status, error)
+                .await
+        }
+
+        async fn settle_pending_operation(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            admitted_epoch: i64,
+            pending_call_id: &str,
+            accounting_state: GoalAccountingState,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .settle_pending_operation(
+                    task_id,
+                    session_id,
+                    admitted_epoch,
+                    pending_call_id,
+                    accounting_state,
+                )
+                .await
+        }
+
+        async fn update_session_goal_limits(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            token_limit: Option<u64>,
+            cost_limit_usd: Option<f64>,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .update_session_goal_limits(
+                    task_id,
+                    session_id,
+                    expected_epoch,
+                    token_limit,
+                    cost_limit_usd,
+                )
+                .await
+        }
+
+        async fn delete_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+        ) -> Result<GoalTransitionResult> {
+            self.store
+                .delete_session_goal(task_id, session_id, expected_epoch)
+                .await
+        }
+    }
+
+    fn faulted_factory(
+        factory: &RuntimeGoalOperationAccountingFactory,
+        store: Arc<SqliteTaskStore>,
+        fault: AdmissionFault,
+    ) -> RuntimeGoalOperationAccountingFactory {
+        RuntimeGoalOperationAccountingFactory::new(
+            Arc::new(AdmissionFaultRegistry { store, fault }),
+            Arc::clone(&factory.tracker),
+            &factory.agent_alias,
+            Arc::clone(&factory.pricer),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fenced_admission_after_durable_admission_rejection_preserves_its_error() {
+        for result in [GoalTransitionResult::Stale, GoalTransitionResult::Missing] {
+            let (store, factory, _tracker, scope, _directory) = fixture().await;
+            let faulted = faulted_factory(&factory, store, AdmissionFault::Admission(result));
+            assert_fenced_admission(
+                &faulted,
+                scope,
+                "Goal operation admission lost its execution fence",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_fence_registry_errors_do_not_carry_the_operation_marker() {
+        for (fault, expected) in [
+            (
+                AdmissionFault::MissingExtension,
+                "Goal task extension is missing",
+            ),
+            (
+                AdmissionFault::StaleExtension,
+                "Goal task extension identity is stale",
+            ),
+            (AdmissionFault::ReadFailure, "fixture registry read failed"),
+            (
+                AdmissionFault::StoreFailure,
+                "fixture registry admission failed",
+            ),
+        ] {
+            let (store, factory, _tracker, scope, _directory) = fixture().await;
+            let faulted = faulted_factory(&factory, store, fault);
+            let error = faulted
+                .for_scope(scope)
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(
+                error
+                    .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                    .is_none()
+            );
+        }
+    }
 
     async fn fixture() -> (
         Arc<SqliteTaskStore>,
@@ -503,6 +792,242 @@ mod tests {
         }
     }
 
+    async fn assert_fenced_admission(
+        factory: &RuntimeGoalOperationAccountingFactory,
+        scope: GoalExecutionScope,
+        expected: &str,
+    ) {
+        let error = factory
+            .for_scope(scope)
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect_err("a non-running execution scope must refuse admission");
+        assert_eq!(error.to_string(), expected);
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_some(),
+            "the committed lifecycle transition must remain distinguishable from an operation failure"
+        );
+    }
+
+    fn assert_untyped_refusal(error: &anyhow::Error, expected: &str) {
+        assert_eq!(error.to_string(), expected);
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_none()
+        );
+    }
+
+    struct FailingPricer;
+
+    impl GoalUsagePricer for FailingPricer {
+        fn price(
+            &self,
+            _provider_ref: &str,
+            _model: &str,
+            _usage: &TokenUsage,
+        ) -> Result<GoalUsagePrice> {
+            bail!("fixture pricing resolver failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn pricing_resolver_errors_are_not_execution_fence_refusals() {
+        let (_store, mut factory, _tracker, scope, _directory) = fixture().await;
+        factory.pricer = Arc::new(FailingPricer);
+        let error = factory
+            .for_scope(scope)
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert_untyped_refusal(&error, "fixture pricing resolver failed");
+    }
+
+    #[tokio::test]
+    async fn ledger_read_errors_are_not_execution_fence_refusals() {
+        let (store, factory, _tracker, scope, directory) = fixture().await;
+        let ledger = directory.path().join("state/costs.jsonl");
+        // A directory at the ledger path fails the existing strict reader;
+        // no ledger format or production error handling is replaced.
+        std::fs::create_dir_all(&ledger).unwrap();
+        let error = factory
+            .for_scope(scope.clone())
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cost storage"));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_none()
+        );
+    }
+
+    fn concrete_accountant(
+        factory: &RuntimeGoalOperationAccountingFactory,
+        scope: GoalExecutionScope,
+    ) -> GoalOperationAccountant {
+        GoalOperationAccountant::new(
+            Arc::clone(&factory.registry),
+            Arc::clone(&factory.tracker),
+            factory.agent_alias.clone(),
+            Arc::clone(&factory.pricer),
+            scope,
+        )
+    }
+
+    #[tokio::test]
+    async fn permit_closure_is_not_an_execution_fence_refusal() {
+        let (_store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = concrete_accountant(&factory, scope);
+        accountant.permit.close();
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert_untyped_refusal(&error, "Goal operation permit closed");
+    }
+
+    #[tokio::test]
+    async fn an_existing_admission_is_not_an_execution_fence_refusal() {
+        let (_store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = concrete_accountant(&factory, scope);
+        // Exercise the defensive invariant independently of semaphore waiting:
+        // a real admitted operation holds the accountant's only permit.
+        *accountant.admitted.lock().await = Some(AdmittedOperation {
+            id: "fixture-existing-operation".to_owned(),
+            _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+        });
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert_untyped_refusal(&error, "Goal operation is already admitted");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_budget_is_not_an_execution_fence_refusal() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        assert_eq!(
+            store
+                .update_session_goal_limits(scope.task_id(), scope.session_id(), 1, Some(1), None)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 2),
+                    priceable: true,
+                }],
+            })
+            .await
+            .unwrap();
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert_untyped_refusal(&error, "Goal budget is exhausted");
+        assert_eq!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(GoalPauseReason::BudgetExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_route_pricing_is_not_an_execution_fence_refusal() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        assert_eq!(
+            store
+                .update_session_goal_limits(scope.task_id(), scope.session_id(), 1, None, Some(1.0))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let error = factory
+            .for_scope(scope)
+            .admit(GoalOperationRequest::new("unpriced-route", "model"))
+            .await
+            .unwrap_err();
+        assert_untyped_refusal(
+            &error,
+            "Goal cost budget lacks complete pricing for the configured route",
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_admission_without_a_current_task_preserves_its_error() {
+        let (_store, factory, _tracker, scope, _directory) = fixture().await;
+        let missing = GoalExecutionScope::new(scope.task_id(), "missing-session", 1).unwrap();
+        assert_fenced_admission(
+            &factory,
+            missing,
+            "Goal session no longer has a current task",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fenced_admission_with_a_stale_task_identity_preserves_its_error() {
+        let (_store, factory, _tracker, scope, _directory) = fixture().await;
+        let stale = GoalExecutionScope::new("stale-task", scope.session_id(), 1).unwrap();
+        assert_fenced_admission(&factory, stale, "Goal task identity is stale").await;
+    }
+
+    #[tokio::test]
+    async fn fenced_admission_after_a_committed_pause_preserves_its_error() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_fenced_admission(&factory, scope, "Goal task is not running").await;
+    }
+
+    #[tokio::test]
+    async fn fenced_admission_with_a_stale_epoch_preserves_its_error() {
+        let (_store, factory, _tracker, scope, _directory) = fixture().await;
+        let stale = GoalExecutionScope::new(scope.task_id(), scope.session_id(), 2).unwrap();
+        assert_fenced_admission(&factory, stale, "Goal execution epoch is stale").await;
+    }
+
     #[tokio::test]
     async fn known_usage_is_persisted_before_invalid_accounting_blocks_next_admission() {
         let (store, factory, _tracker, scope, _directory) = fixture().await;
@@ -534,6 +1059,11 @@ mod tests {
             .await
             .expect_err("incomplete accounting must fence the next provider operation");
         assert!(error.to_string().contains("incomplete"));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_none()
+        );
         assert!(
             store
                 .get_goal_task(scope.task_id())
@@ -658,6 +1188,11 @@ mod tests {
             .await
             .expect_err("a pending operation must fence the next model call");
         assert!(next_error.to_string().contains("pending operation"));
+        assert!(
+            next_error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_none()
+        );
         drop(accountant);
         drop(factory);
         drop(store);
