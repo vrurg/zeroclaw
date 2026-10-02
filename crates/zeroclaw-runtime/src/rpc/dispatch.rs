@@ -7954,6 +7954,7 @@ impl RpcDispatcher {
                 req.session_id.clone(),
                 tui_id,
                 authorization,
+                req.command.clone(),
             )
             .await
             .map_err(|error| {
@@ -27793,6 +27794,7 @@ mod tests {
             .authorize_session_owner(session_id, Method::SessionGoal)
             .await
             .unwrap();
+        let raw_command = command.to_owned();
         let command = zeroclaw_commands::goal::parse_goal_command(command).unwrap();
         crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
             Arc::clone(&dispatcher.ctx),
@@ -27806,6 +27808,7 @@ mod tests {
                 session_id.into(),
                 authorized,
             ),
+            raw_command,
         )
         .await
         .unwrap()
@@ -28155,6 +28158,7 @@ mod tests {
                 GoalAdmissionFixture::SESSION.into(),
                 None,
             ),
+            "/goal start bounded repair".into(),
         )
         .await
         .unwrap();

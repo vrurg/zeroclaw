@@ -1706,7 +1706,8 @@ impl Agent {
         input: &zeroclaw_goal::control::GoalParentTurnInput,
         recall_query: &str,
     ) -> Result<IsolatedTurnOutcome> {
-        self.run_isolated_turn_inner(source, input, None).await
+        self.run_isolated_turn_inner(source, input, recall_query, None)
+            .await
     }
 
     /// Runs one isolated Goal turn while forwarding ordinary turn events to
@@ -1716,9 +1717,10 @@ impl Agent {
         &mut self,
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
+        recall_query: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<IsolatedTurnOutcome> {
-        self.run_isolated_turn_inner(source, input, Some(event_tx))
+        self.run_isolated_turn_inner(source, input, recall_query, Some(event_tx))
             .await
     }
 
@@ -1726,6 +1728,7 @@ impl Agent {
         &mut self,
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
+        recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
@@ -10942,6 +10945,405 @@ mod tests {
         assert_eq!(format!("{:?}", agent.history()), canonical_before);
     }
 
+    fn isolated_fallback_test_agent() -> Agent {
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "primary-fixture",
+            vec![
+                (
+                    "primary-fixture".into(),
+                    Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback-fixture".into(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(Vec::new()),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(provider));
+        agent.model_name = "requested-model".into();
+        agent
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_notice_matches_ordinary_chunks_without_polluting_candidate() {
+        let mut ordinary = isolated_fallback_test_agent();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (ordinary_response, _) = ordinary.turn_streamed("finish", tx, None).await.unwrap();
+        let ordinary_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        let notice = ordinary_chunks
+            .iter()
+            .find(|chunk| chunk.contains("fallback-fixture"))
+            .expect("ordinary Reliable fallback must publish its accepted route");
+        assert!(ordinary_response.ends_with(notice));
+
+        let mut goal = isolated_fallback_test_agent();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = goal
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "done");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains(notice))
+        );
+        assert!(goal.history().iter().all(|row| match row {
+            ConversationMessage::Chat(row) => !row.content.contains(notice),
+            _ => true,
+        }));
+        let goal_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goal_chunks, ordinary_chunks);
+        assert_eq!(
+            goal_chunks.iter().filter(|chunk| *chunk == notice).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_without_events_keeps_clean_response_and_history() {
+        let mut agent = isolated_fallback_test_agent();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let outcome = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "done");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains("fallback-fixture"))
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_safeguard_notice_matches_ordinary_and_stays_presentational() {
+        let provider = || {
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(SafeguardNoticeProvider) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            )) as Box<dyn ModelProvider>
+        };
+        let mut ordinary = blank_input_agent(provider());
+        ordinary.model_name = "requested-model".into();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        ordinary.turn_streamed("finish", tx, None).await.unwrap();
+        let ordinary_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ordinary_chunks
+                .iter()
+                .filter(|chunk| chunk.contains("Safety safeguards"))
+                .count(),
+            1
+        );
+        assert!(
+            ordinary_chunks
+                .iter()
+                .all(|chunk| !chunk.contains("fallback-fixture"))
+        );
+
+        let mut agent = blank_input_agent(provider());
+        agent.model_name = "requested-model".into();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "accepted response");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains("Safety safeguards"))
+        );
+        let goal_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goal_chunks, ordinary_chunks);
+        assert!(
+            goal_chunks
+                .iter()
+                .all(|chunk| !chunk.contains("private-category"))
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_controls_are_silent_without_recovery_or_on_failure() {
+        for fail in [false, true] {
+            let provider: Box<dyn ModelProvider> = if fail {
+                Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                    "primary-fixture",
+                    vec![
+                        (
+                            "primary-fixture".into(),
+                            Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                        ),
+                        (
+                            "fallback-fixture".into(),
+                            Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                        ),
+                    ],
+                    0,
+                    1,
+                ))
+            } else {
+                Box::new(MockModelProvider {
+                    responses: Mutex::new(Vec::new()),
+                })
+            };
+            let mut agent = blank_input_agent(provider);
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                    objective: "finish".into(),
+                    working_history: Vec::new(),
+                });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let result = agent
+                .run_isolated_turn_with_events(
+                    IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                    &input,
+                    "finish",
+                    tx,
+                )
+                .await;
+            let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    TurnEvent::Chunk { delta } => Some(delta),
+                    _ => None,
+                })
+                .collect();
+            if fail {
+                assert!(result.is_err());
+                assert!(chunks.is_empty(), "no success notice on a failed parent");
+            } else {
+                assert_eq!(result.unwrap().response, "done");
+                assert_eq!(chunks, vec!["done"]);
+            }
+        }
+    }
+
+    struct GoalEarlierFallbackProvider {
+        primary: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalEarlierFallbackProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            if self.primary {
+                "primary-fixture"
+            } else {
+                "fallback-fixture"
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalEarlierFallbackProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires structured requests")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.primary && call == 0 {
+                anyhow::bail!("503 Service Unavailable");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: self.primary.then(|| "primary final".into()),
+                tool_calls: if self.primary {
+                    Vec::new()
+                } else {
+                    assert_eq!(call, 0, "only the first iteration may fall back");
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "earlier-fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }]
+                },
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_from_an_earlier_round_never_leaks_a_notice() {
+        let mut observed = Vec::new();
+        for goal in [false, true] {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(GoalEarlierFallbackProvider {
+                            primary: true,
+                            calls: primary_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(GoalEarlierFallbackProvider {
+                            primary: false,
+                            calls: fallback_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+            let mut agent = blank_input_agent(Box::new(provider));
+            agent.tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    MockTool,
+                )]);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            if goal {
+                let input = zeroclaw_goal::control::goal_parent_turn_input(
+                    &zeroclaw_goal::GoalParentTurn {
+                        kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                        objective: "finish".into(),
+                        working_history: Vec::new(),
+                    },
+                );
+                let outcome = agent
+                    .run_isolated_turn_with_events(
+                        IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                        &input,
+                        "finish",
+                        tx,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.response, "primary final");
+                assert!(
+                    outcome
+                        .working_history
+                        .iter()
+                        .all(|row| !row.content.contains("fallback-fixture"))
+                );
+                assert!(
+                    outcome
+                        .working_history
+                        .iter()
+                        .any(|row| row.role == "tool" && row.content.contains("tool-out"))
+                );
+            } else {
+                assert_eq!(
+                    agent.turn_streamed("finish", tx, None).await.unwrap().0,
+                    "primary final"
+                );
+            }
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+            let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    TurnEvent::Chunk { delta } => Some(delta),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(chunks, vec!["primary final"]);
+            observed.push(chunks);
+        }
+        assert_eq!(observed[0], observed[1]);
+    }
+
     struct GoalSwitchRequestProvider {
         calls: Arc<AtomicUsize>,
         xml: bool,
@@ -12014,10 +12416,11 @@ mod tests {
             let outcome = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
                 .scope(
                     Some(accounting.clone()),
-                    agent.run_isolated_turn(
+                    agent.run_isolated_turn_with_events(
                         IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
                         &input,
                         "finish",
+                        tx,
                     ),
                 )
                 .await
@@ -12175,6 +12578,7 @@ mod tests {
                     prefix: vec![ChatMessage::user("user request")],
                 },
                 &input,
+                "/goal start finish",
                 event_tx,
             )
             .await
@@ -12955,6 +13359,142 @@ mod tests {
             response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
             "show_in_response must append the Tool receipts block to the reply, got: {response}"
         );
+    }
+
+    struct GoalReceiptFailureProvider {
+        calls: AtomicUsize,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalReceiptFailureProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "goal-receipt-failure-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalReceiptFailureProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires structured specs")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                anyhow::bail!("fixture failure after successful tool execution");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "receipt-before-failure".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn isolated_receipt_events_fixture(show: bool, fail: bool) -> Vec<TurnEvent> {
+        let mut agent = streamed_agent_with_config(show_in_response_config(show));
+        if fail {
+            agent.model_provider = Box::new(GoalReceiptFailureProvider {
+                calls: AtomicUsize::new(0),
+            });
+        }
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "use the echo tool".into(),
+                working_history: Vec::new(),
+            });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let result = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "/goal start use the echo tool",
+                event_tx,
+            )
+            .await;
+        if fail {
+            assert!(result.is_err());
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.response, "stream-done");
+            assert!(
+                result
+                    .working_history
+                    .iter()
+                    .all(|row| { !row.content.contains("---\nTool receipts:") })
+            );
+            assert!(!history_has_receipt(&agent));
+        }
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+            event, TurnEvent::ToolResult { name, output, .. }
+                if name == "echo" && output.contains("tool-out")
+            )),
+            "the failure control must reach a completed tool before failing"
+        );
+        events
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_shows_receipts_once_as_a_presentation_chunk() {
+        let events = isolated_receipt_events_fixture(true, false).await;
+        let chunks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks.first(), Some(&"stream-done"));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|text| text.contains("Tool receipts:"))
+                .count(),
+            1,
+        );
+        let receipt_block = chunks.last().unwrap();
+        assert!(receipt_block.starts_with("\n\n---\nTool receipts:"));
+        assert!(receipt_block.contains("zc-receipt-"));
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_does_not_emit_receipt_block_when_hidden_or_failed() {
+        for (show, fail) in [(false, false), (true, true)] {
+            let events = isolated_receipt_events_fixture(show, fail).await;
+            assert!(events.iter().all(|event| !matches!(
+                event, TurnEvent::Chunk { delta } if delta.contains("Tool receipts:")
+            )));
+        }
     }
 
     // Control: with show_in_response off the reply carries no receipts block,
