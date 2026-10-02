@@ -60,6 +60,7 @@ pub(super) struct FinishFaultRegistry {
     settlement_failures: AtomicUsize,
     pairing_transition_failures: AtomicUsize,
     fence_observation: Option<Arc<FenceAdmissionObservation>>,
+    observation: Option<Arc<GoalRegistryObservation>>,
 }
 
 /// Observe real registry calls and control commits without injecting faults.
@@ -69,6 +70,33 @@ pub(super) struct FenceAdmissionObservation {
     pub(super) tool_settlements: AtomicUsize,
     pub(super) operation_admissions: AtomicUsize,
     pub(super) control_committed: Notify,
+}
+
+#[derive(Default)]
+pub(super) struct GoalRegistryObservation {
+    pub(super) parent_returned: AtomicBool,
+    pub(super) calls: Mutex<Vec<GoalRegistryCall>>,
+    pub(super) before_retry: Option<Arc<GoalModelAdmissionGate>>,
+    pub(super) model_admissions: AtomicUsize,
+}
+
+#[derive(Default)]
+pub(super) struct GoalModelAdmissionGate {
+    pub(super) observed: Notify,
+    pub(super) released: Notify,
+}
+
+#[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "shared test support: observations are read by the switch contract target"
+)]
+pub(super) struct GoalRegistryCall {
+    pub(super) kind: &'static str,
+    pub(super) batch_id: Option<String>,
+    pub(super) pending_call_id: Option<String>,
+    pub(super) pending_tool_batch_id: Option<String>,
+    pub(super) parent_returned: bool,
 }
 
 /// Hold the failed worker transition until an explicit pause fence is durable.
@@ -97,6 +125,7 @@ impl FinishFaultRegistry {
             settlement_failures: AtomicUsize::new(0),
             pairing_transition_failures: AtomicUsize::new(0),
             fence_observation: None,
+            observation: None,
         }
     }
 
@@ -112,6 +141,46 @@ impl FinishFaultRegistry {
         *registry.remaining_reason.lock().unwrap() = None;
         registry.fence_observation = Some(observation);
         registry
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared test support: only the switch contract target installs observations"
+    )]
+    pub(super) fn observing(
+        store: Arc<SqliteTaskStore>,
+        observation: Arc<GoalRegistryObservation>,
+    ) -> Self {
+        let mut registry = Self::new(store, "unused-fixture-fault", None, None);
+        *registry.remaining_reason.lock().unwrap() = None;
+        registry.observation = Some(observation);
+        registry
+    }
+
+    async fn observe(
+        &self,
+        kind: &'static str,
+        task_id: &str,
+        batch_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(observation) = &self.observation {
+            let task = self.store.get_goal_task(task_id).await?.unwrap();
+            observation.calls.lock().unwrap().push(GoalRegistryCall {
+                kind,
+                batch_id: batch_id.map(str::to_owned),
+                pending_call_id: task.pending_call_id,
+                pending_tool_batch_id: task.pending_tool_batch_id,
+                parent_returned: observation.parent_returned.load(Ordering::SeqCst),
+            });
+            if kind == "model_admit"
+                && observation.model_admissions.fetch_add(1, Ordering::SeqCst) == 1
+                && let Some(gate) = &observation.before_retry
+            {
+                gate.observed.notify_one();
+                gate.released.notified().await;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn fault_counts(&self) -> (usize, usize, usize) {
@@ -146,9 +215,12 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         if let Some(observation) = &self.fence_observation {
             observation.tool_admissions.fetch_add(1, Ordering::SeqCst);
         }
-        self.store
+        let result = self
+            .store
             .admit_pending_tool_batch(task_id, session_id, expected_epoch, batch_id)
-            .await
+            .await?;
+        self.observe("tool_admit", task_id, Some(batch_id)).await?;
+        Ok(result)
     }
 
     async fn settle_pending_tool_batch(
@@ -161,6 +233,7 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         if let Some(observation) = &self.fence_observation {
             observation.tool_settlements.fetch_add(1, Ordering::SeqCst);
         }
+        self.observe("tool_settle", task_id, Some(batch_id)).await?;
         if self.settlement_fault.swap(false, Ordering::SeqCst) {
             self.settlement_failures.fetch_add(1, Ordering::SeqCst);
             return Err(OriginalSettlementFailure.into());
@@ -398,6 +471,7 @@ impl GoalTaskRegistry for FinishFaultRegistry {
                 .operation_admissions
                 .fetch_add(1, Ordering::SeqCst);
         }
+        self.observe("model_admit", task_id, None).await?;
         self.store
             .admit_pending_operation(task_id, session_id, expected_epoch, operation_id)
             .await
