@@ -33,12 +33,28 @@ pub(crate) const OBJECTIVE: &str = "Apply the selected option after asking the u
 const COMPLETION: &str = "Option A is applied; the declared Goal is complete.";
 const PREVIOUS_RESPONSE: &str = "The earlier request is complete.";
 
+#[path = "goal_recall_transport_tests.rs"]
+mod recall;
+
+#[path = "goal_receipt_transport_tests.rs"]
+mod receipts;
+
+#[derive(Clone, Copy)]
+enum FixtureScript {
+    Choice,
+    Recall,
+    Receipts,
+}
+
 /// Exercise answer insertion separately from a resume without user input.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeScenario {
     Answered,
     PlainThenAnswered,
     PrefixMatchesObjective,
+    RecallAnswered,
+    RecallNoneControl,
+    Receipts,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +142,7 @@ pub(crate) struct ActiveGoalFixture {
     backend: Arc<SqliteSessionBackend>,
     server: MockServer,
     answer_failures: Arc<AtomicUsize>,
+    recall: Option<Arc<recall::RecallMemory>>,
 }
 
 /// Keep the real session store; reject only this fixture's resumed answer.
@@ -256,6 +273,18 @@ impl ActiveGoalFixture {
         Self::build(path, None).await
     }
 
+    pub(crate) async fn with_recall(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, true, FixtureScript::Recall).await
+    }
+
+    pub(crate) async fn with_recall_none_control(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, false, FixtureScript::Recall).await
+    }
+
+    pub(crate) async fn with_receipts(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, false, FixtureScript::Receipts).await
+    }
+
     pub(crate) async fn with_answer_append_failure(path: &Path) -> Self {
         Self::build(path, Some(GoalTransportFailure::AnswerAppend)).await
     }
@@ -278,13 +307,35 @@ impl ActiveGoalFixture {
         failure: Option<GoalTransportFailure>,
         local_uid: Option<u32>,
     ) -> Self {
+        Self::build_with_memory(path, failure, local_uid, false, FixtureScript::Choice).await
+    }
+
+    async fn build_with_memory(
+        path: &Path,
+        failure: Option<GoalTransportFailure>,
+        local_uid: Option<u32>,
+        recall_enabled: bool,
+        script: FixtureScript,
+    ) -> Self {
         let canonical_workspace = local_uid.map(|_| path.canonicalize().unwrap());
         let path = canonical_workspace.as_deref().unwrap_or(path);
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(GoalModelResponses)
-            .mount(&server)
-            .await;
+        if matches!(script, FixtureScript::Recall) {
+            Mock::given(method("POST"))
+                .respond_with(recall::RecallResponses::default())
+                .mount(&server)
+                .await;
+        } else if matches!(script, FixtureScript::Receipts) {
+            Mock::given(method("POST"))
+                .respond_with(receipts::ReceiptResponses)
+                .mount(&server)
+                .await;
+        } else {
+            Mock::given(method("POST"))
+                .respond_with(GoalModelResponses)
+                .mount(&server)
+                .await;
+        }
         let mut config = Config {
             data_dir: path.to_path_buf(),
             config_path: path.join("config.toml"),
@@ -315,6 +366,10 @@ impl ActiveGoalFixture {
             model_provider: "openai.goal-test".into(),
             ..Default::default()
         };
+        if matches!(script, FixtureScript::Receipts) {
+            agent_config.resolved.tool_receipts.enabled = true;
+            agent_config.resolved.tool_receipts.show_in_response = true;
+        }
         if let Some(uid) = local_uid {
             use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
             use zeroclaw_config::schema::{PermissionProfileConfig, RiskProfileConfig, UserConfig};
@@ -365,6 +420,11 @@ impl ActiveGoalFixture {
                 Some("goal-worker"),
             )
             .unwrap();
+        let recall = recall_enabled.then(|| Arc::new(recall::RecallMemory::default()));
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = match &recall {
+            Some(memory) => memory.clone(),
+            None => Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        };
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(provider)
             .model_provider_name(provider_ref)
@@ -372,9 +432,14 @@ impl ActiveGoalFixture {
             .model_route_resolver(resolver)
             .config(agent_config)
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![],
+                if matches!(script, FixtureScript::Receipts) {
+                    vec![Box::new(receipts::ReceiptTool)]
+                } else {
+                    vec![]
+                },
             ))
-            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .memory(memory)
+            .memory_session_id(recall_enabled.then(|| format!("rpc_{SESSION_ID}")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
             .workspace_dir(path.to_path_buf())
@@ -426,6 +491,7 @@ impl ActiveGoalFixture {
             backend,
             server,
             answer_failures,
+            recall,
         }
     }
 
@@ -1379,6 +1445,17 @@ pub(crate) async fn assert_active_goal_scenario_with_objective(
     objective: &str,
     scenario: ResumeScenario,
 ) {
+    if scenario == ResumeScenario::Receipts {
+        receipts::assert_receipt_scenario(fixture, transport, remote).await;
+        return;
+    }
+    if matches!(
+        scenario,
+        ResumeScenario::RecallAnswered | ResumeScenario::RecallNoneControl
+    ) {
+        recall::assert_recall_scenario(fixture, transport, remote, objective).await;
+        return;
+    }
     let tui_sig = fixture.context.tui_registry.sign(TUI_ID).unwrap();
     transport.send("initialize", json!({"protocol_version":1,"tui_id":TUI_ID,"tui_sig":tui_sig,"auth_token":remote.then_some("zc_goal_test")}), 1).await;
     let initialized = transport.receive().await;

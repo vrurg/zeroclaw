@@ -2255,6 +2255,36 @@ mod accept_error_tests {
         goal_wss_fixture(test_name, GoalWssScenario::Continuity(objective, scenario)).await;
     }
 
+    #[tokio::test]
+    async fn active_goal_recall_question_answer_and_continuation_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_recall_question_answer_and_continuation_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::RecallAnswered,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_goal_recall_none_control_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_recall_none_control_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::RecallNoneControl,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_goal_receipts_are_presentation_only_over_wss() {
+        active_goal_wss_fixture(
+            "rpc::wss::accept_error_tests::active_goal_receipts_are_presentation_only_over_wss",
+            crate::rpc::goal_transport_test_support::OBJECTIVE,
+            crate::rpc::goal_transport_test_support::ResumeScenario::Receipts,
+        )
+        .await;
+    }
+
     async fn goal_wss_fixture(test_name: &str, scenario: GoalWssScenario<'_>) {
         use crate::rpc::goal_transport_test_support::{
             ActiveGoalFixture, GoalTestTransport, assert_active_goal_scenario_with_objective,
@@ -2273,6 +2303,18 @@ mod accept_error_tests {
             GoalWssScenario::PrefixProjectionFailure => {
                 ActiveGoalFixture::with_prefix_projection_failure(tmp.path()).await
             }
+            GoalWssScenario::Continuity(
+                _,
+                crate::rpc::goal_transport_test_support::ResumeScenario::RecallAnswered,
+            ) => ActiveGoalFixture::with_recall(tmp.path()).await,
+            GoalWssScenario::Continuity(
+                _,
+                crate::rpc::goal_transport_test_support::ResumeScenario::RecallNoneControl,
+            ) => ActiveGoalFixture::with_recall_none_control(tmp.path()).await,
+            GoalWssScenario::Continuity(
+                _,
+                crate::rpc::goal_transport_test_support::ResumeScenario::Receipts,
+            ) => ActiveGoalFixture::with_receipts(tmp.path()).await,
             _ => ActiveGoalFixture::new(tmp.path()).await,
         };
         let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
