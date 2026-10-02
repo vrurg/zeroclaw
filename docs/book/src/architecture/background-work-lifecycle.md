@@ -147,11 +147,30 @@ from the task and obtains its prefix from the bound session owner.
   Objective and feedback bytes can contain the same delimiters or text that
   resembles runtime instructions. Framing does not escape or normalize those
   bytes, confer permissions, or replace ordinary authorization and tool policy.
-- Ordinary Matrix memory injection can prepend recalled context to the last
-  user-role working message. Its wire content can therefore contain a preamble
-  before the verbatim objective or user input. The candidate's Matrix Goal
-  path still has an unresolved parity gap in cleaning this volatile preamble
-  from the carried working transcript; this is not a durability guarantee.
+- On Matrix and ZeroCode, each Goal parent turn uses ordinary read-only memory
+  recall keyed by the raw admitting Goal command. Recalled context is prepended
+  to the last user-role working message for the provider request, then removed
+  at its recorded position before the transcript carries forward. It does not
+  become canonical session history or a new memory entry.
+- Goal parent turns retain their surface's ordinary loop policy: Matrix uses
+  its configured pacing and loop detection; ZeroCode has no loop detector.
+  A repetition abort that ends an ordinary Matrix turn also ends a Matrix Goal
+  parent turn. The ordinary error appears once, followed by the V1
+  unpaired-tool-results failure when the interrupted calls have no recorded
+  results. The loop-detection note retains its ordinary effect after the final
+  Goal delimiter within that parent turn; it is not carried into the next turn.
+- Goal parent turns use their surface's ordinary tool exclusions and configured
+  execution-tree iteration limit. Each parent turn receives a fresh budget;
+  the verifier has no execution-tree budget. Matrix derives ingress
+  classification from the authenticated admitting channel message, and ZeroCode
+  retains its ordinary direct-agent classification. These inputs grant no new
+  permissions or approval exemptions.
+- Goal parent turns use ordinary tool receipts when configured. Signed receipts
+  accompany tool results on the provider path. ZeroCode's optional receipt block
+  appears once after successful response text on both native transports, but
+  remains presentation-only: it is not part of the candidate, verifier input,
+  or canonical history. Failed turns and disabled or hidden receipt display do
+  not emit that block.
 - Within one continuation chain, ordinary context recovery can remove the
   earlier candidate while retaining the newer verifier-feedback boundary.
   Preserving both at assembly does not promise that both reach every request
