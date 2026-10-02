@@ -1688,7 +1688,8 @@ impl Agent {
         input: &zeroclaw_goal::control::GoalParentTurnInput,
         recall_query: &str,
     ) -> Result<IsolatedTurnOutcome> {
-        self.run_isolated_turn_inner(source, input, None).await
+        self.run_isolated_turn_inner(source, input, recall_query, None)
+            .await
     }
 
     /// Runs one isolated Goal turn while forwarding ordinary turn events to
@@ -1698,9 +1699,10 @@ impl Agent {
         &mut self,
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
+        recall_query: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<IsolatedTurnOutcome> {
-        self.run_isolated_turn_inner(source, input, Some(event_tx))
+        self.run_isolated_turn_inner(source, input, recall_query, Some(event_tx))
             .await
     }
 
@@ -1708,6 +1710,7 @@ impl Agent {
         &mut self,
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
+        recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
@@ -10696,6 +10699,7 @@ mod tests {
                     prefix: vec![ChatMessage::user("user request")],
                 },
                 &input,
+                "/goal start finish",
                 event_tx,
             )
             .await
@@ -11476,6 +11480,142 @@ mod tests {
             response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
             "show_in_response must append the Tool receipts block to the reply, got: {response}"
         );
+    }
+
+    struct GoalReceiptFailureProvider {
+        calls: AtomicUsize,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalReceiptFailureProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "goal-receipt-failure-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalReceiptFailureProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires structured specs")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                anyhow::bail!("fixture failure after successful tool execution");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "receipt-before-failure".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn isolated_receipt_events_fixture(show: bool, fail: bool) -> Vec<TurnEvent> {
+        let mut agent = streamed_agent_with_config(show_in_response_config(show));
+        if fail {
+            agent.model_provider = Box::new(GoalReceiptFailureProvider {
+                calls: AtomicUsize::new(0),
+            });
+        }
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "use the echo tool".into(),
+                working_history: Vec::new(),
+            });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let result = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "/goal start use the echo tool",
+                event_tx,
+            )
+            .await;
+        if fail {
+            assert!(result.is_err());
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.response, "stream-done");
+            assert!(
+                result
+                    .working_history
+                    .iter()
+                    .all(|row| { !row.content.contains("---\nTool receipts:") })
+            );
+            assert!(!history_has_receipt(&agent));
+        }
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+            event, TurnEvent::ToolResult { name, output, .. }
+                if name == "echo" && output.contains("tool-out")
+            )),
+            "the failure control must reach a completed tool before failing"
+        );
+        events
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_shows_receipts_once_as_a_presentation_chunk() {
+        let events = isolated_receipt_events_fixture(true, false).await;
+        let chunks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks.first(), Some(&"stream-done"));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|text| text.contains("Tool receipts:"))
+                .count(),
+            1,
+        );
+        let receipt_block = chunks.last().unwrap();
+        assert!(receipt_block.starts_with("\n\n---\nTool receipts:"));
+        assert!(receipt_block.contains("zc-receipt-"));
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_does_not_emit_receipt_block_when_hidden_or_failed() {
+        for (show, fail) in [(false, false), (true, true)] {
+            let events = isolated_receipt_events_fixture(show, fail).await;
+            assert!(events.iter().all(|event| !matches!(
+                event, TurnEvent::Chunk { delta } if delta.contains("Tool receipts:")
+            )));
+        }
     }
 
     // Control: with show_in_response off the reply carries no receipts block,
