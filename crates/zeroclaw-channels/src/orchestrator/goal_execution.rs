@@ -1547,6 +1547,185 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct MatrixPolicyChannelObserver(Mutex<Vec<(&'static str, Option<String>)>>);
+
+    impl zeroclaw_runtime::observability::Observer for MatrixPolicyChannelObserver {
+        fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
+            use zeroclaw_runtime::observability::ObserverEvent;
+            let observation = match event {
+                ObserverEvent::AgentStart { channel, .. } => ("start", channel),
+                ObserverEvent::AgentEnd { channel, .. } => ("end", channel),
+                ObserverEvent::ToolCallStart { channel, .. } => ("tool-start", channel),
+                ObserverEvent::ToolCall { channel, .. } => ("tool-end", channel),
+                _ => return,
+            };
+            self.0
+                .lock()
+                .unwrap()
+                .push((observation.0, observation.1.clone()));
+        }
+
+        fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "matrix-policy-fixture"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_policy_channel_matches_ordinary_turn_and_tool_events() {
+        let mut observations = Vec::new();
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let provider = Arc::new(GoalPolicyProvider {
+                requests: Mutex::new(Vec::new()),
+                tool_rounds: 1,
+                calls_per_round: 1,
+            });
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut context = matrix_policy_context(
+                backend,
+                Arc::new(MatrixGoalErrorRecordingChannel::default()),
+                provider.clone(),
+                calls.clone(),
+            );
+            let observer = Arc::new(MatrixPolicyChannelObserver::default());
+            Arc::get_mut(&mut context).unwrap().observer = observer.clone();
+            if goal {
+                let (result, _) = run_matrix_policy_goal(context).await;
+                assert_eq!(result.unwrap().candidate(), "policy candidate");
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new("event", "user", "room", "bounded repair", "matrix", 1),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(provider.requests.lock().unwrap().len(), 2);
+            let recorded = observer.0.lock().unwrap().clone();
+            assert_eq!(
+                recorded,
+                ["start", "tool-start", "tool-end", "end"]
+                    .map(|kind| (kind, Some("matrix".to_owned())))
+            );
+            observations.push(recorded);
+        }
+        assert_eq!(observations[0], observations[1]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_policy_verifier_ignores_parent_thinking_and_keeps_shared_request() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::WireApi;
+        use zeroclaw_runtime::agent::thinking::{ThinkingConfig, ThinkingLevel};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "verdict"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let turn = GoalVerifierTurn {
+            objective: "bounded repair".into(),
+            candidate: "repair evidence".into(),
+        };
+        let mut requests = Vec::new();
+        for level in [ThinkingLevel::Off, ThinkingLevel::High] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend,
+                Arc::new(MatrixGoalErrorRecordingChannel::default()),
+                Arc::new(GoalThinkingProvider(Mutex::new(Vec::new()))),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config.reliability.provider_retries = 0;
+            config.goal.verifier.model_provider = "openai.verifier-test".into();
+            config.goal.verifier.model = Some("goal-verifier".into());
+            let slot = config
+                .providers
+                .models
+                .ensure("openai", "verifier-test")
+                .unwrap();
+            slot.api_key = Some("test-key".into());
+            slot.uri = Some(server.uri());
+            slot.kind = Some("openai-compatible".into());
+            slot.wire_api = Some(WireApi::ChatCompletions);
+            slot.model = Some("alias-default".into());
+            slot.temperature = Some(0.2);
+            slot.live_pricing = false;
+            config.agents.get_mut("test").unwrap().resolved.thinking = ThinkingConfig {
+                default_level: level,
+                native_thinking: true,
+                ..Default::default()
+            };
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            let session_key = GoalSessionKey::matrix("matrix_verifier_policy_fixture").unwrap();
+            ctx.thinking_overrides
+                .lock()
+                .unwrap()
+                .insert(session_key.durable_id(), level);
+            let operation = GoalOperationScope::new(
+                GoalExecutionScope::new("verifier-policy-fixture", session_key.durable_id(), 1)
+                    .unwrap(),
+            );
+            let mut lease = MatrixGoalExecutionLease {
+                _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                context,
+                session_key,
+                message: ChannelMessage::new(
+                    "event",
+                    "user",
+                    "room",
+                    "/goal start repair",
+                    "matrix",
+                    1,
+                ),
+                pending_delivery: None,
+                pending_receipts: None,
+                history_has_trim_breadcrumb: false,
+            };
+            let result = lease.run_verifier(&operation, turn.clone()).await.unwrap();
+            assert_eq!(result.response, "verdict");
+            assert_eq!(result.attribution.unwrap().model, "goal-verifier");
+            let received = server.received_requests().await.unwrap();
+            requests.push(
+                serde_json::from_slice::<serde_json::Value>(&received.last().unwrap().body)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(requests[0], requests[1]);
+        let request = &requests[0];
+        assert_eq!(request["model"], "goal-verifier");
+        assert_eq!(request["temperature"], 0.2);
+        assert_eq!(
+            request["messages"],
+            serde_json::to_value(turn.to_chat_messages()).unwrap()
+        );
+        assert!(request.get("tools").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+        server.verify().await;
+    }
+
     async fn assert_matrix_goal_verifier_wire_model(
         alias_model: Option<&str>,
         verifier_model: Option<&str>,
@@ -2299,6 +2478,268 @@ mod tests {
         assert_matrix_goal_recall_is_turn_local(false).await;
     }
 
+    /// Prompt-guided results add a user row without starting another recall.
+    #[derive(Default)]
+    struct MatrixRecallToolRoundProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for MatrixRecallToolRoundProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "matrix-recall-round-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MatrixRecallToolRoundProvider {
+        fn supports_native_tools(&self) -> bool {
+            false
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires the actual prompt-guided request")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            assert!(
+                request.tools.is_none(),
+                "fixture must use prompt-guided tools"
+            );
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.messages.to_vec());
+            assert!(requests.len() <= 2, "fixture admits exactly two requests");
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(if requests.len() == 1 {
+                    "<tool_call>{\"name\":\"echo\",\"arguments\":{}}</tool_call>".into()
+                } else {
+                    "bounded recall candidate".into()
+                }),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_recall_xml_no_switch_preserves_the_original_injection_row() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let authored = format!(
+            "{}\nUser-authored fixture text.\n{}",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        let prefix = vec![
+            ChatMessage::user(authored.clone()),
+            ChatMessage::assistant("acknowledged"),
+        ];
+        for goal in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let provider = Arc::new(MatrixRecallToolRoundProvider::default());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                provider.clone(),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            ctx.memory = Arc::new(super::super::tests::RecallMemory);
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(GoalPolicyCountingTool(calls.clone())),
+                ]),
+            );
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                auto_approve: vec!["echo".into()],
+                ..Default::default()
+            };
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config
+                .risk_profiles
+                .insert("recall-fixture".into(), risk.clone());
+            config.agents.get_mut("test").unwrap().risk_profile = "recall-fixture".into();
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            ctx.approval_manager =
+                Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&risk));
+            let message = ChannelMessage::new(
+                "recall-event",
+                "user",
+                "room",
+                "bounded repair",
+                "matrix",
+                1,
+            );
+            let key = super::super::conversation_history_key(&message);
+            for row in &prefix {
+                backend.append(&key, row).unwrap();
+            }
+            let carried = if goal {
+                let session_key = GoalSessionKey::matrix(key.clone()).unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("recall-fixture", session_key.durable_id(), 1).unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context,
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                let result = lease
+                    .run_parent_turn(
+                        &operation,
+                        GoalParentTurn {
+                            kind: GoalParentTurnKind::Start,
+                            objective: "bounded repair".into(),
+                            working_history: prefix.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.candidate(), "bounded recall candidate");
+                lease
+                    .append_parent_candidate(result.candidate().into())
+                    .await
+                    .unwrap();
+                result.working_history().to_vec()
+            } else {
+                super::super::process_channel_message(
+                    context.clone(),
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(
+                channel
+                    .messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|text| text == "bounded recall candidate")
+            );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let injection = requests[0]
+                .iter()
+                .rposition(|row| row.role == "user")
+                .unwrap();
+            assert!(
+                requests[0][injection]
+                    .content
+                    .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            );
+            assert_eq!(requests[1][injection].role, requests[0][injection].role);
+            assert_eq!(
+                requests[1][injection].content,
+                requests[0][injection].content
+            );
+            let newest = requests[1]
+                .iter()
+                .rposition(|row| row.role == "user")
+                .unwrap();
+            assert!(newest > injection);
+            assert!(requests[1][newest].content.starts_with("[Tool results]\n"));
+            assert!(
+                !requests[1][newest]
+                    .content
+                    .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            );
+            for request in requests.iter() {
+                assert_eq!(
+                    request
+                        .iter()
+                        .filter(|row| row.content.contains("memory_key_1"))
+                        .count(),
+                    1
+                );
+                assert!(
+                    request
+                        .iter()
+                        .any(|row| row.role == "user" && row.content == authored)
+                );
+            }
+            let histories = [("carried", carried), ("durable", backend.load(&key))];
+            for (surface, history) in &histories {
+                eprintln!(
+                    "recall control goal={goal} surface={surface} owned_blocks={}",
+                    history
+                        .iter()
+                        .filter(|row| row.content.contains("memory_key_1"))
+                        .count()
+                );
+            }
+            for (surface, history) in histories {
+                if goal {
+                    assert!(
+                        history
+                            .iter()
+                            .all(|row| !row.content.contains("memory_key_1")),
+                        "goal={goal} surface={surface}"
+                    );
+                } else {
+                    // Ordinary resync restores raw input only on the newest user
+                    // row, leaving recall on the earlier injection row.
+                    let owned: Vec<_> = history
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| row.content.contains("memory_key_1"))
+                        .collect();
+                    assert_eq!(owned.len(), 1, "goal={goal} surface={surface}");
+                    let newest = history.iter().rposition(|row| row.role == "user").unwrap();
+                    assert_eq!(owned[0].1.role, "user");
+                    assert!(owned[0].0 < newest, "goal={goal} surface={surface}");
+                }
+                assert!(
+                    history
+                        .iter()
+                        .any(|row| row.role == "user" && row.content == authored)
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn matrix_goal_recall_strip_follows_recovery_trim_remapping() {
         assert_matrix_goal_recall_is_turn_local(true).await;
@@ -2440,6 +2881,1816 @@ mod tests {
         }
     }
 
+    struct GoalFallbackUnavailableProvider;
+
+    impl zeroclaw_api::attribution::Attributable for GoalFallbackUnavailableProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "primary-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for GoalFallbackUnavailableProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("503 service unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            bail!("503 service unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_fallback_footer_matches_ordinary_delivery_but_not_durable_candidate() {
+        let mut replies = Vec::new();
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(GoalFallbackUnavailableProvider)
+                            as Box<dyn zeroclaw_providers::ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(GoalPolicyProvider {
+                            requests: Mutex::new(Vec::new()),
+                            tool_rounds: 0,
+                            calls_per_round: 0,
+                        }) as Box<dyn zeroclaw_providers::ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+            let context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(reliable),
+                0,
+            );
+            if goal {
+                let (result, mut lease) = run_matrix_policy_goal(context).await;
+                let result = result.unwrap();
+                assert_eq!(result.candidate(), "policy candidate");
+                assert!(
+                    result
+                        .working_history()
+                        .iter()
+                        .all(|row| { !row.content.contains("fallback-fixture") })
+                );
+                lease
+                    .append_parent_candidate(result.candidate().to_owned())
+                    .await
+                    .unwrap();
+                let rows = zeroclaw_infra::session_backend::SessionBackend::load(
+                    backend.as_ref(),
+                    &lease.session_key.durable_id(),
+                );
+                assert_eq!(rows.iter().filter(|row| row.role == "assistant").count(), 1);
+                assert_eq!(rows.last().unwrap().content, "policy candidate");
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new(
+                        "ordinary-event",
+                        "user",
+                        "room",
+                        "bounded repair",
+                        "matrix",
+                        1,
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            let messages = channel.messages.lock().await;
+            let reply = messages
+                .iter()
+                .find(|text| text.starts_with("policy candidate"))
+                .expect("both paths must deliver their candidate");
+            replies.push(reply.clone());
+        }
+        assert!(
+            replies[0].contains("fallback-fixture"),
+            "ordinary fallback control"
+        );
+        assert_eq!(replies[1], replies[0]);
+    }
+
+    // Recovery presentation is success-only; an unchanged primary response
+    // must not gain a footer merely because it ran under Goal control.
+    #[tokio::test]
+    async fn matrix_goal_fallback_controls_are_silent_without_recovery_or_on_failure() {
+        for fail in [false, true] {
+            for goal in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let backend = Arc::new(
+                    zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+                );
+                let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+                let provider: Box<dyn ModelProvider> = if fail {
+                    Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                        "primary-fixture",
+                        vec![
+                            (
+                                "primary-fixture".into(),
+                                Box::new(GoalFallbackUnavailableProvider) as Box<dyn ModelProvider>,
+                            ),
+                            (
+                                "fallback-fixture".into(),
+                                Box::new(GoalFallbackUnavailableProvider) as Box<dyn ModelProvider>,
+                            ),
+                        ],
+                        0,
+                        1,
+                    ))
+                } else {
+                    Box::new(GoalPolicyProvider {
+                        requests: Mutex::new(Vec::new()),
+                        tool_rounds: 0,
+                        calls_per_round: 0,
+                    })
+                };
+                let context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                    backend.clone(),
+                    channel.clone(),
+                    Arc::from(provider),
+                    0,
+                );
+                let requested_model = context.model.clone();
+                if goal {
+                    let (result, mut lease) = run_matrix_policy_goal(context).await;
+                    if fail {
+                        assert!(result.is_err());
+                    } else {
+                        let result = result.unwrap();
+                        assert_eq!(result.candidate(), "policy candidate");
+                        assert!(
+                            result
+                                .working_history()
+                                .iter()
+                                .all(|row| { !row.content.contains("fallback-fixture") })
+                        );
+                        lease
+                            .append_parent_candidate(result.candidate().to_owned())
+                            .await
+                            .unwrap();
+                    }
+                    let rows = zeroclaw_infra::session_backend::SessionBackend::load(
+                        backend.as_ref(),
+                        &lease.session_key.durable_id(),
+                    );
+                    assert_eq!(
+                        rows.iter().filter(|row| row.role == "assistant").count(),
+                        usize::from(!fail),
+                    );
+                    if !fail {
+                        assert_eq!(rows.last().unwrap().content, "policy candidate");
+                    }
+                } else {
+                    super::super::process_channel_message(
+                        context,
+                        ChannelMessage::new(
+                            "ordinary-event",
+                            "user",
+                            "room",
+                            "bounded repair",
+                            "matrix",
+                            1,
+                        ),
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                }
+                let messages = channel.messages.lock().await;
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|text| text.starts_with("policy candidate"))
+                        .count(),
+                    usize::from(!fail),
+                    "goal={goal} fail={fail}",
+                );
+                if !fail {
+                    assert!(messages.iter().any(|text| text == "policy candidate"));
+                }
+                // Error details may name an attempted provider; that is not a
+                // recovery notice. Compare the ordinary localized footer itself.
+                let footer = super::super::channel_runtime_cli_string_with_args(
+                    "channel-runtime-fallback-footer",
+                    &[
+                        ("requested", "primary-fixture"),
+                        ("actual", "fallback-fixture"),
+                        ("model", requested_model.as_str()),
+                    ],
+                );
+                assert!(messages.iter().all(|text| !text.contains(&footer)));
+            }
+        }
+    }
+
+    struct MatrixEarlierFallbackProvider {
+        primary: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for MatrixEarlierFallbackProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            if self.primary {
+                "primary-fixture"
+            } else {
+                "fallback-fixture"
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MatrixEarlierFallbackProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires structured requests")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.primary && call == 0 {
+                bail!("503 service unavailable");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: self.primary.then(|| "primary final".into()),
+                tool_calls: if self.primary {
+                    Vec::new()
+                } else {
+                    assert_eq!(call, 0, "only the first round may fall back");
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "earlier-fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }]
+                },
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    // A recovery on a tool-call round must not describe a later primary
+    // response as having been served by that earlier fallback.
+    #[tokio::test]
+    async fn matrix_goal_fallback_from_an_earlier_round_never_leaks_a_footer() {
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(MatrixEarlierFallbackProvider {
+                            primary: true,
+                            calls: primary_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(MatrixEarlierFallbackProvider {
+                            primary: false,
+                            calls: fallback_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+            let context = matrix_policy_context(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(reliable),
+                tool_calls.clone(),
+            );
+            if goal {
+                let (result, mut lease) = run_matrix_policy_goal(context).await;
+                let result = result.unwrap();
+                assert_eq!(result.candidate(), "primary final");
+                assert!(
+                    result
+                        .working_history()
+                        .iter()
+                        .all(|row| { !row.content.contains("fallback-fixture") })
+                );
+                lease
+                    .append_parent_candidate(result.candidate().to_owned())
+                    .await
+                    .unwrap();
+                let rows = zeroclaw_infra::session_backend::SessionBackend::load(
+                    backend.as_ref(),
+                    &lease.session_key.durable_id(),
+                );
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| { row.role == "assistant" && row.content == "primary final" })
+                        .count(),
+                    1
+                );
+                assert!(
+                    rows.iter()
+                        .all(|row| !row.content.contains("fallback-fixture"))
+                );
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new(
+                        "ordinary-event",
+                        "user",
+                        "room",
+                        "bounded repair",
+                        "matrix",
+                        1,
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let messages = channel.messages.lock().await;
+            let replies: Vec<_> = messages
+                .iter()
+                .filter(|text| text.starts_with("primary final"))
+                .collect();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0], "primary final");
+        }
+    }
+
+    struct MatrixSafeguardNoticeProvider;
+
+    impl zeroclaw_api::attribution::Attributable for MatrixSafeguardNoticeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "safeguard-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MatrixSafeguardNoticeProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires structured requests")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            model: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: model.into(),
+                    served_model: "served-model".into(),
+                    category: Some("private-category".into()),
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("accepted response".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    // Safeguard recovery covers this fallback leg: show the ordinary safety
+    // notice once, without a generic footer or presentation in durable state.
+    #[tokio::test]
+    async fn matrix_goal_fallback_safeguard_footer_matches_ordinary_and_stays_presentational() {
+        let mut replies = Vec::new();
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(GoalFallbackUnavailableProvider) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(MatrixSafeguardNoticeProvider) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+            let context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(reliable),
+                0,
+            );
+            if goal {
+                let (result, mut lease) = run_matrix_policy_goal(context).await;
+                let result = result.unwrap();
+                assert_eq!(result.candidate(), "accepted response");
+                assert!(result.working_history().iter().all(|row| {
+                    !row.content.contains("served-model")
+                        && !row.content.contains("private-category")
+                }));
+                lease
+                    .append_parent_candidate(result.candidate().to_owned())
+                    .await
+                    .unwrap();
+                let rows = zeroclaw_infra::session_backend::SessionBackend::load(
+                    backend.as_ref(),
+                    &lease.session_key.durable_id(),
+                );
+                assert_eq!(rows.iter().filter(|row| row.role == "assistant").count(), 1);
+                assert_eq!(rows.last().unwrap().content, "accepted response");
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new(
+                        "ordinary-event",
+                        "user",
+                        "room",
+                        "bounded repair",
+                        "matrix",
+                        1,
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            let messages = channel.messages.lock().await;
+            assert!(
+                messages
+                    .iter()
+                    .all(|text| !text.contains("private-category"))
+            );
+            let delivered: Vec<_> = messages
+                .iter()
+                .filter(|text| text.starts_with("accepted response"))
+                .collect();
+            assert_eq!(delivered.len(), 1);
+            replies.push(delivered[0].clone());
+        }
+        assert_eq!(
+            replies[0].matches("🛡️").count(),
+            1,
+            "ordinary safeguard control"
+        );
+        assert!(replies[0].contains("served-model"));
+        assert!(!replies[0].contains("fallback-fixture"));
+        assert_eq!(replies[1], replies[0]);
+    }
+
+    #[derive(Clone, Debug)]
+    struct GoalThinkingRequest {
+        system: String,
+        temperature: Option<f64>,
+        native: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    }
+
+    struct GoalThinkingProvider(Mutex<Vec<GoalThinkingRequest>>);
+
+    impl zeroclaw_api::attribution::Attributable for GoalThinkingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "thinking-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for GoalThinkingProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires recorded request rows")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.0.lock().unwrap().push(GoalThinkingRequest {
+                system: request.messages[0].content.clone(),
+                temperature,
+                native: request.thinking,
+            });
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("thinking candidate".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn matrix_thinking_requests_with_levels(
+        default_level: zeroclaw_runtime::agent::thinking::ThinkingLevel,
+        session_level: Option<zeroclaw_runtime::agent::thinking::ThinkingLevel>,
+    ) -> (GoalThinkingRequest, GoalThinkingRequest) {
+        let mut requests = Vec::new();
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let provider = Arc::new(GoalThinkingProvider(Mutex::new(Vec::new())));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend,
+                Arc::new(MatrixGoalErrorRecordingChannel::default()),
+                provider.clone(),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config.agents.get_mut("test").unwrap().resolved.thinking =
+                zeroclaw_runtime::agent::thinking::ThinkingConfig {
+                    default_level,
+                    native_thinking: true,
+                    ..Default::default()
+                };
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            let message = ChannelMessage::new(
+                "event",
+                "user",
+                "room",
+                if goal {
+                    "/goal start bounded repair"
+                } else {
+                    "bounded repair"
+                },
+                "matrix",
+                1,
+            );
+            let key = super::super::conversation_history_key(&message);
+            if let Some(level) = session_level {
+                ctx.thinking_overrides
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), level);
+            }
+            if goal {
+                let session_key = GoalSessionKey::matrix(key).unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("thinking-fixture", session_key.durable_id(), 1)
+                        .unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context,
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                assert_eq!(
+                    lease
+                        .run_parent_turn(
+                            &operation,
+                            GoalParentTurn {
+                                kind: GoalParentTurnKind::Start,
+                                objective: "bounded repair".into(),
+                                working_history: Vec::new(),
+                            }
+                        )
+                        .await
+                        .unwrap()
+                        .candidate(),
+                    "thinking candidate"
+                );
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            let recorded = provider.0.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            requests.push(recorded[0].clone());
+        }
+        (requests.remove(0), requests.remove(0))
+    }
+
+    async fn matrix_thinking_requests() -> (GoalThinkingRequest, GoalThinkingRequest) {
+        use zeroclaw_runtime::agent::thinking::ThinkingLevel;
+        matrix_thinking_requests_with_levels(ThinkingLevel::Off, Some(ThinkingLevel::High)).await
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_thinking_uses_the_ordinary_session_prefix() {
+        let (ordinary, goal) = matrix_thinking_requests().await;
+        let prefix = zeroclaw_runtime::agent::thinking::apply_thinking_level(
+            zeroclaw_runtime::agent::thinking::ThinkingLevel::High,
+        )
+        .system_prompt_prefix
+        .unwrap();
+        assert!(ordinary.system.starts_with(&prefix));
+        assert!(goal.system.starts_with(&prefix));
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_thinking_uses_the_ordinary_effective_temperature() {
+        let (ordinary, goal) = matrix_thinking_requests().await;
+        assert_eq!(goal.temperature, ordinary.temperature);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_thinking_uses_the_ordinary_native_budget() {
+        let (ordinary, goal) = matrix_thinking_requests().await;
+        assert!(ordinary.native.is_some());
+        assert_eq!(goal.native, ordinary.native);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_thinking_uses_the_ordinary_configured_default() {
+        use zeroclaw_runtime::agent::thinking::{ThinkingLevel, apply_thinking_level};
+        let (ordinary, goal) =
+            matrix_thinking_requests_with_levels(ThinkingLevel::High, None).await;
+        let prefix = apply_thinking_level(ThinkingLevel::High)
+            .system_prompt_prefix
+            .unwrap();
+        assert!(ordinary.system.starts_with(&prefix));
+        assert!(goal.system.starts_with(&prefix));
+        assert_eq!(goal.temperature, ordinary.temperature);
+        assert_eq!(goal.native, ordinary.native);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_thinking_off_preserves_ordinary_settings() {
+        use zeroclaw_runtime::agent::thinking::{ThinkingLevel, apply_thinking_level};
+        let (ordinary, goal) = matrix_thinking_requests_with_levels(ThinkingLevel::Off, None).await;
+        let ordinary_prefix = apply_thinking_level(ThinkingLevel::Off)
+            .system_prompt_prefix
+            .unwrap();
+        assert!(ordinary.system.starts_with(&ordinary_prefix));
+        assert_eq!(ordinary.native, None);
+        assert_eq!(goal.native, ordinary.native);
+        assert_eq!(goal.temperature, ordinary.temperature);
+    }
+
+    async fn matrix_peer_map_requests(
+        autonomy: zeroclaw_config::autonomy::AutonomyLevel,
+    ) -> (String, String, String) {
+        let mut requests = Vec::new();
+        let mut expected_map = None;
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let provider = Arc::new(GoalThinkingProvider(Mutex::new(Vec::new())));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend,
+                Arc::new(MatrixGoalErrorRecordingChannel::default()),
+                provider.clone(),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            ctx.autonomy_level = autonomy;
+            ctx.non_cli_excluded_tools = Arc::new(vec!["send_message_to_peer".into()]);
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config.agents.get_mut("test").unwrap().channels = vec!["matrix.default".into()];
+            config.agents.insert(
+                "fixture-peer".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec!["matrix.default".into()],
+                    ..Default::default()
+                },
+            );
+            config.peer_groups.insert(
+                "fixture-group".into(),
+                zeroclaw_config::multi_agent::PeerGroupConfig {
+                    channel: "matrix.default".into(),
+                    agents: vec![
+                        zeroclaw_config::multi_agent::AgentAlias::new("test"),
+                        zeroclaw_config::multi_agent::AgentAlias::new("fixture-peer"),
+                    ],
+                    ..Default::default()
+                },
+            );
+            let peer_map =
+                zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
+                    &config,
+                    "test",
+                    "matrix.default",
+                );
+            assert!(!peer_map.is_empty());
+            expected_map = Some(peer_map);
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::SendMessageToPeerTool::new(
+                        ctx.prompt_config.clone(),
+                        "test",
+                    )),
+                ]),
+            );
+            let message = ChannelMessage::new(
+                "peer-event",
+                "user",
+                "room",
+                if goal {
+                    "/goal start bounded repair"
+                } else {
+                    "bounded repair"
+                },
+                "matrix",
+                1,
+            );
+            if goal {
+                let session_key =
+                    GoalSessionKey::matrix(super::super::conversation_history_key(&message))
+                        .unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("peer-fixture", session_key.durable_id(), 1).unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context,
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                assert_eq!(
+                    lease
+                        .run_parent_turn(
+                            &operation,
+                            GoalParentTurn {
+                                kind: GoalParentTurnKind::Start,
+                                objective: "bounded repair".into(),
+                                working_history: Vec::new(),
+                            },
+                        )
+                        .await
+                        .unwrap()
+                        .candidate(),
+                    "thinking candidate"
+                );
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            let recorded = provider.0.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            requests.push(recorded[0].system.clone());
+        }
+        (
+            requests.remove(0),
+            requests.remove(0),
+            expected_map.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_peer_map_matches_the_ordinary_prompt() {
+        let (ordinary, goal, peer_map) =
+            matrix_peer_map_requests(zeroclaw_config::autonomy::AutonomyLevel::Full).await;
+        assert_eq!(ordinary.matches(&peer_map).count(), 1);
+        assert_eq!(goal.matches(&peer_map).count(), 1);
+        assert!(goal.find(&peer_map).unwrap() < goal.find("bounded repair").unwrap());
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_peer_map_exclusion_matches_ordinary_supervised_policy() {
+        let (ordinary, goal, peer_map) =
+            matrix_peer_map_requests(zeroclaw_config::autonomy::AutonomyLevel::Supervised).await;
+        assert!(!ordinary.contains(&peer_map));
+        assert!(!goal.contains(&peer_map));
+    }
+
+    struct GoalSenderBudgetTool {
+        security: Arc<zeroclaw_runtime::security::SecurityPolicy>,
+        observed: Arc<Mutex<Vec<(Option<String>, bool)>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalSenderBudgetTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            "sender-budget-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::tool::Tool for GoalSenderBudgetTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Exercise the ordinary per-sender action budget."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<zeroclaw_api::tool::ToolResult> {
+            let scope = zeroclaw_api::TOOL_LOOP_THREAD_ID
+                .try_with(Clone::clone)
+                .ok()
+                .flatten();
+            let admission = self.security.enforce_tool_operation(
+                zeroclaw_runtime::security::policy::ToolOperation::Act,
+                "echo",
+            );
+            self.observed
+                .lock()
+                .unwrap()
+                .push((scope, admission.is_ok()));
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: admission.is_ok(),
+                output: "budget probe".into(),
+                error: admission.err(),
+            })
+        }
+    }
+
+    async fn matrix_sender_budget_observations(
+        thread: Option<&str>,
+        interruption: Option<&str>,
+    ) -> Vec<(Option<String>, bool)> {
+        let expected = interruption.or(thread).unwrap_or("budget-event");
+        let mut results = Vec::new();
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let mut context = matrix_policy_context(
+                backend,
+                Arc::new(MatrixGoalErrorRecordingChannel::default()),
+                Arc::new(GoalPolicyProvider {
+                    requests: Mutex::new(Vec::new()),
+                    tool_rounds: 1,
+                    calls_per_round: 1,
+                }),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            );
+            let security = Arc::new(zeroclaw_runtime::security::SecurityPolicy {
+                max_actions_per_hour: 1,
+                ..Default::default()
+            });
+            scope_thread_id(Some(expected.into()), async {
+                assert!(security.record_action());
+                assert!(security.is_rate_limited());
+            })
+            .await;
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            Arc::get_mut(&mut context).unwrap().tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(GoalSenderBudgetTool {
+                        security,
+                        observed: observed.clone(),
+                    }),
+                ]),
+            );
+            let mut message = ChannelMessage::new(
+                "budget-event",
+                "user",
+                "room",
+                if goal {
+                    "/goal start bounded repair"
+                } else {
+                    "bounded repair"
+                },
+                "matrix",
+                1,
+            );
+            message.thread_ts = thread.map(str::to_owned);
+            message.interruption_scope_id = interruption.map(str::to_owned);
+            if goal {
+                let session_key =
+                    GoalSessionKey::matrix(super::super::conversation_history_key(&message))
+                        .unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("budget-fixture", session_key.durable_id(), 1).unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context,
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                assert_eq!(
+                    lease
+                        .run_parent_turn(
+                            &operation,
+                            GoalParentTurn {
+                                kind: GoalParentTurnKind::Start,
+                                objective: "bounded repair".into(),
+                                working_history: Vec::new(),
+                            }
+                        )
+                        .await
+                        .unwrap()
+                        .candidate(),
+                    "policy candidate"
+                );
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            results.push(observed[0].clone());
+        }
+        assert_eq!(
+            results[0],
+            (Some(expected.into()), false),
+            "ordinary exhausted bucket"
+        );
+        results
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_sender_budget_uses_the_ordinary_thread_bucket() {
+        let observed = matrix_sender_budget_observations(Some("thread-scope"), None).await;
+        assert_eq!(observed[1], observed[0]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_sender_budget_prefers_the_ordinary_interruption_scope() {
+        let observed =
+            matrix_sender_budget_observations(Some("thread-scope"), Some("interruption-scope"))
+                .await;
+        assert_eq!(observed[1], observed[0]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_sender_budget_top_level_uses_the_ordinary_message_id() {
+        let observed = matrix_sender_budget_observations(None, None).await;
+        assert_eq!(observed[1], observed[0]);
+    }
+
+    struct GoalRoutingChannel {
+        drafts: bool,
+        fail_sends: bool,
+        sent: tokio::sync::Mutex<Vec<SendMessage>>,
+        cancelled: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalRoutingChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "routing-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for GoalRoutingChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+        async fn send(&self, message: &SendMessage) -> Result<()> {
+            self.sent.lock().await.push(message.clone());
+            if self.fail_sends {
+                bail!("synthetic routed delivery failure");
+            }
+            Ok(())
+        }
+        async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn supports_draft_updates(&self) -> bool {
+            self.drafts
+        }
+        async fn send_draft(&self, _: &SendMessage) -> Result<Option<String>> {
+            Ok(Some("routing-draft".into()))
+        }
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            _: &str,
+            text: &str,
+            suppress: bool,
+        ) -> Result<()> {
+            let mut message = SendMessage::new(text, recipient);
+            message.suppress_voice = suppress;
+            self.send(&message).await
+        }
+        async fn cancel_draft(&self, _: &str, id: &str) -> Result<()> {
+            self.cancelled.lock().await.push(id.into());
+            Ok(())
+        }
+    }
+
+    struct GoalRoutingProvider {
+        arguments: serde_json::Value,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalRoutingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "routing-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalRoutingProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires structured requests")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.messages.to_vec());
+            let first = requests.len() == 1;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: (!first).then(|| "routing candidate".into()),
+                tool_calls: if first {
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "route-call".into(),
+                        name: "send_via".into(),
+                        arguments: self.arguments.to_string(),
+                        extra_content: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct GoalRoutingObservation {
+        origin: Vec<SendMessage>,
+        destination: Vec<SendMessage>,
+        cancelled: usize,
+        routing_status: String,
+        append_ok: Option<bool>,
+    }
+
+    async fn matrix_routing_observation(
+        goal: bool,
+        arguments: serde_json::Value,
+        drafts: bool,
+        fail_destination: bool,
+    ) -> GoalRoutingObservation {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let origin = Arc::new(GoalRoutingChannel {
+            drafts,
+            fail_sends: false,
+            sent: Default::default(),
+            cancelled: Default::default(),
+        });
+        let destination = Arc::new(GoalRoutingChannel {
+            drafts: false,
+            fail_sends: fail_destination,
+            sent: Default::default(),
+            cancelled: Default::default(),
+        });
+        let provider = Arc::new(GoalRoutingProvider {
+            arguments,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut context = matrix_policy_context(
+            backend.clone(),
+            Arc::new(MatrixGoalErrorRecordingChannel::default()),
+            Arc::new(GoalPolicyProvider {
+                requests: Mutex::new(Vec::new()),
+                tool_rounds: 0,
+                calls_per_round: 0,
+            }),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.model_provider = provider.clone();
+        let channels: std::collections::HashMap<String, Arc<dyn Channel>> = [
+            ("matrix".into(), origin.clone() as Arc<dyn Channel>),
+            ("matrix.default".into(), origin.clone() as Arc<dyn Channel>),
+            (
+                "matrix.peer".into(),
+                destination.clone() as Arc<dyn Channel>,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        ctx.channels_by_name = Arc::new(channels.clone());
+        let mut config = ctx.prompt_config.as_ref().clone();
+        let group = zeroclaw_config::multi_agent::PeerGroupConfig {
+            channel: "matrix.peer".into(),
+            external_peers: vec![zeroclaw_config::multi_agent::PeerUsername::new(
+                "fixture-recipient",
+            )],
+            output_modality: zeroclaw_config::multi_agent::OutputModality::Text,
+            ..Default::default()
+        };
+        config
+            .peer_groups
+            .insert("fixture-group".into(), group.clone());
+        let risk = config.risk_profiles.get_mut("policy-fixture").unwrap();
+        risk.auto_approve = vec!["send_via".into()];
+        ctx.approval_manager =
+            Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(risk));
+        ctx.prompt_config = Arc::new(config.clone());
+        *ctx.live_config.write() = config;
+        ctx.tools_registry = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                zeroclaw_runtime::tools::SendViaTool::new(
+                    Arc::new(zeroclaw_runtime::security::SecurityPolicy::default()),
+                    Arc::new(parking_lot::RwLock::new(channels)),
+                    Arc::new(move || {
+                        [("fixture-group".into(), group.clone())]
+                            .into_iter()
+                            .collect()
+                    }),
+                ),
+            )]),
+        );
+        let message = ChannelMessage::new(
+            "route-event",
+            "user",
+            "room",
+            if goal {
+                "/goal start bounded routing"
+            } else {
+                "bounded routing"
+            },
+            "matrix",
+            1,
+        );
+        let key = super::super::conversation_history_key(&message);
+        let append_ok = if goal {
+            let session_key = GoalSessionKey::matrix(key.clone()).unwrap();
+            let operation = GoalOperationScope::new(
+                GoalExecutionScope::new("routing-fixture", session_key.durable_id(), 1).unwrap(),
+            );
+            let mut lease = MatrixGoalExecutionLease {
+                _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                context,
+                session_key,
+                message,
+                pending_delivery: None,
+                pending_receipts: None,
+                history_has_trim_breadcrumb: false,
+            };
+            let result = lease
+                .run_parent_turn(
+                    &operation,
+                    GoalParentTurn {
+                        kind: GoalParentTurnKind::Start,
+                        objective: "bounded routing".into(),
+                        working_history: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.candidate(), "routing candidate");
+            Some(
+                lease
+                    .append_parent_candidate(result.candidate().into())
+                    .await
+                    .is_ok(),
+            )
+        } else {
+            super::super::process_channel_message(
+                context,
+                message,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            None
+        };
+        let durable = zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), &key);
+        assert_eq!(
+            durable
+                .iter()
+                .filter(|row| row.role == "assistant" && row.content == "routing candidate")
+                .count(),
+            1
+        );
+        let routing_status = {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let rows: Vec<_> = requests[1]
+                .iter()
+                .filter(|row| row.role == "tool")
+                .collect();
+            assert_eq!(rows.len(), 1);
+            let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+            let content = envelope["content"].as_str().unwrap();
+            // Ordinary executable dispatch prefixes unsuccessful tool output.
+            let output: serde_json::Value =
+                serde_json::from_str(content.strip_prefix("Error: ").unwrap_or(content)).unwrap();
+            output["status"].as_str().unwrap().to_owned()
+        };
+        let result = GoalRoutingObservation {
+            origin: origin.sent.lock().await.clone(),
+            destination: destination.sent.lock().await.clone(),
+            cancelled: origin.cancelled.lock().await.len(),
+            routing_status,
+            append_ok,
+        };
+        result
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_text_modality_matches_ordinary_delivery() {
+        let args = serde_json::json!({"modality": "text"});
+        let ordinary = matrix_routing_observation(false, args.clone(), false, false).await;
+        let goal = matrix_routing_observation(true, args, false, false).await;
+        assert_eq!(ordinary.routing_status, "queued");
+        let reply = ordinary
+            .origin
+            .iter()
+            .find(|row| row.content == "routing candidate")
+            .unwrap();
+        assert!(reply.suppress_voice);
+        let goal_reply = goal
+            .origin
+            .iter()
+            .find(|row| row.content == "routing candidate")
+            .unwrap();
+        assert_eq!(goal_reply.suppress_voice, reply.suppress_voice);
+        assert_eq!(goal.routing_status, "queued");
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_voice_replaces_the_draft_like_ordinary() {
+        let args = serde_json::json!({"modality": "voice"});
+        let ordinary = matrix_routing_observation(false, args.clone(), true, false).await;
+        let goal = matrix_routing_observation(true, args, true, false).await;
+        assert_eq!(ordinary.routing_status, "queued");
+        assert_eq!(ordinary.cancelled, 1);
+        assert!(
+            ordinary
+                .origin
+                .iter()
+                .any(|row| row.content == "routing candidate" && row.force_voice)
+        );
+        assert_eq!(goal.cancelled, ordinary.cancelled);
+        assert!(
+            goal.origin
+                .iter()
+                .any(|row| row.content == "routing candidate" && row.force_voice)
+        );
+        assert_eq!(goal.routing_status, "queued");
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_redirect_matches_ordinary_destination() {
+        let args = serde_json::json!({"target": "fixture-group"});
+        let ordinary = matrix_routing_observation(false, args.clone(), true, false).await;
+        let goal = matrix_routing_observation(true, args, true, false).await;
+        assert_eq!(ordinary.routing_status, "queued");
+        assert_eq!(ordinary.destination.len(), 1);
+        assert_eq!(ordinary.destination[0].recipient, "fixture-recipient");
+        assert!(
+            !ordinary
+                .origin
+                .iter()
+                .any(|row| row.content == "routing candidate")
+        );
+        assert_eq!(goal.destination.len(), ordinary.destination.len());
+        assert_eq!(
+            goal.destination[0].recipient,
+            ordinary.destination[0].recipient
+        );
+        assert_eq!(goal.cancelled, ordinary.cancelled);
+        assert!(
+            !goal
+                .origin
+                .iter()
+                .any(|row| row.content == "routing candidate")
+        );
+        assert_eq!(goal.routing_status, "queued");
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_failed_send_is_not_a_successful_origin_reply() {
+        let args = serde_json::json!({"target": "fixture-group"});
+        let ordinary = matrix_routing_observation(false, args.clone(), false, true).await;
+        let goal = matrix_routing_observation(true, args, false, true).await;
+        assert_eq!(ordinary.routing_status, "queued");
+        assert_eq!(
+            ordinary.destination.len(),
+            1,
+            "ordinary attempted the configured destination"
+        );
+        assert!(
+            !ordinary
+                .origin
+                .iter()
+                .any(|row| row.content == "routing candidate")
+        );
+        assert_eq!(goal.append_ok, Some(false));
+        assert!(goal.origin.iter().any(|row| row.content.contains("Error:")));
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_immediate_send_matches_ordinary_control() {
+        let args = serde_json::json!({"target": "fixture-group", "body": "immediate fixture"});
+        let ordinary = matrix_routing_observation(false, args.clone(), false, false).await;
+        let goal = matrix_routing_observation(true, args, false, false).await;
+        for observation in [&ordinary, &goal] {
+            assert_eq!(observation.destination.len(), 1);
+            assert_eq!(observation.destination[0].content, "immediate fixture");
+            assert_eq!(observation.destination[0].recipient, "fixture-recipient");
+            assert_eq!(
+                observation
+                    .origin
+                    .iter()
+                    .filter(|row| row.content == "routing candidate")
+                    .count(),
+                1
+            );
+            assert_eq!(observation.routing_status, "ok");
+        }
+        assert_eq!(goal.append_ok, Some(true));
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_routing_instruction_is_queued_like_ordinary() {
+        let args = serde_json::json!({"target": "fixture-group"});
+        let ordinary = matrix_routing_observation(false, args.clone(), false, false).await;
+        let goal = matrix_routing_observation(true, args, false, false).await;
+        assert_eq!(ordinary.routing_status, "queued");
+        assert_eq!(goal.routing_status, ordinary.routing_status);
+    }
+
+    struct MatrixSwitchRequestProvider(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl zeroclaw_api::attribution::Attributable for MatrixSwitchRequestProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "matrix-switch-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for MatrixSwitchRequestProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires a structured tool request")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            assert_eq!(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "matrix-permitted-switch".into(),
+                    name: "model_switch".into(),
+                    arguments: serde_json::json!({
+                        "action": "set", "model_provider": "custom.target", "model": "target-model"
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_model_switch_reuses_ordinary_route_and_tool_continuation() {
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate, matchers::method};
+
+        struct TargetReply(std::sync::atomic::AtomicUsize);
+        impl Respond for TargetReply {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["model"], "target-model");
+                assert_ne!(body["stream"], true);
+                let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let message = if call % 2 == 0 {
+                    serde_json::json!({"role":"assistant", "content":null, "tool_calls":[{
+                        "id":"target-echo", "type":"function", "function":{"name":"echo", "arguments":"{}"}
+                    }]})
+                } else {
+                    serde_json::json!({"role":"assistant", "content":"switched candidate"})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":message,"finish_reason":if call % 2 == 0 {"tool_calls"} else {"stop"}}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(TargetReply(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(MatrixSwitchRequestProvider(initial_calls.clone())),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config.reliability.provider_retries = 0;
+            ctx.provider_runtime_options.native_tools = Some(true);
+            let target = config.providers.models.ensure("custom", "target").unwrap();
+            target.uri = Some(server.uri());
+            target.api_key = Some("synthetic-key".into());
+            target.kind = Some("openai-compatible".into());
+            target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            target.model = Some("target-model".into());
+            target.live_pricing = false;
+            target.thinking_passthrough = true;
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                auto_approve: vec!["echo".into(), "model_switch".into()],
+                ..Default::default()
+            };
+            config
+                .risk_profiles
+                .insert("switch-fixture".into(), risk.clone());
+            config.agents.get_mut("test").unwrap().risk_profile = "switch-fixture".into();
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                        ctx.security.clone(),
+                        Arc::new(config.clone()),
+                    )),
+                    Box::new(GoalPolicyCountingTool(tool_calls.clone())),
+                ]),
+            );
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            ctx.approval_manager =
+                Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&risk));
+            let message =
+                ChannelMessage::new("switch-event", "user", "room", "finish", "matrix", 1);
+            let key = super::super::conversation_history_key(&message);
+            if goal {
+                let session_key = GoalSessionKey::matrix(key.clone()).unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("switch-fixture", session_key.durable_id(), 1).unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context: context.clone(),
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                let result = lease
+                    .run_parent_turn(
+                        &operation,
+                        GoalParentTurn {
+                            kind: GoalParentTurnKind::Start,
+                            objective: "finish the bounded fixture".into(),
+                            working_history: Vec::new(),
+                        },
+                    )
+                    .await;
+                assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let candidate =
+                    result.expect("a permitted switch must continue the same parent turn");
+                assert_eq!(candidate.candidate(), "switched candidate");
+                lease
+                    .append_parent_candidate(candidate.candidate().into())
+                    .await
+                    .unwrap();
+            } else {
+                super::super::process_channel_message(
+                    context.clone(),
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(
+                channel
+                    .messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|text| text == "switched candidate")
+            );
+            let route = context
+                .route_overrides
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("the successful switch persists the sender route");
+            assert_eq!(route.model_provider, "custom.target");
+            assert_eq!(route.model, "target-model");
+            let durable =
+                zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), &key);
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|row| row.role == "assistant" && row.content == "switched candidate")
+                    .count(),
+                1
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        let rows = body["messages"].as_array().unwrap();
+        assert_eq!(rows.iter().filter(|row| row["role"] == "system").count(), 1);
+        assert!(
+            rows[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("finish the bounded fixture")
+        );
+        let final_body: serde_json::Value = serde_json::from_slice(&requests[3].body).unwrap();
+        assert!(
+            final_body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["role"] == "tool" && row["tool_call_id"] == "target-echo")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_model_switch_unbuildable_target_preserves_original_error_and_route() {
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(MatrixSwitchRequestProvider(initial_calls.clone())),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            let mut config = ctx.prompt_config.as_ref().clone();
+            // The tool accepts a configured profile. Provider construction,
+            // not tool validation, rejects its missing required endpoint.
+            config.providers.models.ensure("custom", "target").unwrap();
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                auto_approve: vec!["model_switch".into()],
+                ..Default::default()
+            };
+            config
+                .risk_profiles
+                .insert("switch-fixture".into(), risk.clone());
+            config.agents.get_mut("test").unwrap().risk_profile = "switch-fixture".into();
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                        ctx.security.clone(),
+                        Arc::new(config.clone()),
+                    )),
+                ]),
+            );
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            ctx.approval_manager =
+                Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&risk));
+            let message =
+                ChannelMessage::new("switch-event", "user", "room", "finish", "matrix", 1);
+            let key = super::super::conversation_history_key(&message);
+            if goal {
+                let session_key = GoalSessionKey::matrix(key.clone()).unwrap();
+                let operation = GoalOperationScope::new(
+                    GoalExecutionScope::new("switch-fixture", session_key.durable_id(), 1).unwrap(),
+                );
+                let mut lease = MatrixGoalExecutionLease {
+                    _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    context: context.clone(),
+                    session_key,
+                    message,
+                    pending_delivery: None,
+                    pending_receipts: None,
+                    history_has_trim_breadcrumb: false,
+                };
+                let error = lease
+                    .run_parent_turn(
+                        &operation,
+                        GoalParentTurn {
+                            kind: GoalParentTurnKind::Start,
+                            objective: "finish".into(),
+                            working_history: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    zeroclaw_runtime::agent::loop_::is_model_switch_requested(&error).is_some()
+                );
+            } else {
+                super::super::process_channel_message(
+                    context.clone(),
+                    message,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+                assert!(
+                    channel
+                        .messages
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|text| text.contains("model switch requested"))
+                );
+            }
+            assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(context.route_overrides.lock().unwrap().is_empty());
+            assert!(context.provider_cache.lock().unwrap().is_empty());
+            let durable =
+                zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), &key);
+            assert!(
+                !durable
+                    .iter()
+                    .any(|row| row.role == "assistant" && row.content == "switched candidate")
+            );
+        }
+    }
+
     struct GoalPolicyCountingTool(Arc<std::sync::atomic::AtomicUsize>);
 
     impl zeroclaw_api::attribution::Attributable for GoalPolicyCountingTool {
@@ -2482,7 +4733,7 @@ mod tests {
     fn matrix_policy_context(
         backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
         channel: Arc<MatrixGoalErrorRecordingChannel>,
-        provider: Arc<GoalPolicyProvider>,
+        provider: Arc<dyn ModelProvider>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Arc<ChannelRuntimeContext> {
         let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
