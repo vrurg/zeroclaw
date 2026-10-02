@@ -180,6 +180,8 @@ pub struct ZeroCodeGoalSessionDriver {
     session_generation: u64,
     tui_id: String,
     command_lock: Arc<Mutex<()>>,
+    // Query-only input from the admitted command, never execution authority.
+    recall_query: String,
 }
 
 impl ZeroCodeGoalSessionDriver {
@@ -191,6 +193,7 @@ impl ZeroCodeGoalSessionDriver {
         session_id: String,
         tui_id: String,
         authorization: super::dispatch::GoalSessionAuthorization,
+        recall_query: String,
     ) -> Result<Self> {
         let session_key = GoalSessionKey::zero_code(session_id)?;
         let raw_session_id = match &session_key {
@@ -220,6 +223,7 @@ impl ZeroCodeGoalSessionDriver {
             session_generation: snapshot.generation,
             tui_id,
             command_lock: snapshot.goal_command,
+            recall_query,
         })
     }
 
@@ -342,6 +346,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             session_key: self.session_key.clone(),
             authorization: Arc::clone(&self.authorization),
             epoch_admission: GoalEpochAdmission::Pending,
+            recall_query: self.recall_query.clone(),
         }))
     }
 }
@@ -358,6 +363,7 @@ struct ZeroCodeGoalExecutionLease {
     session_key: GoalSessionKey,
     authorization: Arc<super::dispatch::GoalSessionAuthorization>,
     epoch_admission: GoalEpochAdmission,
+    recall_query: String,
 }
 
 enum GoalEpochAdmission {
@@ -534,9 +540,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         };
         let session_id = self.raw_session_id()?.to_owned();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let recall_query = self.recall_query.clone();
         let run = async move {
             agent
-                .run_isolated_turn_with_events(source, &input, event_tx)
+                .run_isolated_turn_with_events(source, &input, &recall_query, event_tx)
                 .await
         };
         tokio::pin!(run);
