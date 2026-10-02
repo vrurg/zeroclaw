@@ -1422,7 +1422,8 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 (result, fallback, safeguard)
             },
         ));
-        let (candidate, fallback, safeguard) = scope_goal_parent_turn(super::scope_safeguard_fallback(scoped_turn)).await;
+        let (candidate, fallback, safeguard) =
+            scope_goal_parent_turn(super::scope_safeguard_fallback(scoped_turn)).await;
         enum AttemptFailure {
             Core(anyhow::Error),
             TimedOut,
