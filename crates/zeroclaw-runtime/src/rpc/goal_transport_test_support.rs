@@ -39,11 +39,17 @@ mod recall;
 #[path = "goal_receipt_transport_tests.rs"]
 mod receipts;
 
+#[path = "goal_routing_transport_tests.rs"]
+mod routing;
+
 #[derive(Clone, Copy)]
 enum FixtureScript {
     Choice,
     Recall,
     Receipts,
+    FallbackReceipts,
+    SwitchReceipts,
+    RoutingControl,
 }
 
 /// Exercise answer insertion separately from a resume without user input.
@@ -55,6 +61,11 @@ pub(crate) enum ResumeScenario {
     RecallAnswered,
     RecallNoneControl,
     Receipts,
+    FallbackReceipts,
+    SwitchReceipts,
+    RoutingControl,
+    OrdinarySwitchControl,
+    OrdinaryFallbackControl,
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +296,18 @@ impl ActiveGoalFixture {
         Self::build_with_memory(path, None, None, false, FixtureScript::Receipts).await
     }
 
+    pub(crate) async fn with_fallback_receipts(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, false, FixtureScript::FallbackReceipts).await
+    }
+
+    pub(crate) async fn with_switch_receipts(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, false, FixtureScript::SwitchReceipts).await
+    }
+
+    pub(crate) async fn with_routing_control(path: &Path) -> Self {
+        Self::build_with_memory(path, None, None, false, FixtureScript::RoutingControl).await
+    }
+
     pub(crate) async fn with_answer_append_failure(path: &Path) -> Self {
         Self::build(path, Some(GoalTransportFailure::AnswerAppend)).await
     }
@@ -320,9 +343,24 @@ impl ActiveGoalFixture {
         let canonical_workspace = local_uid.map(|_| path.canonicalize().unwrap());
         let path = canonical_workspace.as_deref().unwrap_or(path);
         let server = MockServer::start().await;
-        if matches!(script, FixtureScript::Recall) {
+        if matches!(script, FixtureScript::RoutingControl) {
+            Mock::given(method("POST"))
+                .respond_with(routing::RoutingResponses)
+                .mount(&server)
+                .await;
+        } else if matches!(script, FixtureScript::Recall) {
             Mock::given(method("POST"))
                 .respond_with(recall::RecallResponses::default())
+                .mount(&server)
+                .await;
+        } else if matches!(script, FixtureScript::SwitchReceipts) {
+            Mock::given(method("POST"))
+                .respond_with(receipts::SwitchReceiptResponses)
+                .mount(&server)
+                .await;
+        } else if matches!(script, FixtureScript::FallbackReceipts) {
+            Mock::given(method("POST"))
+                .respond_with(receipts::FallbackReceiptResponses)
                 .mount(&server)
                 .await;
         } else if matches!(script, FixtureScript::Receipts) {
@@ -356,17 +394,76 @@ impl ActiveGoalFixture {
         // This fixture serves Chat Completions JSON/SSE, not Responses API.
         provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
         provider.model = Some("goal-worker".into());
+        if matches!(
+            script,
+            FixtureScript::SwitchReceipts | FixtureScript::RoutingControl
+        ) {
+            provider.thinking_passthrough = true;
+        }
+        if matches!(script, FixtureScript::FallbackReceipts) {
+            provider.fallback = vec!["openai.goal-fallback".into()];
+            // Use a supported buffered route: rejected completions retain full
+            // attempt usage, unlike interrupted streaming lower bounds.
+            provider.thinking_passthrough = true;
+            config.reliability.provider_retries = 0;
+            let fallback = config
+                .providers
+                .models
+                .ensure("openai", "goal-fallback")
+                .unwrap();
+            fallback.api_key = Some("fallback-test-key".into());
+            fallback.uri = Some(server.uri());
+            fallback.kind = Some("openai-compatible".into());
+            fallback.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            fallback.model = Some("goal-fallback".into());
+            fallback.thinking_passthrough = true;
+        }
+        if matches!(script, FixtureScript::SwitchReceipts) {
+            config.reliability.provider_retries = 0;
+            let target = config
+                .providers
+                .models
+                .ensure("openai", "goal-target")
+                .unwrap();
+            target.api_key = Some("switch-test-key".into());
+            target.uri = Some(server.uri());
+            target.kind = Some("openai-compatible".into());
+            target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            target.model = Some("goal-target".into());
+            target.thinking_passthrough = true;
+            target.native_tools = Some(true);
+        }
         if matches!(failure, Some(GoalTransportFailure::PrefixProjection)) {
             // Reach the configured vision fallback rather than the primary's
             // documented image-capability short-circuit.
-            provider.vision = Some(false);
+            config
+                .providers
+                .models
+                .ensure("openai", "goal-test")
+                .unwrap()
+                .vision = Some(false);
         }
         let mut agent_config = AliasedAgentConfig {
             enabled: true,
             model_provider: "openai.goal-test".into(),
             ..Default::default()
         };
-        if matches!(script, FixtureScript::Receipts) {
+        if matches!(script, FixtureScript::RoutingControl) {
+            agent_config.risk_profile = "routing-control".into();
+            config.risk_profiles.insert(
+                "routing-control".into(),
+                zeroclaw_config::schema::RiskProfileConfig {
+                    auto_approve: vec!["send_via".into()],
+                    ..Default::default()
+                },
+            );
+        }
+        if matches!(
+            script,
+            FixtureScript::Receipts
+                | FixtureScript::FallbackReceipts
+                | FixtureScript::SwitchReceipts
+        ) {
             agent_config.resolved.tool_receipts.enabled = true;
             agent_config.resolved.tool_receipts.show_in_response = true;
         }
@@ -425,26 +522,56 @@ impl ActiveGoalFixture {
             Some(memory) => memory.clone(),
             None => Arc::new(zeroclaw_memory::NoneMemory::new("none")),
         };
-        let agent = crate::agent::agent::Agent::builder()
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+        let fixture_tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = match script {
+            FixtureScript::RoutingControl => vec![Box::new(crate::tools::SendViaTool::new(
+                security.clone(),
+                Arc::new(parking_lot::RwLock::new(Default::default())),
+                Arc::new(Default::default),
+            ))],
+            FixtureScript::SwitchReceipts => vec![
+                Box::new(crate::tools::ModelSwitchTool::new(
+                    security.clone(),
+                    Arc::new(config.clone()),
+                )),
+                Box::new(receipts::ReceiptTool),
+            ],
+            FixtureScript::Receipts | FixtureScript::FallbackReceipts => {
+                vec![Box::new(receipts::ReceiptTool)]
+            }
+            _ => vec![],
+        };
+        let mut builder = crate::agent::agent::Agent::builder()
             .model_provider(provider)
             .model_provider_name(provider_ref)
             .model_name(model)
             .model_route_resolver(resolver)
             .config(agent_config)
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                if matches!(script, FixtureScript::Receipts) {
-                    vec![Box::new(receipts::ReceiptTool)]
-                } else {
-                    vec![]
-                },
+                fixture_tools,
             ))
             .memory(memory)
             .memory_session_id(recall_enabled.then(|| format!("rpc_{SESSION_ID}")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(path.to_path_buf())
-            .build()
-            .unwrap();
+            .workspace_dir(path.to_path_buf());
+        if matches!(script, FixtureScript::SwitchReceipts) {
+            builder = builder.security(security).provider_switch_config(
+                crate::agent::agent::ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                },
+            );
+        }
+        if matches!(script, FixtureScript::RoutingControl) {
+            builder = builder.approval_manager(Some(Arc::new(
+                crate::approval::ApprovalManager::for_non_interactive(
+                    &config.risk_profiles["routing-control"],
+                ),
+            )));
+        }
+        let agent = builder.build().unwrap();
         let sessions = Arc::new(SessionStore::new(
             4,
             Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -1445,8 +1572,28 @@ pub(crate) async fn assert_active_goal_scenario_with_objective(
     objective: &str,
     scenario: ResumeScenario,
 ) {
+    if scenario == ResumeScenario::OrdinarySwitchControl {
+        receipts::assert_ordinary_switch_control(fixture, transport, remote).await;
+        return;
+    }
+    if scenario == ResumeScenario::OrdinaryFallbackControl {
+        receipts::assert_ordinary_fallback_control(fixture, transport, remote).await;
+        return;
+    }
+    if scenario == ResumeScenario::RoutingControl {
+        routing::assert_routing_control(fixture, transport, remote).await;
+        return;
+    }
     if scenario == ResumeScenario::Receipts {
         receipts::assert_receipt_scenario(fixture, transport, remote).await;
+        return;
+    }
+    if scenario == ResumeScenario::FallbackReceipts {
+        receipts::assert_fallback_receipt_scenario(fixture, transport, remote).await;
+        return;
+    }
+    if scenario == ResumeScenario::SwitchReceipts {
+        receipts::assert_switch_receipt_scenario(fixture, transport, remote).await;
         return;
     }
     if matches!(
