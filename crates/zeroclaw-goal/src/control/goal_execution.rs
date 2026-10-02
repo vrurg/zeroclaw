@@ -1577,6 +1577,19 @@ impl GoalExecutionEngine {
                     parent
                 }
                 Err(error) => {
+                    // A refused successor admission follows the committed
+                    // lifecycle fence only after prior usage settled cleanly.
+                    if let Some(outcome) = self
+                        .fenced_operation_outcome(
+                            &error,
+                            scope,
+                            accountant.as_ref(),
+                            &mut error_report,
+                        )
+                        .await?
+                    {
+                        return Ok(outcome);
+                    }
                     if let Err(transition_error) = self.fail(scope, "parent_operation_failed").await
                     {
                         return Err(report_transition_error(&mut error_report, transition_error));
@@ -1634,6 +1647,19 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
+                    // A clean lifecycle refusal is not a verifier failure and
+                    // must not produce a terminal-failure diagnostic.
+                    if let Some(outcome) = self
+                        .fenced_operation_outcome(
+                            &error,
+                            scope,
+                            accountant.as_ref(),
+                            &mut error_report,
+                        )
+                        .await?
+                    {
+                        return Ok(outcome);
+                    }
                     log_verifier_diagnostic(
                         scope,
                         &candidate_fingerprint,
@@ -1847,6 +1873,26 @@ impl GoalExecutionEngine {
                 }
             }
         }
+    }
+
+    async fn fenced_operation_outcome(
+        &self,
+        error: &anyhow::Error,
+        scope: &GoalExecutionScope,
+        accountant: &dyn crate::accounting::GoalOperationAccounting,
+        error_report: &mut Option<&mut GoalRunErrorReport>,
+    ) -> Result<Option<GoalExecutionOutcome>> {
+        if error
+            .downcast_ref::<crate::accounting::GoalOperationFenced>()
+            .is_none()
+            || self.exact_running_task_or_fenced(scope).await?.is_some()
+        {
+            return Ok(None);
+        }
+        self.require_complete_accounting(scope, accountant, error_report)
+            .await?;
+        report_run_error(error_report, GoalRunErrorReport::Surfaced);
+        Ok(Some(GoalExecutionOutcome::Fenced))
     }
 
     async fn require_complete_accounting(
