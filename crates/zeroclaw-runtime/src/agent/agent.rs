@@ -10713,6 +10713,1266 @@ mod tests {
         );
     }
 
+    fn isolated_fallback_test_agent() -> Agent {
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "primary-fixture",
+            vec![
+                (
+                    "primary-fixture".into(),
+                    Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback-fixture".into(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(Vec::new()),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(provider));
+        agent.model_name = "requested-model".into();
+        agent
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_notice_matches_ordinary_chunks_without_polluting_candidate() {
+        let mut ordinary = isolated_fallback_test_agent();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (ordinary_response, _) = ordinary.turn_streamed("finish", tx, None).await.unwrap();
+        let ordinary_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        let notice = ordinary_chunks
+            .iter()
+            .find(|chunk| chunk.contains("fallback-fixture"))
+            .expect("ordinary Reliable fallback must publish its accepted route");
+        assert!(ordinary_response.ends_with(notice));
+
+        let mut goal = isolated_fallback_test_agent();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = goal
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "done");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains(notice))
+        );
+        assert!(goal.history().iter().all(|row| match row {
+            ConversationMessage::Chat(row) => !row.content.contains(notice),
+            _ => true,
+        }));
+        let goal_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goal_chunks, ordinary_chunks);
+        assert_eq!(
+            goal_chunks.iter().filter(|chunk| *chunk == notice).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_without_events_keeps_clean_response_and_history() {
+        let mut agent = isolated_fallback_test_agent();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let outcome = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "done");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains("fallback-fixture"))
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_safeguard_notice_matches_ordinary_and_stays_presentational() {
+        let provider = || {
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(SafeguardNoticeProvider) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            )) as Box<dyn ModelProvider>
+        };
+        let mut ordinary = blank_input_agent(provider());
+        ordinary.model_name = "requested-model".into();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        ordinary.turn_streamed("finish", tx, None).await.unwrap();
+        let ordinary_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ordinary_chunks
+                .iter()
+                .filter(|chunk| chunk.contains("Safety safeguards"))
+                .count(),
+            1
+        );
+        assert!(
+            ordinary_chunks
+                .iter()
+                .all(|chunk| !chunk.contains("fallback-fixture"))
+        );
+
+        let mut agent = blank_input_agent(provider());
+        agent.model_name = "requested-model".into();
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish".into(),
+                working_history: Vec::new(),
+            });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .run_isolated_turn_with_events(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "accepted response");
+        assert!(
+            outcome
+                .working_history
+                .iter()
+                .all(|row| !row.content.contains("Safety safeguards"))
+        );
+        let goal_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goal_chunks, ordinary_chunks);
+        assert!(
+            goal_chunks
+                .iter()
+                .all(|chunk| !chunk.contains("private-category"))
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_controls_are_silent_without_recovery_or_on_failure() {
+        for fail in [false, true] {
+            let provider: Box<dyn ModelProvider> = if fail {
+                Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                    "primary-fixture",
+                    vec![
+                        (
+                            "primary-fixture".into(),
+                            Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                        ),
+                        (
+                            "fallback-fixture".into(),
+                            Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                        ),
+                    ],
+                    0,
+                    1,
+                ))
+            } else {
+                Box::new(MockModelProvider {
+                    responses: Mutex::new(Vec::new()),
+                })
+            };
+            let mut agent = blank_input_agent(provider);
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                    objective: "finish".into(),
+                    working_history: Vec::new(),
+                });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let result = agent
+                .run_isolated_turn_with_events(
+                    IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                    &input,
+                    "finish",
+                    tx,
+                )
+                .await;
+            let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    TurnEvent::Chunk { delta } => Some(delta),
+                    _ => None,
+                })
+                .collect();
+            if fail {
+                assert!(result.is_err());
+                assert!(chunks.is_empty(), "no success notice on a failed parent");
+            } else {
+                assert_eq!(result.unwrap().response, "done");
+                assert_eq!(chunks, vec!["done"]);
+            }
+        }
+    }
+
+    struct GoalEarlierFallbackProvider {
+        primary: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalEarlierFallbackProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            if self.primary {
+                "primary-fixture"
+            } else {
+                "fallback-fixture"
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalEarlierFallbackProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires structured requests")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.primary && call == 0 {
+                anyhow::bail!("503 Service Unavailable");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: self.primary.then(|| "primary final".into()),
+                tool_calls: if self.primary {
+                    Vec::new()
+                } else {
+                    assert_eq!(call, 0, "only the first iteration may fall back");
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "earlier-fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }]
+                },
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_fallback_from_an_earlier_round_never_leaks_a_notice() {
+        let mut observed = Vec::new();
+        for goal in [false, true] {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "primary-fixture",
+                vec![
+                    (
+                        "primary-fixture".into(),
+                        Box::new(GoalEarlierFallbackProvider {
+                            primary: true,
+                            calls: primary_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "fallback-fixture".into(),
+                        Box::new(GoalEarlierFallbackProvider {
+                            primary: false,
+                            calls: fallback_calls.clone(),
+                        }) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+            let mut agent = blank_input_agent(Box::new(provider));
+            agent.tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    MockTool,
+                )]);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            if goal {
+                let input = zeroclaw_goal::control::goal_parent_turn_input(
+                    &zeroclaw_goal::GoalParentTurn {
+                        kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                        objective: "finish".into(),
+                        working_history: Vec::new(),
+                    },
+                );
+                let outcome = agent
+                    .run_isolated_turn_with_events(
+                        IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                        &input,
+                        "finish",
+                        tx,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.response, "primary final");
+                assert!(
+                    outcome
+                        .working_history
+                        .iter()
+                        .all(|row| !row.content.contains("fallback-fixture"))
+                );
+                assert!(
+                    outcome
+                        .working_history
+                        .iter()
+                        .any(|row| row.role == "tool" && row.content.contains("tool-out"))
+                );
+            } else {
+                assert_eq!(
+                    agent.turn_streamed("finish", tx, None).await.unwrap().0,
+                    "primary final"
+                );
+            }
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+            let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    TurnEvent::Chunk { delta } => Some(delta),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(chunks, vec!["primary final"]);
+            observed.push(chunks);
+        }
+        assert_eq!(observed[0], observed[1]);
+    }
+
+    struct GoalSwitchRequestProvider {
+        calls: Arc<AtomicUsize>,
+        xml: bool,
+        seen_messages: Option<Arc<Mutex<Vec<Vec<ChatMessage>>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalSwitchRequestProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "initial-switch-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalSwitchRequestProvider {
+        fn supports_native_tools(&self) -> bool {
+            !self.xml
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires a structured tool request")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            if let Some(seen) = &self.seen_messages {
+                seen.lock().push(request.messages.to_vec());
+            }
+            let arguments = serde_json::json!({
+                "action": "set", "model_provider": "custom.target", "model": "target-model"
+            });
+            Ok(zeroclaw_providers::ChatResponse {
+                text: self.xml.then(|| {
+                    format!(
+                        "<tool_call>{}</tool_call>",
+                        serde_json::json!({"name":"model_switch","arguments":arguments})
+                    )
+                }),
+                tool_calls: if self.xml {
+                    Vec::new()
+                } else {
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "permitted-switch".into(),
+                        name: "model_switch".into(),
+                        arguments: arguments.to_string(),
+                        extra_content: None,
+                    }]
+                },
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    fn isolated_switch_test_agent(
+        config: Arc<zeroclaw_config::schema::Config>,
+        calls: Arc<AtomicUsize>,
+    ) -> Agent {
+        let mut agent = blank_input_agent(Box::new(GoalSwitchRequestProvider {
+            calls,
+            xml: false,
+            seen_messages: None,
+        }));
+        agent.model_provider_name = "custom.initial".into();
+        agent.model_name = "initial-model".into();
+        agent.set_model_route_resolver(Arc::new(
+            zeroclaw_providers::router::ModelRouteResolver::new(
+                Vec::new(),
+                "custom.initial".into(),
+                "initial-model".into(),
+            ),
+        ));
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            crate::tools::model_switch::ModelSwitchTool::new(
+                agent.security.clone(),
+                config.clone(),
+            ),
+        )]);
+        agent.provider_switch_config = Some(ProviderSwitchConfig {
+            config: Some(config),
+            live_config: None,
+            live: None,
+        });
+        agent
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_model_switch_reuses_the_ordinary_permitted_route_and_goal_row() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "switched candidate"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })))
+            .mount(&server).await;
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.reliability.provider_retries = 0;
+        let target = config.providers.models.ensure("custom", "target").unwrap();
+        target.uri = Some(server.uri());
+        target.api_key = Some("synthetic-key".into());
+        target.kind = Some("openai-compatible".into());
+        target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        target.model = Some("target-model".into());
+        target.live_pricing = false;
+        let config = Arc::new(config);
+        let ordinary_calls = Arc::new(AtomicUsize::new(0));
+        let mut ordinary = isolated_switch_test_agent(config.clone(), ordinary_calls.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (response, _) = ordinary.turn_streamed("finish", tx, None).await.unwrap();
+        assert_eq!(response, "switched candidate");
+        assert_eq!(ordinary.model_provider_name, "custom.target");
+        assert_eq!(ordinary_calls.load(Ordering::SeqCst), 1);
+
+        let goal_calls = Arc::new(AtomicUsize::new(0));
+        let mut goal = isolated_switch_test_agent(config, goal_calls.clone());
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "finish the bounded fixture".into(),
+                working_history: Vec::new(),
+            });
+        let result = goal
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "finish",
+            )
+            .await;
+        assert_eq!(goal_calls.load(Ordering::SeqCst), 1);
+        let outcome = result.expect("a permitted switch must continue the same Goal parent turn");
+        assert_eq!(outcome.response, "switched candidate");
+        assert_eq!(goal.model_provider_name, "custom.target");
+        assert_eq!(goal.model_name, "target-model");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let request: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let rows = request["messages"].as_array().unwrap();
+        assert_eq!(rows.iter().filter(|row| row["role"] == "system").count(), 1);
+        let system = rows[0]["content"].as_str().unwrap();
+        assert!(system.contains("finish the bounded fixture"));
+        assert!(system.contains("Untrusted user-declared success criterion follows."));
+        assert_eq!(request["model"], "target-model");
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_model_switch_recall_native_keeps_one_block_and_clean_carry() {
+        isolated_switch_recall_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_model_switch_recall_xml_keeps_the_block_on_its_injection_row() {
+        isolated_switch_recall_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_recall_xml_no_switch_keeps_the_original_injection_row() {
+        // Prompt-guided results add a newer user row, but recall runs only at
+        // loop entry. Goal must preserve that placement and strip only its block.
+        let authored = format!(
+            "{}\nUser-authored fixture text.\n{}",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE
+        );
+        let prefix = vec![
+            ChatMessage::user(authored.clone()),
+            ChatMessage::assistant("acknowledged"),
+        ];
+        for goal in [false, true] {
+            let memory = Arc::new(GoalRecallMemory::default());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut agent = Agent::builder()
+                .model_provider(Box::new(TranscriptCaptureModelProvider {
+                    alias: "recall-placement-fixture".into(),
+                    responses: Mutex::new(vec![
+                        zeroclaw_providers::ChatResponse {
+                            text: Some(
+                                "<tool_call>{\"name\":\"echo\",\"arguments\":{}}</tool_call>"
+                                    .into(),
+                            ),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        },
+                        zeroclaw_providers::ChatResponse {
+                            text: Some("bounded candidate".into()),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        },
+                    ]),
+                    seen_messages: requests.clone(),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
+                .memory(memory.clone())
+                .memory_session_id(Some("recall-placement-session".into()))
+                .auto_save(false)
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .tool_dispatcher(Box::new(XmlToolDispatcher))
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .build()
+                .unwrap();
+            let carried = if goal {
+                let input = zeroclaw_goal::control::goal_parent_turn_input(
+                    &zeroclaw_goal::GoalParentTurn {
+                        kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                        objective: "finish the bounded recall fixture".into(),
+                        working_history: Vec::new(),
+                    },
+                );
+                let result = agent
+                    .run_isolated_turn(
+                        IsolatedTranscriptSource::Canonical {
+                            prefix: prefix.clone(),
+                        },
+                        &input,
+                        "finish",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.response, "bounded candidate");
+                result.working_history
+            } else {
+                agent
+                    .history
+                    .extend(prefix.iter().cloned().map(ConversationMessage::Chat));
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let (result, ()) = tokio::join!(agent.turn_streamed("finish", tx, None), async {
+                    while rx.recv().await.is_some() {}
+                });
+                assert_eq!(result.unwrap().0, "bounded candidate");
+                agent.tool_dispatcher.to_provider_messages(&agent.history)
+            };
+            let requests = requests.lock();
+            assert_eq!(requests.len(), 2);
+            let injection_index = requests[0]
+                .iter()
+                .rposition(|row| row.role == "user")
+                .unwrap();
+            let injected_row = &requests[0][injection_index];
+            assert!(
+                injected_row
+                    .content
+                    .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            );
+            assert_eq!(requests[1][injection_index].content, injected_row.content);
+            let result_index = requests[1]
+                .iter()
+                .rposition(|row| row.role == "user")
+                .unwrap();
+            assert!(result_index > injection_index);
+            assert!(
+                requests[1][result_index]
+                    .content
+                    .starts_with("[Tool results]\n")
+            );
+            assert!(
+                !requests[1][result_index]
+                    .content
+                    .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            );
+            for request in requests.iter() {
+                assert_eq!(
+                    request
+                        .iter()
+                        .filter(|row| row
+                            .content
+                            .contains("Keep the bounded repair within its declared criterion."))
+                        .count(),
+                    1
+                );
+                assert!(
+                    request
+                        .iter()
+                        .any(|row| row.role == "user" && row.content == authored)
+                );
+            }
+            assert!(carried.iter().all(|row| {
+                !row.content
+                    .contains("Keep the bounded repair within its declared criterion.")
+            }));
+            assert!(
+                carried
+                    .iter()
+                    .any(|row| row.role == "user" && row.content == authored)
+            );
+            assert_eq!(
+                memory.queries.lock().as_slice(),
+                &[("finish".into(), Some("recall-placement-session".into()))]
+            );
+        }
+    }
+
+    async fn isolated_switch_recall_case(xml: bool) {
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate, matchers::method};
+        struct RecallSwitchReplies {
+            xml: bool,
+            calls: AtomicUsize,
+        }
+        impl Respond for RecallSwitchReplies {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let tool_round = self.calls.fetch_add(1, Ordering::SeqCst) % 2 == 0;
+                let message = if !tool_round {
+                    serde_json::json!({"role":"assistant","content":"switched candidate"})
+                } else if self.xml {
+                    serde_json::json!({"role":"assistant","content":"<tool_call>{\"name\":\"echo\",\"arguments\":{}}</tool_call>"})
+                } else {
+                    serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"recall-echo","type":"function","function":{"name":"echo","arguments":"{}"}}]})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":message,"finish_reason":if tool_round && !self.xml {"tool_calls"} else {"stop"}}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+                }))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(RecallSwitchReplies {
+                xml,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.reliability.provider_retries = 0;
+        let target = config.providers.models.ensure("custom", "target").unwrap();
+        target.uri = Some(server.uri());
+        target.api_key = Some("synthetic-key".into());
+        target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        target.model = Some("target-model".into());
+        target.live_pricing = false;
+        target.native_tools = Some(!xml);
+        target.thinking_passthrough = true;
+        let mut agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_config.model_provider = "custom.initial".into();
+        agent_config.resolved.tool_dispatcher = if xml { "xml" } else { "native" }.into();
+        config
+            .agents
+            .insert("switch-recall-fixture".into(), agent_config.clone());
+        let config = Arc::new(config);
+        let authored = format!(
+            "{}\nUser-authored fixture text.\n{}",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE
+        );
+        let prefix = vec![
+            ChatMessage::user(authored.clone()),
+            ChatMessage::assistant("acknowledged"),
+        ];
+        for goal in [false, true] {
+            let memory = Arc::new(GoalRecallMemory::default());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+            let mut agent = Agent::builder()
+                .model_provider(Box::new(GoalSwitchRequestProvider {
+                    calls: calls.clone(),
+                    xml,
+                    seen_messages: Some(seen.clone()),
+                }))
+                .model_provider_name("custom.initial".into())
+                .model_name("initial-model".into())
+                .model_route_resolver(Arc::new(
+                    zeroclaw_providers::router::ModelRouteResolver::new(
+                        Vec::new(),
+                        "custom.initial".into(),
+                        "initial-model".into(),
+                    ),
+                ))
+                .config(agent_config.clone())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![
+                        Box::new(crate::tools::ModelSwitchTool::new(
+                            security.clone(),
+                            config.clone(),
+                        )),
+                        Box::new(MockTool),
+                    ],
+                ))
+                .memory(memory.clone())
+                .memory_session_id(Some("switch-recall-session".into()))
+                .auto_save(false)
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .tool_dispatcher(if xml {
+                    Box::new(XmlToolDispatcher)
+                } else {
+                    Box::new(NativeToolDispatcher)
+                })
+                .workspace_dir(tmp.path().to_path_buf())
+                .security(security)
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(config.clone()),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            let mut pre_switch_objective = None;
+            let carried = if goal {
+                let input = zeroclaw_goal::control::goal_parent_turn_input(
+                    &zeroclaw_goal::GoalParentTurn {
+                        kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                        objective: "finish the bounded recall fixture".into(),
+                        working_history: Vec::new(),
+                    },
+                );
+                if xml {
+                    pre_switch_objective = Some(input.objective_message().content.clone());
+                }
+                let outcome = agent
+                    .run_isolated_turn(
+                        IsolatedTranscriptSource::Canonical {
+                            prefix: prefix.clone(),
+                        },
+                        &input,
+                        "finish",
+                    )
+                    .await;
+                // Prove recall happened before the expected missing-retry RED.
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let initial = seen.lock();
+                assert_eq!(initial.len(), 1);
+                assert!(
+                    initial[0]
+                        .iter()
+                        .rev()
+                        .find(|row| row.role == "user")
+                        .unwrap()
+                        .content
+                        .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+                );
+                drop(initial);
+                let outcome = outcome
+                    .expect("a permitted switch must retry before testing recalled-memory carry");
+                assert_eq!(outcome.response, "switched candidate");
+                outcome.working_history
+            } else {
+                agent
+                    .history
+                    .extend(prefix.iter().cloned().map(ConversationMessage::Chat));
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let (outcome, ()) = tokio::join!(agent.turn_streamed("finish", tx, None), async {
+                    while rx.recv().await.is_some() {}
+                });
+                assert_eq!(outcome.unwrap().0, "switched candidate");
+                agent.tool_dispatcher.to_provider_messages(&agent.history)
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                memory
+                    .queries
+                    .lock()
+                    .iter()
+                    .all(|(query, session)| query == "finish"
+                        && session.as_deref() == Some("switch-recall-session"))
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), if goal { 4 } else { 2 });
+            let mut injection_row = None;
+            for (iteration, request) in requests[if goal { 2 } else { 0 }..].iter().enumerate() {
+                let target: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(target.get("tools").is_some(), !xml);
+                let rows = target["messages"].as_array().unwrap();
+                if let Some(objective) = &pre_switch_objective {
+                    assert!(
+                        rows.iter()
+                            .any(|row| row["role"] == "user" && row["content"] == *objective),
+                        "the pre-switch injection row must be restored exactly"
+                    );
+                }
+                let last_user = rows.iter().rev().find(|row| row["role"] == "user").unwrap();
+                let last_user_has_recall = last_user["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN);
+                if !xml || iteration == 0 {
+                    assert!(
+                        last_user_has_recall,
+                        "recall must belong to the last user row"
+                    );
+                } else {
+                    // The inner XML tool round adds a newer user row on both
+                    // paths. Recall stays on the row injected at loop entry.
+                    assert!(!last_user_has_recall, "XML request {iteration}: {target}");
+                }
+                if iteration == 0 {
+                    let index = rows.iter().rposition(|row| row["role"] == "user").unwrap();
+                    injection_row = Some((index, rows[index]["content"].clone()));
+                } else {
+                    let (index, content) = injection_row.as_ref().unwrap();
+                    assert_eq!(rows[*index]["role"], "user");
+                    assert_eq!(&rows[*index]["content"], content);
+                }
+                let recalled_blocks =
+                    rows.iter()
+                        .filter(|row| {
+                            row["role"] == "user"
+                                && row["content"].as_str().unwrap_or_default().contains(
+                                    "Keep the bounded repair within its declared criterion.",
+                                )
+                        })
+                        .count();
+                assert_eq!(
+                    recalled_blocks,
+                    if !goal && xml { 2 } else { 1 },
+                    "Goal retry must not inherit ordinary XML recall stacking"
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row["role"] == "user" && row["content"] == authored)
+                );
+            }
+            assert!(
+                carried
+                    .iter()
+                    .any(|row| row.role == "user" && row.content == authored)
+            );
+            if goal {
+                assert!(carried.iter().all(|row| {
+                    !row.content
+                        .contains("Keep the bounded repair within its declared criterion.")
+                }));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SopGoalAccountingProbe {
+        admissions: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationRequest>>,
+        settlements: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for SopGoalAccountingProbe {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> Result<()> {
+            self.admissions.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> Result<()> {
+            assert_eq!(
+                settlement.accounting_state,
+                zeroclaw_goal::task::GoalAccountingState::Complete,
+                "every admitted fixture operation must report complete usage"
+            );
+            self.settlements.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn isolated_sop_reassembly_status(
+        goal: bool,
+        with_config: bool,
+    ) -> crate::sop::types::SopRunStatus {
+        use crate::sop::types::{Sop, SopExecutionMode, SopPriority, SopStep, SopTrigger};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        struct SopStepReply;
+        impl wiremock::Respond for SopStepReply {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"step candidate\"}}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n",
+                            "data: [DONE]\n\n",
+                        ))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "step candidate"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .respond_with(SopStepReply)
+            .mount(&server)
+            .await;
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.reliability.provider_retries = 0;
+        let target = config.providers.models.ensure("custom", "step").unwrap();
+        target.uri = Some(server.uri());
+        target.api_key = Some("synthetic-key".into());
+        target.kind = Some("openai-compatible".into());
+        target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        target.model = Some("step-model".into());
+        target.live_pricing = false;
+        config.risk_profiles.insert(
+            "step-policy".into(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                allowed_tools: vec!["file_read".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "fixture-step".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.step".into(),
+                risk_profile: "step-policy".into(),
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig {
+                    backend: zeroclaw_config::multi_agent::MemoryBackendKind::Markdown,
+                },
+                ..Default::default()
+            },
+        );
+        let mut engine = crate::sop::SopEngine::new(Default::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "fixture-sop".into(),
+            description: "bounded cross-agent fixture".into(),
+            version: "0.1.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "bounded step".into(),
+                body: "report the bounded result".into(),
+                agent: Some("fixture-step".into()),
+                ..Default::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "start-sop".into(),
+                        name: "sop_execute".into(),
+                        arguments: "{\"name\":\"fixture-sop\"}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(2),
+                        ..Default::default()
+                    }),
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(2),
+                        ..Default::default()
+                    }),
+                    reasoning_content: None,
+                },
+            ]),
+        }));
+        agent.workspace_dir = tmp.path().to_owned();
+        agent.agent_alias = "fixture-parent".into();
+        agent.model_provider_name = "custom.parent".into();
+        agent.model_name = "parent-model".into();
+        agent.set_model_route_resolver(Arc::new(
+            zeroclaw_providers::router::ModelRouteResolver::new(
+                Vec::new(),
+                "custom.parent".into(),
+                "parent-model".into(),
+            ),
+        ));
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            crate::tools::SopExecuteTool::new(engine.clone()).with_initiator("fixture-parent"),
+        )]);
+        if with_config {
+            let config = Arc::new(config);
+            agent.provider_switch_config = Some(ProviderSwitchConfig {
+                config: Some(config.clone()),
+                live_config: Some(Arc::new(parking_lot::RwLock::new(config.as_ref().clone()))),
+                live: None,
+            });
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        if goal {
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                    objective: "finish the bounded SOP".into(),
+                    working_history: Vec::new(),
+                });
+            let accounting = Arc::new(SopGoalAccountingProbe::default());
+            let outcome = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(accounting.clone()),
+                    agent.run_isolated_turn_with_events(
+                        IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                        &input,
+                        "finish",
+                        tx,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.response, "done");
+            let admissions = accounting.admissions.lock();
+            let settlements = accounting.settlements.lock();
+            assert_eq!(admissions.len(), settlements.len());
+            assert_eq!(
+                admissions
+                    .iter()
+                    .filter(
+                        |row| row.model_provider == "custom.parent" && row.model == "parent-model"
+                    )
+                    .count(),
+                2,
+                "synthetic fixture admissions: {admissions:?}; settlements: {settlements:?}"
+            );
+            let child_count = admissions
+                .iter()
+                .filter(|row| row.model_provider == "custom.step" && row.model == "step-model")
+                .count();
+            assert_eq!(
+                child_count,
+                usize::from(with_config),
+                "the cross-agent step inherits the Goal accounting scope"
+            );
+            assert_eq!(
+                settlements
+                    .iter()
+                    .flat_map(|row| &row.events)
+                    .filter(|row| row.provider_ref == "custom.step"
+                        && row.model == "step-model"
+                        && row.usage.input_tokens == Some(10)
+                        && row.usage.output_tokens == Some(2))
+                    .count(),
+                child_count
+            );
+        } else {
+            assert_eq!(
+                agent.turn_streamed("finish", tx, None).await.unwrap().0,
+                "done"
+            );
+        }
+        let (status, failure_reason) = {
+            let finished = engine.lock().unwrap();
+            let runs = finished.finished_runs(Some("fixture-sop"));
+            assert_eq!(
+                runs.len(),
+                1,
+                "registered SOP tool must actually start and settle the step"
+            );
+            (runs[0].status.clone(), runs[0].failure_reason.clone())
+        };
+        let requests = server.received_requests().await.unwrap();
+        if status == crate::sop::types::SopRunStatus::Completed {
+            assert_eq!(
+                requests.len(),
+                1,
+                "wire operations: {:?}",
+                requests
+                    .iter()
+                    .map(|request| (
+                        request.method.as_str(),
+                        request.url.path(),
+                        serde_json::from_slice::<serde_json::Value>(&request.body)
+                            .ok()
+                            .and_then(|body| body.get("model").cloned()),
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["model"], "step-model");
+            assert!(
+                !body.to_string().contains("sop_execute"),
+                "step does not inherit the parent's tool"
+            );
+        } else {
+            assert!(
+                requests.is_empty(),
+                "failed-closed step must not contact the child provider"
+            );
+            assert!(
+                failure_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("re-assembly handle")
+            );
+        }
+        status
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_sop_reassembly_matches_ordinary_with_live_configuration() {
+        use crate::sop::types::SopRunStatus;
+        assert_eq!(
+            isolated_sop_reassembly_status(false, true).await,
+            SopRunStatus::Completed
+        );
+        assert_eq!(
+            isolated_sop_reassembly_status(true, true).await,
+            SopRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_sop_reassembly_without_configuration_fails_closed_like_ordinary() {
+        use crate::sop::types::SopRunStatus;
+        assert_eq!(
+            isolated_sop_reassembly_status(false, false).await,
+            SopRunStatus::Failed
+        );
+        assert_eq!(
+            isolated_sop_reassembly_status(true, false).await,
+            SopRunStatus::Failed
+        );
+    }
+
     #[test]
     fn seed_conversation_history_trims_over_cap_restore_without_splitting_tools() {
         use zeroclaw_providers::{ToolCall, ToolResultMessage};
