@@ -46,6 +46,16 @@ pub(super) struct FinishFaultRegistry {
     pairing_transition_fault: AtomicBool,
     settlement_failures: AtomicUsize,
     pairing_transition_failures: AtomicUsize,
+    fence_observation: Option<Arc<FenceAdmissionObservation>>,
+}
+
+/// Observe real registry calls and control commits without injecting faults.
+#[derive(Default)]
+pub(super) struct FenceAdmissionObservation {
+    pub(super) tool_admissions: AtomicUsize,
+    pub(super) tool_settlements: AtomicUsize,
+    pub(super) operation_admissions: AtomicUsize,
+    pub(super) control_committed: Notify,
 }
 
 /// Hold the failed worker transition until an explicit pause fence is durable.
@@ -71,7 +81,22 @@ impl FinishFaultRegistry {
             pairing_transition_fault: AtomicBool::new(pairing_fault.unwrap_or(false)),
             settlement_failures: AtomicUsize::new(0),
             pairing_transition_failures: AtomicUsize::new(0),
+            fence_observation: None,
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared support: fence contract installs observations"
+    )]
+    pub(super) fn observing_fence(
+        store: Arc<SqliteTaskStore>,
+        observation: Arc<FenceAdmissionObservation>,
+    ) -> Self {
+        let mut registry = Self::new(store, "unused-fixture-fault", None, None);
+        *registry.remaining_reason.lock().unwrap() = None;
+        registry.fence_observation = Some(observation);
+        registry
     }
 
     pub(super) fn fault_counts(&self) -> (usize, usize, usize) {
@@ -103,6 +128,9 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         expected_epoch: i64,
         batch_id: &str,
     ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation.tool_admissions.fetch_add(1, Ordering::SeqCst);
+        }
         self.store
             .admit_pending_tool_batch(task_id, session_id, expected_epoch, batch_id)
             .await
@@ -115,6 +143,9 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         admitted_epoch: i64,
         batch_id: &str,
     ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation.tool_settlements.fetch_add(1, Ordering::SeqCst);
+        }
         if self.settlement_fault.swap(false, Ordering::SeqCst) {
             self.settlement_failures.fetch_add(1, Ordering::SeqCst);
             return Err(OriginalSettlementFailure.into());
@@ -267,6 +298,11 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         {
             gate.paused.notify_one();
         }
+        if result == GoalTransitionResult::Applied
+            && let Some(observation) = &self.fence_observation
+        {
+            observation.control_committed.notify_one();
+        }
         Ok(result)
     }
 
@@ -329,6 +365,11 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         expected_epoch: i64,
         operation_id: &str,
     ) -> anyhow::Result<GoalTransitionResult> {
+        if let Some(observation) = &self.fence_observation {
+            observation
+                .operation_admissions
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.store
             .admit_pending_operation(task_id, session_id, expected_epoch, operation_id)
             .await
