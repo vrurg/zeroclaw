@@ -1675,14 +1675,18 @@ impl Agent {
     /// Runs one Goal-owned model turn against a process-local transcript.
     ///
     /// This intentionally bypasses the ordinary user-turn conveniences:
-    /// user-message insertion, memory persistence/injection, request hooks,
+    /// user-message insertion, memory persistence, request hooks,
     /// response caching, turn events, and canonical-history replay. The only
     /// canonical mutation permitted here is refreshing the Agent-owned system
     /// prompt for the active tool dispatcher.
+    /// Read-only recall uses the raw admitting command as `recall_query` and
+    /// the Agent's ordinary memory configuration and session scope. Recalled
+    /// context is removed from the returned transcript before it carries forward.
     pub async fn run_isolated_turn(
         &mut self,
         source: IsolatedTranscriptSource,
         input: &zeroclaw_goal::control::GoalParentTurnInput,
+        recall_query: &str,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
             self.history
@@ -1835,7 +1839,13 @@ impl Agent {
                 new_messages_out: None,
                 image_cache: Some(&mut self.image_cache),
                 ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                memory: None,
+                memory: Some(crate::agent::memory_inject::TurnMemory {
+                    handle: self.memory.as_ref(),
+                    query: recall_query.to_owned(),
+                    sessions: vec![self.memory_session_id.clone()],
+                    suppress: false,
+                    cfg: self.memory_inject_cfg,
+                }),
                 agent_alias: agent_alias.as_deref(),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
@@ -1848,6 +1858,9 @@ impl Agent {
         )
         .await?;
 
+        if let Some(preamble) = injected_memory_preamble.take() {
+            preamble.strip_from_history(&mut working_history);
+        }
         Ok(IsolatedTurnOutcome {
             response,
             working_history,
@@ -10283,6 +10296,241 @@ mod tests {
             .expect("agent builder should succeed with valid config")
     }
 
+    /// Read-only fixture records the ordinary recall scope and rejects writes.
+    #[derive(Default)]
+    struct GoalRecallMemory {
+        queries: Mutex<Vec<(String, Option<String>)>>,
+        fail: bool,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalRecallMemory {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-recall-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for GoalRecallMemory {
+        fn name(&self) -> &str {
+            "goal-recall-fixture"
+        }
+
+        async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> Result<()> {
+            panic!("a Goal parent turn must not store recalled memory")
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            _: usize,
+            session: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            self.queries
+                .lock()
+                .push((query.to_owned(), session.map(str::to_owned)));
+            if self.fail {
+                anyhow::bail!("fixture recall failure");
+            }
+            Ok(vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "goal-recall-entry", "key": "repair-guidance",
+                    "content": "Keep the bounded repair within its declared criterion.",
+                    "category": "core", "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "session_id": session, "score": null
+                }))
+                .unwrap(),
+            ])
+        }
+
+        async fn get(&self, _: &str) -> Result<Option<zeroclaw_memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _: Option<&MemoryCategory>,
+            _: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _: &str) -> Result<bool> {
+            panic!("read-only fixture")
+        }
+        async fn forget_for_agent(&self, _: &str, _: &str) -> Result<bool> {
+            panic!("read-only fixture")
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(1)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _: &str,
+            _: &str,
+            _: MemoryCategory,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<&str>,
+        ) -> Result<()> {
+            panic!("a Goal parent turn must not store recalled memory")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _: &[&str],
+            query: &str,
+            limit: usize,
+            session: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            // The returned fixture row is legacy/unattributed, so it is visible
+            // under every ordinary agent allowlist without dropping a filter.
+            self.recall(query, limit, session, since, until).await
+        }
+    }
+
+    fn isolated_recall_test_agent(
+        memory: Arc<dyn Memory>,
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    ) -> Agent {
+        Agent::builder()
+            .model_provider(Box::new(TranscriptCaptureModelProvider {
+                alias: "goal-recall-provider".into(),
+                responses: Mutex::new(Vec::new()),
+                seen_messages: requests,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(memory)
+            .memory_session_id(Some("goal-recall-session".into()))
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_recalls_memory_without_carrying_it_into_continuation() {
+        let memory = Arc::new(GoalRecallMemory::default());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = isolated_recall_test_agent(memory.clone(), requests.clone());
+        let mut history = Vec::new();
+        for kind in [
+            zeroclaw_goal::GoalParentTurnKind::Start,
+            zeroclaw_goal::GoalParentTurnKind::Continue,
+        ] {
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind,
+                    objective: "bounded repair".into(),
+                    working_history: Vec::new(),
+                });
+            let source = if kind == zeroclaw_goal::GoalParentTurnKind::Start {
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() }
+            } else {
+                history.push(zeroclaw_goal::control::goal_verifier_feedback_message(
+                    "Finish the remaining criterion.",
+                ));
+                IsolatedTranscriptSource::Continuation {
+                    history,
+                    history_has_trim_breadcrumb: false,
+                }
+            };
+            let result = agent
+                .run_isolated_turn(source, &input, "/goal start bounded repair")
+                .await
+                .unwrap();
+            history = result.working_history;
+            assert!(
+                history
+                    .iter()
+                    .all(|row| !row.content.contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN)),
+                "provider-only recall must not carry forward"
+            );
+        }
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(
+                request
+                    .iter()
+                    .rev()
+                    .find(|row| row.role == "user")
+                    .unwrap()
+                    .content
+                    .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+                "the isolated Goal request must perform ordinary recall"
+            );
+            assert_eq!(
+                request
+                    .iter()
+                    .map(|row| row
+                        .content
+                        .matches(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+                        .count())
+                    .sum::<usize>(),
+                1
+            );
+        }
+        assert_eq!(
+            memory.queries.lock().as_slice(),
+            &[
+                (
+                    "/goal start bounded repair".into(),
+                    Some("goal-recall-session".into())
+                ),
+                (
+                    "/goal start bounded repair".into(),
+                    Some("goal-recall-session".into())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_recall_failure_preserves_the_candidate() {
+        let memory = Arc::new(GoalRecallMemory {
+            fail: true,
+            ..Default::default()
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = isolated_recall_test_agent(memory.clone(), requests.clone());
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "bounded repair".into(),
+                working_history: Vec::new(),
+            });
+        let result = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "/goal start bounded repair",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.response, "done");
+        assert_eq!(memory.queries.lock().len(), 1);
+        assert!(
+            requests.lock()[0]
+                .iter()
+                .all(|row| !row.content.contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN))
+        );
+        assert_eq!(result.working_history[1].content, "bounded repair");
+    }
+
     #[tokio::test]
     async fn isolated_turn_starts_on_empty_canonical_history() {
         let mut agent = isolated_turn_test_agent();
@@ -10297,6 +10545,7 @@ mod tests {
             .run_isolated_turn(
                 IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
                 &input,
+                "/goal start Empty-session repair.\nPreserve the second line.",
             )
             .await
             .expect("Goal start on an empty session must dispatch");
@@ -10347,7 +10596,11 @@ mod tests {
                 working_history: Vec::new(),
             });
         let outcome = agent
-            .run_isolated_turn(IsolatedTranscriptSource::Canonical { prefix }, &input)
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix },
+                &input,
+                "/goal start finish",
+            )
             .await
             .expect("isolated Goal turn should succeed");
 
@@ -10813,6 +11066,234 @@ mod tests {
                 .any(|r| r.content.contains("[receipt: zc-receipt-")),
             _ => false,
         })
+    }
+
+    async fn run_isolated_receipt_fixture(
+        enabled: bool,
+    ) -> (IsolatedTurnOutcome, Vec<Vec<ChatMessage>>) {
+        let mut agent = streamed_agent_with_receipts(enabled);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        agent.model_provider = Box::new(GoalBudgetProbeProvider {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            messages: messages.clone(),
+        });
+        agent.config.resolved.tool_receipts.show_in_response = true;
+        let input =
+            zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                objective: "use the echo tool".into(),
+                working_history: Vec::new(),
+            });
+        let result = agent
+            .run_isolated_turn(
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                &input,
+                "/goal start use the echo tool",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !history_has_receipt(&agent),
+            "transient tools stay isolated"
+        );
+        assert_eq!(result.response, "budget completion");
+        let requests = messages.lock().clone();
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_signs_tool_results_when_receipts_enabled() {
+        let (result, requests) = run_isolated_receipt_fixture(true).await;
+        assert!(
+            requests[1]
+                .iter()
+                .any(|row| { row.role == "tool" && row.content.contains("[receipt: zc-receipt-") })
+        );
+        assert!(
+            result
+                .working_history
+                .iter()
+                .any(|row| { row.role == "tool" && row.content.contains("[receipt: zc-receipt-") })
+        );
+        assert!(!result.response.contains("Tool receipts:"));
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_omits_receipts_when_disabled() {
+        let (result, requests) = run_isolated_receipt_fixture(false).await;
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .all(|row| { !row.content.contains("[receipt: zc-receipt-") })
+        );
+        assert!(result.working_history.iter().all(|row| {
+            !row.content.contains("[receipt: zc-receipt-")
+                && !row.content.contains("Tool receipts:")
+        }));
+    }
+
+    struct GoalBudgetProbeProvider {
+        requests: Arc<Mutex<Vec<bool>>>,
+        messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalBudgetProbeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "goal-budget-probe"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalBudgetProbeProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("fixture requires structured tool specs")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
+            self.messages.lock().push(request.messages.to_vec());
+            let mut requests = self.requests.lock();
+            requests.push(has_tools);
+            let round = request
+                .messages
+                .iter()
+                .rev()
+                .take_while(|row| row.role != "user")
+                .filter(|row| row.role == "tool")
+                .count()
+                + 1;
+            let call_tool = has_tools && round <= 3;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: (!call_tool).then(|| "budget completion".into()),
+                tool_calls: if call_tool {
+                    vec![zeroclaw_providers::ToolCall {
+                        id: format!("budget-{round}"),
+                        name: "echo".into(),
+                        arguments: format!("{{\"round\":{round}}}"),
+                        extra_content: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn observe_goal_budget(limit: Option<usize>, isolated: bool) -> (Vec<bool>, String) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = streamed_agent_with_receipts(false);
+        agent.model_provider = Box::new(GoalBudgetProbeProvider {
+            requests: requests.clone(),
+            messages: Arc::new(Mutex::new(Vec::new())),
+        });
+        agent.config.resolved.max_execution_tree_iterations = limit;
+        let response = if isolated {
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                    objective: "use the echo tool".into(),
+                    working_history: Vec::new(),
+                });
+            agent
+                .run_isolated_turn(
+                    IsolatedTranscriptSource::Canonical { prefix: Vec::new() },
+                    &input,
+                    "/goal start use the echo tool",
+                )
+                .await
+                .unwrap()
+                .response
+        } else {
+            agent.turn("use the echo tool").await.unwrap()
+        };
+        assert!(response.starts_with("budget completion"));
+        let observed = requests.lock().clone();
+        (observed, response)
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_reuses_the_ordinary_execution_tree_limit() {
+        let ordinary = observe_goal_budget(Some(2), false).await;
+        assert_eq!(ordinary.0, vec![true, false]);
+        assert_eq!(observe_goal_budget(Some(2), true).await, ordinary);
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_uncapped_budget_matches_ordinary() {
+        for limit in [None, Some(0)] {
+            let ordinary = observe_goal_budget(limit, false).await;
+            assert_eq!(ordinary.0, vec![true, true, true, true]);
+            assert_eq!(observe_goal_budget(limit, true).await, ordinary);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_policy_continuation_has_a_fresh_parent_budget() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = streamed_agent_with_receipts(false);
+        agent.model_provider = Box::new(GoalBudgetProbeProvider {
+            requests: requests.clone(),
+            messages: Arc::new(Mutex::new(Vec::new())),
+        });
+        // Each parent needs four calls; a shared five-call budget would cut
+        // the second parent short. Finite exhaustion is asserted separately.
+        agent.config.resolved.max_execution_tree_iterations = Some(5);
+        let mut history = Vec::new();
+        for kind in [
+            zeroclaw_goal::GoalParentTurnKind::Start,
+            zeroclaw_goal::GoalParentTurnKind::Continue,
+        ] {
+            let input =
+                zeroclaw_goal::control::goal_parent_turn_input(&zeroclaw_goal::GoalParentTurn {
+                    kind,
+                    objective: "use the echo tool".into(),
+                    working_history: Vec::new(),
+                });
+            let source = if kind == zeroclaw_goal::GoalParentTurnKind::Start {
+                IsolatedTranscriptSource::Canonical { prefix: Vec::new() }
+            } else {
+                history.push(zeroclaw_goal::control::goal_verifier_feedback_message(
+                    "Finish the remaining criterion.",
+                ));
+                IsolatedTranscriptSource::Continuation {
+                    history,
+                    history_has_trim_breadcrumb: false,
+                }
+            };
+            let result = agent
+                .run_isolated_turn(source, &input, "/goal start use the echo tool")
+                .await
+                .unwrap();
+            assert_eq!(result.response, "budget completion");
+            history = result.working_history;
+        }
+        assert_eq!(requests.lock().as_slice(), &[true; 8]);
     }
 
     // RED on upstream/master: the streamed turn path (ACP, gateway WS) hardcoded
