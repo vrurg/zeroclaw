@@ -29,6 +29,12 @@ mod diagnostics;
 #[path = "goal_cold_restore_tests.rs"]
 mod cold_restore;
 
+#[path = "goal_recall_conformance_tests.rs"]
+mod recall;
+
+#[path = "goal_routing_conformance_tests.rs"]
+mod routing;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionScenario {
     Answered,
