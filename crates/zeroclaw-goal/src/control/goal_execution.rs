@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, OwnedRwLockReadGuard, RwLock, watch},
     task::JoinHandle,
@@ -31,7 +32,7 @@ use crate::{
 use super::{
     GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext, GoalParentTurn,
     GoalResponse, GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease,
-    GoalVerifierTurn, goal_verifier_feedback_message,
+    GoalVerifierAttribution, GoalVerifierTurn, goal_verifier_feedback_message,
 };
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
@@ -75,13 +76,24 @@ impl GoalExecutionSubmission {
     }
 }
 
-/// Executes a Goal through the already validated session driver. Accounting
-/// and provider pricing are supplied by the runtime without giving this
-/// component a dependency on a runtime implementation.
+/// Runtime-owned protection for Goal diagnostic text sent to log, observer,
+/// broadcast, and persisted diagnostic sinks.
+///
+/// Implementations must be infallible. If protection cannot be established,
+/// return a fixed withheld marker rather than the input. This contract does
+/// not apply to model-visible history, durable blockers, or route attribution.
+pub trait GoalDiagnosticTextGuard: Send + Sync {
+    fn guard_diagnostic_text(&self, text: &str) -> String;
+}
+
+/// Executes a Goal through the already validated session driver. Accounting,
+/// provider pricing, and diagnostic protection are supplied by the runtime
+/// without giving this component a dependency on a runtime implementation.
 pub struct GoalExecutionEngine {
     runtime: GoalRuntime,
     registry: Arc<dyn GoalTaskRegistry>,
     accounting_factory: Arc<dyn GoalOperationAccountingFactory>,
+    diagnostic_text_guard: Option<Arc<dyn GoalDiagnosticTextGuard>>,
 }
 
 /// Process-local owner for the workers that execute durable Goal epochs.
@@ -808,7 +820,18 @@ impl GoalExecutionEngine {
             registry: Arc::clone(&runtime.controller.registry),
             runtime,
             accounting_factory,
+            diagnostic_text_guard: None,
         }
+    }
+
+    /// Supply the runtime's credential guard for untrusted diagnostic reasons.
+    ///
+    /// Without a guard, verifier reason text is withheld. Engine-authored
+    /// literals and configured provider/model attribution remain unchanged.
+    #[must_use]
+    pub fn with_diagnostic_text_guard(mut self, guard: Arc<dyn GoalDiagnosticTextGuard>) -> Self {
+        self.diagnostic_text_guard = Some(guard);
+        self
     }
 
     /// Run one admitted Goal epoch to a verified completion or verifier pause.
@@ -913,6 +936,7 @@ impl GoalExecutionEngine {
             // a drained parent result cannot start a second model operation.
             self.exact_running_task(scope).await?;
 
+            let candidate_fingerprint = verifier_candidate_fingerprint(&candidate);
             let verifier = match lease
                 .run_verifier(
                     scope,
@@ -924,32 +948,141 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(response) => {
-                    self.require_complete_accounting(scope, accountant.as_ref())
-                        .await?;
+                    if let Err(error) = self
+                        .require_complete_accounting(scope, accountant.as_ref())
+                        .await
+                    {
+                        log_verifier_diagnostic(
+                            self.diagnostic_text_guard.as_deref(),
+                            scope,
+                            &candidate_fingerprint,
+                            response.attribution.as_ref(),
+                            "accounting_incomplete",
+                            None,
+                            Some(DiagnosticReason::Fixed(
+                                "Verifier usage settlement was incomplete.",
+                            )),
+                            "terminal_failure",
+                            "before_controller_action",
+                        );
+                        return Err(error);
+                    }
                     response
                 }
                 Err(error) => {
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        None,
+                        "operation_failed",
+                        None,
+                        Some(DiagnosticReason::Fixed(
+                            "Verifier operation failed before a decision was available.",
+                        )),
+                        "terminal_failure",
+                        "before_controller_action",
+                    );
                     self.fail(scope, "verifier_operation_failed").await?;
                     return Err(error).context("Goal verifier operation failed");
                 }
             };
 
-            match parse_verifier_response(&verifier.response) {
-                Ok(VerifierDecision::Complete) => {
-                    self.complete(scope).await?;
+            let decision = match parse_verifier_response(&verifier.response) {
+                Ok(decision) => {
+                    let (decision_name, reason, action) = verifier_decision_log_fields(&decision);
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "valid",
+                        Some(decision_name),
+                        Some(DiagnosticReason::Verifier(reason)),
+                        action,
+                        "decision_validated",
+                    );
+                    decision
+                }
+                Err(error) => {
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "invalid",
+                        None,
+                        Some(DiagnosticReason::Fixed(
+                            "Verifier response failed strict JSON/schema validation.",
+                        )),
+                        "terminal_failure",
+                        "before_controller_action",
+                    );
+                    self.fail(scope, "verifier_protocol_invalid").await?;
+                    return Err(error).context("Goal verifier response is invalid");
+                }
+            };
+
+            match decision {
+                VerifierDecision::Complete { reason } => {
+                    if let Err(error) = self.complete(scope).await {
+                        log_verifier_diagnostic(
+                            self.diagnostic_text_guard.as_deref(),
+                            scope,
+                            &candidate_fingerprint,
+                            verifier.attribution.as_ref(),
+                            "valid",
+                            Some("complete"),
+                            Some(DiagnosticReason::Verifier(&reason)),
+                            "completion_transition_failed",
+                            "after_controller_action",
+                        );
+                        return Err(error);
+                    }
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "valid",
+                        Some("complete"),
+                        Some(DiagnosticReason::Verifier(&reason)),
+                        "completed",
+                        "after_controller_action",
+                    );
                     return Ok(GoalExecutionOutcome::Completed);
                 }
-                Ok(VerifierDecision::Continue { reason }) => {
+                VerifierDecision::Continue { reason } => {
                     working_history.push(ChatMessage::assistant(candidate));
                     working_history.push(goal_verifier_feedback_message(&reason));
                 }
-                Ok(VerifierDecision::Blocked { blockers }) => {
-                    self.pause_verifier_blocked(scope, blockers).await?;
+                VerifierDecision::Blocked { reason, blockers } => {
+                    if let Err(error) = self.pause_verifier_blocked(scope, blockers).await {
+                        log_verifier_diagnostic(
+                            self.diagnostic_text_guard.as_deref(),
+                            scope,
+                            &candidate_fingerprint,
+                            verifier.attribution.as_ref(),
+                            "valid",
+                            Some("blocked"),
+                            Some(DiagnosticReason::Verifier(&reason)),
+                            "pause_transition_failed",
+                            "after_controller_action",
+                        );
+                        return Err(error);
+                    }
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "valid",
+                        Some("blocked"),
+                        Some(DiagnosticReason::Verifier(&reason)),
+                        "paused_for_blocker",
+                        "after_controller_action",
+                    );
                     return Ok(GoalExecutionOutcome::VerifierBlocked);
-                }
-                Err(error) => {
-                    self.fail(scope, "verifier_protocol_invalid").await?;
-                    return Err(error).context("Goal verifier response is invalid");
                 }
             }
         }
@@ -1126,9 +1259,123 @@ impl From<VerifierBlockerKind> for GoalBlockerKind {
 }
 
 enum VerifierDecision {
-    Complete,
-    Continue { reason: String },
-    Blocked { blockers: Vec<GoalBlocker> },
+    Complete {
+        reason: String,
+    },
+    Continue {
+        reason: String,
+    },
+    Blocked {
+        reason: String,
+        blockers: Vec<GoalBlocker>,
+    },
+}
+
+fn verifier_candidate_fingerprint(candidate: &str) -> String {
+    format!("{:x}", Sha256::digest(candidate.as_bytes()))
+}
+
+fn verifier_decision_log_fields(decision: &VerifierDecision) -> (&'static str, &str, &'static str) {
+    match decision {
+        VerifierDecision::Complete { reason } => ("complete", reason, "complete"),
+        VerifierDecision::Continue { reason } => ("continue", reason, "continue"),
+        VerifierDecision::Blocked { reason, .. } => ("blocked", reason, "pause"),
+    }
+}
+
+const WITHHELD_VERIFIER_REASON: &str =
+    "[verifier reason withheld: no diagnostic leak guard installed]";
+
+#[derive(Clone, Copy)]
+enum DiagnosticReason<'a> {
+    Fixed(&'static str),
+    Verifier(&'a str),
+}
+
+fn diagnostic_log_reason(
+    guard: Option<&dyn GoalDiagnosticTextGuard>,
+    reason: DiagnosticReason<'_>,
+) -> String {
+    let reason = match reason {
+        DiagnosticReason::Fixed(literal) => return literal.to_owned(),
+        DiagnosticReason::Verifier(reason) => reason,
+    };
+    let Some(guard) = guard else {
+        return WITHHELD_VERIFIER_REASON.to_owned();
+    };
+    let normalized = reason
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                character.is_whitespace().then_some(' ')
+            } else {
+                Some(character)
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    guard
+        .guard_diagnostic_text(&normalized)
+        .chars()
+        .take(256)
+        .collect()
+}
+
+fn verifier_diagnostic_attributes(
+    guard: Option<&dyn GoalDiagnosticTextGuard>,
+    scope: &GoalExecutionScope,
+    candidate_fingerprint: &str,
+    attribution: Option<&GoalVerifierAttribution>,
+    validation_outcome: &str,
+    decision: Option<&str>,
+    reason: Option<DiagnosticReason<'_>>,
+    controller_action: &str,
+    phase: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": scope.task_id(),
+        "execution_epoch": scope.execution_epoch(),
+        "candidate_fingerprint": candidate_fingerprint,
+        "verifier_provider_ref": attribution.map(|value| value.provider_ref.as_str()),
+        "verifier_model": attribution.map(|value| value.model.as_str()),
+        "validation_outcome": validation_outcome,
+        "validated_decision": decision,
+        "reason": reason.map(|reason| diagnostic_log_reason(guard, reason)),
+        "controller_action": controller_action,
+        "phase": phase,
+    })
+}
+
+fn log_verifier_diagnostic(
+    guard: Option<&dyn GoalDiagnosticTextGuard>,
+    scope: &GoalExecutionScope,
+    candidate_fingerprint: &str,
+    attribution: Option<&GoalVerifierAttribution>,
+    validation_outcome: &str,
+    decision: Option<&str>,
+    reason: Option<DiagnosticReason<'_>>,
+    controller_action: &str,
+    phase: &str,
+) {
+    zeroclaw_log::record!(
+        INFO,
+        zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note).with_attrs(
+            verifier_diagnostic_attributes(
+                guard,
+                scope,
+                candidate_fingerprint,
+                attribution,
+                validation_outcome,
+                decision,
+                reason,
+                controller_action,
+                phase,
+            )
+        ),
+        "Goal verifier decision and controller action"
+    );
 }
 
 fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
@@ -1158,7 +1405,7 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
                 response.blockers.is_empty(),
                 "complete verifier response has blockers"
             );
-            Ok(VerifierDecision::Complete)
+            Ok(VerifierDecision::Complete { reason })
         }
         VerifierDecisionKind::Continue => {
             ensure!(
@@ -1173,6 +1420,7 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
                 "blocked verifier response has no actionable blockers"
             );
             Ok(VerifierDecision::Blocked {
+                reason,
                 blockers: response
                     .blockers
                     .into_iter()
@@ -1240,6 +1488,142 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn verifier_diagnostics_are_correlated_without_logging_candidate_text() {
+        let scope = GoalExecutionScope::new("goal-1", "session-1", 4).unwrap();
+        let candidate = "private candidate content";
+        let fingerprint = verifier_candidate_fingerprint(candidate);
+        let attrs = verifier_diagnostic_attributes(
+            Some(&RecordingGuard::default()),
+            &scope,
+            &fingerprint,
+            Some(&GoalVerifierAttribution {
+                provider_ref: "openai.primary".to_owned(),
+                model: "gpt-test".to_owned(),
+            }),
+            "valid",
+            Some("continue"),
+            Some(DiagnosticReason::Verifier(
+                "criterion remains\nwith details",
+            )),
+            "continue",
+            "decision_validated",
+        );
+
+        let encoded = attrs.to_string();
+        assert_eq!(attrs["task_id"], "goal-1");
+        assert_eq!(attrs["execution_epoch"], 4);
+        assert_eq!(attrs["candidate_fingerprint"].as_str().unwrap().len(), 64);
+        assert!(!encoded.contains(candidate));
+        assert_eq!(attrs["verifier_provider_ref"], "openai.primary");
+        assert_eq!(attrs["verifier_model"], "gpt-test");
+        assert_eq!(attrs["reason"], "criterion remains with details");
+        assert_eq!(attrs.as_object().unwrap().len(), 10);
+    }
+
+    #[derive(Default)]
+    struct RecordingGuard {
+        inputs: std::sync::Mutex<Vec<String>>,
+        replacement: Option<String>,
+    }
+
+    impl GoalDiagnosticTextGuard for RecordingGuard {
+        fn guard_diagnostic_text(&self, text: &str) -> String {
+            self.inputs.lock().unwrap().push(text.to_owned());
+            self.replacement
+                .clone()
+                .unwrap_or_else(|| text.replace("fixture-token", "[redacted]"))
+        }
+    }
+
+    #[test]
+    fn verifier_guard_receives_whole_normalized_reason_before_bound() {
+        let guard = RecordingGuard::default();
+        // Bounding first cuts the synthetic token at character 256, so the
+        // guard would miss it. Normalizing first also joins its NUL-split form.
+        for token in ["fixture-token", "fixture-\0token"] {
+            let reason = format!("{}{} end\r\n\t", "x".repeat(250), token);
+            let output = diagnostic_log_reason(Some(&guard), DiagnosticReason::Verifier(&reason));
+            let inputs = guard.inputs.lock().unwrap();
+            let input = inputs.last().unwrap();
+            assert!(input.len() > 256);
+            assert!(input.contains("fixture-token"));
+            assert!(!input.chars().any(char::is_control));
+            assert!(!output.contains("fixtur"));
+            assert_eq!(
+                output,
+                input
+                    .replace("fixture-token", "[redacted]")
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_bound_applies_to_guard_output_not_input() {
+        let guard = RecordingGuard {
+            replacement: Some("🌻".repeat(300)),
+            ..Default::default()
+        };
+        assert_eq!(
+            diagnostic_log_reason(Some(&guard), DiagnosticReason::Verifier("short")),
+            "🌻".repeat(256)
+        );
+    }
+
+    #[test]
+    fn verifier_reason_is_withheld_without_guard() {
+        assert_eq!(
+            diagnostic_log_reason(None, DiagnosticReason::Verifier("private reason")),
+            WITHHELD_VERIFIER_REASON
+        );
+    }
+
+    #[test]
+    fn fixed_reasons_bypass_guard_and_preserve_all_attributes() {
+        let guard = RecordingGuard::default();
+        let scope = GoalExecutionScope::new("goal-1", "session-1", 4).unwrap();
+        let attribution = GoalVerifierAttribution {
+            provider_ref: "configured.route".into(),
+            model: "configured-model".into(),
+        };
+        let literal = "Verifier operation failed before a decision was available.";
+        let attributes = |guard: Option<&dyn GoalDiagnosticTextGuard>| {
+            verifier_diagnostic_attributes(
+                guard,
+                &scope,
+                "fingerprint",
+                Some(&attribution),
+                "operation_failed",
+                None,
+                Some(DiagnosticReason::Fixed(literal)),
+                "terminal_failure",
+                "before_controller_action",
+            )
+        };
+        assert_eq!(attributes(None), attributes(Some(&guard)));
+        assert_eq!(attributes(None)["reason"], literal);
+        assert!(guard.inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verifier_normalization_preserves_unicode_without_control_characters() {
+        let guard = RecordingGuard::default();
+        let reason: String = "К🌻\r\n\t\u{001b}[31m\0\u{202e}"
+            .repeat(200)
+            .chars()
+            .take(2000)
+            .collect();
+        let output = diagnostic_log_reason(Some(&guard), DiagnosticReason::Verifier(&reason));
+        assert!(output.chars().count() <= 256);
+        assert!(!output.chars().any(char::is_control));
+        assert!(output.contains('К') && output.contains('🌻') && output.contains('\u{202e}'));
+        let inputs = guard.inputs.lock().unwrap();
+        assert!(inputs[0].chars().count() > 256);
     }
 
     #[test]

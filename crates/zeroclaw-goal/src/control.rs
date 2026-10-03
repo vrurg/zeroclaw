@@ -31,8 +31,8 @@ use zeroclaw_commands::goal::{
 mod goal_execution;
 
 pub use goal_execution::{
-    GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
-    GoalExecutionSubmission, GoalExecutionSupervisor,
+    GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionOutcome,
+    GoalExecutionRestartCoordinator, GoalExecutionSubmission, GoalExecutionSupervisor,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
@@ -385,6 +385,9 @@ pub struct GoalVerifierTurn {
 
 /// Safe attribution for the provider route that actually accepted a verifier
 /// response. This carries only routing identity, never credentials or usage.
+/// Hosts use the accepted route's configured provider reference and model,
+/// matching usage-ledger identity, never provider-reported free text.
+/// Diagnostics retain this attribution verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalVerifierAttribution {
     pub provider_ref: String,
