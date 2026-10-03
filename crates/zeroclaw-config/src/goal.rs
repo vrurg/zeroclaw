@@ -1,4 +1,4 @@
-//! Dormant Goal Mode configuration. Runtime admission is introduced later.
+//! Goal Mode admission, budget, verifier, and channel prompt configuration.
 
 use serde::{Deserialize, Serialize};
 use zeroclaw_macros::Configurable;
@@ -33,7 +33,7 @@ pub struct GoalVerifierConfig {
 /// Default-closed Goal Mode configuration. Explicit zero defaults mean
 /// unlimited. When the `[goal]` section is present, both defaults are required
 /// so Goal Mode cannot acquire a hidden hard-coded budget.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "goal"]
 pub struct GoalConfig {
@@ -41,9 +41,32 @@ pub struct GoalConfig {
     pub enabled: bool,
     pub default_token_limit: u64,
     pub default_cost_limit_usd: f64,
+    /// Include ordinary channel turn context in the system message of Matrix
+    /// Goal parent turns. Defaults to `true`; `false` narrows ordinary prompt
+    /// reuse by omitting that context. ZeroCode and verifier turns are unchanged.
+    /// Resolved once per parent turn; reload affects the next parent turn.
+    /// Including changing context may affect provider prompt-cache reuse.
+    #[serde(default = "default_true")]
+    pub include_channel_turn_context: bool,
     #[serde(default)]
     #[nested]
     pub verifier: GoalVerifierConfig,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for GoalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_token_limit: 0,
+            default_cost_limit_usd: 0.0,
+            include_channel_turn_context: true,
+            verifier: GoalVerifierConfig::default(),
+        }
+    }
 }
 
 impl GoalConfig {
@@ -85,6 +108,68 @@ impl GoalConfig {
 mod tests {
     use super::*;
     use crate::schema::Config;
+
+    #[test]
+    fn channel_turn_context_defaults_and_round_trips() {
+        assert!(GoalConfig::default().include_channel_turn_context);
+        assert!(Config::default().goal.include_channel_turn_context);
+        assert!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .goal
+                .include_channel_turn_context
+        );
+        let section = "[goal]\ndefault_token_limit = 0\ndefault_cost_limit_usd = 0.0\n";
+        assert!(
+            toml::from_str::<Config>(section)
+                .unwrap()
+                .goal
+                .include_channel_turn_context
+        );
+        for include in [false, true] {
+            let config: Config = toml::from_str(&format!(
+                "{section}include_channel_turn_context = {include}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.goal.include_channel_turn_context, include);
+            let encoded = toml::to_string(&config).unwrap();
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.goal.include_channel_turn_context, include);
+        }
+        for invalid in ["\"yes\"", "1", "\"false\""] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "{section}include_channel_turn_context = {invalid}\n"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn channel_turn_context_does_not_change_validation() {
+        for enabled in [false, true] {
+            let mut config: Config = toml::from_str(&format!(
+                "[goal]\nenabled = {enabled}\ndefault_token_limit = 0\n\
+                 default_cost_limit_usd = 0.0\n[goal.verifier]\n\
+                 model_provider = \"openai.default\"\n\
+                 [providers.models.openai.default]\nmodel = \"gpt-test\"\n"
+            ))
+            .unwrap();
+            for include in [false, true] {
+                config.goal.include_channel_turn_context = include;
+                assert_eq!(config.goal.validate(), Ok(()));
+                assert!(config.validate().is_ok());
+                config.goal.default_cost_limit_usd = -1.0;
+                assert_eq!(
+                    config.goal.validate(),
+                    Err(GoalConfigError::InvalidCostLimit)
+                );
+                assert!(config.validate().is_err());
+                config.goal.default_cost_limit_usd = 0.0;
+            }
+        }
+    }
 
     #[test]
     fn enabled_config_requires_a_verifier() {

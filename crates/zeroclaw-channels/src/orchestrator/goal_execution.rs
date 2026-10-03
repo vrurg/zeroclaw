@@ -818,6 +818,7 @@ impl MatrixGoalExecutionLease {
         provider: &dyn zeroclaw_providers::ModelProvider,
         route: &ChannelRouteSelection,
         thinking: &super::ChannelThinkingResolution,
+        turn_context: Option<&str>,
     ) -> String {
         let excluded_tools = Self::excluded_tools(self.context.as_ref(), &self.message);
         let native_tool_specs_present =
@@ -869,6 +870,9 @@ impl MatrixGoalExecutionLease {
         }
         if let Some(prefix) = thinking.params.system_prompt_prefix.as_ref() {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
+        }
+        if let Some(turn_context) = turn_context {
+            let _ = write!(system_prompt, "\n\n{turn_context}");
         }
         system_prompt
     }
@@ -943,6 +947,14 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
         let defaults = runtime_defaults_snapshot(self.context.as_ref());
+        // Goal has no lawful user row for ordinary channel turn context, so
+        // place it above the Goal framing and reuse it for in-turn switches.
+        let turn_context = defaults.config.goal.include_channel_turn_context.then(|| {
+            super::build_channel_turn_context_preamble(
+                &self.message,
+                find_channel_for_message(&self.context.channels_by_name, &self.message),
+            )
+        });
         let history_key = self.session_key.durable_id();
         let thinking_override = self
             .context
@@ -972,7 +984,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 &defaults,
             )
             .await?;
-            let base_system_prompt = self.base_system_prompt(provider.as_ref(), &route, &thinking);
+            let base_system_prompt = self.base_system_prompt(
+                provider.as_ref(),
+                &route,
+                &thinking,
+                turn_context.as_deref(),
+            );
             let history = match turn.kind {
                 GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                     input.goal_start_transcript(&base_system_prompt, turn.working_history)?
@@ -1245,8 +1262,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                                     route.clone(),
                                     &defaults,
                                 );
-                                let base =
-                                    self.base_system_prompt(provider.as_ref(), &route, &thinking);
+                                let base = self.base_system_prompt(
+                                    provider.as_ref(),
+                                    &route,
+                                    &thinking,
+                                    turn_context.as_deref(),
+                                );
                                 history[0] = input.compose_goal_system_row(&base);
                                 turn_guard.set_model_route(
                                     route.model_provider.clone(),
@@ -2244,6 +2265,7 @@ mod tests {
     struct MatrixGoalErrorRecordingChannel {
         messages: tokio::sync::Mutex<Vec<String>>,
         fail_sends: bool,
+        approval_requests: std::sync::atomic::AtomicUsize,
     }
 
     impl zeroclaw_api::attribution::Attributable for MatrixGoalErrorRecordingChannel {
@@ -2275,6 +2297,16 @@ mod tests {
             _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _: &str,
+            _: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+            self.approval_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
         }
     }
 
@@ -2795,6 +2827,892 @@ mod tests {
                 first_history[1].content,
                 zeroclaw_runtime::agent::history_trim::breadcrumb().content
             );
+        }
+    }
+
+    struct MatrixTurnContextEvidence {
+        requests: Vec<Vec<ChatMessage>>,
+        omit_rows: Vec<String>,
+        contexts: Vec<String>,
+        durable: Vec<ChatMessage>,
+        events: Vec<String>,
+        returned_system_rows: Vec<String>,
+        continuation_input: Vec<ChatMessage>,
+    }
+
+    fn install_matrix_turn_context_reload(
+        context: &ChannelRuntimeContext,
+        config: zeroclaw_config::schema::Config,
+        provider: Arc<dyn ModelProvider>,
+    ) {
+        let defaults = runtime_defaults_snapshot(context).defaults;
+        let mut override_guard = context.runtime_defaults_override.lock().unwrap();
+        let generation = override_guard
+            .as_ref()
+            .map_or(1, |current| current.generation.saturating_add(1));
+        let next_override = Arc::new(super::super::ChannelRuntimeOverride {
+            config: Arc::new(config),
+            defaults: defaults.clone(),
+            generation,
+        });
+        let cache_key =
+            super::super::provider_cache_key(&defaults.default_model_provider, None, generation);
+        let mut cache = context.provider_cache.lock().unwrap();
+        cache.clear();
+        cache.insert(cache_key, provider);
+        *override_guard = Some(next_override);
+    }
+
+    async fn matrix_turn_context_evidence(
+        initial: Option<bool>,
+        successor: Option<bool>,
+    ) -> MatrixTurnContextEvidence {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let provider = Arc::new(GoalMemoryRecordingProvider {
+            requests: Mutex::new(Vec::new()),
+            recover_first_request: false,
+        });
+        let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone(),
+            channel.clone(),
+            provider.clone(),
+            0,
+        );
+        let mut config = context.prompt_config.as_ref().clone();
+        let goal_config = |include: Option<bool>| {
+            let key = include.map_or(String::new(), |value| {
+                format!("include_channel_turn_context = {value}\n")
+            });
+            toml::from_str::<zeroclaw_config::goal::GoalConfig>(&format!(
+                "default_token_limit = 0\ndefault_cost_limit_usd = 0.0\n{key}"
+            ))
+            .unwrap()
+        };
+        config.goal = goal_config(initial);
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.prompt_config = Arc::new(config.clone());
+        *ctx.live_config.write() = config;
+        let message = ChannelMessage::new(
+            "context-event",
+            "fixture-user",
+            "fixture-room",
+            "/goal start bounded repair",
+            "matrix",
+            1,
+        );
+        let session_key =
+            GoalSessionKey::matrix(super::super::conversation_history_key(&message)).unwrap();
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("turn-context-fixture", session_key.durable_id(), 1).unwrap(),
+        );
+        let mut lease = MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context,
+            session_key,
+            message,
+            pending_delivery: None,
+            pending_receipts: None,
+            pending_route: None,
+            pending_fallback: None,
+            history_has_trim_breadcrumb: false,
+        };
+        let mut working = Vec::new();
+        let mut omit_rows = Vec::new();
+        let mut contexts = Vec::new();
+        let mut returned_system_rows = Vec::new();
+        let mut continuation_input = Vec::new();
+        for kind in [GoalParentTurnKind::Start, GoalParentTurnKind::Continue] {
+            if kind == GoalParentTurnKind::Continue
+                && let Some(include) = successor
+            {
+                let snapshot = runtime_defaults_snapshot(lease.context.as_ref());
+                let mut config = snapshot.config.as_ref().clone();
+                config.goal = goal_config(Some(include));
+                install_matrix_turn_context_reload(
+                    lease.context.as_ref(),
+                    config,
+                    provider.clone(),
+                );
+            }
+            let turn = GoalParentTurn {
+                kind,
+                objective: "bounded repair".into(),
+                working_history: working,
+            };
+            if kind == GoalParentTurnKind::Continue {
+                continuation_input = turn.working_history.clone();
+            }
+            let snapshot = runtime_defaults_snapshot(lease.context.as_ref());
+            let route = get_route_selection(
+                lease.context.as_ref(),
+                &lease.message,
+                &lease.session_key.durable_id(),
+                &snapshot,
+            );
+            let thinking = super::super::resolve_channel_thinking(
+                &lease.message.content,
+                None,
+                &lease.context.agent_cfg.resolved.thinking,
+                snapshot.defaults.temperature,
+            );
+            // Capture the pre-P5h ordinary base, independent of the selected key.
+            let base = lease.base_system_prompt(provider.as_ref(), &route, &thinking, None);
+            omit_rows.push(
+                goal_parent_turn_input(&turn)
+                    .compose_goal_system_row(&base)
+                    .content,
+            );
+            contexts.push(super::super::build_channel_turn_context_preamble(
+                &lease.message,
+                find_channel_for_message(&lease.context.channels_by_name, &lease.message),
+            ));
+            let result = lease.run_parent_turn(&operation, turn).await.unwrap();
+            let candidate = result.candidate().to_owned();
+            assert!(!candidate.contains("[turn-context]"));
+            working = result.working_history().to_vec();
+            returned_system_rows.push(working[0].content.clone());
+            assert!(
+                working
+                    .iter()
+                    .filter(|row| row.role != "system")
+                    .all(|row| !row.content.contains("[turn-context]"))
+            );
+            lease
+                .append_parent_candidate(candidate.clone())
+                .await
+                .unwrap();
+            working.push(ChatMessage::assistant(candidate));
+            working.push(zeroclaw_goal::control::goal_verifier_feedback_message(
+                "Finish the remaining criterion.",
+            ));
+        }
+        let durable = zeroclaw_infra::session_backend::SessionBackend::load(
+            backend.as_ref(),
+            &lease.session_key.durable_id(),
+        );
+        assert!(
+            durable
+                .iter()
+                .all(|row| !row.content.contains("[turn-context]"))
+        );
+        let events = channel.messages.lock().await.clone();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        MatrixTurnContextEvidence {
+            requests,
+            omit_rows,
+            contexts,
+            durable,
+            events,
+            returned_system_rows,
+            continuation_input,
+        }
+    }
+
+    fn mask_turn_context_clock(text: &str) -> String {
+        let clock = regex::Regex::new(r"\b(time|date|weekday|tz)=[^ ]*").unwrap();
+        clock.replace_all(text, "$1=<clock>").into_owned()
+    }
+
+    fn assert_matrix_turn_context_rows(evidence: &MatrixTurnContextEvidence, modes: [bool; 2]) {
+        for (index, include) in modes.into_iter().enumerate() {
+            let request = &evidence.requests[index];
+            let row = &request[0];
+            assert_eq!(row.role, "system");
+            assert!(
+                request[1..]
+                    .iter()
+                    .all(|row| !row.content.contains("[turn-context]"))
+            );
+            if include {
+                assert_eq!(row.content.matches("[turn-context]").count(), 1);
+                let (base, framing) = evidence.omit_rows[index]
+                    .split_once("\n\nTurn kind (trusted runtime fact):")
+                    .expect("Goal framing marker");
+                let expected = format!(
+                    "{base}\n\n{}\n\nTurn kind (trusted runtime fact):{framing}",
+                    evidence.contexts[index]
+                );
+                assert_eq!(
+                    mask_turn_context_clock(&row.content),
+                    mask_turn_context_clock(&expected)
+                );
+            } else {
+                assert_eq!(row.content, evidence.omit_rows[index]);
+                assert!(!row.content.contains("[turn-context]"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_omit_baseline() {
+        let evidence = matrix_turn_context_evidence(Some(false), None).await;
+        assert_matrix_turn_context_rows(&evidence, [false, false]);
+        println!("P5h omit row 0: {:?}", evidence.requests[0][0].content);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_default_and_explicit_modes() {
+        let omit = matrix_turn_context_evidence(Some(false), None).await;
+        for mode in [None, Some(true)] {
+            let include = matrix_turn_context_evidence(mode, None).await;
+            assert_matrix_turn_context_rows(&include, [true, true]);
+            assert_eq!(
+                serde_json::to_value(&include.durable).unwrap(),
+                serde_json::to_value(&omit.durable).unwrap()
+            );
+            assert_eq!(include.events, omit.events);
+            for (left, right) in include.requests.iter().zip(&omit.requests) {
+                assert_eq!(
+                    serde_json::to_value(&left[1..]).unwrap(),
+                    serde_json::to_value(&right[1..]).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_reload_omit_to_include() {
+        let evidence = matrix_turn_context_evidence(Some(false), Some(true)).await;
+        assert_matrix_turn_context_rows(&evidence, [false, true]);
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_reload_include_to_omit() {
+        let evidence = matrix_turn_context_evidence(Some(true), Some(false)).await;
+        // The returned scaffold and next input deliberately retain the prior
+        // text, making the later request's absence check nonvacuous.
+        assert_eq!(
+            evidence.returned_system_rows[0]
+                .matches("[turn-context]")
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence.continuation_input[0]
+                .content
+                .matches("[turn-context]")
+                .count(),
+            1
+        );
+        assert!(
+            evidence.continuation_input[1..]
+                .iter()
+                .all(|row| !row.content.contains("[turn-context]"))
+        );
+        assert_matrix_turn_context_rows(&evidence, [true, false]);
+    }
+
+    struct MatrixContextReloadSwitchProvider {
+        inner: Arc<MatrixRecallSwitchProvider>,
+        reload: Mutex<
+            Option<(
+                std::sync::Weak<ChannelRuntimeContext>,
+                zeroclaw_config::schema::Config,
+            )>,
+        >,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for MatrixContextReloadSwitchProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Attributable::role(self.inner.as_ref())
+        }
+
+        fn alias(&self) -> &str {
+            "matrix-context-switch-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MatrixContextReloadSwitchProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires structured messages")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let (context, config) = self
+                .reload
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the initial provider is called exactly once");
+            let context = context.upgrade().expect("the parent owns its context");
+            install_matrix_turn_context_reload(&context, config, self.inner.clone());
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    async fn assert_matrix_context_switch_reload(initial: bool) {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"role":"assistant","content":"switched candidate"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+            })))
+            .expect(2)
+            .mount(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = Arc::new(MatrixRecallSwitchProvider {
+            native: true,
+            calls: calls.clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(MatrixContextReloadSwitchProvider {
+            inner: inner.clone(),
+            reload: Mutex::new(None),
+        });
+        let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone(),
+            channel,
+            provider.clone(),
+            0,
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        let mut config = ctx.prompt_config.as_ref().clone();
+        config.goal = toml::from_str(&format!(
+            "default_token_limit = 0\ndefault_cost_limit_usd = 0.0\ninclude_channel_turn_context = {initial}\n",
+        )).unwrap();
+        config.reliability.provider_retries = 0;
+        ctx.provider_runtime_options.native_tools = Some(true);
+        let target = config.providers.models.ensure("custom", "target").unwrap();
+        target.uri = Some(server.uri());
+        target.api_key = Some("synthetic-key".into());
+        target.native_tools = Some(true);
+        target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        target.model = Some("target-model".into());
+        target.live_pricing = false;
+        target.thinking_passthrough = true;
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["model_switch".into()],
+            ..Default::default()
+        };
+        config
+            .risk_profiles
+            .insert("context-switch-fixture".into(), risk.clone());
+        config.agents.get_mut("test").unwrap().risk_profile = "context-switch-fixture".into();
+        ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+        ctx.tools_registry = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                zeroclaw_runtime::tools::ModelSwitchTool::new(
+                    ctx.security.clone(),
+                    Arc::new(config.clone()),
+                ),
+            )]),
+        );
+        ctx.prompt_config = Arc::new(config.clone());
+        *ctx.live_config.write() = config.clone();
+        ctx.approval_manager =
+            Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&risk));
+        let mut successor = config.clone();
+        let mut goal: toml::Value = toml::Value::try_from(&config.goal).unwrap();
+        goal.as_table_mut().unwrap().insert(
+            "include_channel_turn_context".into(),
+            toml::Value::Boolean(!initial),
+        );
+        successor.goal = goal.try_into().unwrap();
+        *provider.reload.lock().unwrap() = Some((Arc::downgrade(&context), successor));
+        let message = ChannelMessage::new("context-switch", "user", "room", "finish", "matrix", 1);
+        let session_key =
+            GoalSessionKey::matrix(super::super::conversation_history_key(&message)).unwrap();
+        let operation = GoalOperationScope::new(
+            GoalExecutionScope::new("context-switch-fixture", session_key.durable_id(), 1).unwrap(),
+        );
+        let mut lease = MatrixGoalExecutionLease {
+            _foreground: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            context: context.clone(),
+            session_key,
+            message,
+            pending_delivery: None,
+            pending_receipts: None,
+            pending_route: None,
+            pending_fallback: None,
+            history_has_trim_breadcrumb: false,
+        };
+        let mut working = Vec::new();
+        for kind in [GoalParentTurnKind::Start, GoalParentTurnKind::Continue] {
+            let result = lease
+                .run_parent_turn(
+                    &operation,
+                    GoalParentTurn {
+                        kind,
+                        objective: "finish the bounded fixture".into(),
+                        working_history: working,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.candidate(), "switched candidate");
+            working = result.working_history().to_vec();
+            assert!(
+                working
+                    .iter()
+                    .filter(|row| row.role != "system")
+                    .all(|row| !row.content.contains("[turn-context]"))
+            );
+            lease
+                .append_parent_candidate(result.candidate().into())
+                .await
+                .unwrap();
+            working.push(ChatMessage::assistant(result.candidate()));
+            working.push(zeroclaw_goal::control::goal_verifier_feedback_message(
+                "Add the missing detail.",
+            ));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let route = context
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&lease.session_key.durable_id())
+            .cloned()
+            .unwrap();
+        assert_eq!(route.model_provider, "custom.target");
+        let durable = backend.load(&lease.session_key.durable_id());
+        assert!(
+            durable
+                .iter()
+                .all(|row| !row.content.contains("[turn-context]"))
+        );
+        let initial_rows = inner.requests.lock().unwrap()[0].clone();
+        let recorded = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = recorded
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert_eq!(body["model"], "target-model");
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["role"] != "system")
+                    .all(|row| !row.to_string().contains("[turn-context]"))
+            );
+        }
+        let initial_system = &initial_rows[0].content;
+        let switched_system = bodies[0]["messages"][0]["content"].as_str().unwrap();
+        let next_system = bodies[1]["messages"][0]["content"].as_str().unwrap();
+        for system in [initial_system.as_str(), switched_system] {
+            assert_eq!(
+                system.matches("[turn-context]").count(),
+                usize::from(initial)
+            );
+        }
+        if initial {
+            let block = |system: &str| {
+                system
+                    .split_once("[turn-context]")
+                    .unwrap()
+                    .1
+                    .split_once("\n\nTurn kind (trusted runtime fact):")
+                    .unwrap()
+                    .0
+                    .to_owned()
+            };
+            assert_eq!(block(initial_system), block(switched_system));
+        }
+        assert_eq!(
+            next_system.matches("[turn-context]").count(),
+            usize::from(!initial)
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_switch_include_to_omit() {
+        assert_matrix_context_switch_reload(true).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_switch_omit_to_include() {
+        assert_matrix_context_switch_reload(false).await;
+    }
+
+    struct MatrixContextEngineEvidence {
+        events: Vec<String>,
+        durable: serde_json::Value,
+        usage: (u64, f64),
+        verifier_bodies: Vec<serde_json::Value>,
+        parent_rows: Vec<Vec<ChatMessage>>,
+    }
+
+    struct MatrixContextObservingDriver {
+        inner: Arc<MatrixGoalSessionDriver>,
+        parent_inputs: Arc<Mutex<Vec<GoalParentTurn>>>,
+    }
+
+    #[async_trait]
+    impl GoalSessionDriver for MatrixContextObservingDriver {
+        fn session_key(&self) -> &GoalSessionKey {
+            self.inner.session_key()
+        }
+
+        async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
+            self.inner.bind(ingress).await
+        }
+
+        async fn acquire_execution(
+            &self,
+            ingress: &GoalIngressContext,
+            scope: &GoalExecutionScope,
+            checkpoint: &GoalParentTurnCheckpoint,
+        ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+            Ok(Box::new(MatrixContextObservingLease {
+                inner: self
+                    .inner
+                    .acquire_execution(ingress, scope, checkpoint)
+                    .await?,
+                parent_inputs: self.parent_inputs.clone(),
+            }))
+        }
+    }
+
+    struct MatrixContextObservingLease {
+        inner: Box<dyn GoalSessionExecutionLease>,
+        parent_inputs: Arc<Mutex<Vec<GoalParentTurn>>>,
+    }
+
+    #[async_trait]
+    impl GoalSessionExecutionLease for MatrixContextObservingLease {
+        fn session_key(&self) -> &GoalSessionKey {
+            self.inner.session_key()
+        }
+
+        fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
+            self.inner.canonical_history()
+        }
+
+        async fn append_resume_response(&mut self, response: String) -> Result<()> {
+            self.inner.append_resume_response(response).await
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            operation: &GoalOperationScope,
+            turn: GoalParentTurn,
+        ) -> Result<GoalParentTurnResult> {
+            self.parent_inputs.lock().unwrap().push(turn.clone());
+            let result = self.inner.run_parent_turn(operation, turn).await?;
+            assert!(!result.candidate().contains("[turn-context]"));
+            assert!(
+                result
+                    .working_history()
+                    .iter()
+                    .filter(|row| row.role != "system")
+                    .all(|row| !row.content.contains("[turn-context]"))
+            );
+            Ok(result)
+        }
+
+        async fn run_verifier(
+            &mut self,
+            operation: &GoalOperationScope,
+            turn: GoalVerifierTurn,
+        ) -> Result<GoalVerifierResult> {
+            self.inner.run_verifier(operation, turn).await
+        }
+
+        async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
+            self.inner.append_parent_candidate(candidate).await
+        }
+
+        async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
+            self.inner.publish_goal_core_error(error).await
+        }
+
+        async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
+            self.inner.publish_goal_notice(notice).await
+        }
+    }
+
+    async fn matrix_context_engine_evidence(mode: Option<bool>) -> MatrixContextEngineEvidence {
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate, matchers::method};
+        use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_runtime::control_plane::{SqliteTaskStore, TaskStatus};
+
+        struct Verdicts(std::sync::atomic::AtomicUsize);
+        impl Respond for Verdicts {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let verdict = match call {
+                    0 => {
+                        serde_json::json!({"decision":"continue","reason":"add the missing detail","blockers":[]})
+                    }
+                    1 => {
+                        serde_json::json!({"decision":"complete","reason":"candidate satisfies the objective","blockers":[]})
+                    }
+                    _ => panic!("completion must not admit a third verifier call"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant","content":verdict.to_string()},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Verdicts(std::sync::atomic::AtomicUsize::new(0)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let provider = Arc::new(GoalPolicyProvider {
+            requests: Mutex::new(Vec::new()),
+            tool_rounds: 0,
+            calls_per_round: 0,
+        });
+        let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone(),
+            channel.clone(),
+            provider.clone(),
+            0,
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        let mut config = ctx.prompt_config.as_ref().clone();
+        let key_text = mode.map_or(String::new(), |value| {
+            format!("include_channel_turn_context = {value}\n")
+        });
+        config.goal = toml::from_str(&format!(
+            "enabled = true\ndefault_token_limit = 0\ndefault_cost_limit_usd = 0.0\n{key_text}",
+        ))
+        .unwrap();
+        config.reliability.provider_retries = 0;
+        config.goal.verifier.model_provider = "openai.verifier-test".into();
+        config.goal.verifier.model = Some("goal-verifier".into());
+        let slot = config
+            .providers
+            .models
+            .ensure("openai", "verifier-test")
+            .unwrap();
+        slot.api_key = Some("synthetic-key".into());
+        slot.uri = Some(server.uri());
+        slot.kind = Some("openai-compatible".into());
+        slot.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        slot.model = Some("alias-default".into());
+        slot.live_pricing = false;
+        ctx.prompt_config = Arc::new(config.clone());
+        *ctx.live_config.write() = config;
+        let key = "matrix_context_engine_fixture";
+        let driver = Arc::new(
+            MatrixGoalSessionDriver::new(
+                context.clone(),
+                key.into(),
+                "user".into(),
+                "matrix:test:room".into(),
+                ChannelMessage::new(
+                    "context-engine",
+                    "user",
+                    "room",
+                    "/goal start bounded repair",
+                    "matrix",
+                    1,
+                ),
+                goal_command_lock(&context.persist_locks, key)
+                    .lock_owned()
+                    .await,
+            )
+            .unwrap(),
+        );
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "user".into(),
+            },
+        )
+        .unwrap();
+        let settings = GoalHostSettings::new(
+            true,
+            GoalBudgetLimits {
+                token_limit: Some(1000),
+                cost_limit_usd: None,
+            },
+            1,
+            "context-fixture-boot",
+        )
+        .unwrap();
+        let runtime = GoalRuntime::new(store.clone());
+        let tracker = Arc::new(
+            CostTracker::new(zeroclaw_config::schema::CostConfig::default(), tmp.path()).unwrap(),
+        );
+        let accounting = Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                store.clone(),
+                tracker.clone(),
+                "test",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        );
+        let supervisor =
+            GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting)));
+        let parent_inputs = Arc::new(Mutex::new(Vec::new()));
+        let observed_driver = Arc::new(MatrixContextObservingDriver {
+            inner: driver,
+            parent_inputs: parent_inputs.clone(),
+        });
+        let mut submission = supervisor
+            .submit(
+                settings.clone(),
+                ingress,
+                observed_driver,
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded repair".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(projection) = submission.response() else {
+            panic!("fixture must start its Goal");
+        };
+        let scope =
+            GoalExecutionScope::new(&projection.task_id, key, projection.execution_epoch).unwrap();
+        supervisor
+            .launch_after_response(settings, &mut submission)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.drain(&scope))
+            .await
+            .unwrap()
+            .unwrap();
+        let task = store.current_goal_for_session(key).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        // This text-only script admits no tool work or pending tool marker.
+        let extension = serde_json::to_value(&goal).unwrap();
+        assert!(
+            extension
+                .get("pending_tool_batch_id")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert_eq!(
+            channel
+                .approval_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let usage = tracker.get_usage_totals_for_task(&task.id).unwrap();
+        assert_eq!(usage.0, 48);
+        let parent_rows = provider.requests.lock().unwrap().clone();
+        assert_eq!(parent_rows.len(), 2);
+        {
+            let inputs = parent_inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs[0].kind, GoalParentTurnKind::Start);
+            assert_eq!(inputs[1].kind, GoalParentTurnKind::Continue);
+            assert!(
+                inputs
+                    .iter()
+                    .flat_map(|turn| &turn.working_history)
+                    .filter(|row| row.role != "system")
+                    .all(|row| !row.content.contains("[turn-context]"))
+            );
+        }
+        assert!(
+            parent_rows
+                .iter()
+                .flatten()
+                .filter(|row| row.role != "system")
+                .all(|row| !row.content.contains("[turn-context]"))
+        );
+        let durable = backend.load(key);
+        assert_eq!(durable.len(), 2);
+        assert!(
+            durable
+                .iter()
+                .all(|row| row.role == "assistant" && row.content == "policy candidate")
+        );
+        let recorded = server.received_requests().await.unwrap();
+        let verifier_bodies: Vec<serde_json::Value> = recorded
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(verifier_bodies.len(), 2);
+        assert!(
+            verifier_bodies
+                .iter()
+                .all(|body| !body.to_string().contains("[turn-context]"))
+        );
+        let events = channel.messages.lock().await.clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|text| text.as_str() == "policy candidate")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events.last(),
+            Some(&zeroclaw_runtime::i18n::get_required_cli_string(
+                "goal-mode-completed"
+            ))
+        );
+        MatrixContextEngineEvidence {
+            events,
+            durable: serde_json::to_value(durable).unwrap(),
+            usage,
+            verifier_bodies,
+            parent_rows,
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_channel_turn_context_engine_modes_preserve_events_and_accounting() {
+        let baseline = matrix_context_engine_evidence(Some(false)).await;
+        for mode in [None, Some(true)] {
+            let evidence = matrix_context_engine_evidence(mode).await;
+            assert_eq!(evidence.events, baseline.events);
+            assert_eq!(evidence.durable, baseline.durable);
+            assert_eq!(evidence.usage, baseline.usage);
+            assert_eq!(evidence.verifier_bodies, baseline.verifier_bodies);
+            for (left, right) in evidence.parent_rows.iter().zip(&baseline.parent_rows) {
+                assert_eq!(
+                    serde_json::to_value(&left[1..]).unwrap(),
+                    serde_json::to_value(&right[1..]).unwrap()
+                );
+            }
         }
     }
 
