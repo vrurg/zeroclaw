@@ -5666,6 +5666,29 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn install_daemon_sigbus_reset() -> Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a successful sigaction call initializes the output structure.
+    if unsafe { libc::sigaction(libc::SIGBUS, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the SIGBUS action");
+    }
+    // SAFETY: the preceding sigaction call succeeded.
+    let mut action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_DFL || action.sa_sigaction == libc::SIG_IGN {
+        return Ok(());
+    }
+
+    // Rust's handler may live on the same volume as the daemon. If that volume
+    // disappears, the kernel must restore SIG_DFL before entering the handler.
+    action.sa_flags |= libc::SA_RESETHAND;
+    // SAFETY: preserve the installed handler and mask; change only SA_RESETHAND.
+    if unsafe { libc::sigaction(libc::SIGBUS, &raw const action, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("installing the SIGBUS reset action");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -6220,6 +6243,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         && config_dir.trim().is_empty()
     {
         bail!("--config-dir cannot be empty");
+    }
+
+    #[cfg(target_os = "macos")]
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        install_daemon_sigbus_reset()?;
     }
 
     #[cfg(feature = "agent-runtime")]

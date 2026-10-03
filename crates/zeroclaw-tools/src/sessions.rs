@@ -1,4 +1,4 @@
-//! Session-to-session messaging tools for inter-agent communication.
+//! Session inspection, history access, and the deprecated legacy append tool.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -91,6 +91,8 @@ fn current_session_prompt_owner(
         })
 }
 
+static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
+
 /// Agent-scoped access to the durable ACP session store.
 ///
 /// The handle is attached by ACP server and RPC ACP Agent construction. Each tool
@@ -178,6 +180,10 @@ fn current_session_key() -> Option<String> {
 
 fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
     crate::i18n::get_required_tool_string_with_args(key, args)
+}
+
+fn tool_msg(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
 }
 
 fn session_history_header(session_id: &str, shown: usize, total: usize) -> String {
@@ -633,7 +639,7 @@ fn session_not_found(session_id: &str) -> ToolResult {
 
 // ── SessionsSendTool ────────────────────────────────────────────────
 
-/// Sends a message to a specific session, enabling inter-agent communication.
+/// Deprecated compatibility tool that appends content to Chat session history.
 pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
@@ -669,7 +675,9 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
+        SESSIONS_SEND_DESCRIPTION
+            .get_or_init(|| tool_msg("tool-sessions-send"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -678,11 +686,11 @@ impl Tool for SessionsSendTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The target session ID (e.g. telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>."
+                    "description": tool_msg("tool-sessions-send-param-session-id")
                 },
                 "message": {
                     "type": "string",
-                    "description": "The message content to send"
+                    "description": tool_msg("tool-sessions-send-param-message")
                 }
             },
             "required": ["session_id", "message"]
@@ -766,10 +774,17 @@ impl Tool for SessionsSendTool {
         match self.backend.append(&target_session_key, &chat_msg) {
             Ok(()) => {
                 let output = if target_session_key == session_id.trim() {
-                    format!("Message sent to session '{target_session_key}'.")
+                    tool_msg_with_args(
+                        "tool-sessions-send-output-appended",
+                        &[("session_id", &target_session_key)],
+                    )
                 } else {
-                    format!(
-                        "Message sent to session '{target_session_key}' (requested '{session_id}')."
+                    tool_msg_with_args(
+                        "tool-sessions-send-output-appended-alias",
+                        &[
+                            ("session_id", &target_session_key),
+                            ("requested_id", session_id),
+                        ],
                     )
                 };
                 Ok(ToolResult {
@@ -781,7 +796,10 @@ impl Tool for SessionsSendTool {
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to send message: {e}")),
+                error: Some(tool_msg_with_args(
+                    "tool-sessions-send-error-append",
+                    &[("error", &e.to_string())],
+                )),
             }),
         }
     }
@@ -1715,7 +1733,10 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("Message sent"));
+        assert!(result.output.contains("Legacy content appended"));
+        assert!(result.output.contains("ordinary 'user' message"));
+        assert!(result.output.contains("No notification, live delivery"));
+        assert!(result.output.contains("send_message_to_peer"));
 
         // Verify message was appended
         let messages = backend.load("telegram__alice");
@@ -1864,7 +1885,17 @@ mod tests {
         let (_tmp, backend) = test_backend();
         let tool = SessionsSendTool::new(backend, test_security());
         assert_eq!(tool.name(), "sessions_send");
+        let description = tool.description();
+        assert!(description.contains("Deprecated legacy compatibility tool"));
+        assert!(description.contains("does not notify or run the session"));
+        assert!(description.contains("send_message_to_peer"));
         let schema = tool.parameters_schema();
+        assert!(
+            schema["properties"]["message"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not notify or run the session")
+        );
         assert!(
             schema["required"]
                 .as_array()

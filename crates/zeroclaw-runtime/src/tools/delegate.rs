@@ -1865,27 +1865,7 @@ impl DelegateTool {
                 "background delegation requires a durable task store; root config is unavailable",
             ));
         };
-        type ControlPlaneCell =
-            tokio::sync::OnceCell<crate::control_plane::ControlPlaneRecoveryOwner>;
-        static CONTROL_PLANES: std::sync::OnceLock<
-            parking_lot::Mutex<HashMap<PathBuf, Arc<ControlPlaneCell>>>,
-        > = std::sync::OnceLock::new();
-        let cell = CONTROL_PLANES
-            .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
-            .lock()
-            .entry(data_dir.clone())
-            .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
-            .clone();
-        cell.get_or_try_init(|| async {
-            let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir).await?;
-            std::mem::drop(owner.spawn_reaper(
-                crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
-                CancellationToken::new(),
-            ));
-            Ok::<_, anyhow::Error>(owner)
-        })
-        .await
-        .map(|owner| owner.handle().clone())
+        crate::control_plane::non_daemon_control_plane(&data_dir).await
     }
 
     fn serialize_result<T: serde::Serialize>(result: &T) -> anyhow::Result<Vec<u8>> {
