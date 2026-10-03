@@ -2097,6 +2097,50 @@ mod tests {
     }
 
     #[test]
+    fn session_prompts_follow_chat_agent_reassignment_without_reset() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("chat", "agent-a").unwrap();
+        let owner = backend.admit_session_prompt_owner("chat").unwrap();
+        backend
+            .append("chat", &ChatMessage::user("continue task"))
+            .unwrap();
+        backend
+            .set_session_prompt_for_owner(&owner, "task", "retained continuity", None)
+            .unwrap();
+
+        backend.set_session_agent_alias("chat", "agent-b").unwrap();
+        assert!(backend.admit_session_prompt_owner("chat").unwrap() == owner);
+        assert_eq!(
+            backend.get_session_agent_alias("chat").unwrap().as_deref(),
+            Some("agent-b")
+        );
+        assert_eq!(backend.load("chat")[0].content, "continue task");
+        let snapshot =
+            crate::session_prompts::load_session_prompt_snapshot(&backend, &owner).unwrap();
+        assert!(snapshot.owner == owner);
+        assert!(snapshot.rendered.contains("retained continuity"));
+        assert!(
+            backend
+                .list_session_prompts("other-chat")
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.admit_session_prompt_owner("chat").unwrap() == owner);
+        assert_eq!(
+            reopened.get_session_agent_alias("chat").unwrap().as_deref(),
+            Some("agent-b")
+        );
+        assert_eq!(
+            reopened.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+            "retained continuity"
+        );
+    }
+
+    #[test]
     fn session_prompt_owner_survives_restart_but_not_reset_or_key_reuse() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();

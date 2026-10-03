@@ -1446,6 +1446,7 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 session-prompt-approval-description = Approve this one persistent session-prompt mutation. This approval cannot be remembered.
+session-prompt-approval-domain = sqlite chat session prompts
 session-prompt-approval-denied = Session prompt mutation not executed: { $reason }
 session-prompt-approval-binding-failed = the runtime could not bind an exact session confirmation
 session-prompt-approval-manager-unavailable = no approval manager is available

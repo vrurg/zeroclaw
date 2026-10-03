@@ -1177,6 +1177,7 @@ channel-approval-opt-reject-with-edit = Rechazar con edición
 tool-git-operations-error-docker-runtime-write-unsupported = Los comandos de escritura de Git no están disponibles con el entorno de ejecución Docker porque no pueden confinarse a su contenedor.
 
 session-prompt-approval-description = Apruebe este cambio de instrucciones persistentes de la sesión una sola vez. Esta aprobación no se puede recordar.
+session-prompt-approval-domain = instrucciones de sesión de chat en SQLite
 session-prompt-approval-denied = No se ejecutó el cambio de instrucciones de la sesión: { $reason }
 session-prompt-approval-binding-failed = el sistema no pudo vincular una confirmación exacta de la sesión
 session-prompt-approval-manager-unavailable = no hay un gestor de aprobaciones disponible

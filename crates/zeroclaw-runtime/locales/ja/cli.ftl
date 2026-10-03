@@ -1175,6 +1175,7 @@ channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
 
 session-prompt-approval-description = この永続セッション指示の変更を一度だけ承認してください。この承認は記憶できません。
+session-prompt-approval-domain = SQLite のチャットセッション指示
 session-prompt-approval-denied = セッション指示の変更は実行されませんでした: { $reason }
 session-prompt-approval-binding-failed = セッションの正確な確認内容を関連付けることができませんでした
 session-prompt-approval-manager-unavailable = 承認マネージャーを利用できません

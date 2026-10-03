@@ -1420,11 +1420,34 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_approval_domain_has_a_translation_in_every_builtin_locale() {
+        let english = include_str!("../locales/en/cli.ftl");
+        let key = "session-prompt-approval-domain";
+        let english_domain = format_ftl_message(english, "en", key, &[]).unwrap();
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                english
+            } else {
+                builtin_cli_ftl_source(&locale.code).unwrap()
+            };
+            // Query the locale's own embedded catalogue, not the fallback
+            // loader: an English fallback must not conceal a missing entry.
+            let text = format_ftl_message(source, &locale.code, key, &[])
+                .unwrap_or_else(|| panic!("{key} missing in {}", locale.code));
+            assert!(!text.trim().is_empty());
+            if locale.code != "en" {
+                assert_ne!(text, english_domain);
+            }
+        }
+    }
+
+    #[test]
     fn session_prompt_approval_messages_format_in_every_locale() {
         for locale in available_locales() {
             let sources = load_cli_ftl_sources(locale.code.as_str());
             for key in [
                 "session-prompt-approval-description",
+                "session-prompt-approval-domain",
                 "session-prompt-approval-binding-failed",
                 "session-prompt-approval-manager-unavailable",
                 "session-prompt-approval-channel-unavailable",

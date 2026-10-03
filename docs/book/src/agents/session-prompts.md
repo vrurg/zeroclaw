@@ -8,6 +8,15 @@ They are session-scoped, not agent-scoped: another chat session never sees
 them. Resetting or deleting the session removes them atomically with its chat
 history. They are stored only by the SQLite session backend.
 
+Reopening the same Chat session under a different configured agent preserves
+its history and prompt attachments; changing agent attribution is not a session
+reset. The next agent receives the same continuity context. Approval governs
+attachment mutations, not consumption: switching from an agent whose policy
+is `disabled` to one whose policy is `required` does not retroactively confirm
+the inherited text. Reset or delete the session before handing it to another
+agent if that context should not follow it. This does not switch the agent
+inside a running turn; ACP sessions retain their separate agent-binding rules.
+
 Durable TTL cleanup also removes attachments atomically with an expired
 session; history-only clearing does not remove them.
 

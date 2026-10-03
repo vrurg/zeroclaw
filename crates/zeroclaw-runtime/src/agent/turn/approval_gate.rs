@@ -368,8 +368,13 @@ fn session_prompt_approval_summary(
     };
     let mut summary = crate::i18n::get_required_cli_string("session-prompt-approval-description");
     summary.push('\n');
+    // These labels and action tokens are stable technical binding keys across
+    // locales, not translatable prose. Localize only the domain description;
+    // exact IDs, digests and proposed content must remain unchanged. The
+    // structured approval identity is independent of this display description.
     let _ = writeln!(summary, "action: {action}");
-    let _ = writeln!(summary, "storage_domain: sqlite chat session prompts");
+    let domain = crate::i18n::get_required_cli_string("session-prompt-approval-domain");
+    let _ = writeln!(summary, "storage_domain: {domain}");
     let _ = writeln!(
         summary,
         "session_id: {}",
