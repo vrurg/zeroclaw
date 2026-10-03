@@ -2018,6 +2018,7 @@ fn explicitly_unlimited_enabled_config_retains_its_declaration_provenance() {
         enabled: true,
         default_token_limit: 0,
         default_cost_limit_usd: 0.0,
+        include_channel_turn_context: true,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
@@ -2484,6 +2485,7 @@ fn host_settings_rejects_a_blank_boot_id() {
         enabled: true,
         default_token_limit: 0,
         default_cost_limit_usd: 0.0,
+        include_channel_turn_context: true,
         verifier: GoalVerifierConfig {
             model_provider: ModelProviderRef::new("openai.default"),
             model: None,
