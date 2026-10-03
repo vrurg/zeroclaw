@@ -2,6 +2,8 @@
 
 use std::io::{Error, ErrorKind, Result};
 
+use crate::session_backend::{SessionBackend, SessionPromptOwner};
+
 pub const MAX_SESSION_PROMPTS: usize = 4;
 pub const MAX_SESSION_PROMPT_BYTES: usize = 2_048;
 pub const MAX_SESSION_PROMPTS_BYTES: usize = 8_192;
@@ -18,6 +20,45 @@ pub struct SessionPrompt {
 pub enum SessionPromptSetOutcome {
     Created,
     Updated,
+}
+
+/// One primary turn's owner-bound attachment snapshot.
+///
+/// Keep the owner with its rendered section so tools and injection use the
+/// same admitted identity. Opaque content deliberately has no Debug projection.
+pub struct SessionPromptSnapshot {
+    /// Durable identity checked when the attachment collection was read.
+    pub owner: SessionPromptOwner,
+    /// Deterministic host section, empty when the owner has no attachments.
+    pub rendered: String,
+}
+
+/// Read and render attachments for an owner already captured by admission.
+///
+/// Channel callers capture this owner with the inbound-message append. Never
+/// re-admit by key here: a reset could otherwise bind that turn to a successor.
+/// Backend errors propagate without returning a partial or empty snapshot.
+pub fn load_session_prompt_snapshot(
+    backend: &dyn SessionBackend,
+    owner: &SessionPromptOwner,
+) -> Result<SessionPromptSnapshot> {
+    let prompts = backend.list_session_prompts_for_owner(owner)?;
+    Ok(SessionPromptSnapshot {
+        owner: owner.clone(),
+        rendered: render_session_prompts(&prompts),
+    })
+}
+
+/// Admit a primary Chat turn, then load its owner-bound attachment snapshot.
+///
+/// Gateway and RPC callers use this before dispatch. Feature policy, transport
+/// error handling and the final host-prompt budget check remain caller-owned.
+pub fn admit_session_prompt_snapshot(
+    backend: &dyn SessionBackend,
+    session_key: &str,
+) -> Result<SessionPromptSnapshot> {
+    let owner = backend.admit_session_prompt_owner(session_key)?;
+    load_session_prompt_snapshot(backend, &owner)
 }
 
 pub fn validate_prompt_id(id: &str) -> Result<String> {
@@ -72,6 +113,84 @@ pub fn render_session_prompts(prompts: &[SessionPrompt]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{session_sqlite::SqliteSessionBackend, session_store::SessionStore};
+    use tempfile::TempDir;
+    use zeroclaw_api::model_provider::ChatMessage;
+
+    #[test]
+    fn snapshot_admits_empty_owner_and_renders_its_deterministic_collection() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let empty = admit_session_prompt_snapshot(&backend, "chat").unwrap();
+        assert!(empty.owner.belongs_to("chat"));
+        assert!(empty.rendered.is_empty());
+
+        backend
+            .set_session_prompt_for_owner(&empty.owner, "z_task", "last", None)
+            .unwrap();
+        backend
+            .set_session_prompt_for_owner(&empty.owner, "a_task", "first", None)
+            .unwrap();
+        let loaded = load_session_prompt_snapshot(&backend, &empty.owner).unwrap();
+        assert!(loaded.owner == empty.owner);
+        assert_eq!(
+            loaded.rendered,
+            render_session_prompts(
+                &backend
+                    .list_session_prompts_for_owner(&empty.owner)
+                    .unwrap()
+            )
+        );
+        assert!(loaded.rendered.find("a_task").unwrap() < loaded.rendered.find("z_task").unwrap());
+        assert!(
+            empty.rendered.is_empty(),
+            "a turn snapshot is not live state"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_appended_owner_and_refuses_reset_or_reused_successor() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let owner = backend
+            .append_with_session_prompt_owner("chat", &ChatMessage::user("inbound"))
+            .unwrap();
+        let snapshot = load_session_prompt_snapshot(&backend, &owner).unwrap();
+        assert!(snapshot.owner == owner);
+
+        backend.reset_session("chat").unwrap();
+        assert!(load_session_prompt_snapshot(&backend, &owner).is_err());
+        let reset_owner = admit_session_prompt_snapshot(&backend, "chat")
+            .unwrap()
+            .owner;
+        backend.delete_session("chat").unwrap();
+        assert!(load_session_prompt_snapshot(&backend, &reset_owner).is_err());
+        assert!(backend.list_sessions().is_empty());
+
+        let successor = admit_session_prompt_snapshot(&backend, "chat").unwrap();
+        backend
+            .set_session_prompt_for_owner(&successor.owner, "task", "successor", None)
+            .unwrap();
+        assert!(load_session_prompt_snapshot(&backend, &owner).is_err());
+        assert!(load_session_prompt_snapshot(&backend, &reset_owner).is_err());
+        assert!(
+            load_session_prompt_snapshot(&backend, &successor.owner)
+                .unwrap()
+                .rendered
+                .contains("successor")
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_rejects_an_unsupported_backend() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SessionStore::new(tmp.path()).unwrap();
+        let error = admit_session_prompt_snapshot(&backend, "chat")
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(backend.list_sessions().is_empty());
+    }
 
     #[test]
     fn validates_lowercase_symbolic_ids_without_normalizing() {

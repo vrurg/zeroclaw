@@ -9421,13 +9421,18 @@ async fn process_channel_message_body(
     );
     let session_prompt_attachments = if ctx.prompt_config.channels.session_prompts_enabled {
         let prompt_result = match (ctx.session_store.as_ref(), session_prompt_owner.as_ref()) {
-            (Some(backend), Some(owner)) => backend.list_session_prompts_for_owner(owner),
+            (Some(backend), Some(owner)) => {
+                zeroclaw_infra::session_prompts::load_session_prompt_snapshot(
+                    backend.as_ref(),
+                    owner,
+                )
+            }
             _ => Err(std::io::Error::other(
                 "persistent session prompts are enabled but the session backend is unavailable",
             )),
         };
         match prompt_result {
-            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
+            Ok(snapshot) => snapshot.rendered,
             Err(error) => {
                 ::zeroclaw_log::record!(
                     ERROR,

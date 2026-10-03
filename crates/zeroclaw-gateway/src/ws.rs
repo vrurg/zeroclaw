@@ -1954,15 +1954,15 @@ async fn process_chat_message(
                 .await;
             return false;
         };
-        let prompts = backend
-            .admit_session_prompt_owner(session_key)
-            .and_then(|owner| {
-                let prompts = backend.list_session_prompts_for_owner(&owner)?;
-                session_prompt_owner = Some(owner);
-                Ok(prompts)
-            });
-        match prompts {
-            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
+        let snapshot = zeroclaw_infra::session_prompts::admit_session_prompt_snapshot(
+            backend.as_ref(),
+            session_key,
+        );
+        match snapshot {
+            Ok(snapshot) => {
+                session_prompt_owner = Some(snapshot.owner);
+                snapshot.rendered
+            }
             Err(error) => {
                 record_session_prompt_load_failure(session_key, &error);
                 let _ = sender

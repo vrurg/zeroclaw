@@ -6693,27 +6693,24 @@ impl RpcDispatcher {
         };
         let mut session_prompt_owner = None;
         let attachments = if session_prompts_enabled {
-            let prompts = match session_prompt_backend.as_ref() {
-                Some(backend) => backend
-                    .admit_session_prompt_owner(&tool_loop_session_key)
-                    .and_then(|owner| {
-                        let prompts = backend.list_session_prompts_for_owner(&owner)?;
-                        session_prompt_owner = Some(owner);
-                        Ok(prompts)
-                    })
-                    .map_err(|error| {
-                        rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to load persistent session prompts: {error}"),
-                        )
-                    }),
+            let snapshot = match session_prompt_backend.as_ref() {
+                Some(backend) => zeroclaw_infra::session_prompts::admit_session_prompt_snapshot(
+                    backend.as_ref(),
+                    &tool_loop_session_key,
+                )
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load persistent session prompts: {error}"),
+                    )
+                }),
                 None => Err(rpc_err(
                     INTERNAL_ERROR,
                     "Persistent session prompts are enabled but the chat session backend is unavailable.",
                 )),
             };
-            let prompts = match prompts {
-                Ok(prompts) => prompts,
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     // The durable Chat row was marked running before prompt
                     // loading so status surfaces see the whole turn. This
@@ -6734,7 +6731,8 @@ impl RpcDispatcher {
                     return Err(error);
                 }
             };
-            zeroclaw_infra::session_prompts::render_session_prompts(&prompts)
+            session_prompt_owner = Some(snapshot.owner);
+            snapshot.rendered
         } else {
             String::new()
         };
