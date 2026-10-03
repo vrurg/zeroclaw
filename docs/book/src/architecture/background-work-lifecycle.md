@@ -185,6 +185,13 @@ from the task and obtains its prefix from the bound session owner.
   unpaired-tool-results failure when the interrupted calls have no recorded
   results. The loop-detection note retains its ordinary effect after the final
   Goal delimiter within that parent turn; it is not carried into the next turn.
+- A Matrix Goal parent turn uses the ordinary channel message timeout
+  (`channels.message_timeout_secs`, scaled as for ordinary turns) for each
+  parent-turn attempt. A model switch starts a fresh attempt timer. On expiry,
+  the ordinary timeout message appears once, followed by the existing
+  `parent_operation_failed` failure, or `goal_tool_pairing_incomplete` when
+  an executing tool was interrupted. ZeroCode Goal parent turns have no wall
+  clock limit, like ordinary ZeroCode turns.
 - Goal parent turns use their surface's ordinary tool exclusions and configured
   execution-tree iteration limit. Each parent turn receives a fresh budget;
   the verifier has no execution-tree budget. Matrix derives ingress
