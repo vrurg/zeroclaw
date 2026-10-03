@@ -500,8 +500,8 @@ pub struct Config {
     #[group = "Operations"]
     pub cost: CostConfig,
 
-    /// Experimental Goal Mode admission inputs (`[goal]`). This stage only
-    /// stores and validates the configuration; runtime admission is deferred.
+    /// Experimental Goal Mode admission, budgets, verifier selection, and
+    /// channel parent-turn prompt configuration (`[goal]`).
     #[serde(default)]
     #[nested]
     #[group = "Agent"]
@@ -45707,6 +45707,22 @@ allowed_users = []
             config.channels.matrix.get("default").unwrap().homeserver,
             "https://new.org"
         );
+    }
+
+    #[test]
+    async fn goal_channel_turn_context_uses_generic_properties() {
+        let mut config = Config::default();
+        let path = "goal.include_channel_turn_context";
+        assert_eq!(config.get_prop(path).unwrap(), "true");
+        config.set_prop(path, "false").unwrap();
+        assert!(!config.goal.include_channel_turn_context);
+        let error = config.set_prop(path, "yes").unwrap_err();
+        assert!(error.to_string().contains("bool"), "{error}");
+        assert!(!config.goal.include_channel_turn_context);
+        let fields = config.prop_fields();
+        let field = fields.iter().find(|field| field.name == path).unwrap();
+        assert_eq!(field.type_hint, "bool");
+        assert_eq!(field.kind, crate::traits::PropKind::Bool);
     }
 
     #[test]
