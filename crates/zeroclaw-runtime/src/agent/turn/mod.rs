@@ -104,6 +104,135 @@ pub struct MemoryPreamble {
     pub index: usize,
 }
 
+impl MemoryPreamble {
+    /// Remove this turn's recalled context from its recorded user row.
+    ///
+    /// The caller must preserve or remap `index` through history trims. A
+    /// missing row, non-user role, or mismatched prefix leaves history unchanged;
+    /// this method never searches other rows. Returns whether bytes were removed.
+    pub fn strip_from_history(&self, history: &mut [ChatMessage]) -> bool {
+        let Some(message) = history.get_mut(self.index) else {
+            return false;
+        };
+        if message.role != "user" {
+            return false;
+        }
+        let stripped = crate::agent::memory_inject::strip_memory_context_preamble(
+            &message.content,
+            Some(&self.preamble),
+        );
+        if stripped.len() == message.content.len() {
+            return false;
+        }
+        message.content = stripped.to_owned();
+        true
+    }
+}
+
+#[cfg(test)]
+mod memory_preamble_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_memory_strips_only_its_exact_user_position() {
+        let mut history = vec![
+            ChatMessage::user("recalled\n\noriginal"),
+            ChatMessage::user("recalled\n\noriginal"),
+            ChatMessage::assistant("candidate"),
+        ];
+        let untouched = history[0].clone();
+        let record = MemoryPreamble {
+            preamble: "recalled\n\n".into(),
+            index: 1,
+        };
+        assert!(record.strip_from_history(&mut history));
+        assert_eq!(history[0].content, untouched.content);
+        assert_eq!(history[1].content, "original");
+        assert_eq!(history[2].content, "candidate");
+    }
+
+    #[test]
+    fn recorded_memory_does_not_search_for_a_matching_row() {
+        for (index, role, content) in [
+            (0, "assistant", "recalled\n\noriginal"),
+            (0, "user", "a different prefix"),
+            (usize::MAX, "user", "recalled\n\noriginal"),
+        ] {
+            let mut history = vec![ChatMessage {
+                role: role.into(),
+                content: content.into(),
+            }];
+            let before = serde_json::to_value(&history).unwrap();
+            let record = MemoryPreamble {
+                preamble: "recalled\n\n".into(),
+                index,
+            };
+            assert!(!record.strip_from_history(&mut history));
+            assert_eq!(serde_json::to_value(history).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn recorded_memory_strip_uses_the_trimmed_position() {
+        let mut history = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user("older request"),
+            ChatMessage::assistant("older answer"),
+            ChatMessage::user("recalled\n\nretained request"),
+            ChatMessage::assistant("retained answer"),
+        ];
+        let mut record = Some(MemoryPreamble {
+            preamble: "recalled\n\n".into(),
+            index: 3,
+        });
+        let mut breadcrumb = false;
+        let trim = surface_oversized_dispatch_if_needed(
+            &mut record,
+            &mut history,
+            &mut breadcrumb,
+            100,
+            1,
+        );
+        assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
+        assert!(breadcrumb);
+        let record = record.unwrap();
+        assert_eq!(record.index, 2);
+        assert!(record.strip_from_history(&mut history));
+        assert_eq!(history[2].content, "retained request");
+        assert_eq!(
+            history[1].content,
+            crate::agent::history_trim::breadcrumb().content
+        );
+    }
+
+    #[test]
+    fn trimming_the_owned_memory_row_clears_its_record() {
+        let mut history = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user("recalled\n\nolder request"),
+            ChatMessage::assistant("older answer"),
+            ChatMessage::user("retained request"),
+            ChatMessage::assistant("retained answer"),
+        ];
+        let mut record = Some(MemoryPreamble {
+            preamble: "recalled\n\n".into(),
+            index: 1,
+        });
+        let mut breadcrumb = false;
+        let trim = surface_oversized_dispatch_if_needed(
+            &mut record,
+            &mut history,
+            &mut breadcrumb,
+            100,
+            1,
+        );
+        assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
+        assert!(record.is_none());
+        assert_eq!(history[2].content, "retained request");
+        assert_eq!(history[3].content, "retained answer");
+    }
+}
+
 fn retention_layout(history: &[ChatMessage], crumb: bool) -> (usize, usize, bool) {
     (
         history.len(),

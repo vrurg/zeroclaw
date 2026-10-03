@@ -33485,7 +33485,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    struct RecallMemory;
+    pub(super) struct RecallMemory;
 
     #[async_trait::async_trait]
     impl Memory for RecallMemory {
