@@ -131,6 +131,14 @@ provider selection in the isolated Agent path and after an in-turn
 tool-result pairing and usage settlement still finish before the next
 checkpoint. The switch does not create a new parent-turn iteration budget.
 
+Matrix Goal parent turns include the ordinary channel turn context in their
+system message by default. Setting `include_channel_turn_context = false`
+in `[goal]` omits it, narrowing ordinary prompt reuse. The setting is resolved
+once per parent turn: a reload applies from the next parent turn, not during
+an in-turn model switch. It never affects ZeroCode or verifier turns.
+Including changing context may reduce provider prompt-cache reuse; the effect
+depends on the provider and has not been measured.
+
 Each start or resume epoch also composes one user-role message containing the
 verbatim objective. The two projections serve different purposes: the user
 message admits an otherwise empty session through ordinary turn validation;
