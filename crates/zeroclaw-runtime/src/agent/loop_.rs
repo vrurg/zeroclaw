@@ -18586,6 +18586,10 @@ Let me check the result."#;
     #[test]
     fn capture_llm_messages_redacts_supported_session_prompt_envelopes_and_results() {
         const MARKER: &str = "session-prompt-private-marker";
+        const RESULT_PREFIX: &str = crate::agent::history_trim::TOOL_RESULTS_PREFIX;
+        const RESULT_MARKER: &str = crate::agent::prompt::SESSION_PROMPT_TEXT_RESULT_MARKER;
+        // Text results use the runtime's reserved carrier. Unmarked user
+        // messages are ordinary input, even when they mention a tool result.
         let messages = vec![
             ChatMessage::assistant(format!(
                 r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{MARKER}\"}}}}]}}"#
@@ -18594,15 +18598,19 @@ Let me check the result."#;
             ChatMessage::assistant(format!(
                 r#"{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}"#
             )),
-            ChatMessage::user(format!("bare JSON result: {MARKER}")),
+            ChatMessage::user(format!(
+                "{RESULT_PREFIX}{RESULT_MARKER}bare JSON result: {MARKER}"
+            )),
             ChatMessage::assistant(format!(
                 r#"<toolcall>{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}</toolcall>"#
             )),
-            ChatMessage::user(format!("text tool result: {MARKER}")),
+            ChatMessage::user(format!("{RESULT_PREFIX}\ntext tool result: {MARKER}")),
             ChatMessage::assistant(
                 r#"<tool_calls>{"name":"session_prompt_list","arguments":{}}</tool_calls>"#,
             ),
-            ChatMessage::user(format!("plural wrapper result: {MARKER}")),
+            ChatMessage::user(format!(
+                "{RESULT_PREFIX}{RESULT_MARKER}plural wrapper result: {MARKER}"
+            )),
             ChatMessage::assistant(
                 r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
             ),
@@ -18663,6 +18671,11 @@ Let me check the result."#;
                 "malformed-tool parse-rejection output must not expose session-prompt content"
             );
         }
+
+        let ordinary_input = format!("bare JSON result: {MARKER}");
+        let snap = super::capture_llm_messages(&[ChatMessage::user(&ordinary_input)], None, &[])
+            .expect("Some");
+        assert_eq!(snap.input[0].content, ordinary_input);
     }
 
     #[cfg(feature = "observability-otel")]
