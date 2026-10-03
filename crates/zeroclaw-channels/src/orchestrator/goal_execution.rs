@@ -1116,6 +1116,15 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 .prompt_config
                 .effective_max_execution_tree_iterations(&self.context.agent_alias),
         );
+        let timeout_budget_secs = super::channel_message_timeout_budget_secs_with_cap(
+            self.context.message_timeout_secs,
+            self.context.max_tool_iterations,
+            self.context
+                .pacing
+                .message_timeout_scale_max
+                .unwrap_or(super::CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP),
+        );
+        let started_at = std::time::Instant::now();
         let scoped_turn = super::scope_provider_fallback(scope_session_key(
             Some(history_key.clone()),
             async {
@@ -1185,8 +1194,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                         .clone()
                         .or_else(|| self.message.thread_ts.clone())
                         .or_else(|| Some(self.message.id.clone()));
-                    let result = scope_thread_id(thread_scope_id, tool_loop).await;
-                    if let Err(error) = &result
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_budget_secs),
+                        scope_thread_id(thread_scope_id, tool_loop),
+                    )
+                    .await;
+                    if let Ok(Err(error)) = &result
                         && let Some((new_provider, new_model)) =
                             zeroclaw_runtime::agent::loop_::is_model_switch_requested(error)
                     {
@@ -1278,6 +1291,13 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             },
         ));
         let (candidate, fallback, safeguard) = super::scope_safeguard_fallback(scoped_turn).await;
+        enum AttemptFailure {
+            Core(anyhow::Error),
+            TimedOut,
+        }
+        let candidate = candidate
+            .map_err(|_| AttemptFailure::TimedOut)
+            .and_then(|result| result.map_err(AttemptFailure::Core));
         let candidate = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -1290,8 +1310,48 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 if let Some(task) = notify_task {
                     let _ = task.await;
                 }
-                publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error).await;
-                return Err(error);
+                match error {
+                    AttemptFailure::Core(error) => {
+                        publish_matrix_goal_core_error(channel.as_ref(), &self.message, &error)
+                            .await;
+                        return Err(error);
+                    }
+                    AttemptFailure::TimedOut => {
+                        let timeout_msg = format!(
+                            "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
+                            timeout_budget_secs,
+                            self.context.message_timeout_secs,
+                            self.context.max_tool_iterations,
+                        );
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Timeout,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(
+                                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            )
+                            .with_attrs(serde_json::json!({
+                                "model_provider": route.model_provider,
+                                "model": route.model,
+                                "sender": self.message.sender,
+                                "reason": timeout_msg,
+                            })),
+                            "channel_message_timeout"
+                        );
+                        let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
+                            "channel-runtime-request-timeout",
+                        );
+                        let _ = channel
+                            .send(
+                                &SendMessage::reply_to(&self.message, &error_text).suppress_voice(),
+                            )
+                            .await;
+                        return Err(anyhow::Error::msg(error_text));
+                    }
+                }
             }
         };
         turn_guard.finish();
@@ -5672,6 +5732,606 @@ mod tests {
             )
             .await;
         (result, lease)
+    }
+
+    struct DelayBeforeTimeoutFixtureCall(std::time::Duration);
+
+    struct DelayAcrossTimeoutSwitch {
+        calls: std::sync::atomic::AtomicUsize,
+        second: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for DelayAcrossTimeoutSwitch {
+        fn name(&self) -> &str {
+            "delay-across-timeout-switch"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _: &mut Vec<ChatMessage>,
+            _: &mut String,
+        ) -> zeroclaw_runtime::hooks::HookResult<()> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(call < 2, "fixture permits exactly two model attempts");
+            tokio::time::sleep(if call == 0 {
+                std::time::Duration::from_millis(700)
+            } else {
+                self.second
+            })
+            .await;
+            zeroclaw_runtime::hooks::HookResult::Continue(())
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for DelayBeforeTimeoutFixtureCall {
+        fn name(&self) -> &str {
+            "delay-before-timeout-fixture-call"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _: &mut Vec<ChatMessage>,
+            _: &mut String,
+        ) -> zeroclaw_runtime::hooks::HookResult<()> {
+            // This ordinary hook runs before model-operation admission.
+            tokio::time::sleep(self.0).await;
+            zeroclaw_runtime::hooks::HookResult::Continue(())
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_between_operations_matches_ordinary_rendering() {
+        for goal in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let provider = Arc::new(GoalPolicyProvider {
+                requests: Mutex::new(Vec::new()),
+                tool_rounds: 0,
+                calls_per_round: 0,
+            });
+            let mut context = matrix_policy_context(
+                backend.clone(),
+                channel.clone(),
+                provider.clone(),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            ctx.message_timeout_secs = 1;
+            ctx.pacing.message_timeout_scale_max = Some(1);
+            let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+            hooks.register(Box::new(DelayBeforeTimeoutFixtureCall(
+                std::time::Duration::from_millis(1250),
+            )));
+            ctx.hooks = Some(Arc::new(hooks));
+            let timeout_text =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-request-timeout");
+            if goal {
+                let (result, lease) = run_matrix_policy_goal(context).await;
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("Goal must use the ordinary timeout"),
+                };
+                assert_eq!(error.to_string(), timeout_text);
+                let rows = zeroclaw_infra::session_backend::SessionBackend::load(
+                    backend.as_ref(),
+                    &lease.session_key.durable_id(),
+                );
+                assert!(rows.iter().all(|row| row.role != "assistant"));
+                assert!(lease.pending_delivery.is_none());
+                assert!(lease.pending_route.is_none());
+                assert!(lease.pending_fallback.is_none());
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new(
+                        "ordinary-timeout-event",
+                        "user",
+                        "room",
+                        "bounded repair",
+                        "matrix",
+                        1,
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            assert!(provider.requests.lock().unwrap().is_empty());
+            let messages = channel.messages.lock().await;
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|text| **text == timeout_text)
+                    .count(),
+                1
+            );
+            assert!(
+                messages
+                    .iter()
+                    .all(|text| !text.starts_with("policy candidate"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_within_budget_preserves_the_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let mut context = matrix_policy_context(
+            backend,
+            channel.clone(),
+            Arc::new(GoalPolicyProvider {
+                requests: Mutex::new(Vec::new()),
+                tool_rounds: 0,
+                calls_per_round: 0,
+            }),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.message_timeout_secs = 1;
+        ctx.pacing.message_timeout_scale_max = Some(1);
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(DelayBeforeTimeoutFixtureCall(
+            std::time::Duration::from_millis(50),
+        )));
+        ctx.hooks = Some(Arc::new(hooks));
+        let (result, mut lease) = run_matrix_policy_goal(context).await;
+        let result = result.unwrap();
+        assert_eq!(result.candidate(), "policy candidate");
+        lease
+            .append_parent_candidate(result.candidate().into())
+            .await
+            .unwrap();
+        assert_eq!(&*channel.messages.lock().await, &["policy candidate"]);
+    }
+
+    async fn assert_matrix_timeout_after_switch(second_delay_ms: u64) {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        for goal in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant","content":"switched candidate"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+                })))
+                .mount(&server).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+            let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel.clone(),
+                Arc::new(MatrixSwitchRequestProvider(initial_calls.clone())),
+                0,
+            );
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            ctx.message_timeout_secs = 1;
+            ctx.pacing.message_timeout_scale_max = Some(1);
+            let mut config = ctx.prompt_config.as_ref().clone();
+            config.reliability.provider_retries = 0;
+            let target = config.providers.models.ensure("custom", "target").unwrap();
+            target.uri = Some(server.uri());
+            target.api_key = Some("synthetic-key".into());
+            target.native_tools = Some(true);
+            target.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            target.model = Some("target-model".into());
+            target.live_pricing = false;
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                auto_approve: vec!["model_switch".into()],
+                ..Default::default()
+            };
+            config
+                .risk_profiles
+                .insert("switch-fixture".into(), risk.clone());
+            config.agents.get_mut("test").unwrap().risk_profile = "switch-fixture".into();
+            ctx.agent_cfg = Arc::new(config.agents["test"].clone());
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                        ctx.security.clone(),
+                        Arc::new(config.clone()),
+                    )),
+                ]),
+            );
+            ctx.prompt_config = Arc::new(config.clone());
+            *ctx.live_config.write() = config;
+            ctx.approval_manager =
+                Arc::new(zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&risk));
+            let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+            hooks.register(Box::new(DelayAcrossTimeoutSwitch {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                second: std::time::Duration::from_millis(second_delay_ms),
+            }));
+            ctx.hooks = Some(Arc::new(hooks));
+            let expires = second_delay_ms > 1000;
+            let timeout_text =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-request-timeout");
+            let started = std::time::Instant::now();
+            if goal {
+                let (result, mut lease) = run_matrix_policy_goal(context).await;
+                if expires {
+                    assert_eq!(
+                        match result {
+                            Err(error) => error.to_string(),
+                            Ok(_) => panic!("post-switch attempt must time out"),
+                        },
+                        timeout_text
+                    );
+                    assert!(
+                        zeroclaw_infra::session_backend::SessionBackend::load(
+                            backend.as_ref(),
+                            &lease.session_key.durable_id(),
+                        )
+                        .is_empty()
+                    );
+                } else {
+                    let result = result.unwrap();
+                    assert_eq!(result.candidate(), "switched candidate");
+                    lease
+                        .append_parent_candidate(result.candidate().into())
+                        .await
+                        .unwrap();
+                }
+            } else {
+                super::super::process_channel_message(
+                    context,
+                    ChannelMessage::new(
+                        "switch-timeout-event",
+                        "user",
+                        "room",
+                        "finish",
+                        "matrix",
+                        1,
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            }
+            assert!(started.elapsed() > std::time::Duration::from_secs(1));
+            assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method.as_str() == "GET")
+                    .count(),
+                1,
+                "ordinary provider construction warms its catalog without inference"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .count(),
+                usize::from(!expires)
+            );
+            let messages = channel.messages.lock().await;
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|text| **text == timeout_text)
+                    .count(),
+                usize::from(expires)
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|text| **text == "switched candidate")
+                    .count(),
+                usize::from(!expires)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_switch_starts_a_fresh_attempt_budget() {
+        assert_matrix_timeout_after_switch(700).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_switch_expires_the_over_budget_attempt_once() {
+        assert_matrix_timeout_after_switch(1250).await;
+    }
+
+    struct GoalTimeoutStreamProvider {
+        chats: std::sync::atomic::AtomicUsize,
+        streams: std::sync::atomic::AtomicUsize,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalTimeoutStreamProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "timeout-stream-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GoalTimeoutStreamProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            bail!("fixture requires the structured request boundary")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("timeout fixture candidate".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt;
+            use zeroclaw_api::model_provider::{StreamChunk, StreamEvent, TokenUsage};
+            self.streams
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "timeout fixture candidate",
+                )))
+            })
+            .chain(futures_util::stream::iter([
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
+                Ok(StreamEvent::Final),
+            ]))
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_between_operations_retains_the_existing_terminal_reason() {
+        assert_matrix_timeout_terminal(false).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_admitted_stream_drains_unknown_without_changing_reason() {
+        assert_matrix_timeout_terminal(true).await;
+    }
+
+    async fn assert_matrix_timeout_terminal(streaming: bool) {
+        use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+        use zeroclaw_runtime::control_plane::{SqliteTaskStore, TaskStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(GoalRoutingChannel {
+            drafts: streaming,
+            fail_sends: false,
+            sent: tokio::sync::Mutex::new(Vec::new()),
+            cancelled: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(GoalTimeoutStreamProvider {
+            chats: std::sync::atomic::AtomicUsize::new(0),
+            streams: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut context = super::super::test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone(),
+            channel.clone(),
+            provider.clone(),
+            0,
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.message_timeout_secs = 1;
+        ctx.pacing.message_timeout_scale_max = Some(1);
+        if !streaming {
+            let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+            hooks.register(Box::new(DelayBeforeTimeoutFixtureCall(
+                std::time::Duration::from_millis(1250),
+            )));
+            ctx.hooks = Some(Arc::new(hooks));
+        }
+        let key = "matrix_goal_timeout_terminal_fixture";
+        let driver = Arc::new(
+            MatrixGoalSessionDriver::new(
+                context.clone(),
+                key.into(),
+                "user".into(),
+                "matrix:test:room".into(),
+                ChannelMessage::new(
+                    "event",
+                    "user",
+                    "room",
+                    "/goal start bounded repair",
+                    "matrix",
+                    1,
+                ),
+                goal_command_lock(&context.persist_locks, key)
+                    .lock_owned()
+                    .await,
+            )
+            .unwrap(),
+        );
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "user".into(),
+            },
+        )
+        .unwrap();
+        let settings = GoalHostSettings::new(
+            true,
+            GoalBudgetLimits {
+                token_limit: Some(1000),
+                cost_limit_usd: None,
+            },
+            1,
+            "timeout-test-boot",
+        )
+        .unwrap();
+        let runtime = GoalRuntime::new(store.clone());
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        let accounting = Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                store.clone(),
+                tracker,
+                "test",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        );
+        let supervisor =
+            GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting)));
+        let mut submission = supervisor
+            .submit(
+                settings.clone(),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded repair".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(projection) = submission.response() else {
+            panic!("fixture must admit a running Goal");
+        };
+        let scope =
+            GoalExecutionScope::new(&projection.task_id, key, projection.execution_epoch).unwrap();
+        supervisor
+            .launch_after_response(settings, &mut submission)
+            .await
+            .unwrap();
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.drain(&scope))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let timeout_text =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-request-timeout");
+        assert_eq!(
+            error.to_string(),
+            format!("Goal parent operation failed: {timeout_text}")
+        );
+        assert_eq!(provider.chats.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            provider.streams.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(streaming)
+        );
+        let task = store.current_goal_for_session(key).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&task.id, key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("parent_operation_failed")
+        );
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            if streaming {
+                GoalAccountingState::OutcomeUnknown
+            } else {
+                GoalAccountingState::Complete
+            }
+        );
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        let rows = zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), key);
+        assert!(rows.iter().all(|row| row.role != "assistant"));
+        let failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
+            matrix_goal_failure_key(GoalFailureReason::AgentOperationFailed),
+        );
+        let sent = channel.sent.lock().await;
+        let messages: Vec<_> = sent.iter().map(|row| row.content.as_str()).collect();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| **text == timeout_text)
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| **text == failure_text)
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .position(|text| *text == timeout_text)
+                .unwrap()
+                < messages
+                    .iter()
+                    .position(|text| *text == failure_text)
+                    .unwrap()
+        );
     }
 
     #[tokio::test]
