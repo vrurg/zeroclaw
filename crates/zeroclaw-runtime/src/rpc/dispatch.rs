@@ -32097,6 +32097,17 @@ mod tests {
             .await
             .expect("cursor read should recover the interrupted turn");
         assert_eq!(page["messages"][0]["content"], "pending question");
+        assert_eq!(page["messages"][1]["role"], "system");
+        assert_eq!(page["messages"][1]["kind"], "message");
+        assert_eq!(
+            page["messages"][1]["content"],
+            crate::i18n::get_required_cli_string("turn-stream-interrupted")
+        );
+        let full = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("full history should retain the same recovered boundary");
+        assert_eq!(page["messages"], full["messages"]);
         assert!(
             !acp_store
                 .recover_turn_checkpoint(sid, "must not recover twice")

@@ -41,6 +41,9 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
+mod transcript_layout;
+use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
+
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
 const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
@@ -6927,8 +6930,7 @@ fn render_tool_entry(
 }
 
 /// Render a single committed entry into `lines`.
-/// Extracted so both the incremental-append and full-rebuild paths in
-/// `rebuild_lines` share identical rendering logic.
+/// The transcript layout owner uses this renderer in every rebuild mode.
 fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
@@ -7550,7 +7552,9 @@ fn render_conversation(
     let inner_width = area.width.saturating_sub(2);
 
     // ── Rebuild cached lines only when entries changed ────────
-    if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
+    if state.transcript_layout.view().dirty != LinesDirty::Clean
+        || state.transcript_layout.view().cached_render_width != inner_width
+    {
         // Selection endpoints belong to one stable rendered-content geometry.
         // Viewport movement preserves them, but a cache rebuild does not.
         state.clear_transcript_selection_for_render_change();
@@ -7618,7 +7622,10 @@ fn render_conversation(
     };
     let transient_url_regions = if transient {
         let mut regions = url_line_regions_for_lines(&overlay_lines, inner_width);
-        offset_url_line_regions(&mut regions, state.cached_total_rows);
+        offset_url_line_regions(
+            &mut regions,
+            state.transcript_layout.view().cached_total_rows,
+        );
         regions
     } else {
         Vec::new()
@@ -7628,9 +7635,13 @@ fn render_conversation(
         let overlay_rows = Paragraph::new(overlay_lines.iter().map(borrow_line).collect::<Vec<_>>())
             .wrap(Wrap { trim: false })
             .line_count(inner_width) as u16;
-        state.cached_total_rows.saturating_add(overlay_rows)
+        state
+            .transcript_layout
+            .view()
+            .cached_total_rows
+            .saturating_add(overlay_rows)
     } else {
-        state.cached_total_rows
+        state.transcript_layout.view().cached_total_rows
     };
     let max_scroll = total_rows.saturating_sub(inner_height);
     let scroll = if state.pinned_to_bottom {
@@ -7656,6 +7667,8 @@ fn render_conversation(
     };
 
     let row_breaks = state
+        .transcript_layout
+        .view()
         .cached_row_breaks
         .iter()
         .chain(&transient_row_breaks)
@@ -7671,7 +7684,11 @@ fn render_conversation(
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
     capture_transcript_snapshot(f, state, body_area, total_rows, scroll, row_breaks);
-    state.url_hit_regions = project_url_hit_regions(&state.cached_url_regions, scroll, body_area);
+    state.url_hit_regions = project_url_hit_regions(
+        &state.transcript_layout.view().cached_url_regions,
+        scroll,
+        body_area,
+    );
     if transient {
         state.url_hit_regions.extend(project_url_hit_regions(
             &transient_url_regions,
@@ -7696,7 +7713,7 @@ fn render_conversation(
     state.tool_footer_rects.clear();
     for range_idx in visible_cached_window.entries.clone() {
         let (entry_idx, screen_lo, screen_hi, content_width) =
-            state.cached_screen_ranges[range_idx];
+            state.transcript_layout.view().cached_screen_ranges[range_idx];
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll.saturating_add(body_h));
         debug_assert!(visible_hi > visible_lo);
@@ -7712,8 +7729,9 @@ fn render_conversation(
         state.entry_rects.push((entry_idx, rect));
 
         if matches!(state.entries.get(entry_idx), Some(ChatEntry::Tool { .. })) {
-            let (_, line_lo, line_hi) = state.cached_line_ranges[range_idx];
-            let header_line = &state.cached_lines[line_lo];
+            let (_, line_lo, line_hi) =
+                state.transcript_layout.view().cached_line_ranges[range_idx];
+            let header_line = &state.transcript_layout.view().cached_lines[line_lo];
             append_wrapped_hit_rects(
                 &mut state.tool_header_rects,
                 entry_idx,
@@ -7723,14 +7741,19 @@ fn render_conversation(
                 body_area,
             );
 
-            if let Some(&footer_line) = state.cached_tool_footer_lines.get(&entry_idx)
+            if let Some(&footer_line) = state
+                .transcript_layout
+                .view()
+                .cached_tool_footer_lines
+                .get(&entry_idx)
                 && (line_lo..line_hi).contains(&footer_line)
             {
-                let footer_screen_lo = state.cached_line_screen_ranges[footer_line].0;
+                let footer_screen_lo =
+                    state.transcript_layout.view().cached_line_screen_ranges[footer_line].0;
                 append_wrapped_hit_rects(
                     &mut state.tool_footer_rects,
                     entry_idx,
-                    &state.cached_lines[footer_line],
+                    &state.transcript_layout.view().cached_lines[footer_line],
                     footer_screen_lo,
                     scroll,
                     body_area,
@@ -9035,21 +9058,6 @@ impl ModelPickerOverlay {
     }
 }
 
-/// Tracks what kind of update has invalidated the rendered lines cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinesDirty {
-    /// Cache is up-to-date.
-    Clean,
-    /// New entries were appended at the tail; the render window has not shifted.
-    /// `rebuild_lines` can extend `cached_lines` instead of rebuilding from scratch,
-    /// avoiding re-parsing markdown for unchanged `AgentMessage` entries.
-    Appended,
-    /// The final cached entry changed without shifting the render window.
-    TailChanged(usize),
-    /// Full rebuild required (entry mutation, selection/thoughts change, reset).
-    Full,
-}
-
 const MAX_RENDERED_ENTRIES: usize = 1_000;
 const RENDER_WINDOW_SHIFT_ENTRIES: usize = MAX_RENDERED_ENTRIES / 2;
 
@@ -9402,9 +9410,6 @@ pub struct ChatState {
     /// URL hit segments projected from the complete wrapped transcript into
     /// the visible body viewport.
     url_hit_regions: Vec<UrlHitRegion>,
-    /// Tagged URL-bearing logical lines with transcript-relative row extents.
-    /// Rebuilt with `cached_lines` so idle frames do not repeat recognition.
-    cached_url_regions: Vec<UrlLineRegion>,
     /// A normal-mode left press that may become a link activation on release.
     pending_url_activation: Option<PendingUrlActivation>,
     /// Full code-block targets used by right-click context-menu resolution.
@@ -9424,44 +9429,8 @@ pub struct ChatState {
     pinned_to_bottom: bool,
     last_total_rows: u16,
     last_inner_height: u16,
-    /// Cached rendered lines from committed entries.
-    cached_lines: Vec<Line<'static>>,
-    /// Source-derived separator before each wrapped screen row in `cached_lines`.
-    cached_row_breaks: Vec<TranscriptRowBreak>,
-    /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
-    /// start, end_exclusive)`. Used by mouse hit-testing.
-    cached_line_ranges: Vec<(usize, usize, usize)>,
-    /// Per-entry disclosure footer line indices in `cached_lines`.
-    cached_tool_footer_lines: BTreeMap<usize, usize>,
-    /// Per-line wrapped screen-row spans derived from `cached_lines` at
-    /// `cached_render_width`. This is the line-level index for viewport
-    /// slicing; it is rebuilt atomically with the rendered-line cache.
-    cached_line_screen_ranges: Vec<(u16, u16)>,
-    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
-    /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
-    /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
-    /// lands on the correct screen rows for agent messages, code blocks, and
-    /// tables. `content_width` is the widest rendered column extent of the
-    /// entry (clamped to the viewport), so hit-testing ignores the blank space
-    /// beside short messages — a click there dismisses the highlight instead of
-    /// re-selecting the entry.
-    cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
-    /// Copy projections derived from fenced regions in `cached_lines`.
-    /// Keeping their full copy text in the render cache avoids rescanning a
-    /// large visible fence on every steady-state draw.
-    cached_code_blocks: Vec<CachedCodeBlock>,
-    /// Fine-grained dirty tracking — see [`LinesDirty`].
-    dirty: LinesDirty,
-    /// How many entries from `entries[cached_render_start..]` are represented in
-    /// `cached_lines`.  Valid only when `dirty != Full`.
-    cached_entry_count: usize,
-    /// The `entries` index where the render window starts for the current cache.
-    cached_render_start: usize,
-    /// The render width the current `cached_lines` were laid out for.
-    /// A width change forces a full rebuild because tables compute their
-    /// column budgets from it.
-    cached_render_width: u16,
-    cached_total_rows: u16,
+    /// Derived committed transcript layout and its invalidation owner.
+    transcript_layout: TranscriptLayoutCache,
     /// Cumulative token count for this session: every Usage event from the
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
@@ -9562,7 +9531,6 @@ impl ChatState {
             tool_disclosures: BTreeMap::new(),
             copy_hit_regions: Vec::new(),
             url_hit_regions: Vec::new(),
-            cached_url_regions: Vec::new(),
             pending_url_activation: None,
             context_copy_regions: Vec::new(),
             context_menu: None,
@@ -9575,18 +9543,7 @@ impl ChatState {
             pinned_to_bottom: true,
             last_total_rows: 0,
             last_inner_height: 0,
-            cached_lines: Vec::new(),
-            cached_row_breaks: Vec::new(),
-            cached_line_ranges: Vec::new(),
-            cached_tool_footer_lines: BTreeMap::new(),
-            cached_line_screen_ranges: Vec::new(),
-            cached_screen_ranges: Vec::new(),
-            cached_code_blocks: Vec::new(),
-            dirty: LinesDirty::Full,
-            cached_entry_count: 0,
-            cached_render_start: 0,
-            cached_render_width: 0,
-            cached_total_rows: 0,
+            transcript_layout: TranscriptLayoutCache::new(),
             context_input_tokens: None,
             context_max_tokens: None,
             context_model_window: None,
@@ -9609,12 +9566,7 @@ impl ChatState {
 
     fn mark_dirty_append(&mut self) {
         self.invalidate_url_interactions();
-        match self.dirty {
-            LinesDirty::Clean => self.dirty = LinesDirty::Appended,
-            LinesDirty::TailChanged(_) => self.dirty = LinesDirty::Full,
-            LinesDirty::Appended | LinesDirty::Full => {}
-        }
-        // Full is sticky — don't downgrade.
+        self.transcript_layout.invalidate_append();
     }
 
     /// Higher-priority overlays own mouse input before the queue or its menu.
@@ -9628,22 +9580,7 @@ impl ChatState {
     }
 
     fn mark_dirty_tail(&mut self, entry_index: usize) {
-        match self.dirty {
-            LinesDirty::Clean => self.dirty = LinesDirty::TailChanged(entry_index),
-            LinesDirty::TailChanged(index) if index == entry_index => {}
-            LinesDirty::Appended => {
-                // An intervening append does not make previously cached text fresh.
-                if (self.cached_render_start
-                    ..self
-                        .cached_render_start
-                        .saturating_add(self.cached_entry_count))
-                    .contains(&entry_index)
-                {
-                    self.dirty = LinesDirty::Full;
-                }
-            }
-            LinesDirty::TailChanged(_) | LinesDirty::Full => self.dirty = LinesDirty::Full,
-        }
+        self.transcript_layout.invalidate_tail(entry_index);
     }
 
     /// Whether text input currently belongs to the composer rather than a
@@ -9685,7 +9622,7 @@ impl ChatState {
 
     fn mark_dirty_full(&mut self) {
         self.invalidate_url_interactions();
-        self.dirty = LinesDirty::Full;
+        self.transcript_layout.invalidate_full();
     }
 
     fn clear_transcript_selection(&mut self) {
@@ -9738,7 +9675,9 @@ impl ChatState {
         let Some(current) = self.transcript_snapshot.as_ref() else {
             return 0;
         };
-        if self.cached_lines.is_empty() || start >= current.content_height() {
+        if self.transcript_layout.view().cached_lines.is_empty()
+            || start >= current.content_height()
+        {
             return 0;
         }
         let area = current.area;
@@ -9750,11 +9689,13 @@ impl ChatState {
             let height = missing_end.saturating_sub(missing_start).saturating_add(1);
             let window = self.visible_cached_window(missing_start, height);
             let local_scroll = missing_start.saturating_sub(window.screen_lo);
-            let lines = self.cached_lines[window.lines]
+            let lines = self.transcript_layout.view().cached_lines[window.lines]
                 .iter()
                 .map(borrow_line)
                 .collect();
             let row_breaks = self
+                .transcript_layout
+                .view()
                 .cached_row_breaks
                 .iter()
                 .copied()
@@ -10280,22 +10221,6 @@ impl ChatState {
         true
     }
 
-    fn disclosure_for_entry(&self, entry: &ChatEntry) -> ToolDisclosure {
-        let ChatEntry::Tool {
-            tool_call_id,
-            name,
-            input_json,
-            ..
-        } = entry
-        else {
-            return ToolDisclosure::Collapsed;
-        };
-        self.tool_disclosures
-            .get(tool_call_id)
-            .copied()
-            .unwrap_or_else(|| default_tool_disclosure(name, input_json))
-    }
-
     fn toggle_tool_footer_at(&mut self, column: u16, row: u16) -> bool {
         let Some(entry_idx) = self
             .tool_footer_rects
@@ -10425,6 +10350,8 @@ impl ChatState {
     /// (pre-render path).
     fn scroll_entry_into_view(&mut self, entry_idx: usize) {
         let Some(&(_, lo, _hi, _)) = self
+            .transcript_layout
+            .view()
             .cached_screen_ranges
             .iter()
             .find(|(idx, _, _, _)| *idx == entry_idx)
@@ -10452,23 +10379,6 @@ impl ChatState {
         Some((lo, hi))
     }
 
-    /// True when `idx` falls inside the current browse selection range.
-    fn is_in_browse_range(&self, idx: usize) -> bool {
-        self.browse_range()
-            .is_some_and(|(lo, hi)| idx >= lo && idx <= hi)
-    }
-
-    /// True when `idx` should render highlighted in browse mode.
-    fn is_entry_highlighted(&self, idx: usize) -> bool {
-        if self.browse_multi.contains(&idx) {
-            return true;
-        }
-        if self.is_in_browse_range(idx) {
-            return true;
-        }
-        self.browse_cursor == Some(idx)
-    }
-
     /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
     fn selected_entries(&self) -> std::collections::BTreeSet<usize> {
         let mut out = self.browse_multi.clone();
@@ -10483,157 +10393,49 @@ impl ChatState {
     }
 
     fn rebuild_lines(&mut self, width: u16) {
-        if self.cached_render_width != width {
+        if self.transcript_layout.view().cached_render_width != width {
             self.pending_url_activation = None;
-            self.dirty = LinesDirty::Full;
-            self.cached_render_width = width;
         }
-        let total = self.entries.len();
-        let natural_start = total.saturating_sub(MAX_RENDERED_ENTRIES);
-        let mut start = if self.pinned_to_bottom || self.cached_render_width == 0 {
-            natural_start
-        } else {
-            self.cached_render_start.min(natural_start)
-        };
-        if let Some(cursor) = self.browse_cursor {
-            if cursor < start {
-                start = cursor;
-            } else if cursor >= start.saturating_add(MAX_RENDERED_ENTRIES) {
-                start = cursor
-                    .saturating_add(1)
-                    .saturating_sub(MAX_RENDERED_ENTRIES);
-            }
-        }
-        start = start.min(natural_start);
-        let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
-
-        // A prompt-response fallback may commit the current stream just before
-        // its final chunks arrive. Re-render only that final entry: earlier
-        // markdown and row metadata remain valid.
-        if let LinesDirty::TailChanged(entry_index) = self.dirty
-            && start == self.cached_render_start
-            && entry_index + 1 == end
-            && let Some(range_pos) = self
-                .cached_line_ranges
+        let range = self.transcript_layout.render_range(
+            self.entries.len(),
+            self.pinned_to_bottom,
+            self.browse_cursor,
+            width,
+        );
+        let browse_range = self.browse_range();
+        let browse_cursor = self.browse_cursor;
+        let browse_multi = &self.browse_multi;
+        let tool_disclosures = &self.tool_disclosures;
+        let inputs =
+            self.entries[range.clone()]
                 .iter()
-                .position(|&(index, _, _)| index == entry_index)
-            && range_pos + 1 == self.cached_line_ranges.len()
-        {
-            let line_start = self.cached_line_ranges[range_pos].1;
-            self.cached_lines.truncate(line_start);
-            self.cached_line_ranges.truncate(range_pos);
-
-            let mut changed_lines = Vec::new();
-            let footer_line = render_entry_into(
-                &self.entries[entry_index],
-                self.is_entry_highlighted(entry_index),
-                self.show_thoughts,
-                self.disclosure_for_entry(&self.entries[entry_index]),
-                width,
-                &mut changed_lines,
-            );
-            self.cached_tool_footer_lines.remove(&entry_index);
-            if let Some(footer_line) = footer_line {
-                self.cached_tool_footer_lines
-                    .insert(entry_index, line_start + footer_line);
-            }
-            let line_end = line_start + changed_lines.len();
-            self.cached_lines.extend(changed_lines);
-            self.cached_line_ranges
-                .push((entry_index, line_start, line_end));
-            self.cached_row_breaks = row_breaks_for_lines(&self.cached_lines, width);
-            let row_start = self.cached_line_screen_ranges[line_start].0;
-            if row_start == u16::MAX {
-                // Saturated row offsets cannot distinguish the unchanged prefix.
-                self.cached_url_regions = url_line_regions_for_lines(&self.cached_lines, width);
-            } else {
-                self.cached_url_regions
-                    .retain(|region| region.row < row_start);
-                let mut tail_regions =
-                    url_line_regions_for_lines(&self.cached_lines[line_start..], width);
-                offset_url_line_regions(&mut tail_regions, row_start);
-                self.cached_url_regions.extend(tail_regions);
-            }
-            self.dirty = LinesDirty::Clean;
-            self.rebuild_screen_ranges(width);
-            return;
-        }
-
-        // Incremental append path.
-        if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
-            let render_from = start + self.cached_entry_count;
-            let show_thoughts = self.show_thoughts;
-            let mut new_lines = Vec::new();
-            let mut new_ranges = Vec::new();
-            for (rel_idx, entry) in self.entries[render_from..end].iter().enumerate() {
-                let abs_idx = render_from + rel_idx;
-                let before = new_lines.len();
-                let disclosure = self.disclosure_for_entry(entry);
-                let footer_line = render_entry_into(
-                    entry,
-                    self.is_entry_highlighted(abs_idx),
-                    show_thoughts,
-                    disclosure,
-                    width,
-                    &mut new_lines,
-                );
-                let after = new_lines.len();
-                if after > before {
-                    let base = self.cached_lines.len();
-                    new_ranges.push((abs_idx, base + before, base + after));
-                }
-                if let Some(footer_line) = footer_line {
-                    self.cached_tool_footer_lines
-                        .insert(abs_idx, self.cached_lines.len() + footer_line);
-                }
-            }
-            self.cached_row_breaks
-                .extend(row_breaks_for_lines(&new_lines, width));
-            let mut appended_url_regions = url_line_regions_for_lines(&new_lines, width);
-            offset_url_line_regions(&mut appended_url_regions, self.cached_total_rows);
-            self.cached_url_regions.extend(appended_url_regions);
-            self.cached_lines.extend(new_lines);
-            self.cached_line_ranges.extend(new_ranges);
-            self.cached_entry_count = end - start;
-            self.dirty = LinesDirty::Clean;
-            self.rebuild_screen_ranges(width);
-            return;
-        }
-
-        // Full rebuild path.
-        let mut lines = Vec::new();
-        let mut ranges = Vec::new();
-        let mut footer_lines = BTreeMap::new();
-        let show_thoughts = self.show_thoughts;
-        for (rel_idx, entry) in self.entries[start..end].iter().enumerate() {
-            let abs_idx = start + rel_idx;
-            let before = lines.len();
-            let disclosure = self.disclosure_for_entry(entry);
-            let footer_line = render_entry_into(
-                entry,
-                self.is_entry_highlighted(abs_idx),
-                show_thoughts,
-                disclosure,
-                width,
-                &mut lines,
-            );
-            let after = lines.len();
-            if after > before {
-                ranges.push((abs_idx, before, after));
-            }
-            if let Some(footer_line) = footer_line {
-                footer_lines.insert(abs_idx, footer_line);
-            }
-        }
-        self.cached_row_breaks = row_breaks_for_lines(&lines, width);
-        self.cached_url_regions = url_line_regions_for_lines(&lines, width);
-        self.cached_lines = lines;
-        self.cached_line_ranges = ranges;
-        self.cached_tool_footer_lines = footer_lines;
-        self.cached_entry_count = end - start;
-        self.cached_render_start = start;
-        self.dirty = LinesDirty::Clean;
-        self.rebuild_screen_ranges(width);
+                .enumerate()
+                .map(|(relative_index, entry)| {
+                    let index = range.start + relative_index;
+                    let highlighted = browse_multi.contains(&index)
+                        || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
+                        || browse_cursor == Some(index);
+                    let disclosure = match entry {
+                        ChatEntry::Tool {
+                            tool_call_id,
+                            name,
+                            input_json,
+                            ..
+                        } => tool_disclosures
+                            .get(tool_call_id)
+                            .copied()
+                            .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
+                        _ => ToolDisclosure::Collapsed,
+                    };
+                    EntryLayoutInput {
+                        index,
+                        entry,
+                        highlighted,
+                        disclosure,
+                    }
+                });
+        self.transcript_layout
+            .rebuild(width, range.clone(), self.show_thoughts, inputs);
     }
 
     /// Resolve the ordered cached-entry indices whose screen rows overlap the
@@ -10644,9 +10446,13 @@ impl ChatState {
         }
         let view_end = scroll.saturating_add(height);
         let first = self
+            .transcript_layout
+            .view()
             .cached_screen_ranges
             .partition_point(|&(_, _, screen_hi, _)| screen_hi <= scroll);
         let end = self
+            .transcript_layout
+            .view()
             .cached_screen_ranges
             .partition_point(|&(_, screen_lo, _, _)| screen_lo < view_end);
         first.min(end)..end
@@ -10667,13 +10473,19 @@ impl ChatState {
 
         let view_end = scroll.saturating_add(height);
         let first = self
+            .transcript_layout
+            .view()
             .cached_line_screen_ranges
             .partition_point(|&(_, screen_hi)| screen_hi <= scroll);
         let end = self
+            .transcript_layout
+            .view()
             .cached_line_screen_ranges
             .partition_point(|&(screen_lo, _)| screen_lo < view_end);
         let lines = first.min(end)..end;
         let screen_lo = self
+            .transcript_layout
+            .view()
             .cached_line_screen_ranges
             .get(lines.start)
             .map_or(0, |&(screen_lo, _)| screen_lo);
@@ -10694,7 +10506,7 @@ impl ChatState {
         }
         let local_scroll = scroll.saturating_sub(window.screen_lo);
         (
-            self.cached_lines[window.lines.clone()].to_vec(),
+            self.transcript_layout.view().cached_lines[window.lines.clone()].to_vec(),
             local_scroll,
         )
     }
@@ -10727,7 +10539,7 @@ impl ChatState {
     }
 
     /// Like `visible_line_slice`, but the virtual buffer is cached history
-    /// rows (`0..cached_total_rows`) followed by `overlay` rows — the
+    /// rows (`0..transcript_layout.view().cached_total_rows`) followed by `overlay` rows — the
     /// transient streaming/thinking/approval lines, which are rebuilt fresh
     /// every frame and never cached. Slices the history the same bounded way
     /// `visible_line_slice` does, and appends the (small) overlay in full
@@ -10740,7 +10552,7 @@ impl ChatState {
         window: &VisibleCachedWindow,
         overlay: Vec<Line<'static>>,
     ) -> (Vec<Line<'static>>, u16) {
-        let cached_total_rows = self.cached_total_rows;
+        let cached_total_rows = self.transcript_layout.view().cached_total_rows;
         if scroll >= cached_total_rows {
             // Window is entirely within the overlay (includes the empty
             // history case, where cached_total_rows is 0).
@@ -10753,94 +10565,16 @@ impl ChatState {
         (lines, local_scroll)
     }
 
-    /// Recompute every screen-space index derived from `cached_lines`.
-    /// Cache rebuilds may remain history-sized; steady-state frames use these
-    /// ordered indexes without rescanning committed entries or lines.
-    fn rebuild_screen_ranges(&mut self, width: u16) {
-        self.cached_line_screen_ranges.clear();
-        self.cached_screen_ranges.clear();
-        self.cached_code_blocks.clear();
-        let mut screen_cursor = 0u16;
-        let mut pending_fence: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
-
-        for line in &self.cached_lines {
-            let line_start = screen_cursor;
-            screen_cursor = screen_cursor.saturating_add(wrapped_rows(line, width));
-            self.cached_line_screen_ranges
-                .push((line_start, screen_cursor));
-
-            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-            if first.starts_with('\u{250c}') {
-                let lang = header_fence_lang(line);
-                pending_fence = label_cells(line, " [Copy] ").map(|(col, cells)| {
-                    (
-                        line_start,
-                        col,
-                        cells,
-                        line_start as usize,
-                        lang,
-                        String::new(),
-                    )
-                });
-            } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, group, lang, body)) =
-                    pending_fence.take()
-                {
-                    self.cached_code_blocks.push(CachedCodeBlock {
-                        header_row,
-                        block_end: screen_cursor,
-                        header_label: (header_col, header_cells),
-                        footer_row: line_start,
-                        footer_label: label_cells(line, " [Copy] "),
-                        text: Arc::<str>::from(fenced_text(lang.as_deref(), &body)),
-                        group,
-                    });
-                }
-            } else if let Some((_, _, _, _, _, body)) = pending_fence.as_mut() {
-                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let body_text = full.strip_prefix("  ").unwrap_or(&full);
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(body_text);
-            }
-        }
-
-        self.cached_total_rows = screen_cursor;
-        for &(entry_idx, lo, hi) in &self.cached_line_ranges {
-            if lo >= hi {
-                continue;
-            }
-            // Widest rendered column extent of the entry, clamped to the
-            // viewport. Lines wider than `width` wrap to full-width rows, so the
-            // clamp yields the true on-screen extent. Hit-testing uses this so
-            // the blank space beside a short message is treated as outside the
-            // entry.
-            let content_width = self.cached_lines[lo..hi]
-                .iter()
-                .map(|l| l.width() as u16)
-                .max()
-                .unwrap_or(0)
-                .min(width);
-            let Some(&(screen_lo, _)) = self.cached_line_screen_ranges.get(lo) else {
-                continue;
-            };
-            let Some(&(_, screen_hi)) = self.cached_line_screen_ranges.get(hi - 1) else {
-                continue;
-            };
-            self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_hi, content_width));
-        }
-    }
-
     fn rebuild_copy_regions(&mut self, scroll: u16, body: Rect) -> usize {
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let mut context_regions: Vec<CopyHitRegion> = Vec::new();
         let view_end = scroll.saturating_add(body.height);
         let first = self
+            .transcript_layout
+            .view()
             .cached_code_blocks
             .partition_point(|block| block.block_end <= scroll);
-        let visible_blocks = self.cached_code_blocks[first..]
+        let visible_blocks = self.transcript_layout.view().cached_code_blocks[first..]
             .iter()
             .take_while(|block| block.header_row < view_end);
         let mut visited_blocks = 0;
@@ -10921,13 +10655,17 @@ impl ChatState {
     }
 
     fn render_window_end(&self) -> usize {
-        self.cached_render_start
-            .saturating_add(self.cached_entry_count)
+        self.transcript_layout
+            .view()
+            .cached_render_start
+            .saturating_add(self.transcript_layout.view().cached_entry_count)
             .min(self.entries.len())
     }
 
     fn shift_render_window(&mut self, new_start: usize) {
-        if self.cached_render_width == 0 || new_start == self.cached_render_start {
+        if self.transcript_layout.view().cached_render_width == 0
+            || new_start == self.transcript_layout.view().cached_render_start
+        {
             return;
         }
 
@@ -10937,18 +10675,21 @@ impl ChatState {
         self.clear_transcript_selection();
         self.transcript_snapshot = None;
         let anchor = self
+            .transcript_layout
+            .view()
             .cached_screen_ranges
             .iter()
             .find(|(_, _lo, hi, _)| *hi > self.scroll_offset)
             .map(|(idx, lo, _hi, _)| (*idx, self.scroll_offset.saturating_sub(*lo)));
 
-        self.cached_render_start = new_start;
-        self.dirty = LinesDirty::Full;
-        self.rebuild_lines(self.cached_render_width);
-        self.last_total_rows = self.cached_total_rows;
+        self.transcript_layout.set_render_start(new_start);
+        self.rebuild_lines(self.transcript_layout.view().cached_render_width);
+        self.last_total_rows = self.transcript_layout.view().cached_total_rows;
 
         if let Some((anchor_idx, intra_entry_row)) = anchor
             && let Some((_, lo, _hi, _)) = self
+                .transcript_layout
+                .view()
                 .cached_screen_ranges
                 .iter()
                 .find(|(idx, _, _, _)| *idx == anchor_idx)
@@ -10959,8 +10700,10 @@ impl ChatState {
 
     pub fn scroll_up(&mut self, lines: u16) {
         self.pinned_to_bottom = false;
-        if lines > self.scroll_offset && self.cached_render_start > 0 {
+        if lines > self.scroll_offset && self.transcript_layout.view().cached_render_start > 0 {
             let new_start = self
+                .transcript_layout
+                .view()
                 .cached_render_start
                 .saturating_sub(RENDER_WINDOW_SHIFT_ENTRIES);
             self.shift_render_window(new_start);
@@ -10976,6 +10719,8 @@ impl ChatState {
         {
             let natural_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
             let new_start = self
+                .transcript_layout
+                .view()
                 .cached_render_start
                 .saturating_add(RENDER_WINDOW_SHIFT_ENTRIES)
                 .min(natural_start);
@@ -10999,10 +10744,10 @@ impl ChatState {
 
     pub fn scroll_to_top(&mut self) {
         self.pinned_to_bottom = false;
-        if self.cached_render_start != 0 {
+        if self.transcript_layout.view().cached_render_start != 0 {
             self.clear_transcript_selection();
             self.transcript_snapshot = None;
-            self.cached_render_start = 0;
+            self.transcript_layout.set_render_start(0);
             self.mark_dirty_full();
         }
         self.scroll_offset = 0;
@@ -11011,10 +10756,10 @@ impl ChatState {
 
     pub fn scroll_to_bottom(&mut self) {
         let natural_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
-        if self.cached_render_start != natural_start {
+        if self.transcript_layout.view().cached_render_start != natural_start {
             self.clear_transcript_selection();
             self.transcript_snapshot = None;
-            self.cached_render_start = natural_start;
+            self.transcript_layout.set_render_start(natural_start);
             self.mark_dirty_full();
         }
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
@@ -12207,14 +11952,7 @@ impl ChatState {
     ) {
         self.entries.clear();
         self.first_message = None;
-        self.cached_lines.clear();
-        self.cached_row_breaks.clear();
-        self.cached_line_ranges.clear();
-        self.cached_screen_ranges.clear();
-        self.cached_entry_count = 0;
-        self.cached_render_start = 0;
-        self.cached_render_width = 0;
-        self.cached_total_rows = 0;
+        self.transcript_layout.reset();
         self.clear_transcript_selection();
         self.load_history(messages, strip_runtime_enrichment);
         let notice_text = match notice {
@@ -12259,11 +11997,7 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn load_history(
-        &mut self,
-        messages: Vec<crate::client::MessageEntry>,
-        strip_runtime_enrichment: bool,
-    ) {
+    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
         for m in messages {
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
@@ -12315,7 +12049,7 @@ impl ChatState {
             }
             match m.role() {
                 crate::client::MessageRole::User => {
-                    let display = if strip_runtime_enrichment {
+                    let display = if acp_history {
                         strip_enrichment_prefix(&m.content)
                     } else {
                         &m.content
@@ -12331,6 +12065,13 @@ impl ChatState {
                 crate::client::MessageRole::Assistant => {
                     self.entries
                         .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                }
+                crate::client::MessageRole::System if acp_history => {
+                    // ACP history excludes real system prompts in the store.
+                    // Its system rows are persisted recovery notices, not
+                    // provider instructions. Ordinary Chat has no such contract.
+                    self.entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
@@ -12358,28 +12099,17 @@ impl ChatState {
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
-        self.cached_lines.clear();
-        self.cached_row_breaks.clear();
-        self.cached_line_ranges.clear();
-        self.cached_line_screen_ranges.clear();
-        self.cached_screen_ranges.clear();
-        self.cached_code_blocks.clear();
+        self.transcript_layout.reset();
         self.entry_rects.clear();
         self.tool_header_rects.clear();
         self.tool_footer_rects.clear();
         self.tool_disclosures.clear();
-        self.cached_tool_footer_lines.clear();
         self.copy_hit_regions.clear();
         self.url_hit_regions.clear();
-        self.cached_url_regions.clear();
         self.pending_url_activation = None;
         self.context_copy_regions.clear();
         self.context_menu = None;
         self.copy_feedback = None;
-        self.dirty = LinesDirty::Full;
-        self.cached_entry_count = 0;
-        self.cached_render_start = 0;
-        self.cached_render_width = 0;
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.last_error = None;
@@ -13022,7 +12752,7 @@ mod tests {
     #[test]
     fn transcript_reflow_cancels_pending_url_activation() {
         let mut state = state();
-        state.cached_render_width = 80;
+        state.rebuild_lines(80);
         state.begin_url_activation(url_hit(Rect::new(4, 2, 8, 1), "https://example.com", 2, 4));
 
         state.rebuild_lines(40);
@@ -14076,17 +13806,17 @@ mod tests {
         ));
         state.entry_rects.push((0, Rect::new(0, 0, 5, 1)));
         state.browse_cursor = Some(0);
-        state.dirty = LinesDirty::Clean;
+        state.rebuild_lines(80);
 
         assert!(state.open_transcript_context_menu(1, 0));
-        assert_eq!(state.dirty, LinesDirty::Clean);
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         state.dismiss_context_menu();
 
         assert!(state.context_menu.is_none());
         assert_eq!(state.browse_cursor, Some(0));
         assert!(state.info_message.is_none());
         assert_eq!(state.copy_feedback, None);
-        assert_eq!(state.dirty, LinesDirty::Clean);
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
     }
 
     #[test]
@@ -14194,7 +13924,7 @@ mod tests {
             head: CellPoint { column: 6, row: 0 },
             dragged: true,
         });
-        state.dirty = LinesDirty::Clean;
+        state.rebuild_lines(80);
 
         assert!(state.copy_current_selection());
         assert_eq!(state.transcript_selection, None);
@@ -14207,10 +13937,10 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(state.dirty, LinesDirty::Clean);
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
 
         state.browse_cursor = Some(0);
-        state.dirty = LinesDirty::Clean;
+        state.rebuild_lines(80);
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(0, 0, 8, 1),
             text: Arc::<str>::from("whole message"),
@@ -14220,7 +13950,7 @@ mod tests {
         });
         assert!(state.copy_current_selection());
         assert_eq!(state.browse_cursor, None);
-        assert_eq!(state.dirty, LinesDirty::Full);
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Full);
         assert!(matches!(
             state.copy_feedback,
             Some(CopyFeedback {
@@ -14329,11 +14059,15 @@ mod tests {
         let area = Rect::new(0, 0, 4, 1);
         let line = Line::from(format!("{}tail", "a".repeat(400)));
         let mut state = state();
-        state.cached_lines = vec![line];
-        state.cached_line_ranges = vec![(0, 0, 1)];
-        state.cached_line_screen_ranges = vec![(0, 101)];
-        state.cached_screen_ranges = vec![(0, 0, 101, 4)];
-        state.cached_row_breaks = vec![TranscriptRowBreak::SoftConcat; 101];
+        state.transcript_layout.fixture_mut().cached_lines = vec![line];
+        state.transcript_layout.fixture_mut().cached_line_ranges = vec![(0, 0, 1)];
+        state
+            .transcript_layout
+            .fixture_mut()
+            .cached_line_screen_ranges = vec![(0, 101)];
+        state.transcript_layout.fixture_mut().cached_screen_ranges = vec![(0, 0, 101, 4)];
+        state.transcript_layout.fixture_mut().cached_row_breaks =
+            vec![TranscriptRowBreak::SoftConcat; 101];
         state.transcript_snapshot = Some(TranscriptSnapshot::capture_lines(
             vec![Line::from("aaaa")],
             area,
@@ -14599,7 +14333,7 @@ mod tests {
         }
         state.mark_dirty_full();
         state.rebuild_lines(80);
-        state.last_total_rows = state.cached_total_rows;
+        state.last_total_rows = state.transcript_layout.view().cached_total_rows;
         state.last_inner_height = 20;
         state.scroll_offset = 20;
         state.pinned_to_bottom = false;
@@ -14612,19 +14346,19 @@ mod tests {
         let selection = state.transcript_selection;
 
         state.scroll_up(1);
-        assert_eq!(state.cached_render_start, 1_200);
+        assert_eq!(state.transcript_layout.view().cached_render_start, 1_200);
         assert_eq!(state.transcript_selection, selection);
 
         state.scroll_offset = 0;
         state.scroll_up(1);
-        assert_eq!(state.cached_render_start, 700);
+        assert_eq!(state.transcript_layout.view().cached_render_start, 700);
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.transcript_snapshot, None);
 
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
         state.transcript_selection = selection;
         state.scroll_to_bottom();
-        assert_eq!(state.cached_render_start, 1_200);
+        assert_eq!(state.transcript_layout.view().cached_render_start, 1_200);
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.transcript_snapshot, None);
 
@@ -14632,7 +14366,7 @@ mod tests {
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
         state.transcript_selection = selection;
         state.scroll_to_bottom();
-        assert_eq!(state.cached_render_start, 1_200);
+        assert_eq!(state.transcript_layout.view().cached_render_start, 1_200);
         assert_eq!(state.transcript_selection, selection);
         assert!(state.transcript_snapshot.is_some());
     }
@@ -15507,7 +15241,7 @@ mod tests {
         let width = 80u16;
         s.rebuild_lines(width);
 
-        let total_rows = s.cached_total_rows;
+        let total_rows = s.transcript_layout.view().cached_total_rows;
         assert!(
             total_rows > 200,
             "expected a history far deeper than one viewport, got {total_rows} rows"
@@ -15528,8 +15262,10 @@ mod tests {
                 }
 
                 // 1. The range must cover the viewport window it was resolved for.
-                let screen_lo = s.cached_screen_ranges[window.entries.start].1;
-                let screen_hi = s.cached_screen_ranges[window.entries.end - 1].2;
+                let screen_lo =
+                    s.transcript_layout.view().cached_screen_ranges[window.entries.start].1;
+                let screen_hi =
+                    s.transcript_layout.view().cached_screen_ranges[window.entries.end - 1].2;
                 let view_end = scroll.saturating_add(height).min(total_rows);
                 assert!(
                     screen_lo <= scroll,
@@ -15544,7 +15280,8 @@ mod tests {
 
                 // 2. The line-level range and local scroll must cover the same
                 // viewport without materializing the complete boundary entry.
-                let line_screen_hi = s.cached_line_screen_ranges[window.lines.end - 1].1;
+                let line_screen_hi =
+                    s.transcript_layout.view().cached_line_screen_ranges[window.lines.end - 1].1;
                 assert!(window.screen_lo <= scroll);
                 assert!(line_screen_hi >= view_end);
                 assert!(
@@ -15652,11 +15389,15 @@ mod tests {
         let width = 80u16;
         s.rebuild_lines(width);
 
-        let total = s.cached_lines.len();
+        let total = s.transcript_layout.view().cached_lines.len();
         assert!(total > 100, "expected a deep history, got {total} lines");
 
         let height = 20u16;
-        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let max_scroll = s
+            .transcript_layout
+            .view()
+            .cached_total_rows
+            .saturating_sub(height);
         let mid_scroll = max_scroll / 2;
 
         let window = s.visible_cached_window(mid_scroll, height);
@@ -15696,7 +15437,11 @@ mod tests {
         assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
         assert!(!top.is_empty());
 
-        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let max_scroll = s
+            .transcript_layout
+            .view()
+            .cached_total_rows
+            .saturating_sub(height);
         let bottom_window = s.visible_cached_window(max_scroll, height);
         let (bottom, _) = s.visible_line_slice(max_scroll, &bottom_window);
         assert!(!bottom.is_empty(), "bottom extent must still yield lines");
@@ -15709,7 +15454,10 @@ mod tests {
         let overlay_rows = Paragraph::new(overlay.iter().map(borrow_line).collect::<Vec<_>>())
             .wrap(Wrap { trim: false })
             .line_count(width) as u16;
-        s.cached_total_rows.saturating_add(overlay_rows)
+        s.transcript_layout
+            .view()
+            .cached_total_rows
+            .saturating_add(overlay_rows)
     }
 
     fn approval() -> PendingApproval {
@@ -15867,7 +15615,7 @@ mod tests {
                 let overlay = s.build_overlay_lines(width);
                 let total_rows = transient_total_rows(&s, &overlay, width);
 
-                let mut full: Vec<Line<'static>> = s.cached_lines.clone();
+                let mut full: Vec<Line<'static>> = s.transcript_layout.view().cached_lines.clone();
                 full.extend(overlay);
                 let authoritative = Paragraph::new(full)
                     .wrap(Wrap { trim: false })
@@ -15888,7 +15636,11 @@ mod tests {
         s.pending_approval = Some(approval());
         let width = 80u16;
         s.rebuild_lines(width);
-        assert_eq!(s.cached_total_rows, 0, "no entries means no history rows");
+        assert_eq!(
+            s.transcript_layout.view().cached_total_rows,
+            0,
+            "no entries means no history rows"
+        );
 
         let overlay = s.build_overlay_lines(width);
         let total_rows = transient_total_rows(&s, &overlay, width);
@@ -15918,13 +15670,13 @@ mod tests {
         let overlay = s.build_overlay_lines(width);
         let total_rows = transient_total_rows(&s, &overlay, width);
         assert!(
-            total_rows > s.cached_total_rows,
+            total_rows > s.transcript_layout.view().cached_total_rows,
             "overlay must contribute rows beyond the tiny history"
         );
 
         // Window starting past the tiny history sits entirely in the overlay.
         let height = 6u16;
-        let scroll = s.cached_total_rows;
+        let scroll = s.transcript_layout.view().cached_total_rows;
         let window = s.visible_cached_window(scroll, height);
         let (slice, local_scroll) = s.visible_transient_slice(scroll, height, &window, overlay);
         assert_eq!(local_scroll, 0);
@@ -16052,8 +15804,8 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 24);
         s.rebuild_lines(area.width.saturating_sub(2));
-        s.scroll_offset = s.cached_total_rows / 2;
-        let cached_copy_text = Arc::clone(&s.cached_code_blocks[0].text);
+        s.scroll_offset = s.transcript_layout.view().cached_total_rows / 2;
+        let cached_copy_text = Arc::clone(&s.transcript_layout.view().cached_code_blocks[0].text);
 
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -16098,20 +15850,28 @@ mod tests {
         s.mark_dirty_full();
         s.rebuild_lines(80);
 
-        assert_eq!(s.cached_render_start, 1_200);
-        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(s.transcript_layout.view().cached_render_start, 1_200);
+        assert_eq!(
+            s.transcript_layout.view().cached_entry_count,
+            MAX_RENDERED_ENTRIES
+        );
 
-        s.last_total_rows = s.cached_total_rows;
+        s.last_total_rows = s.transcript_layout.view().cached_total_rows;
         s.last_inner_height = 20;
         s.scroll_offset = 0;
         s.pinned_to_bottom = false;
-        let previous_top = s.cached_render_start;
+        let previous_top = s.transcript_layout.view().cached_render_start;
 
         s.page_up();
 
-        assert_eq!(s.cached_render_start, 700);
-        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(s.transcript_layout.view().cached_render_start, 700);
+        assert_eq!(
+            s.transcript_layout.view().cached_entry_count,
+            MAX_RENDERED_ENTRIES
+        );
         let previous_top_row = s
+            .transcript_layout
+            .view()
             .cached_screen_ranges
             .iter()
             .find(|(idx, _, _, _)| *idx == previous_top)
@@ -16126,10 +15886,17 @@ mod tests {
         s.scroll_to_top();
         s.rebuild_lines(80);
 
-        assert_eq!(s.cached_render_start, 0);
-        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(s.transcript_layout.view().cached_render_start, 0);
         assert_eq!(
-            s.cached_screen_ranges.first().map(|(idx, _, _, _)| *idx),
+            s.transcript_layout.view().cached_entry_count,
+            MAX_RENDERED_ENTRIES
+        );
+        assert_eq!(
+            s.transcript_layout
+                .view()
+                .cached_screen_ranges
+                .first()
+                .map(|(idx, _, _, _)| *idx),
             Some(0),
             "jump-to-start exposes the oldest transcript entry"
         );
@@ -16138,7 +15905,7 @@ mod tests {
         browse.entries = s.entries.clone();
         browse.mark_dirty_full();
         browse.rebuild_lines(80);
-        browse.last_total_rows = browse.cached_total_rows;
+        browse.last_total_rows = browse.transcript_layout.view().cached_total_rows;
         browse.last_inner_height = 20;
         browse.enter_browse_mode();
         browse.rebuild_lines(80);
@@ -16148,9 +15915,14 @@ mod tests {
 
         let cursor = browse.browse_cursor.expect("browse cursor");
         assert_eq!(cursor, 999);
-        assert_eq!(browse.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(
+            browse.transcript_layout.view().cached_entry_count,
+            MAX_RENDERED_ENTRIES
+        );
         assert!(
             browse
+                .transcript_layout
+                .view()
                 .cached_screen_ranges
                 .iter()
                 .any(|(idx, _, _, _)| *idx == cursor),
@@ -19545,11 +19317,15 @@ mod tests {
         let cached_a = chat
             .state_for_session("sess-a")
             .expect("focused session")
+            .transcript_layout
+            .view()
             .cached_lines
             .clone();
         let cached_b = chat
             .state_for_session("sess-b")
             .expect("background session")
+            .transcript_layout
+            .view()
             .cached_lines
             .clone();
 
@@ -19561,30 +19337,30 @@ mod tests {
             panic!("focus must activate the picked session");
         };
         assert!(matches!(&b.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-b"));
-        assert_eq!(b.dirty, LinesDirty::Clean);
-        assert_eq!(b.cached_lines, cached_b);
+        assert_eq!(b.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(b.transcript_layout.view().cached_lines, cached_b);
         let a = chat
             .background
             .iter()
             .find(|s| s.session_id == "sess-a")
             .expect("previous session stays tracked");
         assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
-        assert_eq!(a.dirty, LinesDirty::Clean);
-        assert_eq!(a.cached_lines, cached_a);
+        assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
 
         assert!(chat.focus_session("sess-a").await);
         let ChatPhase::Active(a) = &chat.phase else {
             panic!("round-trip focus must reactivate the original session");
         };
-        assert_eq!(a.dirty, LinesDirty::Clean);
-        assert_eq!(a.cached_lines, cached_a);
+        assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
         let b = chat
             .background
             .iter()
             .find(|s| s.session_id == "sess-b")
             .expect("second session stays tracked after round-trip focus");
-        assert_eq!(b.dirty, LinesDirty::Clean);
-        assert_eq!(b.cached_lines, cached_b);
+        assert_eq!(b.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(b.transcript_layout.view().cached_lines, cached_b);
 
         // Sidebar order is stable across focus changes.
         let ids: Vec<_> = chat
@@ -19724,7 +19500,7 @@ mod tests {
                 .entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-b")));
             promoted.rebuild_lines(40);
-            promoted.cached_lines.clone()
+            promoted.transcript_layout.view().cached_lines.clone()
         };
 
         let handle = tokio::spawn(async move {
@@ -19757,8 +19533,11 @@ mod tests {
         let ChatPhase::Active(promoted) = &chat.phase else {
             panic!("remaining session must be promoted");
         };
-        assert_eq!(promoted.dirty, LinesDirty::Clean);
-        assert_eq!(promoted.cached_lines, promoted_cache);
+        assert_eq!(promoted.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(
+            promoted.transcript_layout.view().cached_lines,
+            promoted_cache
+        );
     }
 
     #[tokio::test]
@@ -22606,7 +22385,7 @@ mod tests {
             dragged: true,
         });
 
-        state.dirty = LinesDirty::Clean;
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         let click = MouseEvent {
@@ -22623,7 +22402,7 @@ mod tests {
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
-            state.dirty,
+            state.transcript_layout.view().dirty,
             LinesDirty::Clean,
             "clearing an overlay-only selection must preserve cached transcript lines"
         );
@@ -22724,7 +22503,7 @@ mod tests {
             "blank column stays in the panel"
         );
 
-        state.dirty = LinesDirty::Clean;
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         let mouse_down = MouseEvent {
@@ -22748,7 +22527,7 @@ mod tests {
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
-            state.dirty,
+            state.transcript_layout.view().dirty,
             LinesDirty::Clean,
             "clearing an overlay-only selection must preserve cached transcript lines"
         );
@@ -22780,8 +22559,8 @@ mod tests {
             .first()
             .expect("entry region should be rendered")
             .1;
-        let rows_before = state.cached_total_rows;
-        state.dirty = LinesDirty::Clean;
+        let rows_before = state.transcript_layout.view().cached_total_rows;
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         let click = MouseEvent {
@@ -22821,7 +22600,8 @@ mod tests {
             .expect("selected entry region should still be rendered")
             .1;
         assert_eq!(
-            state.cached_total_rows, rows_before,
+            state.transcript_layout.view().cached_total_rows,
+            rows_before,
             "message copy affordance must overlay the transcript without adding rows"
         );
         assert_eq!(
@@ -22903,7 +22683,7 @@ mod tests {
             .first()
             .expect("entry region should be rendered")
             .1;
-        state.dirty = LinesDirty::Clean;
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         let click = MouseEvent {
@@ -23128,7 +22908,7 @@ mod tests {
         );
         let copy_rect = code_regions[0].rect;
         let copy_group = code_regions[0].group;
-        state.dirty = LinesDirty::Clean;
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         let click = MouseEvent {
@@ -23201,9 +22981,89 @@ mod tests {
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
-        Paragraph::new(s.cached_lines.iter().map(borrow_line).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .line_count(width) as u16
+        Paragraph::new(
+            s.transcript_layout
+                .view()
+                .cached_lines
+                .iter()
+                .map(borrow_line)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
+    }
+
+    #[test]
+    fn transcript_layout_incremental_metadata_matches_full_rebuild() {
+        fn assert_matches_full(incremental: &ChatState, width: u16) {
+            let mut full = state();
+            full.entries = incremental.entries.clone();
+            full.show_thoughts = incremental.show_thoughts;
+            full.browse_cursor = incremental.browse_cursor;
+            full.browse_anchor = incremental.browse_anchor;
+            full.browse_multi = incremental.browse_multi.clone();
+            full.tool_disclosures = incremental.tool_disclosures.clone();
+            full.rebuild_lines(width);
+            assert_eq!(
+                incremental.transcript_layout.view(),
+                full.transcript_layout.view()
+            );
+        }
+
+        let mut s = state();
+        s.show_thoughts = false;
+        s.browse_multi.insert(0);
+        s.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "https://example.org/prefix",
+        )));
+        s.entries
+            .push(ChatEntry::AgentThought(Arc::from("hidden prefix")));
+        s.rebuild_lines(40);
+        assert_matches_full(&s, 40);
+
+        s.entries
+            .push(ChatEntry::AgentThought(Arc::from("hidden append")));
+        s.entries.push(ChatEntry::Tool {
+            tool_call_id: Arc::from("layout-tool"),
+            name: Arc::from("file_write"),
+            input_json: Arc::from(serde_json::json!({
+                "path": "fixture.txt", "content": "a line that wraps at narrow widths\n".repeat(10)
+            }).to_string()),
+            result: None,
+        });
+        s.mark_dirty_append();
+        s.rebuild_lines(40);
+        assert!(
+            !s.transcript_layout
+                .view()
+                .cached_tool_footer_lines
+                .is_empty()
+        );
+        assert_matches_full(&s, 40);
+
+        if let ChatEntry::Tool { result, .. } = &mut s.entries[3] {
+            *result = Some(Arc::from("written"));
+        }
+        s.mark_dirty_tail(3);
+        s.rebuild_lines(40);
+        assert_matches_full(&s, 40);
+
+        s.entries.push(ChatEntry::AgentMessageContinuation(
+            "https://example.net/tail\n```rust\nlet value = 1;\n```".to_string(),
+        ));
+        s.mark_dirty_append();
+        s.rebuild_lines(40);
+        assert!(!s.transcript_layout.view().cached_code_blocks.is_empty());
+        assert_matches_full(&s, 40);
+
+        if let ChatEntry::AgentMessageContinuation(text) = &mut s.entries[4] {
+            text.push_str("\nhttps://example.net/late");
+        }
+        s.mark_dirty_tail(4);
+        s.rebuild_lines(40);
+        assert_matches_full(&s, 40);
+        s.rebuild_lines(20);
+        assert_matches_full(&s, 20);
     }
 
     #[test]
@@ -23216,13 +23076,13 @@ mod tests {
         }
         s.rebuild_lines(width);
         assert_eq!(
-            s.cached_total_rows,
+            s.transcript_layout.view().cached_total_rows,
             authoritative_rows(&s, width),
             "full-rebuild row total must match line_count"
         );
         assert_eq!(
-            s.cached_row_breaks.len(),
-            usize::from(s.cached_total_rows),
+            s.transcript_layout.view().cached_row_breaks.len(),
+            usize::from(s.transcript_layout.view().cached_total_rows),
             "full rebuild must cache one separator per rendered row"
         );
 
@@ -23236,26 +23096,26 @@ mod tests {
         }
         s.rebuild_lines(width);
         assert_eq!(
-            s.cached_total_rows,
+            s.transcript_layout.view().cached_total_rows,
             authoritative_rows(&s, width),
             "incremental-append row total must match line_count"
         );
         assert_eq!(
-            s.cached_row_breaks.len(),
-            usize::from(s.cached_total_rows),
+            s.transcript_layout.view().cached_row_breaks.len(),
+            usize::from(s.transcript_layout.view().cached_total_rows),
             "incremental append must preserve separator alignment"
         );
 
         let narrower: u16 = 20;
         s.rebuild_lines(narrower);
         assert_eq!(
-            s.cached_total_rows,
+            s.transcript_layout.view().cached_total_rows,
             authoritative_rows(&s, narrower),
             "width change must force a recompute that still matches line_count"
         );
         assert_eq!(
-            s.cached_row_breaks.len(),
-            usize::from(s.cached_total_rows),
+            s.transcript_layout.view().cached_row_breaks.len(),
+            usize::from(s.transcript_layout.view().cached_total_rows),
             "width rebuild must realign cached separators"
         );
     }
@@ -24745,7 +24605,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
             .expect("draw chat");
         state.pinned_to_bottom = false;
-        state.scroll_offset = state.cached_screen_ranges[1].1;
+        state.scroll_offset = state.transcript_layout.view().cached_screen_ranges[1].1;
         terminal
             .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
             .expect("draw scrolled chat");
@@ -24782,7 +24642,7 @@ mod tests {
         );
         assert!(!state.tool_disclosures.contains_key("tc-2"));
         assert!(!state.tool_disclosures.contains_key("tc-offscreen"));
-        assert_eq!(state.dirty, LinesDirty::Full);
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Full);
 
         terminal
             .draw(|frame| render(frame, state, area, PaneKind::Chat))
@@ -26639,10 +26499,16 @@ mod tests {
         state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
             "```rust\nfn main() {}\n```\n",
         )));
-        state.dirty = LinesDirty::Full;
+        state.mark_dirty_full();
         state.rebuild_lines(60);
 
-        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
+        let fence_entry = state
+            .transcript_layout
+            .view()
+            .cached_screen_ranges
+            .last()
+            .copied()
+            .expect("fence");
         let body = Rect::new(0, 0, 60, 20);
 
         state.rebuild_copy_regions(fence_entry.1, body);
@@ -28122,6 +27988,63 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn load_history_preserves_acp_recovery_notice_between_turns() {
+        use crate::client::MessageEntry;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut s = state();
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "partial answer".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "localized recovery notice".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "continue".to_string(),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::UserMessage { .. }, ChatEntry::AgentMessage(partial),
+             ChatEntry::SystemMessage(notice), ChatEntry::UserMessage { .. }]
+                if partial.as_ref() == "partial answer"
+                    && notice.as_ref() == "localized recovery notice"
+        ));
+        assert_eq!(s.first_message.as_deref(), Some("question"));
+
+        let mut chat = chat_with_active_input(PaneKind::Acp);
+        chat.phase = ChatPhase::Active(Box::new(s));
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+            .unwrap();
+        let text = overlay_text(&terminal, area);
+        let partial = text
+            .find("partial answer")
+            .expect("partial output is visible");
+        let notice = text
+            .find("localized recovery notice")
+            .expect("recovery notice is visible in the final terminal cells");
+        let next = text.find("continue").expect("next prompt is visible");
+        assert!(partial < notice && notice < next, "{text}");
+    }
+
     #[test]
     fn load_history_skips_prefix_only_content_when_seeding_first_message() {
         use crate::client::MessageEntry;
@@ -28520,7 +28443,8 @@ mod tests {
         let width = 24;
         let body = Rect::new(0, 0, width, 20);
         state.rebuild_lines(width);
-        state.url_hit_regions = project_url_hit_regions(&state.cached_url_regions, 0, body);
+        state.url_hit_regions =
+            project_url_hit_regions(&state.transcript_layout.view().cached_url_regions, 0, body);
         let hit = state
             .url_hit_regions
             .iter()
@@ -28538,12 +28462,15 @@ mod tests {
             session_id: "sess-1".to_string(),
             text: "/long-path?query=yes".to_string(),
         });
-        assert!(matches!(state.dirty, LinesDirty::TailChanged(_)));
+        assert!(matches!(
+            state.transcript_layout.view().dirty,
+            LinesDirty::TailChanged(_)
+        ));
         assert!(state.pending_url_activation.is_none());
         assert!(state.context_menu.is_none());
         assert!(state.take_url_activation(hit.rect.x, hit.rect.y).is_none());
         state.rebuild_lines(width);
-        let tail_regions = state.cached_url_regions.clone();
+        let tail_regions = state.transcript_layout.view().cached_url_regions.clone();
         let hits = project_url_hit_regions(&tail_regions, 0, body);
         assert!(!hits.is_empty());
         assert!(
@@ -28558,7 +28485,10 @@ mod tests {
 
         state.mark_dirty_full();
         state.rebuild_lines(width);
-        assert_eq!(tail_regions, state.cached_url_regions);
+        assert_eq!(
+            tail_regions,
+            state.transcript_layout.view().cached_url_regions
+        );
     }
 
     #[tokio::test]
@@ -28593,7 +28523,7 @@ mod tests {
             chat.drain_prompt_completions();
             let state = active_state(&mut chat);
             state.rebuild_lines(80);
-            assert_eq!(state.dirty, LinesDirty::Clean);
+            assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
             assert!(state.prompt_settled_stream_entry.is_some());
             let continuation_index = state.prompt_settled_stream_entry.unwrap().1;
 
@@ -28609,7 +28539,7 @@ mod tests {
                 chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
                     .await;
                 let state = active_state(&mut chat);
-                assert_eq!(state.dirty, LinesDirty::Appended);
+                assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Appended);
                 assert!(matches!(
                     state.entries().last(),
                     Some(ChatEntry::SystemMessage(_))
@@ -28634,7 +28564,7 @@ mod tests {
             chat.drain_notifications();
             let state = active_state(&mut chat);
             assert_eq!(
-                state.dirty,
+                state.transcript_layout.view().dirty,
                 if interposed_error {
                     LinesDirty::Full
                 } else {
@@ -28647,14 +28577,25 @@ mod tests {
                     if text == "```rust\nlet daemon = 1;\nlet late = 2;\n```"
             ));
             state.rebuild_lines(80);
-            assert_eq!(state.dirty, LinesDirty::Clean);
-            assert!(rendered_text(&state.cached_lines).contains("let late = 2;"));
-            assert_eq!(
-                state.cached_line_screen_ranges.len(),
-                state.cached_lines.len()
+            assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
+            assert!(
+                rendered_text(&state.transcript_layout.view().cached_lines)
+                    .contains("let late = 2;")
             );
-            assert_eq!(state.cached_code_blocks.len(), 1);
-            assert!(state.cached_code_blocks[0].text.contains("let late = 2;"));
+            assert_eq!(
+                state
+                    .transcript_layout
+                    .view()
+                    .cached_line_screen_ranges
+                    .len(),
+                state.transcript_layout.view().cached_lines.len()
+            );
+            assert_eq!(state.transcript_layout.view().cached_code_blocks.len(), 1);
+            assert!(
+                state.transcript_layout.view().cached_code_blocks[0]
+                    .text
+                    .contains("let late = 2;")
+            );
             notif_tx
                 .send(RpcNotification {
                     method: "session/update".to_string(),
@@ -28667,7 +28608,10 @@ mod tests {
                 })
                 .unwrap();
             chat.drain_notifications();
-            assert_eq!(active_state(&mut chat).dirty, LinesDirty::Clean);
+            assert_eq!(
+                active_state(&mut chat).transcript_layout.view().dirty,
+                LinesDirty::Clean
+            );
 
             let replies = active_state(&mut chat)
                 .entries()
