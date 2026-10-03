@@ -272,6 +272,68 @@ fn change_directory_start_dir(
         .unwrap_or_else(local_picker_root)
 }
 
+/// Why rooting a fresh local session at the launch directory failed.
+///
+/// A fresh local session, Chat or Code, starts in the directory zerocode was
+/// launched from. If that directory cannot be captured, the session is not
+/// created: omitting the cwd would root it at the agent's workspace, and it
+/// would look healthy while its file and shell tools act on a different tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchCwdError {
+    /// `std::env::current_dir()` failed, e.g. the directory was deleted.
+    /// Carries the OS error text.
+    Unavailable(String),
+    /// The launch directory is not valid UTF-8, so the JSON-RPC `cwd` string
+    /// cannot carry it. Carries the lossy rendering for diagnosis.
+    NotUtf8(String),
+}
+
+impl LaunchCwdError {
+    /// Localized, user-facing text for this capture failure.
+    fn localized(&self) -> String {
+        match self {
+            LaunchCwdError::Unavailable(error) => crate::i18n::t_args(
+                "zc-chat-launch-cwd-unavailable",
+                &[("error", error.as_str())],
+            ),
+            LaunchCwdError::NotUtf8(path) => {
+                crate::i18n::t_args("zc-chat-launch-cwd-not-utf8", &[("path", path.as_str())])
+            }
+        }
+    }
+}
+
+/// Reads the directory zerocode was launched from.
+///
+/// Production uses [`std::env::current_dir`]. Tests substitute a source that
+/// fails or returns a fixed path, which they cannot do to the process
+/// directory itself while other tests share it.
+type LaunchDirSource = fn() -> std::io::Result<std::path::PathBuf>;
+
+/// Default root for a fresh session with no explicit selection.
+///
+/// A local session, Chat or Code, defaults to the directory zerocode was
+/// launched from, so file and shell tools act on that project. A remote
+/// session has no launch directory on the daemon's machine: remote Chat uses
+/// the agent's workspace and remote Code chooses through the daemon-side
+/// picker, so both return `Ok(None)` and the request omits `cwd`.
+///
+/// The daemon still resolves and authorizes whatever is sent, so this only
+/// chooses what to ask for.
+fn default_fresh_session_cwd(
+    transport: crate::client::Transport,
+    current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<String>, LaunchCwdError> {
+    if transport != crate::client::Transport::Local {
+        return Ok(None);
+    }
+    let dir = current_dir().map_err(|e| LaunchCwdError::Unavailable(e.to_string()))?;
+    match dir.to_str() {
+        Some(dir) => Ok(Some(dir.to_owned())),
+        None => Err(LaunchCwdError::NotUtf8(dir.display().to_string())),
+    }
+}
+
 /// Combine a directory-change report with the notice the session restore
 /// already left on the focused session.
 ///
@@ -441,6 +503,8 @@ pub(crate) struct Chat {
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
     phase: ChatPhase,
     pane_kind: PaneKind,
+    /// Where a fresh session reads the directory zerocode was launched from.
+    launch_dir: LaunchDirSource,
     /// Live but unfocused sessions of this pane. Each keeps its full
     /// transcript, caches, queue, and pending prompts warm; notifications
     /// route to them by session id so switching back is instant.
@@ -809,6 +873,7 @@ impl Chat {
                 loading: true,
             },
             pane_kind,
+            launch_dir: std::env::current_dir,
             background: Vec::new(),
             session_order: Vec::new(),
             last_focused_sid: None,
@@ -1736,14 +1801,14 @@ impl Chat {
 
     /// Open the Code directory picker for `/change-directory`.
     ///
-    /// Code-only: a Chat session follows its agent's workspace, so there is no
-    /// root for the user to re-select. The active session is stashed (never
+    /// Code-only: a Chat session keeps the root it started with, so there is
+    /// no root for the user to re-select. The active session is stashed (never
     /// closed or re-rooted) so cancelling, a rejected path, or a failed start
     /// can return to it untouched.
     fn begin_change_directory(&mut self) {
         if self.pane_kind != PaneKind::Acp {
-            // Chat follows the selected agent's workspace. Say so instead of
-            // dropping the command: a silent no-op reads as a broken command.
+            // Chat keeps the root it started with. Say so instead of dropping
+            // the command: a silent no-op reads as a broken command.
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t("zc-chat-change-directory-chat-only"));
             }
@@ -2125,19 +2190,35 @@ impl Chat {
             EntryRetrySessionOwnership::RetryCreated
         };
         // A resume must not re-point the session at a new root: pass no cwd so
-        // the daemon keeps the retained session's own saved cwd, whatever this
-        // process's directory or the agent's workspace is now.
+        // the daemon keeps the retained session's own root, whatever this
+        // process's directory or the agent's workspace is now. (The daemon
+        // persists a Code session's root; a Chat session it has to rebuild
+        // comes back at the agent's workspace.)
         //
-        // A fresh session sends a root only when one was explicitly selected
-        // (the startup picker or `/change-directory`). Otherwise cwd is
-        // omitted so the daemon resolves the selected agent's configured
-        // workspace — the default session root for Chat and Code alike.
+        // A fresh session sends an explicit selection (the startup picker or
+        // `/change-directory`) when there is one. Otherwise a local session,
+        // Chat or Code, sends the launch directory, and a remote one omits cwd
+        // so the daemon uses the agent's workspace.
+        let explicit_cwd = cwd_override
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_owned);
         let cwd_str: Option<String> = if resume_id.is_some() {
             None
+        } else if explicit_cwd.is_some() {
+            explicit_cwd
         } else {
-            cwd_override
-                .filter(|cwd| !cwd.trim().is_empty())
-                .map(str::to_owned)
+            match default_fresh_session_cwd(self.rpc.transport(), self.launch_dir) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    let error = error.localized();
+                    self.phase = ChatPhase::Error(crate::i18n::t_args(
+                        "zc-chat-error-create-session",
+                        &[("error", &error)],
+                    ));
+                    self.after_session_start().await;
+                    return SessionStartOutcome::Failed(error);
+                }
+            }
         };
         if is_cancelled(cancellation) {
             return SessionStartOutcome::Cancelled;
@@ -2489,6 +2570,7 @@ impl Chat {
         rpc: &Arc<RpcClient>,
         pane_kind: PaneKind,
         state: &mut ChatState,
+        launch_dir: LaunchDirSource,
     ) -> Option<ChatPhase> {
         let alias = state.agent_alias.clone();
         if pane_kind == PaneKind::Acp && rpc.transport() == crate::client::Transport::Wss {
@@ -2509,13 +2591,27 @@ impl Chat {
         }
 
         // A restart mints a *fresh* session, so it follows the fresh-session
-        // default: omit cwd and let the daemon root the replacement at the
-        // selected agent's workspace. Remote ACP re-prompts via the picker
-        // above, which supplies an explicit root through `start_session`.
+        // default: a local restart, Chat or Code, sends the launch directory,
+        // and a remote Chat restart omits cwd so the daemon uses the agent's
+        // workspace. Remote ACP re-prompts via the picker above, which supplies
+        // an explicit root through `start_session`.
+        //
+        // A capture failure keeps the existing session rather than minting one
+        // rooted somewhere the user did not launch from.
+        let cwd_str = match default_fresh_session_cwd(rpc.transport(), launch_dir) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-restart-error",
+                    &[("error", &error.localized())],
+                ));
+                return None;
+            }
+        };
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, None, None).await
+            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
         } else {
-            rpc.session_new(&alias, None).await
+            rpc.session_new(&alias, cwd_str.as_deref()).await
         };
         match new_session {
             Ok(s) => {
@@ -4293,9 +4389,10 @@ impl Chat {
                 InputBarAction::RestartSession => {
                     let rpc = self.rpc.clone();
                     let pane_kind = self.pane_kind;
+                    let launch_dir = self.launch_dir;
                     let old_sid = state.session_id.clone();
                     if let Some(next_phase) =
-                        Self::restart_session_for_state(&rpc, pane_kind, state).await
+                        Self::restart_session_for_state(&rpc, pane_kind, state, launch_dir).await
                     {
                         self.phase = next_phase;
                     }
@@ -5968,7 +6065,7 @@ impl crate::widgets::HelpContext for Chat {
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
                 // Code owns a session root the user can re-select; Chat
-                // sessions follow their agent's workspace, so the hint is
+                // sessions keep the root they started with, so the hint is
                 // scoped to this pane.
                 if self.pane_kind == PaneKind::Acp {
                     pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-change-directory")));
@@ -16187,7 +16284,13 @@ mod tests {
         let restart = {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
-                Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+                Chat::restart_session_for_state(
+                    &client,
+                    PaneKind::Chat,
+                    &mut state,
+                    std::env::current_dir,
+                )
+                .await;
                 state
             })
         };
@@ -20689,8 +20792,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_directory_on_the_chat_pane_explains_why_it_is_unavailable() {
-        // Chat follows the selected agent's workspace, so there is no root to
-        // re-select — but a silent no-op looks like a broken command.
+        // Directory selection belongs to Code; Chat explains the unavailable
+        // command without changing its current session or root.
         let mut chat = active_chat();
 
         chat.begin_change_directory();
@@ -21252,11 +21355,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+    async fn fresh_local_chat_session_sends_the_launch_directory() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
-        // `with_rpc` defaults to Local transport — the path that used to leak
-        // the TUI's launch directory into `session/new`.
+        // `with_rpc` defaults to Local transport.
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
 
@@ -21282,16 +21384,22 @@ mod tests {
         let params = &request["params"];
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
-        // Regression guard: a fresh local session must not send the TUI's
-        // launch directory as cwd. Omitting it lets the daemon resolve the
-        // selected agent's configured workspace.
-        assert!(params["cwd"].is_null());
+        assert!(params["chat_mode"].is_null(), "this is a Chat session");
+        // A fresh local Chat session works on the project zerocode was
+        // launched from, like Code. With `null` the daemon would root it at
+        // the agent's workspace, which holds agent state, not the user's work.
+        let launch_dir = std::env::current_dir().expect("test process has a cwd");
+        assert_eq!(
+            params["cwd"],
+            launch_dir.to_str().expect("test cwd is UTF-8"),
+            "a fresh local Chat session must carry the launch directory"
+        );
 
         init.abort();
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+    async fn fresh_local_acp_session_sends_the_launch_directory() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -21335,16 +21443,21 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        // Regression guard: a fresh Code session must not send the TUI's
-        // launch directory. Omitting cwd lets the daemon root the session at
-        // the selected agent's configured workspace.
-        assert!(params["cwd"].is_null());
+        // A fresh local Code session with no explicit selection sends the
+        // directory zerocode was launched from, not `null`: with `null` the
+        // daemon would root it at the agent's workspace instead.
+        let launch_dir = std::env::current_dir().expect("test process has a cwd");
+        assert_eq!(
+            params["cwd"],
+            launch_dir.to_str().expect("test cwd is UTF-8"),
+            "a fresh local Code session must carry the launch directory"
+        );
         respond_ok(
             &rpc,
             &request,
             serde_json::json!({
                 "session_id": "sess-fresh",
-                "workspace_dir": "/agents/alpha/workspace"
+                "workspace_dir": "/launch/project"
             }),
         );
 
@@ -21356,8 +21469,605 @@ mod tests {
             .await
             .expect("start should finish")
             .unwrap();
-        // The daemon-selected workspace is the session root of record.
-        assert_eq!(chat.current_cwd(), Some("/agents/alpha/workspace"));
+        // The daemon reports the launch project as the root of the new session.
+        assert_eq!(chat.current_cwd(), Some("/launch/project"));
+    }
+
+    #[test]
+    fn only_a_local_session_defaults_to_the_launch_directory() {
+        assert_eq!(
+            default_fresh_session_cwd(crate::client::Transport::Local, || {
+                Ok(std::path::PathBuf::from("/launch/project"))
+            }),
+            Ok(Some("/launch/project".to_string()))
+        );
+        assert_eq!(
+            default_fresh_session_cwd(crate::client::Transport::Wss, || {
+                panic!("a remote session must not read the local launch directory")
+            }),
+            Ok(None),
+            "a remote session omits cwd"
+        );
+    }
+
+    #[test]
+    fn a_launch_directory_that_cannot_be_captured_is_an_error_not_an_omission() {
+        let err = default_fresh_session_cwd(crate::client::Transport::Local, || {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap_err();
+        assert_eq!(err, LaunchCwdError::Unavailable("gone".to_string()));
+        assert!(err.localized().contains("gone"), "{}", err.localized());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_launch_directory_is_an_error_not_an_omission() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/launch/\xff"));
+        let err =
+            default_fresh_session_cwd(crate::client::Transport::Local, || Ok(dir)).unwrap_err();
+        assert!(matches!(err, LaunchCwdError::NotUtf8(_)), "{err:?}");
+    }
+
+    /// Launch-directory source for a directory that was removed after
+    /// zerocode started.
+    fn removed_launch_dir() -> std::io::Result<std::path::PathBuf> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "launch directory removed",
+        ))
+    }
+
+    /// Asserts that `rx` stays empty: the client sent nothing.
+    async fn assert_no_rpc_request(rx: &mut mpsc::Receiver<String>, reason: &str) {
+        if let Ok(Some(raw)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            panic!("{reason}, but the client sent {raw}");
+        }
+    }
+
+    async fn assert_sibling_capture_refusal_restores_active_session(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/selected/project");
+        chat.pane_kind = pane_kind;
+        chat.launch_dir = launch_dir;
+        let capture_error = default_fresh_session_cwd(crate::client::Transport::Local, launch_dir)
+            .expect_err("the fixture must refuse launch capture")
+            .localized();
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.input_bar.insert_text("preserved draft");
+            state.turn_in_flight = true;
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), chat.add_agent_session("alpha"))
+            .await
+            .expect("capture refusal must finish without an RPC response");
+        assert_no_rpc_request(
+            &mut rx,
+            "a refused sibling capture must send no RPC request",
+        )
+        .await;
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert_eq!(chat.tracked_session_count(), 1);
+        assert!(
+            chat.background.is_empty(),
+            "the focused session must be restored"
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("capture refusal must return to the active session");
+        };
+        assert_eq!(state.input_bar.input(), "preserved draft");
+        assert!(
+            state.turn_in_flight,
+            "the running turn must remain in flight"
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains(&capture_error)),
+            "the capture refusal must be visible as a notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_start_chat_deleted_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Chat, removed_launch_dir)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sibling_start_code_deleted_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Acp, removed_launch_dir)
+            .await;
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_launch_dir() -> std::io::Result<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/launch/\xff",
+        )))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_start_chat_non_utf8_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Chat, non_utf8_launch_dir)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_start_code_non_utf8_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Acp, non_utf8_launch_dir)
+            .await;
+    }
+
+    fn draw_app_notice_frame(
+        mode: crate::app::Mode,
+        chat: &mut Chat,
+        code: &mut crate::acp::Acp,
+    ) -> (Vec<String>, Rect) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 50)).unwrap();
+        let mut content = Rect::default();
+        terminal
+            .draw(|frame| {
+                crate::app::draw_app_frame(frame, mode, chat, code, |frame, areas, chat, code| {
+                    content = areas[1];
+                    match mode {
+                        crate::app::Mode::Acp => code.draw_with_dock(frame, content, None, None),
+                        crate::app::Mode::Chat => chat.draw_with_dock(frame, content, None, None),
+                        _ => {}
+                    }
+                    frame.render_widget(ratatui::widgets::Paragraph::new("STATUS"), areas[2]);
+                });
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..50)
+            .map(|y| {
+                (0..180)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, content)
+    }
+
+    async fn assert_sibling_capture_refusal_reaches_app_frame(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut focused = local_code_chat_with_session(&rpc, "sess-focused", "/selected/project");
+        focused.pane_kind = pane_kind;
+        focused.launch_dir = launch_dir;
+        if let ChatPhase::Active(state) = &mut focused.phase {
+            state.input_bar.insert_text("PRESERVED_APP_DRAFT");
+            state.turn_in_flight = true;
+        }
+        let capture_error = default_fresh_session_cwd(crate::client::Transport::Local, launch_dir)
+            .expect_err("fixture must refuse launch capture")
+            .localized();
+        let mut other = local_code_chat_with_session(&rpc, "sess-other", "/other/project");
+        if let ChatPhase::Active(state) = &mut other.phase {
+            state.set_info_notice("OTHER_PANE_NOTICE".to_string());
+        }
+        let (mode, mut chat, mut code) = if pane_kind == PaneKind::Acp {
+            other.pane_kind = PaneKind::Chat;
+            (
+                crate::app::Mode::Acp,
+                other,
+                crate::acp::Acp::from_chat_for_test(focused),
+            )
+        } else {
+            (
+                crate::app::Mode::Chat,
+                focused,
+                crate::acp::Acp::from_chat_for_test(other),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if pane_kind == PaneKind::Acp {
+                code.add_agent_session("alpha").await;
+                assert_eq!(code.current_session_id(), Some("sess-focused"));
+                assert_eq!(code.current_cwd(), Some("/selected/project"));
+            } else {
+                chat.add_agent_session("alpha").await;
+                assert_eq!(chat.current_session_id(), Some("sess-focused"));
+                assert_eq!(chat.current_cwd(), Some("/selected/project"));
+            }
+        })
+        .await
+        .expect("capture refusal must restore focus without an RPC response");
+        assert_no_rpc_request(&mut rx, "capture refusal must send no RPC request").await;
+
+        let (rows, content) = draw_app_notice_frame(mode, &mut chat, &mut code);
+        assert!(rows[48].contains(&capture_error), "app frame: {rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("OTHER_PANE_NOTICE")));
+        assert!(rows.iter().any(|row| row.contains("PRESERVED_APP_DRAFT")));
+        assert_eq!(content.bottom(), 48, "notice must have its own app row");
+        assert!(rows[49].starts_with("STATUS"));
+    }
+
+    fn assert_sibling_capture_refusal_is_rendered(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let _guard = crate::test_support::env_test_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_sibling_capture_refusal_reaches_app_frame(
+                pane_kind, launch_dir,
+            ));
+    }
+
+    #[test]
+    fn app_frame_chat_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Chat, removed_launch_dir);
+    }
+
+    #[test]
+    fn app_frame_code_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Acp, removed_launch_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_frame_code_non_utf8_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Acp, non_utf8_launch_dir);
+    }
+
+    #[tokio::test]
+    async fn app_frame_notice_follows_active_pane_and_expires_from_canonical_state() {
+        let _guard = crate::test_support::env_test_lock();
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-chat", "/chat/project");
+        chat.pane_kind = PaneKind::Chat;
+        let mut inner = local_code_chat_with_session(&rpc, "sess-code", "/code/project");
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.set_info_notice("CHAT_NOTICE".to_string());
+        }
+        if let ChatPhase::Active(state) = &mut inner.phase {
+            state.set_info_notice("CODE_NOTICE".to_string());
+        }
+        let mut code = crate::acp::Acp::from_chat_for_test(inner);
+        for (mode, expected) in [
+            (crate::app::Mode::Chat, "CHAT_NOTICE"),
+            (crate::app::Mode::Acp, "CODE_NOTICE"),
+            (crate::app::Mode::Chat, "CHAT_NOTICE"),
+        ] {
+            let (rows, content) = draw_app_notice_frame(mode, &mut chat, &mut code);
+            assert_eq!(rows[48].trim_end(), expected);
+            assert_eq!(content.bottom(), 48);
+        }
+        let (rows, content) =
+            draw_app_notice_frame(crate::app::Mode::Dashboard, &mut chat, &mut code);
+        assert!(!rows.iter().any(|row| row.contains("NOTICE")));
+        assert_eq!(content.bottom(), 49);
+
+        // Age the existing notice rather than adding an app-owned copy or sleeping.
+        let mut expired = local_code_chat_with_session(&rpc, "sess-expired", "/code/project");
+        if let ChatPhase::Active(state) = &mut expired.phase {
+            state.set_info_notice("EXPIRED_CODE_NOTICE".to_string());
+            state.info_message.as_mut().unwrap().set_at =
+                Instant::now() - crate::widgets::INFO_BAR_TTL - Duration::from_secs(1);
+        }
+        let mut code = crate::acp::Acp::from_chat_for_test(expired);
+        let (rows, content) = draw_app_notice_frame(crate::app::Mode::Acp, &mut chat, &mut code);
+        assert!(!rows.iter().any(|row| row.contains("NOTICE")));
+        assert_eq!(content.bottom(), 49);
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_with_an_unavailable_launch_directory_sends_no_request() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = removed_launch_dir;
+        let task = tokio::spawn(async move {
+            let outcome = chat.start_session("alpha", None).await;
+            (chat, outcome)
+        });
+
+        // Sending `cwd: null` instead would root the session at the agent's
+        // workspace while it looked healthy.
+        assert_no_rpc_request(
+            &mut rx,
+            "an unavailable launch directory must stop the session before session/new",
+        )
+        .await;
+        let (chat, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a refused start should finish")
+            .unwrap();
+        assert!(
+            matches!(&outcome, SessionStartOutcome::Failed(error) if error.contains("launch directory removed")),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(&chat.phase, ChatPhase::Error(message) if message.contains("launch directory removed")),
+            "the pane must show why no session started"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_local_acp_session_with_a_non_utf8_launch_directory_sends_no_request() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || {
+            use std::os::unix::ffi::OsStrExt;
+            Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"/launch/\xff",
+            )))
+        };
+        let task = tokio::spawn(async move {
+            let outcome = chat.start_session("alpha", None).await;
+            (chat, outcome)
+        });
+
+        // A lossy conversion would name a different directory.
+        assert_no_rpc_request(
+            &mut rx,
+            "a non-UTF-8 launch directory must stop the session before session/new",
+        )
+        .await;
+        let (chat, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a refused start should finish")
+            .unwrap();
+        assert!(
+            matches!(outcome, SessionStartOutcome::Failed(_)),
+            "{outcome:?}"
+        );
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_local_acp_session_with_an_unavailable_launch_directory_keeps_the_old_session()
+    {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Acp,
+                &mut state,
+                removed_launch_dir,
+            )
+            .await;
+            (state, phase)
+        });
+
+        assert_no_rpc_request(
+            &mut rx,
+            "a failed capture must neither mint a replacement nor close the old session",
+        )
+        .await;
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("a refused restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-old");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("launch directory removed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_local_chat_session_with_an_unavailable_launch_directory_sends_no_request() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.launch_dir = removed_launch_dir;
+        let task = tokio::spawn(async move {
+            let outcome = chat.start_session("alpha", None).await;
+            (chat, outcome)
+        });
+
+        assert_no_rpc_request(
+            &mut rx,
+            "an unavailable launch directory must stop a Chat session before session/new",
+        )
+        .await;
+        let (chat, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a refused start should finish")
+            .unwrap();
+        assert!(
+            matches!(&outcome, SessionStartOutcome::Failed(error) if error.contains("launch directory removed")),
+            "{outcome:?}"
+        );
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_local_chat_session_with_an_unavailable_launch_directory_keeps_the_old_session()
+    {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Chat,
+                &mut state,
+                removed_launch_dir,
+            )
+            .await;
+            (state, phase)
+        });
+
+        assert_no_rpc_request(
+            &mut rx,
+            "a failed capture must neither mint a replacement Chat session nor close the old one",
+        )
+        .await;
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("a refused restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-old");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("launch directory removed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_local_chat_session_sends_no_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.launch_dir = || panic!("a resume must not read the launch directory");
+        chat.set_resume_sessions(vec![resume_entry("sess-saved", "alpha", true)]);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", None).await;
+        });
+
+        let request = next_rpc_request(&mut rx, "resume should reattach the saved session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        assert!(
+            request["params"]["chat_mode"].is_null(),
+            "this is a Chat session"
+        );
+        // A resume keeps the root the session already has rather than moving
+        // it to wherever this zerocode process was launched.
+        assert!(request["params"]["cwd"].is_null());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_wss_chat_session_sends_no_launch_directory() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.launch_dir = || panic!("a remote session must not read the local launch directory");
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", None).await;
+        });
+
+        let request = next_rpc_request(&mut rx, "remote Chat should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert!(request["params"]["session_id"].is_null());
+        // This machine's directory names nothing on the daemon's filesystem,
+        // so the daemon's own default, the agent's workspace, answers.
+        assert!(request["params"]["cwd"].is_null());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_wss_chat_session_sends_no_launch_directory() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state, || {
+                panic!("a remote restart must not read the local launch directory")
+            })
+            .await
+        });
+
+        let request = next_rpc_request(&mut rx, "remote Chat restart should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert!(request["params"]["session_id"].is_null());
+        assert!(request["params"]["cwd"].is_null());
+        restart.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_wss_acp_session_opens_the_daemon_picker_without_reading_the_launch_directory() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("remote Code must not read the local launch directory");
+        let task = tokio::spawn(async move {
+            chat.pick_or_start_session("alpha").await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "remote Code lists the daemon root").await;
+        assert_eq!(request["method"], method::FS_LIST_DIR);
+        assert_eq!(request["params"]["path"], WSS_PICKER_ROOT);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"cwd": "/", "entries": []}),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the remote picker should open")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickCwd { .. }));
+        assert_no_rpc_request(&mut rx, "remote Code creates no session before the pick").await;
     }
 
     #[tokio::test]
@@ -21369,6 +22079,7 @@ mod tests {
             crate::client::Transport::Local,
         ));
         let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("an explicit selection must not read the launch directory");
         let task = tokio::spawn(async move {
             chat.start_session("alpha", Some("/selected/project")).await;
             chat
@@ -21409,6 +22120,7 @@ mod tests {
             crate::client::Transport::Local,
         ));
         let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("a resume must not read the launch directory");
         chat.set_resume_sessions(vec![resume_entry("sess-saved", "alpha", true)]);
         let task = tokio::spawn(async move {
             chat.start_session("alpha", None).await;
@@ -21453,7 +22165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+    async fn restart_local_chat_session_sends_the_launch_directory() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -21464,7 +22176,14 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Chat,
+                &mut state,
+                std::env::current_dir,
+            )
+            .await;
+            (state, phase)
         });
 
         let request = next_rpc_request(&mut rx, "restart should start a fresh session").await;
@@ -21472,13 +22191,19 @@ mod tests {
         let params = &request["params"];
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
-        // Regression guard: restart must not re-point the session at the TUI's
-        // launch directory either.
-        assert!(params["cwd"].is_null());
+        assert!(params["chat_mode"].is_null(), "this is a Chat session");
+        // A restart mints a fresh session, so it carries the launch directory
+        // too rather than moving the conversation into agent state.
+        let launch_dir = std::env::current_dir().expect("test process has a cwd");
+        assert_eq!(
+            params["cwd"],
+            launch_dir.to_str().expect("test cwd is UTF-8"),
+            "a local Chat restart must carry the launch directory"
+        );
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/launch/project" }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;
@@ -21490,15 +22215,18 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
-        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+        assert_eq!(state.session_id, "sess-fresh");
+        // The replacement adopts the root the daemon reports.
+        assert_eq!(state.cwd.as_deref(), Some("/launch/project"));
     }
 
     #[tokio::test]
-    async fn restart_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+    async fn restart_local_acp_session_sends_the_launch_directory() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -21509,7 +22237,13 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Acp,
+                &mut state,
+                std::env::current_dir,
+            )
+            .await;
             (state, phase)
         });
 
@@ -21519,15 +22253,20 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        // Regression guard: a restart mints a *fresh* session, so it must not
-        // send the TUI's launch directory either.
-        assert!(params["cwd"].is_null());
+        // A restart mints a fresh session, so it carries the launch directory
+        // too rather than `null`.
+        let launch_dir = std::env::current_dir().expect("test process has a cwd");
+        assert_eq!(
+            params["cwd"],
+            launch_dir.to_str().expect("test cwd is UTF-8"),
+            "a local Code restart must carry the launch directory"
+        );
         respond_ok(
             &rpc,
             &request,
             serde_json::json!({
                 "session_id": "sess-fresh",
-                "workspace_dir": "/agents/alpha/workspace"
+                "workspace_dir": "/launch/project"
             }),
         );
 
@@ -21545,8 +22284,8 @@ mod tests {
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
-        // The replacement session adopts the daemon-selected workspace.
-        assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
+        // The replacement adopts the launch project reported by the daemon.
+        assert_eq!(state.cwd.as_deref(), Some("/launch/project"));
     }
 
     #[tokio::test]
@@ -21561,7 +22300,13 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            let phase = Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Chat,
+                &mut state,
+                std::env::current_dir,
+            )
+            .await;
             (state, phase)
         });
 
@@ -21616,7 +22361,13 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            let phase = Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+            let phase = Chat::restart_session_for_state(
+                &client,
+                PaneKind::Chat,
+                &mut state,
+                std::env::current_dir,
+            )
+            .await;
             (state, phase)
         });
 
@@ -21665,7 +22416,10 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state, || {
+                panic!("remote Code must not read the local launch directory")
+            })
+            .await;
             (state, phase)
         });
 
