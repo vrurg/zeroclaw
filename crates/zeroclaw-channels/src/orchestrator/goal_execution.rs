@@ -8069,6 +8069,220 @@ mod tests {
         );
     }
 
+    struct GoalTimeoutExecutingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl zeroclaw_api::attribution::Attributable for GoalTimeoutExecutingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "timeout-tool-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_runtime::tools::Tool for GoalTimeoutExecutingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Return a delayed fixture result."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<zeroclaw_runtime::tools::ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+            Ok(zeroclaw_runtime::tools::ToolResult {
+                success: true,
+                output: "delayed tool result".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_timeout_executing_tool_commits_pairing_failure_and_drains_batch() {
+        use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+        use zeroclaw_runtime::control_plane::{SqliteTaskStore, TaskStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel = Arc::new(MatrixGoalErrorRecordingChannel::default());
+        let provider = Arc::new(GoalPolicyProvider {
+            requests: Mutex::new(Vec::new()),
+            tool_rounds: 1,
+            calls_per_round: 1,
+        });
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut context = matrix_policy_context(
+            backend.clone(),
+            channel.clone(),
+            provider.clone(),
+            tool_calls.clone(),
+        );
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.message_timeout_secs = 1;
+        ctx.pacing.message_timeout_scale_max = Some(1);
+        ctx.tools_registry = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                GoalTimeoutExecutingTool(tool_calls.clone()),
+            )]),
+        );
+        let key = "matrix_goal_timeout_tool_fixture";
+        let driver = Arc::new(
+            MatrixGoalSessionDriver::new(
+                context.clone(),
+                key.into(),
+                "user".into(),
+                "matrix:test:room".into(),
+                ChannelMessage::new(
+                    "event",
+                    "user",
+                    "room",
+                    "/goal start bounded repair",
+                    "matrix",
+                    1,
+                ),
+                goal_command_lock(&context.persist_locks, key)
+                    .lock_owned()
+                    .await,
+            )
+            .unwrap(),
+        );
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key.clone(),
+            "test",
+            "matrix:test:room",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "user".into(),
+            },
+        )
+        .unwrap();
+        let settings = GoalHostSettings::new(
+            true,
+            GoalBudgetLimits {
+                token_limit: Some(1000),
+                cost_limit_usd: None,
+            },
+            1,
+            "timeout-test-boot",
+        )
+        .unwrap();
+        let runtime = GoalRuntime::new(store.clone());
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        let accounting = Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                store.clone(),
+                tracker,
+                "test",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        );
+        let supervisor =
+            GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting)));
+        let mut submission = supervisor
+            .submit(
+                settings.clone(),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded repair".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(projection) = submission.response() else {
+            panic!("fixture must admit a running Goal");
+        };
+        let scope =
+            GoalExecutionScope::new(&projection.task_id, key, projection.execution_epoch).unwrap();
+        supervisor
+            .launch_after_response(settings, &mut submission)
+            .await
+            .unwrap();
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), supervisor.drain(&scope))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let timeout_text =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-request-timeout");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Goal parent operation failed; tool pairing also failed (Goal parent turn returned with an unpaired tool batch): {timeout_text}"
+            )
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let task = store.current_goal_for_session(key).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&task.id, key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("goal_tool_pairing_incomplete")
+        );
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_tool_epoch.is_none());
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        let rows = zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), key);
+        assert!(rows.iter().all(|row| row.role != "assistant"));
+        let failure_text = zeroclaw_runtime::i18n::get_required_cli_string(
+            matrix_goal_failure_key(GoalFailureReason::ToolResultsUnpaired),
+        );
+        let messages = channel.messages.lock().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| **text == timeout_text)
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|text| **text == failure_text)
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .position(|text| *text == timeout_text)
+                .unwrap()
+                < messages
+                    .iter()
+                    .position(|text| *text == failure_text)
+                    .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn matrix_goal_policy_loop_break_commits_pairing_failure_after_core_error() {
         use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
