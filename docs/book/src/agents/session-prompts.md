@@ -8,6 +8,9 @@ They are session-scoped, not agent-scoped: another chat session never sees
 them. Resetting or deleting the session removes them atomically with its chat
 history. They are stored only by the SQLite session backend.
 
+Durable TTL cleanup also removes attachments atomically with an expired
+session; history-only clearing does not remove them.
+
 Each admitted primary turn is bound to the durable owner's incarnation, not
 just its reusable session key. Reset or deletion invalidates that binding. A
 late prompt read or mutation from the old turn fails instead of recreating a
@@ -137,6 +140,13 @@ session_prompt_approval = "disabled"
 Read/Act authorization and ordinary risk-profile approval rules still apply.
 This is an operator configuration decision; an agent cannot change the active
 policy during a turn.
+
+This mode is unsuitable where untrusted model or user input can create
+attachments without the operator accepting that risk. With ordinary
+auto-approval or full autonomy, prompt mutations may proceed without an
+operator seeing the proposed content. Text influenced by a web page, file, or
+inbound message can then persist in later system prompts across daemon
+restarts until the attachment or owning session is removed.
 
 Approval-policy changes follow the existing configuration-generation boundary:
 RPC sessions refresh their configuration at turn entry; existing WebSocket

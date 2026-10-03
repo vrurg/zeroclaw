@@ -280,6 +280,10 @@ pub struct Config {
     /// Default: `required`. A risk-profile override may replace the global
     /// value with either `required` or `disabled`; agents cannot select this
     /// policy for themselves.
+    /// `disabled` is unsuitable where untrusted model or user input can create
+    /// attachments without the operator accepting that risk. Ordinary
+    /// auto-approval or full autonomy may then permit persistent writes without
+    /// an operator seeing the proposed content.
     #[serde(default)]
     #[group = "Agent"]
     pub session_prompt_approval: SessionPromptApproval,
@@ -14548,6 +14552,10 @@ pub struct RiskProfileConfig {
     /// Override the global persistent-session-prompt approval policy for
     /// agents assigned to this profile. Omitted means inherit the global
     /// `session_prompt_approval` setting.
+    /// `disabled` is unsuitable where untrusted model or user input can create
+    /// attachments without the operator accepting that risk. Ordinary
+    /// auto-approval or full autonomy may then permit persistent writes without
+    /// an operator seeing the proposed content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_prompt_approval: Option<SessionPromptApproval>,
     /// Extra directory roots the agent may access.
@@ -14651,6 +14659,10 @@ impl Default for RiskProfileConfig {
 
 /// Whether each persistent-session-prompt mutation requires a one-time,
 /// content-bound operator approval. The default is deliberately fail-closed.
+/// `disabled` is unsuitable where untrusted model or user input can create
+/// attachments without the operator accepting that risk. Ordinary auto-approval
+/// or full autonomy may then permit persistent writes without an operator seeing
+/// the proposed content.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
