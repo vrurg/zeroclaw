@@ -81,6 +81,54 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// Audit-only record of a normal control waiting for its session's turn boundary.
+///
+/// This record is not lifecycle or authorization authority. User objectives and
+/// resume answers remain process-local until the canonical transition commits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalControlIntent {
+    /// Fresh UUID v4 identifying this intent, not a task or session identity.
+    pub intent_id: String,
+    /// Session identity captured at authenticated admission.
+    pub session_id: String,
+    /// Exact current task, absent only for Start.
+    pub task_id: Option<String>,
+    /// Admitted task epoch, absent only for Start.
+    pub expected_epoch: Option<i64>,
+    /// Terminal predecessor captured for Start; not a replacement authority.
+    pub predecessor_task_id: Option<String>,
+    pub kind: GoalControlIntentKind,
+    pub owner_pid: u32,
+    pub owner_boot_id: String,
+    pub created_at: String,
+}
+
+/// Bounded control parameters: deliberately contains no objective or answer text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalControlIntentKind {
+    Start {
+        budget: zeroclaw_commands::goal::GoalBudgetSelection,
+    },
+    Resume {
+        has_response: bool,
+    },
+    Pause,
+    SetBudget {
+        budget: zeroclaw_commands::goal::GoalBudgetSelection,
+    },
+}
+
+/// Final audit disposition, independent of the canonical Goal lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalControlIntentSettlement {
+    /// The claimed control committed its canonical transition.
+    Applied,
+    /// A competing canonical transition invalidated this control.
+    Superseded { reason: String },
+    /// The control was not applied (for example after cancellation or restart).
+    Abandoned { reason: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -272,6 +320,31 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// Persist a pending audit intent before acknowledging deferred work.
+    async fn record_control_intent(&self, _intent: &GoalControlIntent) -> anyhow::Result<()> {
+        anyhow::bail!("Goal registry does not support deferred control intents")
+    }
+
+    /// Claim pending audit work once, only for the boot that recorded it.
+    /// Returns Missing for an absent intent and Stale for any other failed guard.
+    async fn claim_control_intent(
+        &self,
+        _intent_id: &str,
+        _owner_boot_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("Goal registry does not support deferred control intents")
+    }
+
+    /// Settle claimed work as applied, or pending/claimed work as not applied.
+    /// Settled records cannot be changed or replayed.
+    async fn settle_control_intent(
+        &self,
+        _intent_id: &str,
+        _settlement: GoalControlIntentSettlement,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("Goal registry does not support deferred control intents")
+    }
+
     /// Resolve an observational latest non-terminal goal for `agent`.
     ///
     /// This is not a V1 control or attribution authority: multiple sessions

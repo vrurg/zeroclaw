@@ -15,6 +15,9 @@ use super::{
     log_unreadable_task_row, row_to_record, status_to_db,
 };
 
+#[path = "goal_control_intents.rs"]
+mod control_intents;
+
 fn transition_failure(conn: &Connection, task_id: &str) -> Result<GoalTransitionResult> {
     let row = conn
         .query_row(
@@ -48,6 +51,7 @@ fn reject_session_goal_legacy_mutation(conn: &Connection, task_id: &str) -> Resu
 }
 
 pub(super) fn converge_schema(conn: &Connection) -> Result<()> {
+    control_intents::converge_schema(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS goal_tasks (
              task_id        TEXT PRIMARY KEY
@@ -372,6 +376,7 @@ impl SqliteTaskStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start goal boot reconciliation")?;
         let now = chrono::Utc::now().to_rfc3339();
+        control_intents::abandon_previous_boot(&tx, boot_id, &now)?;
         let daemon_restart = pause_reason_to_db(GoalPauseReason::DaemonRestart)?;
 
         let missing_extension = tx
@@ -774,6 +779,29 @@ fn upsert_continuation_context(
 
 #[async_trait::async_trait]
 impl GoalTaskRegistry for SqliteTaskStore {
+    async fn record_control_intent(
+        &self,
+        intent: &zeroclaw_goal::task::GoalControlIntent,
+    ) -> Result<()> {
+        control_intents::record(&self.conn.lock(), intent)
+    }
+
+    async fn claim_control_intent(
+        &self,
+        intent_id: &str,
+        owner_boot_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        control_intents::claim(&self.conn.lock(), intent_id, owner_boot_id)
+    }
+
+    async fn settle_control_intent(
+        &self,
+        intent_id: &str,
+        settlement: zeroclaw_goal::task::GoalControlIntentSettlement,
+    ) -> Result<GoalTransitionResult> {
+        control_intents::settle(&self.conn.lock(), intent_id, settlement)
+    }
+
     async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn
@@ -1287,10 +1315,15 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if deleted == 0 {
             return transition_failure(&tx, task_id);
         }
+        control_intents::delete_settled_start_intents(&tx, session_id)?;
         tx.commit().context("commit guarded goal deletion")?;
         Ok(GoalTransitionResult::Applied)
     }
 }
+
+#[cfg(test)]
+#[path = "goal_control_intent_tests.rs"]
+mod control_intent_tests;
 
 #[cfg(test)]
 mod tests {
