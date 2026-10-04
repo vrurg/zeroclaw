@@ -4053,6 +4053,9 @@ fn turns_appended_after<'a>(
 /// concurrent worker's append can rotate `known_prefix`'s own earliest
 /// messages out of the live cache without changing its length, or even
 /// shrinking it below `known_prefix.len()`.
+/// Project the complete merged state through the shared export helper before
+/// either durable replacement or cache publication, without modifying the
+/// provider's working history.
 ///
 /// Returns `true` once the durable write (if any) has succeeded and the
 /// in-memory cache and `history_crumb_flags` now match the published state.
@@ -4090,6 +4093,10 @@ fn resync_sender_history_after_trim(
             published_turns.extend_from_slice(turns_appended_after(known_prefix, live));
         }
     }
+    let published_turns = zeroclaw_runtime::agent::prompt::redact_session_prompt_history_for_export(
+        &published_turns,
+        ctx.prompt_config.channels.session_prompts_enabled,
+    );
 
     if let Some(ref store) = ctx.session_store {
         // One call, not two independent best-effort writes: if the transcript
@@ -4196,7 +4203,7 @@ fn resync_history_after_trim_or_evict_cache(
     known_prefix: &[ChatMessage],
     outgoing_user_turn_raw_content: Option<&str>,
 ) -> bool {
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let last_user_idx = last_turn_opening_user_index(history).unwrap_or(0);
     let retained_prior_turns = if last_user_idx >= 1 {
         &history[1..=last_user_idx]
     } else {
@@ -4273,48 +4280,47 @@ fn resync_history_after_trim_or_evict_cache(
     !reconciled
 }
 
-/// Extract tool-call (assistant with tool_call content) and tool-result
-/// messages from the current turn in the LLM history, excluding the final
-/// assistant text response.  "Current turn" = everything after the last
-/// user-role message.
-fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
-    // Find the index of the last user message — tool messages for the
-    // current turn come after it.
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
-
-    let tail = &history[last_user_idx + 1..];
-    if tail.is_empty() {
-        return Vec::new();
-    }
-
-    // Everything except the very last assistant message (which is the
-    // final text response that gets stored separately).
-    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
-        tail.len() - 1
-    } else {
-        tail.len()
-    };
-
-    tail[..end]
-        .iter()
-        .filter(|m| m.role == "assistant" || m.role == "tool")
-        .cloned()
-        .collect()
+fn last_turn_opening_user_index(history: &[ChatMessage]) -> Option<usize> {
+    // Runtime owns the carrier distinction. Scan backward and clone only
+    // user-role candidates needed by its existing ConversationMessage API.
+    history.iter().rposition(|message| {
+        message.role == "user"
+            && zeroclaw_runtime::agent::is_turn_opening_user_message(
+                &zeroclaw_providers::ConversationMessage::Chat(message.clone()),
+            )
+    })
 }
 
-/// Persistent-prompt mutation arguments are private provider context. Retained
-/// channel history must not turn them into a later transcript/API export.
-fn redact_sensitive_session_prompt_tool_messages(
-    messages: Vec<ChatMessage>,
+/// Project the current turn's complete exchange and delivered final response
+/// before selecting the assistant/tool rows retained by channels. Text-result
+/// carriers supply host sensitivity provenance but are not persisted as user
+/// turns. The provider's working history remains unchanged.
+fn retained_current_turn_messages(
+    history: &[ChatMessage],
+    final_response: &str,
+    keep_tool_context: bool,
     session_prompts_enabled: bool,
 ) -> Vec<ChatMessage> {
-    if !session_prompts_enabled {
-        // With the feature disabled, preserve ordinary transcript content
-        // instead of applying a prompt-specific heuristic to prose or
-        // malformed tool diagnostics that merely mention its names.
-        return messages;
+    let mut delta = Vec::new();
+    if keep_tool_context {
+        let last_user_idx = last_turn_opening_user_index(history).unwrap_or(0);
+        let tail = history.get(last_user_idx + 1..).unwrap_or_default();
+        // The loop's final assistant is replaced by the delivered response.
+        let end = if tail.last().is_some_and(|m| m.role == "assistant") {
+            tail.len() - 1
+        } else {
+            tail.len()
+        };
+        delta.extend_from_slice(&tail[..end]);
     }
-    zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages)
+    delta.push(ChatMessage::assistant(final_response));
+    zeroclaw_runtime::agent::prompt::redact_session_prompt_history_for_export(
+        &delta,
+        session_prompts_enabled,
+    )
+    .into_iter()
+    .filter(|message| message.role == "assistant" || message.role == "tool")
+    .collect()
 }
 
 fn rollback_orphan_user_turn(
@@ -10615,25 +10621,16 @@ async fn process_channel_message_body(
             // below; only this turn's contribution to the stored transcript
             // is dropped, and the next turn reloads from the backend.
             let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if !history_resync_failed && keep_tool_turns > 0 {
-                // Find tool messages for the current turn: everything after
-                // the last user message up to (but not including) the final
-                // assistant response that matches our delivered text.
-                let tool_messages = redact_sensitive_session_prompt_tool_messages(
-                    extract_current_turn_tool_messages(&history),
+            if !history_resync_failed {
+                let retained_messages = retained_current_turn_messages(
+                    &history,
+                    &history_response,
+                    keep_tool_turns > 0,
                     ctx.prompt_config.channels.session_prompts_enabled,
                 );
-                for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                for message in retained_messages {
+                    append_sender_turn(ctx.as_ref(), &history_key, message);
                 }
-            }
-
-            if !history_resync_failed {
-                append_sender_turn(
-                    ctx.as_ref(),
-                    &history_key,
-                    ChatMessage::assistant(&history_response),
-                );
             }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
@@ -23171,6 +23168,267 @@ api_key = "anthropic-key"
             stamped.contains("] hello"),
             "timestamped content should preserve the user message after the timestamp: {stamped}"
         );
+    }
+
+    const RETENTION_PRIVATE_MARKER: &str = "session-prompt-private-marker";
+
+    struct SessionPromptRetentionProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        fail_after_set: bool,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SessionPromptRetentionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SessionPromptRetentionProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SessionPromptRetentionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("retention fixture requires history requests")
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(messages.to_vec());
+            match requests.len() {
+                1 => Ok(format!(
+                    "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{RETENTION_PRIVATE_MARKER}\"}}}}</tool_call>"
+                )),
+                _ if self.fail_after_set => anyhow::bail!("retention fixture transport failure"),
+                2 => Ok(
+                    "<tool_call>{\"name\":\"session_prompt_list\",\"arguments\":{}}</tool_call>"
+                        .to_string(),
+                ),
+                _ => Ok("Session context saved and listed.".to_string()),
+            }
+        }
+    }
+
+    async fn run_session_prompt_retention_turn(fail_after_set: bool, trim_prior_turn: bool) {
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+        use zeroclaw_tools::sessions::{SessionPromptListTool, SessionPromptSetTool};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let provider = Arc::new(SessionPromptRetentionProvider {
+            requests: Mutex::new(Vec::new()),
+            fail_after_set,
+        });
+        let base = test_channel_ctx_with_backend(backend.clone());
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            ..SecurityPolicy::default()
+        });
+        let mut config = (*base.prompt_config).clone();
+        config.channels.session_prompts_enabled = true;
+        config.session_prompt_approval = zeroclaw_config::schema::SessionPromptApproval::Disabled;
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            auto_approve: vec!["session_prompt_set".into(), "session_prompt_list".into()],
+            ..Default::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), profile.clone());
+        let mut agent = (*base.agent_cfg).clone();
+        agent.resolved.keep_tool_context_turns = 2;
+        if trim_prior_turn {
+            agent.runtime_profile =
+                zeroclaw_config::providers::RuntimeProfileRef::from("retention-trim");
+            config.runtime_profiles.insert(
+                "retention-trim".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_context_tokens: Some(8_000),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert("test".into(), agent.clone());
+        }
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::from([(
+                "webhook".into(),
+                mock_channel("webhook"),
+            )])),
+            model_provider: provider.clone(),
+            security: security.clone(),
+            autonomy_level: AutonomyLevel::Full,
+            agent_cfg: Arc::new(agent),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(SessionPromptSetTool::new(security.clone())),
+                    Box::new(SessionPromptListTool::new(security)),
+                ]),
+            ),
+            approval_manager: Arc::new(
+                zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&profile),
+            ),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            prompt_config: Arc::new(config.clone()),
+            live_config: Arc::new(RwLock::new(config)),
+            ..(*base).clone()
+        });
+        let mut msg = channel_message("webhook", None);
+        msg.id = "retention-volatile-message-id".into();
+        msg.content = "Save the current task context.".into();
+        let key = runtime_conversation_history_key(&ctx, &msg);
+        if trim_prior_turn {
+            append_sender_turn(
+                &ctx,
+                &key,
+                ChatMessage::user("older bounded fixture ".repeat(6_000)),
+            );
+            append_sender_turn(&ctx, &key, ChatMessage::assistant("older fixture reply"));
+        }
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        // Prove valid attachment state and provider use before testing its egress copies.
+        let owner = backend.admit_session_prompt_owner(&key).unwrap();
+        assert_eq!(
+            backend.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+            RETENTION_PRIVATE_MARKER
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.contains(RETENTION_PRIVATE_MARKER))
+        );
+        if !fail_after_set {
+            assert_eq!(requests.len(), 3);
+            assert!(requests[2].iter().any(|m| m.role == "user"
+                && m.content.starts_with("[Tool results]")
+                && m.content.contains("[Session-prompt tool result]")
+                && m.content.contains(RETENTION_PRIVATE_MARKER)));
+        }
+        drop(requests);
+
+        let durable = backend.load(&key);
+        let cache = ctx
+            .conversation_histories
+            .lock()
+            .unwrap()
+            .peek(&key)
+            .unwrap()
+            .clone();
+        let sql = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        let mut statement = sql
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id")
+            .unwrap();
+        let raw: Vec<(String, String)> = statement
+            .query_map([&key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            raw.iter()
+                .all(|(_, text)| !text.contains(RETENTION_PRIVATE_MARKER)),
+            "raw SQLite transcript leaked prompt content"
+        );
+        for messages in [&durable, &cache] {
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains(RETENTION_PRIVATE_MARKER))
+            );
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains("retention-volatile-message-id"))
+            );
+            let retained = if trim_prior_turn {
+                assert!(
+                    zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(
+                        &messages[0].content
+                    )
+                );
+                &messages[1..]
+            } else {
+                messages.as_slice()
+            };
+            assert_eq!(retained.iter().filter(|m| m.role == "user").count(), 1);
+            assert!(
+                retained[0]
+                    .content
+                    .ends_with("Save the current task context.")
+            );
+        }
+        let pairs = |messages: &[ChatMessage]| {
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&durable), pairs(&cache));
+        // The no-resync branch records cache provenance only; absent durable
+        // provenance is distinct from a trim and is inferred as false at hydration.
+        assert_eq!(
+            backend
+                .get_session_trim_breadcrumb(&key)
+                .unwrap()
+                .unwrap_or(false),
+            trim_prior_turn
+        );
+        assert_eq!(
+            ctx.history_crumb_flags.lock().unwrap().peek(&key).copied(),
+            Some(trim_prior_turn)
+        );
+        let retained = &durable[usize::from(trim_prior_turn)..];
+        if fail_after_set {
+            assert_eq!(retained.len(), 2);
+            assert_eq!(
+                retained[1].content,
+                "[Task failed — not continuing this request]"
+            );
+        } else {
+            assert_eq!(retained.len(), 4);
+            assert!(retained[1..3].iter().all(|m| {
+                m.role == "assistant"
+                    && m.content
+                        .contains("[Session-prompt tool exchange omitted from export]")
+            }));
+        }
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let hydrated = hydrate_session_transcript(&reopened, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pairs(&hydrated.messages), pairs(&durable));
+    }
+
+    #[tokio::test]
+    async fn channel_session_prompt_retention_text_set_list_keeps_provider_context_private() {
+        run_session_prompt_retention_turn(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn channel_session_prompt_retention_error_does_not_resync_raw_tool_context() {
+        run_session_prompt_retention_turn(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn channel_session_prompt_retention_trimmed_text_set_list_preserves_breadcrumb() {
+        run_session_prompt_retention_turn(false, true).await;
     }
 
     #[test]
@@ -54722,7 +54980,7 @@ Done."#;
     // ── Tests tool context preservation ──────────────
 
     #[test]
-    fn extract_current_turn_tool_messages_returns_intermediate_messages() {
+    fn retained_current_turn_messages_returns_intermediate_messages() {
         let history = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("older msg"),
@@ -54733,26 +54991,29 @@ Done."#;
             ChatMessage::assistant("Done, iPad is blocked."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
-        assert_eq!(tool_msgs.len(), 2);
+        let tool_msgs =
+            retained_current_turn_messages(&history, "Done, iPad is blocked.", true, true);
+        assert_eq!(tool_msgs.len(), 3);
         assert_eq!(tool_msgs[0].role, "assistant");
         assert!(tool_msgs[0].content.contains("tool_call"));
         assert_eq!(tool_msgs[1].role, "tool");
+        assert_eq!(tool_msgs[2].content, "Done, iPad is blocked.");
     }
 
     #[test]
-    fn extract_current_turn_tool_messages_empty_when_no_tools() {
+    fn retained_current_turn_messages_keeps_final_when_no_tools() {
         let history = vec![
             ChatMessage::user("hello"),
             ChatMessage::assistant("Hi there!"),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
-        assert!(tool_msgs.is_empty());
+        let tool_msgs = retained_current_turn_messages(&history, "Hi there!", true, true);
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0].content, "Hi there!");
     }
 
     #[test]
-    fn extract_current_turn_tool_messages_multiple_tool_rounds() {
+    fn retained_current_turn_messages_multiple_tool_rounds() {
         let history = vec![
             ChatMessage::user("do two things"),
             ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
@@ -54762,8 +55023,271 @@ Done."#;
             ChatMessage::assistant("All done."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
-        assert_eq!(tool_msgs.len(), 4);
+        let tool_msgs = retained_current_turn_messages(&history, "All done.", true, true);
+        assert_eq!(tool_msgs.len(), 5);
+        assert_eq!(tool_msgs[4].content, "All done.");
+    }
+
+    fn retained_tool_exchange_for_test(
+        messages: &[ChatMessage],
+        enabled: bool,
+    ) -> Vec<ChatMessage> {
+        let mut history = vec![ChatMessage::user("current turn")];
+        history.extend_from_slice(messages);
+        history.push(ChatMessage::assistant("final response"));
+        let mut retained =
+            retained_current_turn_messages(&history, "final response", true, enabled);
+        assert_eq!(retained.pop().unwrap().content, "final response");
+        retained
+    }
+
+    fn message_pairs(messages: &[ChatMessage]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    fn retention_test_context(backend: Arc<dyn SessionBackend>) -> Arc<ChannelRuntimeContext> {
+        let base = test_channel_ctx_with_backend(backend);
+        let mut config = (*base.prompt_config).clone();
+        config.channels.session_prompts_enabled = true;
+        Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(config),
+            ..(*base).clone()
+        })
+    }
+
+    fn sensitive_text_exchange() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::assistant(format!(
+                "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{RETENTION_PRIVATE_MARKER}\"}}}}</tool_call>"
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\n[Session-prompt tool result]\n{RETENTION_PRIVATE_MARKER}"
+            )),
+        ]
+    }
+
+    #[test]
+    fn channel_session_prompt_retention_feature_off_preserves_unmarked_and_masks_host_marked() {
+        let marked = sensitive_text_exchange();
+        let retained = retained_tool_exchange_for_test(&marked, false);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].role, "assistant");
+        assert!(
+            retained[0]
+                .content
+                .contains("[Session-prompt tool exchange omitted from export]")
+        );
+
+        let unmarked = vec![
+            marked[0].clone(),
+            ChatMessage::user("[Tool results]\nordinary unmarked response"),
+        ];
+        let mut history = vec![ChatMessage::user("current")];
+        history.extend(unmarked);
+        history.push(ChatMessage::assistant("loop response"));
+        let prose = "session_prompt_set is disabled";
+        let retained = retained_current_turn_messages(&history, prose, true, false);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].content, marked[0].content);
+        assert_eq!(retained[1].content, prose);
+    }
+
+    #[test]
+    fn channel_session_prompt_retention_native_parity_at_completion_and_trim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let ctx = retention_test_context(backend.clone());
+        let exchange = vec![
+            sensitive_text_exchange()[0].clone(),
+            ChatMessage::tool(serde_json::json!({"tool_call_id":"private-call", "content":RETENTION_PRIVATE_MARKER, "session_prompt_tool_result":true}).to_string()),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"ordinary-call","name":"shell","arguments":{}}]}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"ordinary-call","content":"ordinary output"}"#),
+        ];
+        for enabled in [true, false] {
+            let retained = retained_tool_exchange_for_test(&exchange, enabled);
+            assert_eq!(retained.len(), 4);
+            assert!(
+                retained[..2]
+                    .iter()
+                    .all(|m| m.content == "[Session-prompt tool exchange omitted from export]")
+            );
+            assert_eq!(message_pairs(&retained[2..]), message_pairs(&exchange[2..]));
+        }
+        let mut trimmed = vec![
+            ChatMessage::user(breadcrumb_text()),
+            ChatMessage::user("current"),
+        ];
+        trimmed.extend(exchange.clone());
+        assert!(resync_sender_history_after_trim(
+            &ctx,
+            "native-retention",
+            &trimmed,
+            true,
+            &[],
+            false
+        ));
+        let durable = backend.load("native-retention");
+        assert!(
+            durable
+                .iter()
+                .all(|m| !m.content.contains(RETENTION_PRIVATE_MARKER))
+        );
+        assert_eq!(message_pairs(&durable[4..]), message_pairs(&exchange[2..]));
+        assert_eq!(
+            message_pairs(&durable),
+            message_pairs(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("native-retention")
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn channel_session_prompt_retention_concurrent_tail_and_repeated_projection_are_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let ctx = retention_test_context(backend.clone());
+        let key = "concurrent-retention";
+        let known = [ChatMessage::user("worker A")];
+        append_sender_turn(&ctx, key, known[0].clone());
+        let tail = vec![
+            ChatMessage::user("worker B"),
+            ChatMessage::assistant("ordinary response"),
+            ChatMessage::assistant("[Session-prompt tool exchange omitted from export]"),
+            ChatMessage::user("[Tool results]\n[Session-prompt tool exchange omitted from export]"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+        ];
+        for message in &tail {
+            append_sender_turn(&ctx, key, message.clone());
+        }
+        let mut trimmed = vec![ChatMessage::user(breadcrumb_text()), known[0].clone()];
+        trimmed.extend(sensitive_text_exchange());
+        assert!(resync_sender_history_after_trim(
+            &ctx, key, &trimmed, true, &known, false
+        ));
+        let durable = backend.load(key);
+        assert!(
+            durable
+                .iter()
+                .all(|m| !m.content.contains(RETENTION_PRIVATE_MARKER))
+        );
+        assert_eq!(
+            message_pairs(&durable[trimmed.len()..]),
+            message_pairs(&tail)
+        );
+        assert_eq!(durable[0].content, breadcrumb_text());
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(key).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            message_pairs(&durable),
+            message_pairs(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek(key)
+                    .unwrap()
+            )
+        );
+        let projected = zeroclaw_runtime::agent::prompt::redact_session_prompt_history_for_export(
+            &durable, true,
+        );
+        assert_eq!(message_pairs(&projected), message_pairs(&durable));
+        assert_eq!(
+            message_pairs(
+                &zeroclaw_runtime::agent::prompt::redact_session_prompt_history_for_export(
+                    &projected, true
+                )
+            ),
+            message_pairs(&projected)
+        );
+        assert!(resync_sender_history_after_trim(
+            &ctx, key, &durable, true, &durable, true
+        ));
+        assert_eq!(message_pairs(&backend.load(key)), message_pairs(&durable));
+    }
+
+    #[test]
+    fn channel_session_prompt_retention_projects_final_reply_without_retained_tool_context() {
+        let history = [
+            ChatMessage::user("current"),
+            ChatMessage::assistant("loop reply"),
+        ];
+        let envelope = sensitive_text_exchange()[0].content.clone();
+        let retained = retained_current_turn_messages(&history, &envelope, false, true);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].content,
+            "[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(history[1].content, "loop reply");
+        let ordinary =
+            retained_current_turn_messages(&history, "ordinary final response", false, true);
+        assert_eq!(ordinary[0].content, "ordinary final response");
+    }
+
+    #[test]
+    fn channel_session_prompt_retention_parse_feedback_misanchor_remains_private() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let ctx = retention_test_context(backend.clone());
+        let key = "parse-feedback-retention";
+        let known = [ChatMessage::user("raw current input")];
+        append_sender_turn(&ctx, key, known[0].clone());
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("volatile preamble and current input"),
+        ];
+        history.extend(sensitive_text_exchange());
+        history.extend([
+            ChatMessage::assistant("malformed call"),
+            ChatMessage::user("[Tool call parse error] repair the call"),
+            ChatMessage::assistant("final"),
+        ]);
+        let before = message_pairs(&history);
+        // Synthetic feedback anchoring/preamble placement is a pre-existing
+        // integrity issue outside this repair; complete retention projection
+        // must still protect privacy without changing provider history.
+        assert!(!resync_history_after_trim_or_evict_cache(
+            &ctx,
+            key,
+            &history,
+            false,
+            false,
+            known.len(),
+            &known,
+            Some("raw current input")
+        ));
+        let durable = backend.load(key);
+        assert!(
+            durable
+                .iter()
+                .all(|m| !m.content.contains(RETENTION_PRIVATE_MARKER))
+        );
+        assert_eq!(
+            message_pairs(&durable),
+            message_pairs(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek(key)
+                    .unwrap()
+            )
+        );
+        assert_eq!(message_pairs(&history), before);
     }
 
     #[test]
@@ -54777,7 +55301,7 @@ Done."#;
             ChatMessage::tool("shell result"),
         ];
 
-        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
+        let retained = retained_tool_exchange_for_test(&messages, true);
         assert_eq!(retained.len(), 4);
         assert!(
             retained
@@ -54800,7 +55324,7 @@ Done."#;
             ChatMessage::tool("shell result"),
             ChatMessage::tool("private marker from list"),
         ];
-        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
+        let retained = retained_tool_exchange_for_test(&messages, true);
         assert_eq!(retained.len(), 3);
         assert!(
             retained
@@ -54818,7 +55342,7 @@ Done."#;
             ChatMessage::tool("session prompt tool name echoed"),
         ];
 
-        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), true);
+        let retained = retained_tool_exchange_for_test(&messages, true);
         assert_eq!(retained.len(), messages.len());
         for (actual, expected) in retained.iter().zip(&messages) {
             assert_eq!(actual.role, expected.role);
@@ -54835,7 +55359,7 @@ Done."#;
             ChatMessage::tool("ordinary diagnostic details"),
         ];
 
-        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), false);
+        let retained = retained_tool_exchange_for_test(&messages, false);
         assert_eq!(retained.len(), messages.len());
         for (actual, expected) in retained.iter().zip(&messages) {
             assert_eq!(actual.role, expected.role);

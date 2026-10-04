@@ -37,6 +37,39 @@ behavior because that runtime has no attached durable owner it can clear. An
 operator switching back to durable persistence should reset the session after
 the backend is re-enabled before relying on the old durable rows being gone.
 
+## External database tools, upgrades, and downgrades
+
+Each attachment row records its owning session incarnation. Reads and writes
+use that binding, not just the reusable session key. Deleting or recreating
+session metadata through a connection without SQLite foreign-key enforcement
+(for example, an external database tool) cannot pass bound attachments to the
+replacement session. Leftover orphan or mismatched rows are removed when the
+session backend next opens; a write also removes that key's non-current rows
+in the same transaction as its owner check and update.
+
+At backend open, migration and reconciliation are automatic, transactional,
+and idempotent. An unbound legacy row is attached to its key's current owner
+only if that metadata exists; genuine orphans are deleted. Adoption preserves
+valid content without rotating the owner, but cannot prove the row's original
+lifetime. A legacy row that survived an earlier external delete-and-recreate
+cannot be distinguished from valid retained context. Reset affected sessions
+if that historical uncertainty is unacceptable. Already-bound mismatches are
+stale, not legacy, and are removed rather than adopted.
+
+A release without session-prompt support ignores the attachment table. Its
+history clear does not remove attachments or rotate their owner, so retained
+attachments can become active again after upgrading. Its deletion or expiry
+may leave rows behind, but bound leftovers do not become visible to a new
+owner and are removed at the next backend open. Before downgrading, reset or
+delete sessions whose attachments must not return. After upgrading again,
+reset sessions that were history-cleared while downgraded before resuming
+their conversations.
+
+Turning the feature off stops injection and tools; it deletes no stored
+attachments. Do not run different binary versions concurrently against the
+same session database. Legacy unbound writes are hidden until open-time
+reconciliation and do not carry the current lifetime guarantee.
+
 ## Enable the feature
 
 The feature is off by default. Enable durable SQLite sessions and then opt in:
@@ -184,6 +217,13 @@ the opaque arguments or results. This redaction is the restart boundary: after
 loading a retained transcript, the model does not recover the hidden tool
 exchange from history, but the attached prompt collection itself remains
 available through the session metadata and the next injected system prompt.
+
+Masking does not remove content-derived fingerprints. Generic approval and
+audit arguments can include the attachment's full `content_sha256`; LLM request
+telemetry can include a truncated `system_sha256` covering the system prompt,
+including its attachments. These hashes do not reveal the text directly, but
+can help someone with access to those records confirm guessed, low-entropy
+content. Do not treat this masking boundary as protection against such guesses.
 
 Disabling prompt injection does not make previously sensitive exchanges public:
 retained/export copies still redact host-marked results and their associated

@@ -66,7 +66,7 @@ impl SqliteSessionBackend {
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
         let db_path = sessions_dir.join("sessions.db");
 
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
 
         conn.execute_batch(
@@ -102,6 +102,7 @@ impl SqliteSessionBackend {
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                prompt_incarnation TEXT,
                 PRIMARY KEY (session_key, prompt_id)
              );
 
@@ -179,22 +180,8 @@ impl SqliteSessionBackend {
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
-        // The metadata row is the canonical owner, including empty sessions
-        // created by routing/attribution or import. Initialize at that boundary
-        // rather than maintaining a second process-local generation registry.
-        // ADD COLUMN cannot use a non-constant default on an existing table.
-        conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TRIGGER IF NOT EXISTS session_metadata_prompt_owner
-             AFTER INSERT ON session_metadata WHEN new.prompt_incarnation IS NULL BEGIN
-                UPDATE session_metadata SET prompt_incarnation = lower(hex(randomblob(16)))
-                WHERE session_key = new.session_key;
-             END;
-             UPDATE session_metadata SET prompt_incarnation = lower(hex(randomblob(16)))
-             WHERE prompt_incarnation IS NULL;
-             COMMIT;",
-        )
-        .context("Failed to initialize durable session prompt ownership")?;
+        Self::reconcile_prompt_ownership(&mut conn)
+            .context("Failed to reconcile durable session prompt ownership")?;
         for (index, ddl) in [
             (
                 "idx_session_metadata_agent_alias",
@@ -875,6 +862,52 @@ impl SqliteSessionBackend {
 }
 
 impl SqliteSessionBackend {
+    /// Bind legacy rows only at open without claiming their original lifetime.
+    /// Bound mismatches are provably stale, including rows left by writers
+    /// without connection-local foreign-key enforcement. An immediate
+    /// transaction serializes schema detection, adoption and stale-row cleanup.
+    fn reconcile_prompt_ownership(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Metadata remains the canonical owner, including empty sessions
+        // created by routing or import; no process-local generation registry.
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS session_metadata_prompt_owner
+             AFTER INSERT ON session_metadata WHEN new.prompt_incarnation IS NULL BEGIN
+                UPDATE session_metadata SET prompt_incarnation = lower(hex(randomblob(16)))
+                WHERE session_key = new.session_key;
+             END;
+             UPDATE session_metadata SET prompt_incarnation = lower(hex(randomblob(16)))
+             WHERE prompt_incarnation IS NULL;",
+        )?;
+        let has_binding: bool = tx.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('session_prompts')
+             WHERE name = 'prompt_incarnation'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_binding {
+            tx.execute_batch("ALTER TABLE session_prompts ADD COLUMN prompt_incarnation TEXT")?;
+        }
+        // Remove genuine orphans before adoption so the UPDATE never depends
+        // on foreign-key checks for rows whose parent is already absent.
+        tx.execute_batch(
+            "DELETE FROM session_prompts WHERE NOT EXISTS (
+                SELECT 1 FROM session_metadata AS m
+                WHERE m.session_key = session_prompts.session_key
+             );
+             UPDATE session_prompts SET prompt_incarnation = (
+                SELECT m.prompt_incarnation FROM session_metadata AS m
+                WHERE m.session_key = session_prompts.session_key
+             ) WHERE prompt_incarnation IS NULL;
+             DELETE FROM session_prompts WHERE prompt_incarnation IS NOT (
+                SELECT m.prompt_incarnation FROM session_metadata AS m
+                WHERE m.session_key = session_prompts.session_key
+             );",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn prompt_owner_on(
         conn: &Connection,
         session_key: &str,
@@ -916,12 +949,13 @@ impl SqliteSessionBackend {
     fn list_session_prompts_on(
         conn: &Connection,
         session_key: &str,
+        incarnation: &str,
     ) -> std::io::Result<Vec<SessionPrompt>> {
         let mut statement = conn
-            .prepare("SELECT prompt_id, content, updated_at FROM session_prompts WHERE session_key = ?1 ORDER BY prompt_id ASC")
+            .prepare("SELECT prompt_id, content, updated_at FROM session_prompts WHERE session_key = ?1 AND prompt_incarnation = ?2 ORDER BY prompt_id ASC")
             .map_err(std::io::Error::other)?;
         statement
-            .query_map(params![session_key], |row| {
+            .query_map(params![session_key, incarnation], |row| {
                 Ok(SessionPrompt {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -945,8 +979,9 @@ impl SqliteSessionBackend {
         let mut conn = self.conn.lock();
         let transaction = conn.transaction().map_err(std::io::Error::other)?;
         let now = Utc::now().to_rfc3339();
-        if let Some(owner) = owner {
+        let incarnation = if let Some(owner) = owner {
             Self::require_prompt_owner_on(&transaction, owner)?;
+            owner.incarnation.clone()
         } else {
             // Host-side storage calls retain their first-owner creation path.
             // Model tools always supply their admission-bound owner instead.
@@ -957,15 +992,24 @@ impl SqliteSessionBackend {
                 params![session_key, now],
             )
             .map_err(std::io::Error::other)?;
-        }
+            Self::prompt_owner_on(&transaction, session_key)?.incarnation
+        };
+        // A foreign-key-disabled writer can leave same-key predecessor rows.
+        // Purge them only after checking the current owner, inside this write.
+        transaction
+            .execute(
+                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_incarnation IS NOT ?2",
+                params![session_key, incarnation],
+            )
+            .map_err(std::io::Error::other)?;
         let already_exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2)", params![session_key, id], |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2 AND prompt_incarnation = ?3)", params![session_key, id, incarnation], |row| row.get(0),
         ).map_err(std::io::Error::other)?;
         if !already_exists {
             let count: usize = transaction
                 .query_row(
-                    "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1",
-                    params![session_key],
+                    "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1 AND prompt_incarnation = ?2",
+                    params![session_key, incarnation],
                     |row| row.get(0),
                 )
                 .map_err(std::io::Error::other)?;
@@ -977,7 +1021,7 @@ impl SqliteSessionBackend {
             }
         }
         let total_bytes: usize = transaction.query_row(
-            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM session_prompts WHERE session_key = ?1 AND prompt_id <> ?2", params![session_key, id], |row| row.get(0),
+            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM session_prompts WHERE session_key = ?1 AND prompt_id <> ?2 AND prompt_incarnation = ?3", params![session_key, id, incarnation], |row| row.get(0),
         ).map_err(std::io::Error::other)?;
         if total_bytes.saturating_add(content.len()) > MAX_SESSION_PROMPTS_BYTES {
             return Err(std::io::Error::new(
@@ -989,11 +1033,11 @@ impl SqliteSessionBackend {
             let mut statement = transaction
                 .prepare(
                     "SELECT prompt_id, content, updated_at FROM session_prompts \
-                     WHERE session_key = ?1 ORDER BY prompt_id ASC",
+                     WHERE session_key = ?1 AND prompt_incarnation = ?2 ORDER BY prompt_id ASC",
                 )
                 .map_err(std::io::Error::other)?;
             let mut proposed = statement
-                .query_map(params![session_key], |row| {
+                .query_map(params![session_key, incarnation], |row| {
                     Ok(SessionPrompt {
                         id: row.get(0)?,
                         content: row.get(1)?,
@@ -1020,8 +1064,8 @@ impl SqliteSessionBackend {
             }
         }
         transaction.execute(
-            "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-            params![session_key, id, content, now],
+            "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at, prompt_incarnation) VALUES (?1, ?2, ?3, ?4, ?4, ?5) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            params![session_key, id, content, now, incarnation],
         ).map_err(std::io::Error::other)?;
         transaction.commit().map_err(std::io::Error::other)?;
         Ok(if already_exists {
@@ -1069,7 +1113,7 @@ impl SessionBackend for SqliteSessionBackend {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         Self::require_prompt_owner_on(&tx, owner)?;
-        let prompts = Self::list_session_prompts_on(&tx, &owner.session_key)?;
+        let prompts = Self::list_session_prompts_on(&tx, &owner.session_key, &owner.incarnation)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(prompts)
     }
@@ -1095,8 +1139,8 @@ impl SessionBackend for SqliteSessionBackend {
         Self::require_prompt_owner_on(&tx, owner)?;
         let count = tx
             .execute(
-                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2",
-                params![owner.session_key, id],
+                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2 AND prompt_incarnation = ?3",
+                params![owner.session_key, id, owner.incarnation],
             )
             .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
@@ -1104,7 +1148,26 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn list_session_prompts(&self, session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
-        Self::list_session_prompts_on(&self.conn.lock(), session_key)
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare(
+                "SELECT p.prompt_id, p.content, p.updated_at FROM session_prompts AS p
+                 JOIN session_metadata AS m ON m.session_key = p.session_key
+                 AND m.prompt_incarnation = p.prompt_incarnation
+                 WHERE p.session_key = ?1 ORDER BY p.prompt_id ASC",
+            )
+            .map_err(std::io::Error::other)?;
+        statement
+            .query_map(params![session_key], |row| {
+                Ok(SessionPrompt {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })
+            .map_err(std::io::Error::other)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
     }
 
     fn set_session_prompt(
@@ -1131,7 +1194,8 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock();
         Ok(conn
             .execute(
-                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2",
+                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2
+                 AND prompt_incarnation = (SELECT prompt_incarnation FROM session_metadata WHERE session_key = ?1)",
                 params![session_key, id],
             )
             .map_err(std::io::Error::other)?
@@ -1502,7 +1566,9 @@ impl SessionBackend for SqliteSessionBackend {
                 )
                 .map_err(std::io::Error::other)?;
 
-            // Delete metadata and its cascade-owned prompt attachments.
+            // This connection cascades attachment deletion atomically. Row
+            // binding and open-time reconciliation also protect same-key
+            // successors from leftovers created by foreign-key-disabled writers.
             transaction
                 .execute(
                     "DELETE FROM session_metadata WHERE session_key = ?1",
@@ -2042,6 +2108,27 @@ mod tests {
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
 
+    /// Build the earlier candidate's unbound attachment shape without changing
+    /// unrelated metadata columns; concurrent migration tests isolate this DDL.
+    fn legacy_prompt_connection(workspace: &Path) -> Connection {
+        let conn = Connection::open(workspace.join("sessions/sessions.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             ALTER TABLE session_prompts DROP COLUMN prompt_incarnation;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn prompt_row_count(conn: &Connection, key: &str) -> usize {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn round_trip_sqlite() {
         let tmp = TempDir::new().unwrap();
@@ -2214,11 +2301,13 @@ mod tests {
         backend
             .set_session_prompt("legacy", "task", "retained prompt")
             .unwrap();
+        drop(backend);
         {
-            let conn = backend.conn.lock();
+            // Real legacy databases had neither binding column. Dropping only
+            // metadata identity would instead make existing bound rows stale.
+            let conn = legacy_prompt_connection(tmp.path());
             conn.execute_batch("DROP TRIGGER session_metadata_prompt_owner; ALTER TABLE session_metadata DROP COLUMN prompt_incarnation;").unwrap();
         }
-        drop(backend);
         let migrated = SqliteSessionBackend::new(tmp.path()).unwrap();
         let owner = migrated.admit_session_prompt_owner("legacy").unwrap();
         assert_eq!(migrated.load("legacy")[0].content, "retained");
@@ -2229,6 +2318,341 @@ mod tests {
         drop(migrated);
         let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(reopened.list_session_prompts_for_owner(&owner).is_ok());
+    }
+
+    #[test]
+    fn session_prompt_migration_adopts_valid_legacy_rows_and_purges_orphans() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let kept = backend.admit_session_prompt_owner("kept").unwrap();
+        for key in ["kept", "gone"] {
+            backend
+                .set_session_prompt(key, "task", "retained text")
+                .unwrap();
+        }
+        let before = backend.list_session_prompts_for_owner(&kept).unwrap();
+        drop(backend);
+        {
+            let conn = legacy_prompt_connection(tmp.path());
+            conn.execute(
+                "DELETE FROM session_metadata WHERE session_key = 'gone'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(prompt_row_count(&conn, "gone"), 1);
+        }
+        let migrated = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(migrated.admit_session_prompt_owner("kept").unwrap() == kept);
+        assert_eq!(
+            migrated.list_session_prompts_for_owner(&kept).unwrap(),
+            before
+        );
+        assert_eq!(prompt_row_count(&migrated.conn.lock(), "gone"), 0);
+        let gone = migrated.admit_session_prompt_owner("gone").unwrap();
+        assert!(
+            migrated
+                .list_session_prompts_for_owner(&gone)
+                .unwrap()
+                .is_empty()
+        );
+        drop(migrated);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.admit_session_prompt_owner("kept").unwrap() == kept);
+        assert_eq!(
+            reopened.list_session_prompts_for_owner(&kept).unwrap(),
+            before
+        );
+        assert_eq!(prompt_row_count(&reopened.conn.lock(), "gone"), 0);
+    }
+
+    #[test]
+    fn session_prompt_successor_excludes_fk_disabled_predecessor_rows_and_bounds() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let old = backend.admit_session_prompt_owner("chat").unwrap();
+        let full = "x".repeat(MAX_SESSION_PROMPT_BYTES);
+        for id in ["task", "second", "third", "fourth"] {
+            backend
+                .set_session_prompt_for_owner(&old, id, &full, None)
+                .unwrap();
+        }
+        backend
+            .set_session_prompt("other", "task", "other session")
+            .unwrap();
+        let control = backend.list_session_prompts("other").unwrap();
+        let raw = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        raw.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM session_metadata WHERE session_key = 'chat';
+             INSERT INTO session_metadata (session_key, created_at, last_activity)
+             VALUES ('chat', 'replacement', 'replacement');",
+        )
+        .unwrap();
+        let current = backend.admit_session_prompt_owner("chat").unwrap();
+        assert!(old != current);
+        assert!(backend.list_session_prompts_for_owner(&old).is_err());
+        assert!(
+            backend
+                .set_session_prompt_for_owner(&old, "task", "stale", None)
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_session_prompt_for_owner(&old, "task")
+                .is_err()
+        );
+        assert!(
+            backend
+                .list_session_prompts_for_owner(&current)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(backend.list_session_prompts("chat").unwrap().is_empty());
+        assert!(!backend.delete_session_prompt("chat", "task").unwrap());
+        assert!(
+            !backend
+                .delete_session_prompt_for_owner(&current, "task")
+                .unwrap()
+        );
+        assert_eq!(prompt_row_count(&raw, "chat"), MAX_SESSION_PROMPTS);
+        raw.execute(
+            "UPDATE session_prompts SET prompt_incarnation = NULL WHERE session_key = ?1 AND prompt_id = ?2",
+            params!["chat", "second"],
+        )
+        .unwrap();
+        assert!(
+            !backend
+                .delete_session_prompt_for_owner(&current, "second")
+                .unwrap()
+        );
+        assert!(
+            backend
+                .list_session_prompts_for_owner(&current)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(prompt_row_count(&raw, "chat"), MAX_SESSION_PROMPTS);
+
+        let one = render_session_prompts(&[SessionPrompt {
+            id: "task".into(),
+            content: full.clone(),
+            updated_at: String::new(),
+        }]);
+        assert_eq!(
+            backend
+                .set_session_prompt_for_owner(
+                    &current,
+                    "task",
+                    &full,
+                    Some(SessionPromptBudget::new(0, one.chars().count() + 2)),
+                )
+                .unwrap(),
+            SessionPromptSetOutcome::Created
+        );
+        for id in ["second", "third", "fourth"] {
+            assert_eq!(
+                backend
+                    .set_session_prompt_for_owner(&current, id, &full, None)
+                    .unwrap(),
+                SessionPromptSetOutcome::Created
+            );
+        }
+        assert!(
+            backend
+                .set_session_prompt_for_owner(&current, "fifth", "too many", None)
+                .is_err()
+        );
+        assert_eq!(backend.list_session_prompts("other").unwrap(), control);
+        drop(raw);
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .list_session_prompts_for_owner(&current)
+                .unwrap()
+                .len(),
+            MAX_SESSION_PROMPTS
+        );
+        let conn = reopened.conn.lock();
+        assert_eq!(prompt_row_count(&conn, "chat"), MAX_SESSION_PROMPTS);
+        let bound: usize = conn.query_row(
+            "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1 AND prompt_incarnation = ?2",
+            params![current.session_key, current.incarnation], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(bound, MAX_SESSION_PROMPTS);
+        drop(conn);
+        assert_eq!(reopened.list_session_prompts("other").unwrap(), control);
+    }
+
+    #[test]
+    fn session_prompt_open_purges_bound_rows_after_fk_disabled_owner_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .set_session_prompt("gone", "task", "old lifetime")
+            .unwrap();
+        drop(backend);
+        {
+            let raw = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+            raw.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM session_metadata WHERE session_key = 'gone';").unwrap();
+            assert_eq!(prompt_row_count(&raw, "gone"), 1);
+        }
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(prompt_row_count(&reopened.conn.lock(), "gone"), 0);
+        let owner = reopened.admit_session_prompt_owner("gone").unwrap();
+        assert!(
+            reopened
+                .list_session_prompts_for_owner(&owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_prompt_additive_schema_keeps_legacy_upsert_compatible() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let owner = backend.admit_session_prompt_owner("chat").unwrap();
+        backend
+            .set_session_prompt_for_owner(&owner, "task", "initial", None)
+            .unwrap();
+        let raw = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        // Exact pre-binding INSERT: new rows are unbound, while conflict
+        // updates keep the existing binding. Mixed-version use is unsupported.
+        let old_upsert = "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at";
+        for (id, content) in [("task", "updated"), ("new", "legacy-created")] {
+            raw.execute(old_upsert, params!["chat", id, content, "legacy timestamp"])
+                .unwrap();
+        }
+        let visible = backend.list_session_prompts_for_owner(&owner).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].content, "updated");
+        assert_eq!(visible[0].updated_at, "legacy timestamp");
+        let unbound: bool = raw
+            .query_row(
+                "SELECT prompt_incarnation IS NULL FROM session_prompts WHERE prompt_id = 'new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unbound);
+        drop(raw);
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.admit_session_prompt_owner("chat").unwrap() == owner);
+        let visible = reopened.list_session_prompts_for_owner(&owner).unwrap();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].content, "legacy-created");
+        assert_eq!(visible[1].content, "updated");
+        assert!(
+            visible
+                .iter()
+                .all(|prompt| prompt.updated_at == "legacy timestamp")
+        );
+    }
+
+    #[test]
+    fn session_prompt_concurrent_legacy_opens_serialize_binding_migration() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let owner = backend.admit_session_prompt_owner("chat").unwrap();
+        backend
+            .set_session_prompt_for_owner(&owner, "task", "retained", None)
+            .unwrap();
+        drop(backend);
+        drop(legacy_prompt_connection(tmp.path()));
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let start = Arc::clone(&barrier);
+                let root = tmp.path();
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    SqliteSessionBackend::new(root)
+                }));
+            }
+            barrier.wait();
+            for handle in handles {
+                let opened = handle.join().unwrap().unwrap();
+                assert!(opened.admit_session_prompt_owner("chat").unwrap() == owner);
+                assert_eq!(
+                    opened.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+                    "retained"
+                );
+                assert_eq!(prompt_row_count(&opened.conn.lock(), "chat"), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn session_prompt_failed_reconciliation_rolls_back_schema_and_rows_then_retries() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let owner = backend.admit_session_prompt_owner("kept").unwrap();
+        for key in ["kept", "gone"] {
+            backend.set_session_prompt(key, "task", "retained").unwrap();
+        }
+        drop(backend);
+        let raw = legacy_prompt_connection(tmp.path());
+        raw.execute_batch(
+            "DELETE FROM session_metadata WHERE session_key = 'gone';
+             CREATE TRIGGER reject_prompt_reconciliation BEFORE DELETE ON session_prompts
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        )
+        .unwrap();
+        assert!(SqliteSessionBackend::new(tmp.path()).is_err());
+        let has_binding: bool = raw.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('session_prompts') WHERE name = 'prompt_incarnation'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!has_binding);
+        assert_eq!(prompt_row_count(&raw, "gone"), 1);
+        assert_eq!(prompt_row_count(&raw, "kept"), 1);
+        assert!(SqliteSessionBackend::prompt_owner_on(&raw, "kept").unwrap() == owner);
+        raw.execute_batch("DROP TRIGGER reject_prompt_reconciliation")
+            .unwrap();
+        drop(raw);
+        let migrated = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(prompt_row_count(&migrated.conn.lock(), "gone"), 0);
+        assert_eq!(
+            migrated.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+            "retained"
+        );
+    }
+
+    #[test]
+    fn session_prompt_open_purges_bound_mismatches_instead_of_readopting_them() {
+        for lose_metadata_identity in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let old = backend.admit_session_prompt_owner("chat").unwrap();
+            backend
+                .set_session_prompt_for_owner(&old, "task", "old lifetime", None)
+                .unwrap();
+            drop(backend);
+            {
+                let raw = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+                if lose_metadata_identity {
+                    // A previously bound row is not legacy just because its
+                    // parent's identity column was replaced externally.
+                    raw.execute_batch("DROP TRIGGER session_metadata_prompt_owner; ALTER TABLE session_metadata DROP COLUMN prompt_incarnation;").unwrap();
+                } else {
+                    raw.execute_batch("UPDATE session_metadata SET prompt_incarnation = 'replacement' WHERE session_key = 'chat';").unwrap();
+                }
+            }
+            let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let current = reopened.admit_session_prompt_owner("chat").unwrap();
+            assert!(old != current);
+            assert!(reopened.list_session_prompts_for_owner(&old).is_err());
+            assert!(
+                reopened
+                    .list_session_prompts_for_owner(&current)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(prompt_row_count(&reopened.conn.lock(), "chat"), 0);
+        }
     }
 
     #[test]
