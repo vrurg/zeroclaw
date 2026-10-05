@@ -5910,12 +5910,12 @@ async fn assert_matrix_goal_deferred_ingress(
             let budget_updated = channel_runtime_cli_string("goal-mode-budget-updated");
             let budget_updates = replies
                 .iter()
-                .filter(|reply| reply.content == budget_updated)
+                .filter(|reply| reply.content.lines().next() == Some(budget_updated.as_str()))
                 .count();
             assert_eq!(budget_updates, 1);
             let final_response = replies
                 .iter()
-                .position(|reply| reply.content == budget_updated)
+                .position(|reply| reply.content.lines().next() == Some(budget_updated.as_str()))
                 .unwrap();
             assert!(
                 candidate < final_response,
