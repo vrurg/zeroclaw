@@ -42,6 +42,8 @@ enum Control {
     ExternalCancellation,
     Cancel,
     StillRunning,
+    Budget,
+    StillRunningBudget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,7 @@ struct Observation {
     gates: AtomicUsize,
     admissions: AtomicUsize,
     settlements: AtomicUsize,
+    budget_fences: AtomicUsize,
     parents: AtomicUsize,
     verifiers: AtomicUsize,
     events: Mutex<Vec<String>>,
@@ -173,6 +176,9 @@ impl Lease {
         let error = if self.control == Control::StillRunning {
             // The public marker alone is not proof of a committed fence.
             anyhow::Error::new(GoalOperationFenced::NOT_RUNNING)
+        } else if self.control == Control::StillRunningBudget {
+            // A forged budget marker cannot substitute for a durable pause.
+            anyhow::Error::new(GoalOperationFenced::BUDGET_EXHAUSTED)
         } else if self.refusal == Refusal::Plain {
             anyhow::Error::msg("fixture untyped error after pause")
         } else {
@@ -183,6 +189,15 @@ impl Lease {
                 .await
                 .expect_err("the committed transition must refuse admission")
         };
+        if self.control == Control::Budget {
+            // Observe the causal type without panicking before the actual
+            // engine consumer and supervisor drain receive this error.
+            if error.downcast_ref::<GoalOperationFenced>().is_some() {
+                self.observation
+                    .budget_fences
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }
         self.observation
             .events
             .lock()
@@ -289,6 +304,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         gates: AtomicUsize::new(0),
         admissions: AtomicUsize::new(0),
         settlements: AtomicUsize::new(0),
+        budget_fences: AtomicUsize::new(0),
         parents: AtomicUsize::new(0),
         verifiers: AtomicUsize::new(0),
         events: Mutex::new(vec![]),
@@ -453,7 +469,32 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             }
             None
         }
-        Control::StillRunning => {
+        Control::Budget => {
+            let consumed = if window == Window::Verifier { 24 } else { 12 };
+            assert_eq!(
+                store
+                    .update_session_goal_limits(
+                        &original.id,
+                        &key.durable_id(),
+                        original.execution_epoch,
+                        Some(consumed),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            observation.release.notify_one();
+            assert_eq!(
+                timeout(Duration::from_secs(5), supervisor.drain(&scope))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                GoalExecutionOutcome::Fenced
+            );
+            None
+        }
+        Control::StillRunning | Control::StillRunningBudget => {
             observation.release.notify_one();
             assert!(
                 timeout(Duration::from_secs(5), supervisor.drain(&scope))
@@ -470,7 +511,8 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         .unwrap()
         .unwrap();
     let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
-    let failed = control == Control::StillRunning || refusal != Refusal::Fenced;
+    let uncommitted = matches!(control, Control::StillRunning | Control::StillRunningBudget);
+    let failed = uncommitted || refusal != Refusal::Fenced;
     let expected = if control == Control::Cancel {
         TaskStatus::Cancelled
     } else if failed {
@@ -479,6 +521,10 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         TaskStatus::Paused
     };
     let events = observation.events.lock().unwrap().clone();
+    if control == Control::Budget {
+        assert_eq!(observation.budget_fences.load(Ordering::SeqCst), 1);
+        assert_eq!(events[0], "host_error:Goal budget is exhausted");
+    }
     assert_eq!(
         task.status, expected,
         "{window:?}/{control:?}/{refusal:?}: {events:?}; late={late:?}"
@@ -519,10 +565,10 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         if expected == TaskStatus::Paused {
             assert_eq!(
                 goal.pause_reason,
-                Some(if control == Control::Restart {
-                    GoalPauseReason::DaemonRestart
-                } else {
-                    GoalPauseReason::OperatorPaused
+                Some(match control {
+                    Control::Restart => GoalPauseReason::DaemonRestart,
+                    Control::Budget => GoalPauseReason::BudgetExhausted,
+                    _ => GoalPauseReason::OperatorPaused,
                 })
             );
             if matches!(control, Control::Pause | Control::Resume) {
@@ -536,7 +582,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             .unwrap();
         assert_eq!(
             reason.as_deref(),
-            Some(if control == Control::StillRunning {
+            Some(if uncommitted {
                 if window == Window::Parent {
                     "parent_operation_failed"
                 } else {
@@ -552,7 +598,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             events.iter().filter(|e| e.starts_with("notice:")).count(),
             1
         );
-        if control == Control::StillRunning {
+        if uncommitted {
             assert_eq!(events.len(), 2);
         } else {
             assert_eq!(events.len(), 3);
@@ -730,5 +776,33 @@ case!(
     zerocode_marked_verifier_error_while_running_remains_terminal,
     Verifier,
     StillRunning,
+    Fenced
+);
+case!(
+    committed_parent_budget_pause_survives_drain,
+    zerocode_committed_parent_budget_pause_survives_drain,
+    Parent,
+    Budget,
+    Fenced
+);
+case!(
+    committed_verifier_budget_pause_survives_drain,
+    zerocode_committed_verifier_budget_pause_survives_drain,
+    Verifier,
+    Budget,
+    Fenced
+);
+case!(
+    forged_parent_budget_marker_remains_terminal,
+    zerocode_forged_parent_budget_marker_remains_terminal,
+    Parent,
+    StillRunningBudget,
+    Fenced
+);
+case!(
+    forged_verifier_budget_marker_remains_terminal,
+    zerocode_forged_verifier_budget_marker_remains_terminal,
+    Verifier,
+    StillRunningBudget,
     Fenced
 );

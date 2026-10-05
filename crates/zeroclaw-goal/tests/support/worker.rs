@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_goal::{
-    GoalParentTurn, GoalVerifierResult, GoalVerifierTurn,
+    GoalExecutionNotice, GoalOperationScope, GoalParentTurn, GoalParentTurnResult,
+    GoalVerifierResult, GoalVerifierTurn,
     accounting::{
         GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
         GoalOperationSettlement,
@@ -17,6 +18,7 @@ struct Script {
     release: Semaphore,
     published: AtomicUsize,
     verified: AtomicUsize,
+    notices: AtomicUsize,
     hold_verifier: AtomicBool,
     verifier_entered: Semaphore,
     verifier_release: Semaphore,
@@ -29,6 +31,7 @@ impl Default for Script {
             release: Semaphore::new(0),
             published: AtomicUsize::new(0),
             verified: AtomicUsize::new(0),
+            notices: AtomicUsize::new(0),
             hold_verifier: AtomicBool::new(false),
             verifier_entered: Semaphore::new(0),
             verifier_release: Semaphore::new(0),
@@ -128,12 +131,16 @@ impl GoalSessionExecutionLease for WorkerLease {
 
     async fn run_parent_turn(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         _turn: GoalParentTurn,
-    ) -> Result<String> {
+    ) -> Result<GoalParentTurnResult> {
         self.script.entered.add_permits(1);
         self.script.release.acquire().await?.forget();
-        Ok("The bounded fixture is complete.".into())
+        let candidate = "The bounded fixture is complete.";
+        GoalParentTurnResult::from_completed_agent_turn(
+            candidate.into(),
+            vec![ChatMessage::assistant(candidate)],
+        )
     }
 
     async fn append_parent_candidate(&mut self, _candidate: String) -> Result<()> {
@@ -143,7 +150,7 @@ impl GoalSessionExecutionLease for WorkerLease {
 
     async fn run_verifier(
         &mut self,
-        _scope: &GoalExecutionScope,
+        _scope: &GoalOperationScope,
         _turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult> {
         self.script.verified.fetch_add(1, Ordering::SeqCst);
@@ -155,6 +162,11 @@ impl GoalSessionExecutionLease for WorkerLease {
             response: r#"{"decision":"complete","reason":"The declared criterion is satisfied.","blockers":[]}"#.into(),
             attribution: None,
         })
+    }
+
+    async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
+        self.script.notices.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -528,6 +540,7 @@ async fn completed_worker_falls_back_to_the_ordinary_boundary_without_duplicate_
     )
     .await
     .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
     let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().id.clone();
     let deferred = queued(
         supervisor

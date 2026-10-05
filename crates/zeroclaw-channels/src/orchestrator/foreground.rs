@@ -15,6 +15,10 @@ use zeroclaw_goal::GoalExecutionSupervisor;
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
     matrix_goal: OnceLock<MatrixGoalLocks>,
+    // Isolated ingress fixtures use the real store/coordinator handle without
+    // initializing the daemon singleton shared by unrelated unit tests.
+    #[cfg(test)]
+    goal_test_control_plane: OnceLock<zeroclaw_runtime::control_plane::ControlPlaneHandle>,
 }
 
 /// Locks required only after a Matrix conversation enters the Goal control
@@ -31,6 +35,8 @@ impl ConversationLocks {
         Self {
             persist: Arc::new(Mutex::new(())),
             matrix_goal: OnceLock::new(),
+            #[cfg(test)]
+            goal_test_control_plane: OnceLock::new(),
         }
     }
 
@@ -46,6 +52,31 @@ impl ConversationLocks {
     fn has_matrix_goal_locks(&self) -> bool {
         self.matrix_goal.get().is_some()
     }
+}
+
+#[cfg(test)]
+pub(super) fn install_goal_test_control_plane(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+    handle: zeroclaw_runtime::control_plane::ControlPlaneHandle,
+) {
+    assert!(
+        locks_for_key(locks, key)
+            .goal_test_control_plane
+            .set(handle)
+            .is_ok()
+    );
+}
+
+#[cfg(test)]
+pub(super) fn goal_test_control_plane(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> Option<zeroclaw_runtime::control_plane::ControlPlaneHandle> {
+    locks_for_key(locks, key)
+        .goal_test_control_plane
+        .get()
+        .cloned()
 }
 
 fn locks_for_key(
