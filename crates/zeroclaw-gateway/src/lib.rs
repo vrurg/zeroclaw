@@ -1059,6 +1059,77 @@ fn build_gateway_boot_provider(
     zeroclaw_providers::create_model_provider_from_ref(config, &provider_ref)
 }
 
+/// Gateway-local state derived from the configured boot seed.
+///
+/// A missing model is ordinary first-run state. Keep that case explicit here
+/// so the gateway never fabricates a provider reference before Quickstart can
+/// configure one.
+struct GatewayBootState<'a> {
+    model_provider: Arc<dyn ModelProvider>,
+    fallback: Option<&'a zeroclaw_config::schema::ModelProviderConfig>,
+    model: String,
+}
+
+fn initialize_gateway_boot_state<'a>(
+    config: &'a Config,
+    display_addr: &str,
+) -> GatewayBootState<'a> {
+    match gateway_boot_provider_inputs(config) {
+        Some((boot_family, boot_alias, boot_entry)) => {
+            let model_provider_ref = format!("{boot_family}.{boot_alias}");
+            match build_gateway_boot_provider(config, &boot_family, &boot_alias) {
+                Ok(provider) => GatewayBootState {
+                    model_provider: Arc::from(provider),
+                    fallback: Some(boot_entry),
+                    model: boot_entry
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": model_provider_ref,
+                                "alias": boot_alias,
+                                "error": format!("{e}"),
+                            })),
+                        "Gateway: seed model_provider failed to construct; booting in \
+                         needs_quickstart mode so /quickstart and /admin/reload stay \
+                         reachable. Fix the [providers.models.<type>.<alias>] entry \
+                         and POST /admin/reload."
+                    );
+                    GatewayBootState {
+                        model_provider: Arc::new(UnconfiguredModelProvider),
+                        fallback: Some(boot_entry),
+                        model: String::new(),
+                    }
+                }
+            }
+        }
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                )
+            );
+            GatewayBootState {
+                model_provider: Arc::new(UnconfiguredModelProvider),
+                fallback: None,
+                model: String::new(),
+            }
+        }
+    }
+}
+
 /// Run the supervised gateway with the daemon generation's channel-plugin
 /// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
@@ -1151,64 +1222,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     // model, do not invent a provider reference: that is ordinary first-run
     // state, not a broken alias, and must reach the established Quickstart
     // admission path.
-    let (model_provider, fallback, model): (
-        Arc<dyn ModelProvider>,
-        Option<&zeroclaw_config::schema::ModelProviderConfig>,
-        String,
-    ) = match gateway_boot_provider_inputs(&config) {
-        Some((boot_family, boot_alias, boot_entry)) => {
-            let model_provider_ref = format!("{boot_family}.{boot_alias}");
-            match build_gateway_boot_provider(&config, &boot_family, &boot_alias) {
-                Ok(provider) => (
-                    Arc::from(provider),
-                    Some(boot_entry),
-                    boot_entry
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "model_provider": model_provider_ref,
-                                "alias": boot_alias,
-                                "error": format!("{e}"),
-                            })),
-                        "Gateway: seed model_provider failed to construct; booting in \
-                         needs_quickstart mode so /quickstart and /admin/reload stay \
-                         reachable. Fix the [providers.models.<type>.<alias>] entry \
-                         and POST /admin/reload."
-                    );
-                    (
-                        Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
-                        Some(boot_entry),
-                        String::new(),
-                    )
-                }
-            }
-        }
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                &format!(
-                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                )
-            );
-            (
-                Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
-                None,
-                String::new(),
-            )
-        }
-    };
+    let GatewayBootState {
+        model_provider,
+        fallback,
+        model,
+    } = initialize_gateway_boot_state(&config, &display_addr);
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
@@ -5348,12 +5366,19 @@ mod tests {
 
     #[test]
     fn gateway_boot_without_a_model_does_not_invent_a_provider_alias() {
+        use zeroclaw_api::attribution::Attributable;
+
         let config = Config::default();
 
         assert!(
             gateway_boot_provider_inputs(&config).is_none(),
             "a first-run config must use needs_quickstart rather than construct a synthetic provider"
         );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617");
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.fallback.is_none());
+        assert!(state.model.is_empty());
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
