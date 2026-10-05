@@ -1048,24 +1048,17 @@ fn gateway_boot_provider_inputs(
     (family, alias, entry)
 }
 
-/// Construct the selected gateway seed through the same alias-aware factory
-/// used by normal routed calls.
+/// Construct the selected gateway seed through the alias-aware, non-resilient
+/// factory. The seed establishes gateway readiness; per-agent routed calls own
+/// fallback behavior. A broken fallback on the chosen seed must not put every
+/// unrelated agent into needs-Quickstart mode.
 fn build_gateway_boot_provider(
     config: &Config,
     family: &str,
     alias: &str,
-    entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_ref = format!("{family}.{alias}");
-    let provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
-        config,
-        &provider_ref,
-        entry.and_then(|entry| entry.api_key.as_deref()),
-        entry.and_then(|entry| entry.uri.as_deref()),
-        &config.reliability,
-        &zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias),
-    )?;
-    Ok(provider)
+    zeroclaw_providers::create_model_provider_from_ref(config, &provider_ref)
 }
 
 /// Run the supervised gateway with the daemon generation's channel-plugin
@@ -1161,7 +1154,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let fallback = boot_entry;
     let model_provider_ref = format!("{boot_family}.{boot_alias}");
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
-        match build_gateway_boot_provider(&config, &boot_family, &boot_alias, boot_entry) {
+        match build_gateway_boot_provider(&config, &boot_family, &boot_alias) {
             Ok(provider) => (Arc::from(provider), false),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -5272,8 +5265,8 @@ mod tests {
             },
         );
 
-        let (family, alias, entry) = gateway_boot_provider_inputs(&config);
-        let provider = build_gateway_boot_provider(&config, &family, &alias, entry)
+        let (family, alias, _) = gateway_boot_provider_inputs(&config);
+        let provider = build_gateway_boot_provider(&config, &family, &alias)
             .expect("the gateway boot path must build the configured OAuth alias");
 
         assert_eq!(family, "anthropic");
@@ -5283,6 +5276,66 @@ mod tests {
             "subscription",
             "gateway boot must enter the typed alias factory rather than the bare family factory"
         );
+    }
+
+    #[test]
+    fn gateway_boot_rejects_a_noncanonical_anthropic_oauth_alias() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config);
+        let error = match build_gateway_boot_provider(&config, &family, &alias) {
+            Ok(_) => panic!("gateway boot must reject an OAuth alias that cannot name a profile"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires a canonical alias"),
+            "unexpected gateway construction error: {error}"
+        );
+    }
+
+    #[test]
+    fn gateway_boot_ignores_a_seed_fallback_that_is_not_auth_ready() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "main".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig::default(),
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config);
+        let provider = build_gateway_boot_provider(&config, &family, &alias)
+            .expect("gateway seed must not construct its routed fallback chain");
+        assert_eq!(provider.alias(), "main");
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.

@@ -1213,6 +1213,15 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let oauth = self.auth_mode == Some(AnthropicAuthMode::OAuth);
+        // Config loading intentionally warns and continues after validation
+        // errors. OAuth aliases name stored-profile namespaces, so repeat the
+        // canonical-alias admission check at the construction boundary rather
+        // than allowing an invalid loaded key to reach credential selection.
+        if oauth && let Err(error) = zeroclaw_config::helpers::validate_alias_key(alias) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires a canonical alias: {error}"
+            );
+        }
         if oauth && has_api_key(key) {
             anyhow::bail!(
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
@@ -2062,6 +2071,36 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn anthropic_oauth_factory_rejects_noncanonical_loaded_aliases() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let config = AnthropicModelProviderConfig {
+            auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
+        };
+        for alias in [
+            "team:subscription",
+            " subscription",
+            "subscription ",
+            "Uppercase",
+        ] {
+            let error = match config.create_provider(
+                alias,
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            ) {
+                Ok(_) => panic!("OAuth construction must reject noncanonical alias {alias}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("requires a canonical alias"),
+                "unexpected error for {alias:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {
