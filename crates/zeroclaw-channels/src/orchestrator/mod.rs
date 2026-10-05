@@ -148,7 +148,13 @@ use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{
-    deliver_matrix_goal_stop, dispose_matrix_goal, submit_matrix_goal, submit_matrix_goal_stop,
+    deliver_matrix_goal_command, deliver_matrix_goal_stop, dispose_matrix_goal, submit_matrix_goal,
+    submit_matrix_goal_stop,
+};
+mod goal_control;
+use self::goal_control::{
+    deliver_prepared_matrix_goal_command, matrix_goal_command_snapshot,
+    prepare_matrix_goal_command, should_drop_channel_message,
 };
 use self::turn_execution::resolved_channel_execution;
 
@@ -1493,6 +1499,9 @@ async fn route_inbound_slot(
     }
 
     let ctx = Arc::clone(&turn.ctx);
+    // Preserve admitted control facts across the modifying hook. Hook
+    // cancellation still ends the message before any control admission.
+    let goal_snapshot = matrix_goal_command_snapshot(ctx.as_ref(), &turn.msg);
     // Hooks can execute agent-scoped work, but waiting for debounce or a lane
     // must not pin a lifecycle lease. Revalidate again at model execution.
     let hooked = {
@@ -1512,6 +1521,28 @@ async fn route_inbound_slot(
     // within the source conversation. Waiting here holds neither an execution
     // permit nor a conversation lane, and never waits on another conversation.
     order.wait_admission().await;
+    if let Some((history_key, original, parsed)) = goal_snapshot {
+        let prepared = {
+            let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+            else {
+                return;
+            };
+            let channel = find_channel_for_message(&ctx.channels_by_name, &turn.msg);
+            if should_drop_channel_message(channel, &turn.msg) {
+                return;
+            }
+            prepare_matrix_goal_command(Arc::clone(&ctx), history_key, original.clone(), parsed)
+                .await
+        };
+        order.finish();
+        busy_notice_tasks.spawn(async move {
+            // Keep the aggregate ingress permit and picker cleanup duty until
+            // acknowledgement, wait, final delivery and launch all finish.
+            let _turn = turn;
+            deliver_prepared_matrix_goal_command(ctx, original, prepared).await;
+        });
+        return;
+    }
     // The final cancellation check lives inside `enqueue`, under the registry
     // lock: checked here, a cancellation landing between the check and the
     // append could commit this turn into a lane behind the very successor
@@ -8946,16 +8977,7 @@ async fn process_channel_message_body(
     // Capture Goal command authority before mutable hooks. A hook can cancel
     // the message, but it cannot rewrite its principal, session, route, or
     // command before admission.
-    let parsed_goal_command =
-        is_matrix_channel_name(&msg.channel).then(|| parse_goal_command(&msg.content));
-    let goal_snapshot = match parsed_goal_command {
-        Some(Err(GoalCommandParseError::NotGoalCommand)) | None => None,
-        Some(parsed_goal_command) => Some((
-            runtime_conversation_history_key(ctx.as_ref(), &msg),
-            matrix_goal_message_snapshot(&msg),
-            parsed_goal_command,
-        )),
-    };
+    let goal_snapshot = matrix_goal_command_snapshot(ctx.as_ref(), &msg);
     let logged_content = if goal_snapshot.is_some() {
         "<goal command>"
     } else {
@@ -8984,155 +9006,15 @@ async fn process_channel_message_body(
     let mut msg = msg;
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-
-    if let Some(channel) = target_channel.as_ref() {
-        if channel.drop_self_messages(&msg) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, sdk layer)"
-            );
-            return;
-        }
-        if zeroclaw_runtime::peers::should_drop_self_loop(
-            &msg.sender,
-            channel.self_handle().as_deref(),
-        ) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
-            );
-            return;
-        }
+    if should_drop_channel_message(target_channel.as_ref(), &msg) {
+        return;
     }
 
-    if let Some((goal_history_key, original_goal_message, parsed_goal_command)) = goal_snapshot {
-        let response = match parsed_goal_command {
-            Ok(command) => match submit_matrix_goal(
-                Arc::clone(&ctx),
-                goal_history_key,
-                original_goal_message.clone(),
-                command,
-            )
-            .await
-            {
-                Ok(mut submission) => {
-                    let response = render_goal_response(submission.response());
-                    let channel =
-                        find_channel_for_message(&ctx.channels_by_name, &original_goal_message);
-                    let delivery_error = match channel {
-                        Some(channel) => channel
-                            .send(&SendMessage::reply_to(&original_goal_message, response))
-                            .await
-                            .err(),
-                        None => Some(anyhow::Error::msg(
-                            "Matrix channel is unavailable for Goal acknowledgement",
-                        )),
-                    };
-                    if let Some(error) = delivery_error {
-                        if let Err(pause_error) = submission.response_delivery_failed().await {
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail,
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "error": zeroclaw_providers::sanitize_api_error(&pause_error.to_string()),
-                                })),
-                                "Goal could not be paused after Matrix acknowledgement failure"
-                            );
-                        }
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
-                            })),
-                            "Goal command acknowledgement could not be delivered"
-                        );
-                        // A failed send can still mean the channel accepted
-                        // the event before losing its acknowledgement. Do not
-                        // retry with a second response that could duplicate it.
-                        return;
-                    } else {
-                        match submission.after_response().await {
-                            Ok(late_response) => {
-                                if let Some(response) = late_response.as_ref()
-                                    && let Some(channel) = channel
-                                    && let Err(error) = channel
-                                        .send(&SendMessage::reply_to(
-                                            &original_goal_message,
-                                            render_goal_response(response),
-                                        ))
-                                        .await
-                                {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail,
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(::serde_json::json!({
-                                            "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
-                                        })),
-                                        "Final Goal lifecycle response could not be delivered"
-                                    );
-                                }
-                                submission
-                                    .final_response_delivered(late_response.as_ref())
-                                    .await;
-                                return;
-                            }
-                            Err(error) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Fail,
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({
-                                        "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
-                                    })),
-                                    "Goal execution could not start after Matrix acknowledgement"
-                                );
-                                channel_runtime_cli_string("goal-mode-command-failed")
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": zeroclaw_providers::sanitize_api_error(&error.to_string()),
-                            })),
-                        "Goal command submission failed"
-                    );
-                    channel_runtime_cli_string("goal-mode-command-failed")
-                }
-            },
-            Err(_) => channel_runtime_cli_string("goal-mode-command-invalid"),
-        };
-        if let Some(channel) =
-            find_channel_for_message(&ctx.channels_by_name, &original_goal_message)
-        {
-            let _ = channel
-                .send(&SendMessage::reply_to(&original_goal_message, response))
+    if let Some((history_key, original, parsed)) = goal_snapshot {
+        let prepared =
+            prepare_matrix_goal_command(Arc::clone(&ctx), history_key, original.clone(), parsed)
                 .await;
-        }
+        deliver_prepared_matrix_goal_command(Arc::clone(&ctx), original, prepared).await;
         return;
     }
 
@@ -11261,8 +11143,12 @@ fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
 }
 
 fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
-    use zeroclaw_goal::{GoalPendingAction, GoalResponse};
+    use zeroclaw_goal::{GoalPendingAction, GoalQueuedControl, GoalResponse};
     let key = match response {
+        GoalResponse::Queued(GoalQueuedControl::Start) => "goal-mode-queued-start",
+        GoalResponse::Queued(GoalQueuedControl::Resume) => "goal-mode-queued-resume",
+        GoalResponse::Queued(GoalQueuedControl::Pause) => "goal-mode-queued-pause",
+        GoalResponse::Queued(GoalQueuedControl::Budget) => "goal-mode-queued-budget",
         GoalResponse::Help => "goal-mode-help",
         GoalResponse::Disabled => "goal-mode-disabled",
         GoalResponse::Started(_) => "goal-mode-started",
@@ -11314,6 +11200,17 @@ mod goal_command_message_tests {
     }
 }
 
+// Goal controls, including parse errors, use control admission rather than
+// acquiring an ordinary sender slot or becoming part of a debounced prompt.
+fn is_matrix_goal_control(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    !msg.passive_context
+        && is_matrix_channel_name(&msg.channel)
+        && !matches!(
+            parse_goal_command(&msg.content),
+            Err(GoalCommandParseError::NotGoalCommand)
+        )
+}
+
 /// Claim the sender's interruption slot for a message that is about to be
 /// queued.
 ///
@@ -11328,7 +11225,7 @@ async fn register_inbound_turn(
     task_sequence: &Arc<AtomicU64>,
     generation_cancel: &CancellationToken,
 ) -> Option<TurnRegistration> {
-    if msg.channel == "cli" || msg.passive_context {
+    if msg.channel == "cli" || msg.passive_context || is_matrix_goal_control(msg) {
         return None;
     }
 
@@ -12401,6 +12298,7 @@ async fn run_message_dispatch_loop_until_cancelled(
         let msg = if msg.channel != "cli"
             && !msg.passive_context
             && parse_runtime_command(&msg.channel, &msg.content).is_none()
+            && !is_matrix_goal_control(&msg)
         {
             let debounce_key =
                 message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), &msg), &msg);
@@ -19541,6 +19439,8 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    mod goal_deferred;
 
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
