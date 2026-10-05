@@ -2227,6 +2227,11 @@ impl ReliableModelProvider {
                 let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
                     model_slot == failed.model_slot && entry_index == failed.entry_index
                 });
+                // Connect-failed is a typed transport fact, not an error-text
+                // reading: the flag is set only when the recorded failure
+                // carries `StreamError::ConnectFailed`, emitted at the send
+                // site on a transport-reported connection failure. Provider
+                // error text and unknown transport provenance keep the skip.
                 let connect_failed = accounting.stream_recovery_connect_failed;
                 let decision = Self::stream_recovery_decision(
                     max_retries,
@@ -2238,9 +2243,13 @@ impl ReliableModelProvider {
                 match decision {
                     RetryDecision::Admit(limit) => {
                         if exact_failed_entry {
-                            // Semantic-empty is a one-shot recovery. The
-                            // connection-failure and lone-candidate grants are
-                            // consumed for this candidate before continuing.
+                            // Consume one-shot recovery grants so each fires at
+                            // most once. Clearing the resume marker merges the
+                            // single-candidate and connect-failed grants into
+                            // the semantic-empty attempt when more than one
+                            // applies, and keeps the connection-failure grant
+                            // from firing twice in one call. The next candidate
+                            // keeps its own ordinary budget.
                             accounting.stream_recovery_semantic_empty_permission = false;
                             if !has_other_candidate || connect_failed {
                                 accounting.stream_resume_after = None;

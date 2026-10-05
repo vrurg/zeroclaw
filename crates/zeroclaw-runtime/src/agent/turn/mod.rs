@@ -1965,7 +1965,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // is consumed by `commit_accepted_provider_route` partway through.
         let (served_provider, served_model) = accepted_route
             .as_ref()
-            .filter(|route| route.is_fallback())
             .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
             .unwrap_or_else(|| {
                 (

@@ -349,12 +349,11 @@ pub(crate) async fn record_accepted_chat_response(
     iteration: usize,
     accepted_route: Option<&AcceptedRoute>,
 ) {
-    // A Reliable fallback is the only accepted-route envelope that supersedes
-    // the configured route context. Plain dispatch also creates an envelope,
-    // but it can contain an implementation alias rather than a configured
-    // provider reference.
+    // An accepted route is the canonical physical identity whenever Reliable
+    // produced one. Its fallback flag describes recovery observability, not
+    // whether its provider/model pair is authoritative for this response.
     let (effective_provider, effective_model) = match accepted_route {
-        Some(route) if route.is_fallback() => (route.provider_ref(), route.model()),
+        Some(route) => (route.provider_ref(), route.model()),
         _ => {
             // Direct and vision calls have no Reliable route. `for_route`
             // records their configured serving identity, which remains

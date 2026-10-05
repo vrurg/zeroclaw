@@ -123,7 +123,8 @@ struct StreamingToolState {
     name: String,
     // Anthropic starts native tools with an object placeholder. A zero-argument
     // tool may legitimately have no later JSON deltas, so retain that object
-    // until an input_json_delta makes the accumulated wire JSON authoritative.
+    // until the first non-empty input_json_delta makes accumulated wire JSON
+    // authoritative. Empty fragments carry no replacement payload.
     input_json: String,
     saw_input_json_delta: bool,
 }
@@ -136,8 +137,9 @@ struct StreamingToolState {
 struct StreamingProviderToolInputState {
     input_json: String,
     /// As with native client tools, only the start-envelope object is a
-    /// placeholder. Later `input_json_delta` fragments are wire content and
-    /// must never be discarded merely because an earlier fragment was `{}`.
+    /// placeholder. The first non-empty `input_json_delta` fragment becomes
+    /// wire content and must never be discarded merely because an earlier
+    /// fragment was `{}`. Empty fragments carry no replacement payload.
     saw_input_json_delta: bool,
 }
 
@@ -1119,10 +1121,13 @@ impl AnthropicModelProvider {
     fn tool_result_content(content: &str) -> ToolResultContent {
         let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
+            // Sweep the *cleaned* text, never the original. An over-ceiling
+            // marker yields zero references and lands in `cleaned` as the
+            // fixed refusal note - returning the original instead would
+            // forward its raw oversized body past the marker ceiling. The
+            // sweep is still needed on top of `cleaned` because an
+            // unterminated marker also yields zero references and copies its
+            // payload verbatim into the cleaned text.
             return ToolResultContent::Text(Self::sweep_residual_image_data(&cleaned).into_owned());
         }
 
@@ -3470,7 +3475,7 @@ impl AnthropicModelProvider {
                             ) {
                                 (Some(index), Some(json)) => {
                                     if let Some(state) = tool_blocks.get_mut(&index) {
-                                        if !state.saw_input_json_delta {
+                                        if !json.is_empty() && !state.saw_input_json_delta {
                                             state.input_json.clear();
                                             state.saw_input_json_delta = true;
                                         }
@@ -3504,7 +3509,7 @@ impl AnthropicModelProvider {
                                         // envelope before streamed input JSON. Like client
                                         // tools, that placeholder is not a prefix of the first
                                         // delta and must not be concatenated with it.
-                                        if !state.saw_input_json_delta {
+                                        if !json.is_empty() && !state.saw_input_json_delta {
                                             state.input_json.clear();
                                             state.saw_input_json_delta = true;
                                         }
@@ -3917,11 +3922,22 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let msg = event
+                    let message = event
                         .get("error")
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
+                    // Preserve the provider's bounded protocol type when it is
+                    // present so downstream retry classification can distinguish
+                    // an accepted SSE error from an untyped message alone.
+                    let msg = match event
+                        .get("error")
+                        .and_then(|error| error.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some(error_type) => format!("{error_type}: {message}"),
+                        None => message.to_string(),
+                    };
                     let usage = Self::streaming_usage(
                         input_tokens,
                         output_tokens,
@@ -3954,9 +3970,7 @@ impl AnthropicModelProvider {
                         if let Some(usage) = usage {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
                         }
-                        let _ = tx
-                            .send(Err(StreamError::ModelProvider(msg.to_string())))
-                            .await;
+                        let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
                     }
                     return;
                 }
@@ -5178,6 +5192,72 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"u
             Some(42),
             "cache_read_input_tokens from message_start"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_carries_error_type() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            &tx,
+            None,
+            Some("claude-sonnet-4-6"),
+        )
+        .await;
+
+        let mut last_err = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(error) = event {
+                last_err = Some(error);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(message) => assert_eq!(
+                message, "overloaded_error: Overloaded",
+                "the machine-readable type must prefix the message so retry classification can match it"
+            ),
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_without_type_keeps_message() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_model(
+            reader,
+            &tx,
+            None,
+            Some("claude-sonnet-4-6"),
+        )
+        .await;
+
+        let mut last_err = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(error) = event {
+                last_err = Some(error);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(message) => assert_eq!(
+                message, "Overloaded",
+                "message must be unchanged when the type is absent"
+            ),
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -7393,6 +7473,65 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 failure.usage.and_then(|usage| usage.output_tokens),
                 Some(5),
                 "terminal usage must survive the valid zero-delta start"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_tool_empty_input_delta_preserves_object_start_input() {
+        use std::io::Cursor;
+
+        for content_block in [
+            r#"{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}"#,
+            r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example","input":{}}"#,
+        ] {
+            let bytes = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut terminal_failures = 0;
+            let mut semantic_empty = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(_)) => terminal_failures += 1,
+                    Err(StreamError::SemanticEmpty(failure)) => semantic_empty = Some(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(
+                final_count, 0,
+                "provider-executed work without visible text is never Final"
+            );
+            assert_eq!(
+                terminal_failures, 0,
+                "an empty delta must not erase the object start input"
+            );
+            let failure = semantic_empty
+                .expect("the retained object start input reaches normal provider-tool completion");
+            assert!(failure.has_pre_executed_tool_activity());
+            assert_eq!(
+                failure.usage.and_then(|usage| usage.output_tokens),
+                Some(5),
+                "terminal usage must survive the empty delta"
             );
         }
     }
