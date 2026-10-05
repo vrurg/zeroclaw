@@ -248,17 +248,21 @@ pub(crate) async fn call_provider(
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response(
-                        active_model_provider,
-                        prepared_messages,
-                        request_tools,
-                        active_dispatch_model,
-                        ctx.temperature,
-                        ctx.cancellation_token,
-                        ctx.on_delta,
-                        ctx.event_tx,
-                        ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
+                    match with_exact_dispatch_route(
+                        active_model_provider_name.to_string(),
+                        active_model.to_string(),
+                        consume_provider_streaming_response(
+                            active_model_provider,
+                            prepared_messages,
+                            request_tools,
+                            active_dispatch_model,
+                            ctx.temperature,
+                            ctx.cancellation_token,
+                            ctx.on_delta,
+                            ctx.event_tx,
+                            ctx.strict_tool_parsing,
+                            ctx.draft_reasoning,
+                        ),
                     )
                     .await
                     {

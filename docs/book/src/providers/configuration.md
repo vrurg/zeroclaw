@@ -675,8 +675,9 @@ exposed, no provider or client tool activity occurred, and the failed stream
 identifies its exact configured candidate, ZeroClaw asks Reliable to continue
 for an output/context limit or a pre-output refusal. Reliable advances to the
 next distinct candidate when one exists. If no distinct candidate exists, it
-may make its one documented non-streaming recovery attempt of the same entry;
-that exception is consumed once and is not fallback attribution. A missing
+may begin one documented non-streaming recovery operation of the same entry.
+That operation follows the entry's configured retry budget, is consumed once
+as a recovery operation, and is not fallback attribution. A missing
 candidate identity, paused turn, any visible partial output, or any tool
 activity returns an explicit incomplete result instead: replaying could
 duplicate a visible answer or a side effect.
