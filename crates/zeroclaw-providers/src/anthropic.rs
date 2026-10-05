@@ -831,8 +831,16 @@ impl AnthropicModelProvider {
                 anyhow::bail!("Anthropic OAuth aliases require a stored setup-token profile")
             }
         }
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
+        .and_then(|token| {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() == token.len() {
+                Some(token)
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
         .ok_or_else(Self::missing_credentials_error)?;
         let auth_kind = match profile.metadata.get("auth_kind") {
             // Stored profiles predate `auth_kind` metadata. Retain their

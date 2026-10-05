@@ -173,11 +173,11 @@ impl AuthService {
         profile_override: Option<&str>,
     ) -> Result<Option<AuthProfile>> {
         let model_provider = normalize_model_provider(model_provider)?;
-        let data = self.store.load().await?;
+        let mut data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, &model_provider, profile_override) else {
             return Ok(None);
         };
-        let Some(profile) = data.profiles.get(&profile_id) else {
+        let Some(profile) = data.profiles.remove(&profile_id) else {
             return Ok(None);
         };
         if profile.model_provider != model_provider {
@@ -187,14 +187,15 @@ impl AuthService {
                 model_provider
             );
         }
-        Ok(Some(profile.clone()))
+        Ok(Some(profile))
     }
 
     /// Return the profile with this provider-local name exactly as written.
     ///
     /// Unlike [`Self::get_profile`], this does not accept a fully-qualified
-    /// profile ID. Alias-bound callers use it when a colon is a valid part of
-    /// the alias rather than a separator supplied by a user profile override.
+    /// profile ID. Alias-bound callers use it when the provider-local name
+    /// must remain literal rather than being treated as a user-supplied
+    /// fully-qualified profile override.
     pub async fn get_profile_by_name(
         &self,
         model_provider: &str,
@@ -207,8 +208,8 @@ impl AuthService {
             );
         }
         let profile_id = profile_id(&model_provider, profile_name);
-        let data = self.store.load().await?;
-        let Some(profile) = data.profiles.get(&profile_id) else {
+        let mut data = self.store.load().await?;
+        let Some(profile) = data.profiles.remove(&profile_id) else {
             return Ok(None);
         };
         if profile.model_provider != model_provider {
@@ -218,7 +219,7 @@ impl AuthService {
                 model_provider
             );
         }
-        Ok(Some(profile.clone()))
+        Ok(Some(profile))
     }
 
     pub async fn get_provider_bearer_token(
