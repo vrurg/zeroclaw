@@ -214,12 +214,12 @@ async fn queued_control_abandonment_fixture(exit: QueuedControlExit) {
     };
     assert_eq!(state(), ("pending".into(), None));
     let slot = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&supervisor))));
-    let command = MatrixGoalCommandSubmission {
+    let command = MatrixGoalCommandSubmission::Deferred {
         supervisor: Arc::clone(&supervisor),
         supervisor_slot: Arc::clone(&slot),
         settings,
         context: Arc::clone(&context),
-        submission: admission,
+        submission: Box::new(admission),
         history_key: session.clone(),
     };
 
