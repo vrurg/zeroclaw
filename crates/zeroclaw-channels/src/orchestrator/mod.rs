@@ -4397,19 +4397,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     if zeroclaw_runtime::agent::context_window_exceeded_from_error(err).is_some() {
         return false;
     }
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
+    zeroclaw_providers::reliable::is_context_window_exceeded(err)
 }
 
 fn load_cached_model_preview(

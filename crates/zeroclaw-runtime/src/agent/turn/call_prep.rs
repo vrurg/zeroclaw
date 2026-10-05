@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_api::hook::ToolCallHookContext;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
@@ -315,7 +316,9 @@ pub(crate) async fn prepare_tool_calls(
                 if let Some(hook_context) = hook_context.as_ref() {
                     abandon_prepared_context(ctx, hook_context, &tool_name).await;
                 }
-                anyhow::bail!("{repeated}");
+                return Err(
+                    TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
+                );
             }
         }
 
@@ -1501,6 +1504,13 @@ mod tests {
             panic!("the repeated prompt-required call must abort preparation");
         };
         assert!(error.to_string().contains("repeated prompt-required"));
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error)
+            .expect("repeated approval must retain the upstream typed stop");
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::PromptRequiredRepeat
+        );
+        assert_eq!(stop.class, zeroclaw_api::turn_stop::TurnStopClass::CloseOut);
 
         assert_eq!(
             *events.lock().unwrap(),
