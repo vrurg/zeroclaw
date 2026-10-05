@@ -1562,6 +1562,32 @@ fn apply_factory_leaf_metadata(
     ))
 }
 
+/// Reject raw inline keys on persisted Anthropic OAuth aliases before the
+/// common credential resolver trims empty values away. Config loading records
+/// validation failures but continues, so every alias-aware construction path
+/// must preserve the schema's presence-based admission rule.
+fn reject_anthropic_oauth_inline_api_key(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> anyhow::Result<()> {
+    if canonicalize_v2_model_provider_name(family) != "anthropic" {
+        return Ok(());
+    }
+
+    let Some(entry) = config.providers.models.anthropic.get(alias) else {
+        return Ok(());
+    };
+    if entry.auth_mode == Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth)
+        && entry.base.api_key.is_some()
+    {
+        anyhow::bail!(
+            "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+        );
+    }
+    Ok(())
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1595,6 +1621,10 @@ fn create_model_provider_inner(
         .filter(|value| !value.is_empty())
         .map(canonicalize_v2_model_provider_name)
         .unwrap_or(name);
+
+    if let Some(config) = config {
+        reject_anthropic_oauth_inline_api_key(config, name, alias)?;
+    }
 
     // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
     // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
@@ -4187,6 +4217,39 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn alias_construction_rejects_blank_anthropic_oauth_inline_keys_before_normalization() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        for api_key in ["", "   "] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".to_string(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        api_key: Some(api_key.to_string()),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+
+            let error = match create_model_provider_from_ref(&config, "anthropic.subscription") {
+                Ok(_) => panic!("an explicitly present inline OAuth key must fail before trimming"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not be combined with api_key"),
+                "unexpected error for {api_key:?}: {error}"
+            );
+        }
     }
 
     #[test]
