@@ -272,6 +272,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
                                 model_provider: provider.as_ref(),
                                 provider_name: &provider_name,
                                 model: &model,
+                                dispatch_model: &model,
                                 temperature: None,
                             }
                             .run_text_query(system.as_deref(), &prompt)

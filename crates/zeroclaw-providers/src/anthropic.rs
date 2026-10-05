@@ -19,6 +19,7 @@ use zeroclaw_api::model_provider::{
     TerminalCompletionError, TerminalCompletionFailure, ThinkingDisplay,
 };
 use zeroclaw_api::tool::ToolSpec;
+use zeroclaw_config::schema::CacheTtl;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
@@ -101,6 +102,9 @@ pub struct AnthropicModelProvider {
     /// non-streaming requests only. Empty means requests are byte-identical to
     /// the pre-opt-in wire format.
     server_fallback_models: Vec<String>,
+    /// Cache entry lifetime carried by every marker this provider places.
+    /// The default is Anthropic's five-minute lifetime.
+    cache_ttl: CacheTtl,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -308,16 +312,23 @@ fn anthropic_beta_features(
 }
 
 /// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
+/// Fable 5) reject the fixed-budget `enabled` shape with HTTP 400 and
 /// require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+/// Resolves the request shape accepted by the given Anthropic model family.
+///
+/// Fable 5 is adaptive-only, including unsuffixed and dated model IDs. The
+/// matcher intentionally covers the family rather than a single release.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
         AnthropicThinkingStyle::Adaptive
     } else {
         AnthropicThinkingStyle::Budget
@@ -523,12 +534,28 @@ struct NativeToolSpec {
 pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
+    /// The API default is intentionally omitted to preserve the established
+    /// five-minute wire format; one-hour markers emit this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
 }
 
 impl CacheControl {
     pub(crate) fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    /// Creates an ephemeral marker for the configured cache lifetime.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+        match ttl {
+            CacheTtl::FiveMinutes => Self::ephemeral(),
+            CacheTtl::OneHour => Self {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("1h".to_string()),
+            },
         }
     }
 }
@@ -704,14 +731,14 @@ fn is_valid_provider_owned_block(
     phase: ProviderOwnedBlockPhase,
 ) -> bool {
     let input_is_object = fields.input.is_some_and(serde_json::Value::is_object);
-    let input_is_required = matches!(phase, ProviderOwnedBlockPhase::NativeResponse);
+    // Native responses always carry the completed provider-tool input. Stream
+    // starts may defer it to `input_json_delta`, but when they do include it,
+    // it is already the same object-shaped wire value validated at close.
+    let input_is_valid = input_is_object
+        || (matches!(phase, ProviderOwnedBlockPhase::StreamStart) && fields.input.is_none());
 
     match kind {
-        "server_tool_use" => {
-            non_empty(fields.id)
-                && non_empty(fields.name)
-                && (!input_is_required || input_is_object)
-        }
+        "server_tool_use" => non_empty(fields.id) && non_empty(fields.name) && input_is_valid,
         "web_search_tool_result" => {
             non_empty(fields.tool_use_id)
                 && fields.content.is_some_and(is_web_search_result_content)
@@ -720,7 +747,7 @@ fn is_valid_provider_owned_block(
             non_empty(fields.id)
                 && non_empty(fields.name)
                 && non_empty(fields.server_name)
-                && (!input_is_required || input_is_object)
+                && input_is_valid
         }
         "mcp_tool_result" => {
             non_empty(fields.tool_use_id)
@@ -747,6 +774,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
+    cache_ttl: Option<CacheTtl>,
 }
 
 impl AnthropicBuilder {
@@ -790,6 +818,12 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Requests a cache lifetime for every marker the native provider emits.
+    pub fn cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -802,6 +836,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
+            cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -818,6 +853,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
+            cache_ttl: None,
         }
     }
 
@@ -896,11 +932,14 @@ impl AnthropicModelProvider {
 
     /// For OAuth tokens, Anthropic requires the system prompt to start with the
     /// Claude Code identity prefix. This prepends it to any existing system prompt.
-    fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
+    fn apply_oauth_system_prompt(
+        system: Option<SystemPrompt>,
+        cache_ttl: CacheTtl,
+    ) -> Option<SystemPrompt> {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -912,7 +951,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral()),
+                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -924,20 +963,27 @@ impl AnthropicModelProvider {
         messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
-    /// Apply cache control to the last message content block
+    /// Apply the default cache marker used by unit tests and legacy callers.
+    #[cfg(test)]
     fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
-        {
-            match last_content {
-                NativeContentOut::Text { cache_control, .. }
-                | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral());
+        Self::apply_cache_to_last_message_with_ttl(messages, CacheTtl::FiveMinutes);
+    }
+
+    /// Apply the rolling cache breakpoint with the configured lifetime.
+    fn apply_cache_to_last_message_with_ttl(messages: &mut [NativeMessage], cache_ttl: CacheTtl) {
+        for message in messages.iter_mut().rev() {
+            for content in message.content.iter_mut().rev() {
+                match content {
+                    NativeContentOut::Text { cache_control, .. }
+                    | NativeContentOut::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                        return;
+                    }
+                    NativeContentOut::ToolUse { .. }
+                    | NativeContentOut::Image { .. }
+                    | NativeContentOut::Thinking { .. }
+                    | NativeContentOut::RedactedThinking { .. } => {}
                 }
-                NativeContentOut::ToolUse { .. }
-                | NativeContentOut::Image { .. }
-                | NativeContentOut::Thinking { .. }
-                | NativeContentOut::RedactedThinking { .. } => {}
             }
         }
     }
@@ -964,7 +1010,7 @@ impl AnthropicModelProvider {
 
         // Cache the last tool definition (caches all tools)
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral());
+            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
         }
 
         Some(native_tools)
@@ -1432,7 +1478,18 @@ impl AnthropicModelProvider {
         })
     }
 
+    #[cfg(test)]
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
+        Self::convert_messages_with_ttl(messages, CacheTtl::FiveMinutes)
+    }
+
+    /// Converts messages while applying the configured lifetime to the system
+    /// cache marker. The default wrapper above keeps focused unit fixtures
+    /// pinned to Anthropic's five-minute wire shape.
+    fn convert_messages_with_ttl(
+        messages: &[ChatMessage],
+        cache_ttl: CacheTtl,
+    ) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
         let mut run = ToolResultRun::default();
@@ -1697,7 +1754,7 @@ impl AnthropicModelProvider {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral()),
+                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
             }])
         });
 
@@ -3351,13 +3408,17 @@ impl AnthropicModelProvider {
                         }
                         if started && matches!(block_type, "server_tool_use" | "mcp_tool_use") {
                             if let Some(index) = content_block_index {
+                                // A start-envelope object is already complete
+                                // provider-owned input. Retain it until the
+                                // matching stop so a zero-argument tool with
+                                // no later delta is valid, while an absent
+                                // input remains available for delta assembly.
+                                let input_json = block
+                                    .get("input")
+                                    .map(serde_json::Value::to_string)
+                                    .unwrap_or_default();
                                 if provider_tool_input_blocks
-                                    .insert(
-                                        index,
-                                        StreamingProviderToolInputState {
-                                            input_json: String::new(),
-                                        },
-                                    )
+                                    .insert(index, StreamingProviderToolInputState { input_json })
                                     .is_some()
                                 {
                                     terminal_completion_error.get_or_insert(
@@ -3450,6 +3511,13 @@ impl AnthropicModelProvider {
                                 (Some(index), Some(json)) => {
                                     if let Some(state) = provider_tool_input_blocks.get_mut(&index)
                                     {
+                                        // Anthropic can emit an empty object in the start
+                                        // envelope before streamed input JSON. Like client
+                                        // tools, that placeholder is not a prefix of the first
+                                        // delta and must not be concatenated with it.
+                                        if state.input_json == "{}" {
+                                            state.input_json.clear();
+                                        }
                                         state.input_json.push_str(json);
                                     } else {
                                         invalid();
@@ -3983,7 +4051,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
         let system = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system)
+            Self::apply_oauth_system_prompt(system, self.cache_ttl)
         } else {
             system
         };
@@ -4073,11 +4141,12 @@ impl ModelProvider for AnthropicModelProvider {
             )
         })?;
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages_with_ttl(request.messages, self.cache_ttl);
 
         // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message_with_ttl(&mut messages, self.cache_ttl);
         }
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -4096,7 +4165,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         // For OAuth tokens, prepend Claude Code identity to system prompt
         let system_prompt = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
@@ -4298,9 +4367,10 @@ impl ModelProvider for AnthropicModelProvider {
             }
         };
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages_with_ttl(request.messages, self.cache_ttl);
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message_with_ttl(&mut messages, self.cache_ttl);
         }
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
@@ -4316,7 +4386,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let system_prompt = if Self::is_setup_token(&credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
@@ -7213,6 +7283,240 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[tokio::test]
+    async fn provider_tool_start_input_must_be_object_and_never_recovers_to_final() {
+        use std::io::Cursor;
+
+        for content_block in [
+            r#"{"type":"server_tool_use","id":"srv_1","name":"web_search","input":7}"#,
+            r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example","input":7}"#,
+        ] {
+            let bytes = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{content_block}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut failures = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(
+                final_count, 0,
+                "wrong-typed start input must not emit Final"
+            );
+            assert_eq!(failures.len(), 1, "wrong-typed start input must fail once");
+            assert_eq!(
+                failures[0].reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+            assert_eq!(
+                failures[0]
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
+                Some(5),
+                "latest cumulative usage must survive the malformed start"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_tool_object_start_input_is_valid_without_a_later_delta() {
+        use std::io::Cursor;
+
+        for content_block in [
+            r#"{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}"#,
+            r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example","input":{}}"#,
+        ] {
+            let bytes = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut invalid_terminal_failures = 0;
+            let mut semantic_empty = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(_)) => invalid_terminal_failures += 1,
+                    Err(StreamError::SemanticEmpty(failure)) => semantic_empty = Some(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(
+                final_count, 0,
+                "provider-executed work without visible text is never Final"
+            );
+            assert_eq!(
+                invalid_terminal_failures, 0,
+                "object start input must not be rejected as malformed"
+            );
+            let failure = semantic_empty
+                .expect("valid provider-tool work without text is a typed semantic-empty result");
+            assert!(failure.has_pre_executed_tool_activity());
+            assert_eq!(
+                failure.usage.and_then(|usage| usage.output_tokens),
+                Some(5),
+                "terminal usage must survive the valid zero-delta start"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_tool_empty_start_placeholder_is_replaced_by_later_json() {
+        use std::io::Cursor;
+
+        for content_block in [
+            r#"{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}"#,
+            r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example","input":{}}"#,
+        ] {
+            let bytes = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{content_block}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"query\\\":\\\"x\\\"}}\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut tool_calls = 0;
+            let mut failures = 0;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Ok(StreamEvent::ToolCall(_)) => tool_calls += 1,
+                    Err(StreamError::TerminalCompletion(_)) => failures += 1,
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(final_count, 1, "valid later JSON must finalize");
+            assert_eq!(tool_calls, 0, "provider tools must not become client calls");
+            assert_eq!(failures, 0, "placeholder replacement must be valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_tool_json_after_visible_text_never_emits_final() {
+        use std::io::Cursor;
+
+        for content_block in [
+            r#"{"type":"server_tool_use","id":"srv_1","name":"web_search"}"#,
+            r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example"}"#,
+        ] {
+            let bytes = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{content_block}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut failures = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(final_count, 0, "incomplete input must not reach Final");
+            assert_eq!(failures.len(), 1, "incomplete input must fail once");
+            assert_eq!(
+                failures[0].reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+            assert_eq!(
+                failures[0]
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
+                Some(5),
+                "terminal usage must survive the malformed provider input"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_stream_without_message_start_preserves_partial_and_fails_closed() {
         use std::io::Cursor;
 
@@ -8316,6 +8620,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(
             anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // The whole Fable 5 family is adaptive-only: bare fable-5 and
+        // gateway-prefixed IDs resolve like fable-5-1.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
             AnthropicThinkingStyle::Adaptive
         );
         // Budget-based families keep the `enabled` shape.
@@ -12514,13 +12828,20 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A PNG signature is enough for MIME detection, and its 12-character
-        // base64 is canonical.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .expect("write png");
+        // Multimodal preparation decodes pixels, so the fixture must be a
+        // real PNG rather than only a recognizable signature.
+        let png_bytes = {
+            let mut buffer = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buffer, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buffer.into_inner()
+        };
+        std::fs::write(&image_path, &png_bytes).expect("write png");
 
         let messages = vec![
             ChatMessage::user("take a screenshot"),
@@ -12575,7 +12896,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("payload must be decodable base64"),
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            png_bytes,
             "the bytes written to disk must be the bytes on the wire"
         );
 

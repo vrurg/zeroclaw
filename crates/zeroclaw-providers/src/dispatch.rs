@@ -183,6 +183,17 @@ impl AcceptedRoute {
             .map(|attribution| &attribution.fallback)
     }
 
+    /// Whether Reliable selected a fallback candidate for this response.
+    ///
+    /// A plain dispatch scope also records an accepted route, but that route
+    /// may carry only a provider implementation alias. Callers that already
+    /// have a configured route must retain that canonical context unless a
+    /// Reliable fallback explicitly superseded it.
+    #[must_use]
+    pub fn is_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
     pub(crate) fn into_fallback_attribution(
         self,
     ) -> Option<crate::reliable::ProviderFallbackAttribution> {
@@ -392,10 +403,13 @@ impl AccountedChatScope {
         self.inner.take().with_attempts(attempts, successful_route)
     }
 
-    /// Whether the selected Reliable stream can advance to a distinct
-    /// candidate without replaying the already attempted route.
-    pub fn has_distinct_reliable_stream_recovery_candidate(&self) -> bool {
-        crate::reliable::has_distinct_reliable_stream_recovery_candidate()
+    /// Whether this scope is recovering a stream owned by Reliable. A direct
+    /// provider can make one pre-output non-streaming recovery call. Reliable
+    /// owns candidate selection: it advances to a distinct candidate when one
+    /// exists, otherwise its documented single-candidate exception decides
+    /// whether one same-entry non-stream recovery is permitted.
+    pub fn has_reliable_stream_recovery_context(&self) -> bool {
+        crate::reliable::has_reliable_stream_recovery_context()
     }
 
     /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.

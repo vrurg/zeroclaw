@@ -17,6 +17,7 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::dispatch::{AcceptedRoute, AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
@@ -48,9 +49,47 @@ fn account_terminal_stream_rejection(
     }
 }
 
+/// Content-free fingerprints of the cacheable prompt prefix and tool list.
+struct PrefixFingerprint {
+    system_chars: usize,
+    system_sha256: Option<String>,
+    tools_count: usize,
+    tools_sha256: Option<String>,
+}
+
+fn prefix_fingerprint(
+    request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
+) -> PrefixFingerprint {
+    let leading_system: Vec<&str> = request_messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .collect();
+    PrefixFingerprint {
+        system_chars: leading_system
+            .iter()
+            .map(|content| content.chars().count())
+            .sum(),
+        system_sha256: (!leading_system.is_empty()).then(|| {
+            short_sha256_prefix(&::serde_json::to_vec(&leading_system).unwrap_or_default())
+        }),
+        tools_count: request_tools.map_or(0, <[ToolSpec]>::len),
+        tools_sha256: request_tools
+            .map(|tools| short_sha256_prefix(&::serde_json::to_vec(tools).unwrap_or_default())),
+    }
+}
+
+fn short_sha256_prefix(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(&Sha256::digest(bytes)[..8])
+}
+
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -76,12 +115,25 @@ pub(crate) async fn announce_llm_request(
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
+        // Prefix fingerprints remain content-free while allowing operators to
+        // correlate cacheable request shapes without logging request bodies.
+        let fingerprint = prefix_fingerprint(request_messages, request_tools);
         let mut attrs = ::serde_json::json!({
             "iteration": iteration + 1,
             "messages_count": request_messages.len(),
+            "system_chars": fingerprint.system_chars,
+            "tools_count": fingerprint.tools_count,
             "model": active_model,
             "trace_id": ctx.turn_id,
         });
+        if let ::serde_json::Value::Object(map) = &mut attrs {
+            if let Some(system_sha256) = fingerprint.system_sha256.as_deref() {
+                map.insert("system_sha256".to_string(), system_sha256.into());
+            }
+            if let Some(tools_sha256) = fingerprint.tools_sha256.as_deref() {
+                map.insert("tools_sha256".to_string(), tools_sha256.into());
+            }
+        }
         // Opt-in request payload capture (observability.log_llm_request_payload,
         // default off). When enabled, attach the scrubbed + truncated message
         // history; when off (or no writer installed) `attrs` is unchanged.
@@ -138,6 +190,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         current_usd,
         limit_usd,
         period,
+        agent_alias,
     }) = check_tool_loop_budget()
     {
         ::zeroclaw_log::record!(
@@ -149,15 +202,22 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
                     "current_usd": current_usd,
                     "limit_usd": limit_usd,
                     "period": format!("{period:?}"),
+                    "agent_alias": agent_alias,
                 })),
             "tool-call loop budget exceeded"
         );
-        anyhow::bail!(
-            "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-            current_usd,
-            limit_usd,
-            period
-        );
+        let message = if let Some(agent_alias) = agent_alias {
+            format!(
+                "Budget exceeded for agent `{agent_alias}`: ${current_usd:.4} of \
+                 ${limit_usd:.2} {period:?} daily ceiling. Cannot make further API \
+                 calls until the budget resets."
+            )
+        } else {
+            format!(
+                "Budget exceeded: ${current_usd:.4} of ${limit_usd:.2} {period:?} limit. Cannot make further API calls until the budget resets."
+            )
+        };
+        return Err(TurnStop::fatal(TurnStopCode::BudgetExhausted, message).into());
     }
     Ok(())
 }
@@ -171,6 +231,7 @@ pub(crate) async fn call_provider(
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
+    active_dispatch_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
@@ -191,7 +252,7 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         prepared_messages,
                         request_tools,
-                        active_model,
+                        active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
                         ctx.on_delta,
@@ -266,14 +327,41 @@ pub(crate) async fn call_provider(
                         Err(stream_err) => {
                             let streamed_refusal =
                                 zeroclaw_providers::model_refusal_from_error(&stream_err).cloned();
-                            let should_recover = if let Some(terminal) = stream_err
+                            // A provider-terminal error has already exhausted the provider's
+                            // own stream/recovery budget. Replaying its non-streaming call here
+                            // would repeat that work and contradict the terminal contract.
+                            let provider_terminal = stream_err
+                                .downcast_ref::<StreamErrorWithUsage>()
+                                .is_some_and(|error| {
+                                    error.source.chain().any(|cause| {
+                                        matches!(
+                                            cause.downcast_ref::<
+                                                zeroclaw_api::model_provider::StreamError,
+                                            >(),
+                                            Some(
+                                                zeroclaw_api::model_provider::StreamError::Terminal(
+                                                    _
+                                                )
+                                            )
+                                        )
+                                    })
+                                });
+                            let should_recover = if provider_terminal {
+                                if let Some(usage) = stream_err
+                                    .downcast_ref::<StreamErrorWithUsage>()
+                                    .and_then(|error| error.usage.clone())
+                                {
+                                    scope.record_stream_interruption_usage(usage);
+                                }
+                                false
+                            } else if let Some(terminal) = stream_err
                                 .downcast_ref::<StreamTerminalCompletion>()
                             {
                                 account_terminal_stream_rejection(&scope, terminal);
 
                                 terminal.policy.recovery()
                                     == zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
-                                    && scope.has_distinct_reliable_stream_recovery_candidate()
+                                    && scope.has_reliable_stream_recovery_context()
                             } else if let Some(semantic_empty) = stream_err
                                 .downcast_ref::<StreamSemanticEmptyCompletion>()
                             {
@@ -295,6 +383,11 @@ pub(crate) async fn call_provider(
                                 {
                                     scope.record_stream_interruption_usage(usage);
                                 }
+                                // Runtime only decides whether this pre-output failure is
+                                // eligible to re-enter recovery. Reliable owns candidate
+                                // selection: it skips the selected entry when another is
+                                // available, but permits its documented one-shot
+                                // single-candidate non-streaming recovery.
                                 true
                             };
 
@@ -334,7 +427,7 @@ pub(crate) async fn call_provider(
                                             dispatcher
                                                 .chat_after_stream_refusal(
                                                     request,
-                                                    active_model,
+                                                    active_dispatch_model,
                                                     ctx.temperature,
                                                     refusal,
                                                 )
@@ -342,7 +435,7 @@ pub(crate) async fn call_provider(
                                         }
                                         None => {
                                             dispatcher
-                                                .chat(request, active_model, ctx.temperature)
+                                                .chat(request, active_dispatch_model, ctx.temperature)
                                                 .await
                                         }
                                     }
@@ -388,7 +481,7 @@ pub(crate) async fn call_provider(
                         .ok()
                         .flatten(),
                 },
-                active_model,
+                active_dispatch_model,
                 ctx.temperature,
             ),
         )));
@@ -402,7 +495,7 @@ pub(crate) async fn call_provider(
                         result = tokio::time::timeout(step_timeout, chat_future) => {
                             match result {
                                 Ok(inner) => inner,
-                                Err(_) => Err(anyhow::Error::msg(format!("LLM inference step timed out after {step_secs}s (step_timeout_secs)"))),
+                                Err(_) => Err(step_timeout_stop(step_secs).into()),
                             }
                         },
                         () = token.cancelled() => Err(ToolLoopCancelled.into()),
@@ -410,9 +503,7 @@ pub(crate) async fn call_provider(
                 } else {
                     match tokio::time::timeout(step_timeout, chat_future).await {
                         Ok(inner) => inner,
-                        Err(_) => Err(anyhow::Error::msg(format!(
-                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                        ))),
+                        Err(_) => Err(step_timeout_stop(step_secs).into()),
                     }
                 }
             }
@@ -453,7 +544,7 @@ mod payload_capture_tests {
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+    use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits, StreamReasoningMode};
     use zeroclaw_log::LogConfig;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -499,6 +590,9 @@ mod payload_capture_tests {
             observer,
             provider_name: "stub",
             model: "stub-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: None,
             approval: None,
             channel_name: "test",
@@ -527,7 +621,8 @@ mod payload_capture_tests {
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
             let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
-            let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+            let _ = announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0)
+                .await;
             drop(tx);
             assert!(matches!(
                 rx.recv().await,
@@ -541,7 +636,8 @@ mod payload_capture_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
         let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 3).await;
         drop(tx);
         assert!(matches!(
             rx.recv().await,
@@ -621,7 +717,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
         let attrs = on_record
@@ -660,7 +757,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
         let off_attrs = off_record
@@ -701,7 +799,7 @@ mod streaming_fallback_tests {
     };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::StreamEvent;
-    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits};
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
     use zeroclaw_providers::{
@@ -1283,6 +1381,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1314,6 +1415,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "test-provider",
+                        "test-model",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -1355,7 +1457,7 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
-    async fn stream_failure_without_fallback_keeps_typed_terminal_cause() {
+    async fn single_candidate_stream_failure_uses_one_non_streaming_recovery() {
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableModelProvider::new(
             "test",
@@ -1374,6 +1476,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1392,10 +1497,11 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let error = call_provider(
+        let response = call_provider(
             &ctx,
             &provider,
             "test-provider",
+            "test-model",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1403,25 +1509,12 @@ mod streaming_fallback_tests {
             0,
         )
         .await
-        .expect("stream fallback remains a provider-call outcome")
+        .expect("stream recovery remains a provider-call outcome")
         .chat_result
-        .expect_err("the only stream candidate must fail");
+        .expect("the only Reliable candidate receives its one recovery attempt");
 
-        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
-        assert!(
-            error
-                .to_string()
-                .contains("All model providers/models failed after 0 failure event(s)")
-        );
-        let terminal = error
-            .chain()
-            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
-            .expect("recovery error must preserve a typed terminal cause");
-        assert_eq!(
-            terminal.kind(),
-            ReliableProviderTerminalFailureKind::Connection
-        );
-        assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+        assert_eq!(response.text.as_deref(), Some("must not replay"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1437,6 +1530,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1459,6 +1555,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "test-provider",
+            "test-model",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1505,7 +1602,7 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
-    async fn compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay() {
+    async fn compatible_stream_failures_keep_typed_kinds_after_single_candidate_recovery() {
         use axum::{Router, http::StatusCode, routing::post};
         use tokio::net::TcpListener;
         use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
@@ -1572,6 +1669,9 @@ mod streaming_fallback_tests {
                 observer: &observer,
                 provider_name: "test-provider",
                 model: "test-model",
+                context_limits: ResolvedContextLimits::legacy_fallback(0),
+                serving_provider_name: None,
+                serving_model: None,
                 temperature: Some(0.0),
                 approval: None,
                 channel_name: "test",
@@ -1595,6 +1695,7 @@ mod streaming_fallback_tests {
                 &provider,
                 "test-provider",
                 "test-model",
+                "test-model",
                 &[ChatMessage::user("go")],
                 None,
                 true,
@@ -1614,13 +1715,17 @@ mod streaming_fallback_tests {
                 expected_kind,
                 "{status} must retain its compatible streaming classification"
             );
-            assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
+            assert_eq!(
+                request_count.load(Ordering::Relaxed),
+                2,
+                "{status} gets one stream attempt and one single-candidate recovery"
+            );
             server.abort();
         }
     }
 
     #[tokio::test]
-    async fn single_reliable_terminal_stream_preserves_cause_without_replay() {
+    async fn single_reliable_terminal_stream_uses_one_non_streaming_recovery() {
         let selected = std::sync::Arc::new(TerminalStreamProvider {
             non_stream_calls: AtomicUsize::new(0),
             text_delta: None,
@@ -1640,6 +1745,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1658,10 +1766,11 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let error = call_provider(
+        let response = call_provider(
             &ctx,
             &provider,
             "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1669,19 +1778,15 @@ mod streaming_fallback_tests {
             0,
         )
         .await
-        .expect("dispatch returns the terminal provider outcome")
+        .expect("dispatch returns the recovered provider outcome")
         .chat_result
-        .expect_err("the only Reliable candidate cannot be replayed");
+        .expect("the only Reliable candidate receives its one recovery attempt");
 
-        assert_eq!(
-            zeroclaw_api::model_provider::terminal_completion_error(&error),
-            Some(zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit),
-            "the original terminal reason must remain visible"
-        );
+        assert_eq!(response.text.as_deref(), Some("must not be requested"));
         assert_eq!(
             selected.non_stream_calls.load(Ordering::Relaxed),
-            0,
-            "a single candidate must not receive a non-stream recovery request"
+            1,
+            "a single candidate receives exactly one non-stream recovery request"
         );
     }
 
@@ -1715,6 +1820,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1737,6 +1845,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1783,6 +1892,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1805,6 +1917,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1832,6 +1945,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "base-provider",
             model: "base-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1854,6 +1970,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "effective-provider",
+            "effective-model",
             "effective-model",
             &[ChatMessage::user("go")],
             None,
@@ -1887,6 +2004,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1909,6 +2029,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "test-provider",
+            "test-model",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1953,6 +2074,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1975,6 +2099,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -2020,6 +2145,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2042,6 +2170,7 @@ mod streaming_fallback_tests {
             &ctx,
             &provider,
             "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -2081,6 +2210,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2107,6 +2239,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "anthropic.test",
+                        "claude-test",
                         "claude-test",
                         &[ChatMessage::user("go")],
                         None,
@@ -2179,6 +2312,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2205,6 +2341,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "anthropic.test",
+                        "claude-test",
                         "claude-test",
                         &[ChatMessage::user("go")],
                         None,
@@ -2269,6 +2406,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2295,6 +2435,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "anthropic.test",
+                        "claude-test",
                         "claude-test",
                         &[ChatMessage::user("go")],
                         None,
@@ -2358,6 +2499,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2384,6 +2528,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "anthropic.test",
+                        "claude-test",
                         "claude-test",
                         &[ChatMessage::user("go")],
                         None,
@@ -2448,6 +2593,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2474,6 +2622,7 @@ mod streaming_fallback_tests {
                         &ctx,
                         &provider,
                         "anthropic.test",
+                        "claude-test",
                         "claude-test",
                         &[ChatMessage::user("go")],
                         None,
@@ -2529,6 +2678,9 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "anthropic.test",
             model: "claude-test",
+            context_limits: ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -2556,6 +2708,7 @@ mod streaming_fallback_tests {
                         &provider,
                         "anthropic.test",
                         "claude-test",
+                        "claude-test",
                         &[ChatMessage::user("go")],
                         None,
                         true,
@@ -2582,4 +2735,11 @@ mod streaming_fallback_tests {
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
     }
+}
+/// The per-step timeout stop, shared by both `step_timeout_secs` arms.
+fn step_timeout_stop(step_secs: u64) -> TurnStop {
+    TurnStop::close_out(
+        TurnStopCode::StepTimeout,
+        format!("LLM inference step timed out after {step_secs}s (step_timeout_secs)"),
+    )
 }
