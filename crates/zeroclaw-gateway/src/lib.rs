@@ -5332,6 +5332,37 @@ mod tests {
     }
 
     #[test]
+    fn gateway_boot_with_a_broken_oauth_seed_stays_unconfigured() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617");
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.model.is_empty());
+        assert_eq!(
+            state
+                .fallback
+                .expect("the rejected seed remains available for reload diagnostics")
+                .model
+                .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
     fn gateway_boot_ignores_a_seed_fallback_that_is_not_auth_ready() {
         use zeroclaw_api::attribution::Attributable;
         use zeroclaw_config::providers::ModelProviderRef;
