@@ -13750,6 +13750,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let typed = crate::model_refusal_from_error(&err)
             .expect("error must retain AnthropicRefusalError in its cause chain");
         assert_eq!(typed.category.as_deref(), Some("provider_refusal"));
+        let usage = crate::rejected_attempt_usage_from_error(&err)
+            .expect("a direct billable refusal must retain rejected usage");
+        assert_eq!(usage.input_tokens, Some(412));
+        assert_eq!(usage.output_tokens, Some(0));
     }
 
     #[tokio::test]

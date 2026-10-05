@@ -104,13 +104,7 @@ pub fn rejected_attempt_usage_from_error(error: &anyhow::Error) -> Option<&trait
                 .downcast_ref::<ReliableRejectedCompletionUsage>()
                 .map(|rejected| &rejected.usage)
         })
-        .or_else(|| {
-            error.chain().find_map(|cause| {
-                cause
-                    .downcast_ref::<AnthropicRefusalError>()
-                    .and_then(|refusal| refusal.usage.as_deref())
-            })
-        })
+        .or_else(|| model_refusal_from_error(error).and_then(|refusal| refusal.usage.as_deref()))
 }
 mod request_payload;
 
