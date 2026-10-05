@@ -201,6 +201,11 @@ impl AuthService {
         profile_name: &str,
     ) -> Result<Option<AuthProfile>> {
         let model_provider = normalize_model_provider(model_provider)?;
+        if profile_name != profile_name.trim() {
+            anyhow::bail!(
+                "Profile name must not have leading or trailing whitespace when resolved by exact name"
+            );
+        }
         let profile_id = profile_id(&model_provider, profile_name);
         let data = self.store.load().await?;
         let Some(profile) = data.profiles.get(&profile_id) else {
@@ -2003,6 +2008,30 @@ mod tests {
             .await
             .expect_err("cross-provider profile lookup must fail closed");
         assert!(error.to_string().contains("belongs to model_provider"));
+    }
+
+    #[tokio::test]
+    async fn get_profile_by_name_rejects_whitespace_that_would_change_the_profile_id() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            "anthropic",
+            "work",
+            "token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store profile");
+
+        let error = auth
+            .get_profile_by_name("anthropic", " work")
+            .await
+            .expect_err("exact-name lookup must reject a selector that trims to another profile");
+        assert!(
+            error.to_string().contains("leading or trailing whitespace"),
+            "the failed lookup must describe the exact-name boundary: {error}"
+        );
     }
 
     #[tokio::test]
