@@ -1222,7 +1222,12 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires a canonical alias: {error}"
             );
         }
-        if oauth && has_api_key(key) {
+        // Match schema admission exactly: OAuth aliases own their credential
+        // through AuthService, so the presence of an inline `api_key` is
+        // invalid even when that value is blank. Config::load logs validation
+        // failures and continues, therefore construction must keep the same
+        // fail-closed boundary.
+        if oauth && key.is_some() {
             anyhow::bail!(
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
             );
@@ -2100,6 +2105,31 @@ mod tests {
                 "unexpected error for {alias:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_oauth_factory_rejects_an_explicitly_empty_inline_key() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let config = AnthropicModelProviderConfig {
+            auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "subscription",
+            Some(""),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("OAuth construction must reject an explicitly empty api_key"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must not be combined with api_key"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
