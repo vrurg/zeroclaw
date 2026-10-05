@@ -31,8 +31,8 @@ pub use control::{
     GoalParentTurnKind, GoalParentTurnResult, GoalPendingAction, GoalQueuedControl, GoalResponse,
     GoalRuntime, GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver,
     GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
-    GoalSubmission, GoalSupervisorRetired, GoalSurface, GoalTurnBoundary,
-    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, classify_goal_control,
+    GoalSubmission, GoalSupervisorRetired, GoalSurface, GoalTurnBoundary, GoalVerifierAttribution,
+    GoalVerifierResult, GoalVerifierTurn, classify_goal_control,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,

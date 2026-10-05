@@ -724,7 +724,8 @@ impl GoalExecutionSupervisor {
                     scope,
                     submission.driver.as_ref(),
                     &submission.ingress,
-                ).await?;
+                )
+                .await?;
             }
         }
         launch_guard.settled();

@@ -17,14 +17,17 @@ use zeroclaw_api::{
 use zeroclaw_commands::goal::GoalBudgetLimits;
 use zeroclaw_config::schema::Config;
 use zeroclaw_goal::{
-    GoalDiagnosticTextGuard, GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission,
-    GoalExecutionSupervisor, GoalFailureReason, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
-    GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
-    checkpoint::GoalParentTurnCheckpoint, control::goal_parent_turn_input,
+    GoalControlAbandonReason, GoalControlAdmission, GoalDiagnosticTextGuard, GoalExecutionNotice,
+    GoalExecutionScope, GoalExecutionSupervisor, GoalFailureReason, GoalHostSettings,
+    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalSurface, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult,
+    GoalVerifierTurn, checkpoint::GoalParentTurnCheckpoint, control::goal_parent_turn_input,
 };
+
+mod control_delivery;
+pub(super) use control_delivery::deliver_matrix_goal_command;
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
     agent::execution_tree_budget::ExecutionTreeBudget,
@@ -135,18 +138,26 @@ pub(super) struct MatrixGoalCommandSubmission {
     supervisor: Arc<GoalExecutionSupervisor>,
     supervisor_slot: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
     settings: GoalHostSettings,
-    submission: GoalExecutionSubmission,
+    context: Arc<ChannelRuntimeContext>,
+    submission: GoalControlAdmission,
+    history_key: String,
 }
 
 impl MatrixGoalCommandSubmission {
     pub(super) fn response(&self) -> &GoalResponse {
-        self.submission.response()
+        match &self.submission {
+            GoalControlAdmission::Direct(submission) => submission.response(),
+            GoalControlAdmission::Queued { response, .. } => response,
+        }
     }
 
     /// Release the admitted worker after Matrix confirms lifecycle delivery.
     pub(super) async fn after_response(&mut self) -> Result<Option<GoalResponse>> {
+        let GoalControlAdmission::Direct(submission) = &mut self.submission else {
+            bail!("Goal deferred control must commit before launch handoff");
+        };
         self.supervisor
-            .launch_after_response(self.settings.clone(), &mut self.submission)
+            .launch_after_response(self.settings.clone(), submission)
             .await
     }
 
@@ -154,17 +165,15 @@ impl MatrixGoalCommandSubmission {
     /// response has been delivered by Matrix.
     pub(super) async fn final_response_delivered(&self, late_response: Option<&GoalResponse>) {
         let initial_is_final = matches!(
-            self.submission.response(),
+            self.response(),
             GoalResponse::Paused(_)
                 | GoalResponse::AlreadyPaused(_)
                 | GoalResponse::Cancelled(_)
                 | GoalResponse::AlreadyCancelled(_)
                 | GoalResponse::Terminal(_)
         );
-        let pending_was_finalized = matches!(
-            self.submission.response(),
-            GoalResponse::TransitionPending(_)
-        ) && late_response.is_some();
+        let pending_was_finalized = matches!(self.response(), GoalResponse::TransitionPending(_))
+            && late_response.is_some();
         if initial_is_final || pending_was_finalized {
             clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
         }
@@ -172,11 +181,20 @@ impl MatrixGoalCommandSubmission {
 
     /// Keep an unseen Goal from starting when Matrix cannot deliver its
     /// lifecycle acknowledgement.
-    pub(super) async fn response_delivery_failed(mut self) -> Result<()> {
-        self.supervisor
-            .pause_before_launch(&mut self.submission, GoalPauseReason::ExternalDependency)
-            .await?;
-        clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+    pub(super) async fn response_delivery_failed(self) -> Result<()> {
+        match self.submission {
+            GoalControlAdmission::Direct(mut submission) => {
+                self.supervisor
+                    .pause_before_launch(&mut submission, GoalPauseReason::ExternalDependency)
+                    .await?;
+                clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+            }
+            GoalControlAdmission::Queued { deferred, .. } => {
+                deferred
+                    .abandon(GoalControlAbandonReason::DeliveryFailed)
+                    .await?;
+            }
+        }
         Ok(())
     }
 }
@@ -307,23 +325,12 @@ async fn submit_matrix_goal_with_command_lease(
         original,
         command_lease,
     )?);
-    let control_plane = control_plane().context("Goal control plane is unavailable")?;
+    let control_plane = matrix_goal_control_plane(context.as_ref(), &history_key)
+        .context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
     let defaults = runtime_defaults_snapshot(context.as_ref());
-    let effective_limits =
-        defaults.config.goal.effective_limits().map_err(|error| {
-            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
-        })?;
-    let settings = GoalHostSettings::from_validated_limits(
-        defaults.config.goal.enabled,
-        GoalBudgetLimits {
-            token_limit: effective_limits.token_limit,
-            cost_limit_usd: effective_limits.cost_limit_usd,
-        },
-        std::process::id(),
-        control_plane.boot_id.clone(),
-    )?;
+    let settings = matrix_goal_settings(context.as_ref(), &history_key)?;
     let current = registry.current_goal_for_session(&history_key).await?;
     let supervisor_slot = goal_supervisor_slot(&context.persist_locks, &history_key);
     let retired_scope = current
@@ -376,7 +383,7 @@ async fn submit_matrix_goal_with_command_lease(
         }
     };
     let ingress = GoalIngressContext::trusted(
-        GoalSessionKey::matrix(history_key)?,
+        GoalSessionKey::matrix(history_key.clone())?,
         context.agent_alias.to_string(),
         route,
         GoalIngressPrincipal::Matrix {
@@ -384,14 +391,51 @@ async fn submit_matrix_goal_with_command_lease(
         },
     )?;
     let submission = supervisor
-        .submit(settings.clone(), ingress, driver, command)
+        .admit_control(settings.clone(), ingress, driver, command)
         .await?;
     Ok(MatrixGoalCommandSubmission {
         supervisor,
         supervisor_slot,
         settings,
+        context,
         submission,
+        history_key,
     })
+}
+
+fn matrix_goal_control_plane(
+    _context: &ChannelRuntimeContext,
+    _history_key: &str,
+) -> Option<zeroclaw_runtime::control_plane::ControlPlaneHandle> {
+    #[cfg(test)]
+    if let Some(handle) =
+        super::foreground::goal_test_control_plane(&_context.persist_locks, _history_key)
+    {
+        return Some(handle);
+    }
+    control_plane().cloned()
+}
+
+fn matrix_goal_settings(
+    context: &ChannelRuntimeContext,
+    history_key: &str,
+) -> Result<GoalHostSettings> {
+    let control_plane = matrix_goal_control_plane(context, history_key)
+        .context("Goal control plane is unavailable")?;
+    let defaults = runtime_defaults_snapshot(context);
+    let limits =
+        defaults.config.goal.effective_limits().map_err(|error| {
+            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
+        })?;
+    GoalHostSettings::from_validated_limits(
+        defaults.config.goal.enabled,
+        GoalBudgetLimits {
+            token_limit: limits.token_limit,
+            cost_limit_usd: limits.cost_limit_usd,
+        },
+        std::process::id(),
+        control_plane.boot_id.clone(),
+    )
 }
 
 /// Route Matrix `/stop` through the ordinary immediate Goal-pause command
@@ -416,7 +460,7 @@ pub(super) async fn submit_matrix_goal_stop(
     let command_lease = goal_command_lock(&context.persist_locks, &history_key)
         .lock_owned()
         .await;
-    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
+    let Some(control_plane) = matrix_goal_control_plane(context.as_ref(), &history_key) else {
         // Goal admission itself requires this control plane, so no live Goal
         // can be running when it is unavailable.
         return Ok(None);
@@ -463,7 +507,7 @@ pub(super) async fn dispose_matrix_goal(
         return Ok(());
     }
 
-    let Some(control_plane) = control_plane() else {
+    let Some(control_plane) = matrix_goal_control_plane(context, history_key) else {
         // Without the canonical control plane no Goal could have been
         // admitted, so ordinary Matrix `/new` keeps its historical behavior.
         return Ok(());
@@ -757,6 +801,29 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
         ))
+    }
+
+    async fn try_turn_boundary(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<Option<GoalTurnBoundary>> {
+        self.assert_ingress(ingress)?;
+        let lock = foreground_lock(&self.context.persist_locks, &self.session_key.durable_id());
+        Ok(lock.try_lock_owned().ok().map(GoalTurnBoundary::new))
+    }
+
+    async fn await_turn_boundary(
+        &self,
+        ingress: &GoalIngressContext,
+        checkpoint: &GoalParentTurnCheckpoint,
+    ) -> Result<GoalTurnBoundary> {
+        self.assert_ingress(ingress)?;
+        let lock = foreground_lock(&self.context.persist_locks, &self.session_key.durable_id());
+        tokio::select! {
+            biased;
+            () = checkpoint.wait_closed() => Err(zeroclaw_goal::GoalCheckpointClosed.into()),
+            foreground = lock.lock_owned() => Ok(GoalTurnBoundary::new(foreground)),
+        }
     }
 
     async fn acquire_execution(
@@ -1868,6 +1935,8 @@ fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deferred_control;
 
     #[tokio::test]
     async fn matrix_goal_restores_cold_canonical_history_without_installing_cache() {

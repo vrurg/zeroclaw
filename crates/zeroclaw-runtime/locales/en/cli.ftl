@@ -1458,6 +1458,10 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 # Goal Mode V1 channel control responses.
 goal-mode-help = Goal commands: start, status, budget, pause, resume, cancel, help.
 goal-mode-disabled = Goal Mode is disabled.
+goal-mode-queued-start = Goal start queued; it begins after the current turn.
+goal-mode-queued-resume = Goal resume queued; it continues after the current turn.
+goal-mode-queued-pause = Goal pause queued; it applies after the current step.
+goal-mode-queued-budget = Goal budget change queued; it applies after the current step.
 goal-mode-started = Goal started.
 goal-mode-completed = Goal completed.
 goal-mode-status = Goal status is available.
