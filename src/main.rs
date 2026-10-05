@@ -123,11 +123,15 @@ fn build_foundation_agent_provider(
     config: &Config,
     agent_alias: &str,
 ) -> Result<(Box<dyn zeroclaw_providers::ModelProvider>, String)> {
-    let (provider_name, provider_alias, resolved_entry) = config
+    let (model_provider_ref, resolved_entry) = config
         .resolved_model_provider_for_agent(agent_alias)
-        .map(|(provider_name, provider_alias, entry)| (provider_name, provider_alias, Some(entry)))
-        .unwrap_or(("openai", "default", None));
-    let model_provider_ref = format!("{provider_name}.{provider_alias}");
+        .map(|(provider_name, provider_alias, entry)| {
+            (format!("{provider_name}.{provider_alias}"), Some(entry))
+        })
+        // No configured entry means the historical foundation-only fallback is
+        // the bare provider family. A dotted `openai.default` is a configured
+        // alias reference and must fail closed when that entry is absent.
+        .unwrap_or_else(|| ("openai".to_string(), None));
     let model_provider =
         zeroclaw_providers::create_model_provider_from_ref(config, &model_provider_ref)?;
     let model_name = resolved_entry
@@ -13269,6 +13273,18 @@ mod tests {
             "subscription",
             "the foundation-only CLI must use the alias-aware provider factory"
         );
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[test]
+    fn foundation_agent_provider_without_a_configured_entry_keeps_the_bare_openai_fallback() {
+        let config = Config::default();
+
+        let (provider, model) = build_foundation_agent_provider(&config, "worker")
+            .expect("the historical bare OpenAI fallback must remain constructible");
+
+        assert_eq!(provider.alias(), "default");
+        assert_eq!(model, "default");
     }
 
     /// `oidc login` prints the access token on stdout and shells capture it, so

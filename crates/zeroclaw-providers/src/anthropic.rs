@@ -4880,7 +4880,13 @@ data: {\"type\":\"message_stop\"}\n\n";
                 &options,
             )
             .expect("official Anthropic endpoint must be accepted");
-        for endpoint in ["http://api.anthropic.com", "https://proxy.example"] {
+        for endpoint in [
+            "http://api.anthropic.com",
+            "https://proxy.example",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com?unexpected=query",
+        ] {
             let error = match config.create_provider("subscription", None, Some(endpoint), &options)
             {
                 Ok(_) => {

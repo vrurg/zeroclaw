@@ -1342,15 +1342,12 @@ pub struct AnthropicModelProviderConfig {
 impl AnthropicModelProviderConfig {
     /// OAuth setup tokens are accepted only by Anthropic's public API.
     pub fn has_official_oauth_endpoint(api_url: Option<&str>) -> bool {
-        api_url.is_none_or(|url| {
-            reqwest::Url::parse(url)
-                .map(|parsed| {
-                    parsed.scheme() == "https"
-                        && parsed.host_str() == Some("api.anthropic.com")
-                        && parsed.port().is_none()
-                })
-                .unwrap_or(false)
-        })
+        // OAuth is deliberately an exact-root allowlist. The native provider
+        // appends its own API path, so endpoint variants (including a version
+        // path, query, fragment, or trailing slash) are not OAuth endpoints.
+        // Match the provider factory's normalization so validation and
+        // construction accept and reject the same submitted endpoint.
+        api_url.is_none_or(|url| url.trim() == AnthropicEndpoint::Default.uri())
     }
 }
 
@@ -49617,6 +49614,57 @@ model_provider = \"ollama.default\"
                 .to_string()
                 .contains("official https://api.anthropic.com")
         );
+
+        for uri in [
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+            "https://api.anthropic.com?unexpected=query",
+            "https://api.anthropic.com#unexpected-fragment",
+        ] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".into(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: Some(uri.into()),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                config
+                    .validate()
+                    .expect_err("OAuth must reject non-root official endpoint")
+                    .to_string()
+                    .contains("official https://api.anthropic.com"),
+                "OAuth must reject non-root official endpoint {uri:?} with the official-endpoint error"
+            );
+        }
+
+        for uri in [
+            None,
+            Some("https://api.anthropic.com"),
+            Some(" https://api.anthropic.com "),
+        ] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".into(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: uri.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("OAuth must accept {uri:?}: {error}"));
+        }
     }
 
     #[test]
