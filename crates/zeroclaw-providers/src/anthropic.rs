@@ -10,7 +10,6 @@ use crate::traits::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
-use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -136,6 +135,10 @@ struct StreamingToolState {
 /// input makes the terminal response invalid and cannot be ignored.
 struct StreamingProviderToolInputState {
     input_json: String,
+    /// As with native client tools, only the start-envelope object is a
+    /// placeholder. Later `input_json_delta` fragments are wire content and
+    /// must never be discarded merely because an earlier fragment was `{}`.
+    saw_input_json_delta: bool,
 }
 
 #[cfg(test)]
@@ -1120,7 +1123,7 @@ impl AnthropicModelProvider {
             // references and copies its payload verbatim into the cleaned text,
             // so returning here without sweeping would leave raw base64 in a
             // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            return ToolResultContent::Text(Self::sweep_residual_image_data(&cleaned).into_owned());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
@@ -1641,31 +1644,11 @@ impl AnthropicModelProvider {
                                     continue;
                                 }
                             }
-                        } else if std::path::Path::new(img_ref.trim()).exists() {
-                            // Local file path
-                            match std::fs::read(img_ref.trim()) {
-                                Ok(bytes) => {
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    let ext = std::path::Path::new(img_ref.trim())
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("jpg");
-                                    let mime = match ext {
-                                        "png" => "image/png",
-                                        "gif" => "image/gif",
-                                        "webp" => "image/webp",
-                                        _ => "image/jpeg",
-                                    }
-                                    .to_string();
-                                    (mime, b64)
-                                }
-                                Err(_) => {
-                                    omitted += 1;
-                                    continue;
-                                }
-                            }
                         } else {
+                            // The multimodal normalization boundary owns local
+                            // file loading and validation. This adapter accepts
+                            // only already-normalized data URIs, so direct
+                            // provider calls cannot bypass those safeguards.
                             omitted += 1;
                             continue;
                         };
@@ -3418,7 +3401,13 @@ impl AnthropicModelProvider {
                                     .map(serde_json::Value::to_string)
                                     .unwrap_or_default();
                                 if provider_tool_input_blocks
-                                    .insert(index, StreamingProviderToolInputState { input_json })
+                                    .insert(
+                                        index,
+                                        StreamingProviderToolInputState {
+                                            input_json,
+                                            saw_input_json_delta: false,
+                                        },
+                                    )
                                     .is_some()
                                 {
                                     terminal_completion_error.get_or_insert(
@@ -3515,8 +3504,9 @@ impl AnthropicModelProvider {
                                         // envelope before streamed input JSON. Like client
                                         // tools, that placeholder is not a prefix of the first
                                         // delta and must not be concatenated with it.
-                                        if state.input_json == "{}" {
+                                        if !state.saw_input_json_delta {
                                             state.input_json.clear();
+                                            state.saw_input_json_delta = true;
                                         }
                                         state.input_json.push_str(json);
                                     } else {
@@ -4682,9 +4672,12 @@ impl ModelProvider for AnthropicModelProvider {
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    let error = if e.is_connect() {
+                        StreamError::ConnectFailed(super::format_error_chain(&e))
+                    } else {
+                        StreamError::Http(super::format_error_chain(&e))
+                    };
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
                 Err(_) => {
@@ -4749,6 +4742,7 @@ mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
     use crate::safeguard_notice::{scope_safeguard_fallback, take_last_safeguard_fallback};
+    use base64::Engine as _;
 
     /// Canonical base64 for a 1x1 PNG: 68 characters, a multiple of four,
     /// standard alphabet, no padding. Anything shorter that merely looks like a
@@ -7453,6 +7447,54 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             assert_eq!(tool_calls, 0, "provider tools must not become client calls");
             assert_eq!(failures, 0, "placeholder replacement must be valid");
         }
+    }
+
+    #[tokio::test]
+    async fn provider_tool_only_replaces_the_start_placeholder_once() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"x\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut final_count = 0;
+        let mut failures = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => final_count += 1,
+                Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(final_count, 0, "later JSON fragments must not be discarded");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
     }
 
     #[tokio::test]

@@ -2743,3 +2743,26 @@ fn step_timeout_stop(step_secs: u64) -> TurnStop {
         format!("LLM inference step timed out after {step_secs}s (step_timeout_secs)"),
     )
 }
+
+#[cfg(test)]
+mod timeout_regression_tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn step_timeout_stop_is_typed_across_anyhow() {
+        let stop = step_timeout_stop(30);
+        assert_eq!(stop.code, TurnStopCode::StepTimeout);
+        assert_eq!(
+            stop.to_string(),
+            "LLM inference step timed out after 30s (step_timeout_secs)"
+        );
+        let error: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&error)
+                .expect("typed step timeout must survive the anyhow boundary")
+                .code,
+            TurnStopCode::StepTimeout
+        );
+    }
+}
