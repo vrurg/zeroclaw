@@ -40,7 +40,10 @@ impl GoalControlAbandonReason {
 
 enum WaitResource {
     Worker(GoalDeferredControlTicket),
-    Boundary(GoalParentTurnCheckpoint),
+    Boundary {
+        checkpoint: GoalParentTurnCheckpoint,
+        settle_predecessor: bool,
+    },
 }
 
 /// A queued control waiting without command serialization. The surface owns
@@ -284,7 +287,15 @@ impl GoalExecutionSupervisor {
             }
         }
 
-        let boundary = driver.try_turn_boundary(&ingress).await?;
+        let settle_predecessor = matches!(command, GoalCommand::Start { .. })
+            && self
+                .failed_predecessor_publication_unsettled(current.as_ref(), &ingress)
+                .await;
+        let boundary = if settle_predecessor {
+            None
+        } else {
+            driver.try_turn_boundary(&ingress).await?
+        };
         if let Some(boundary) = boundary {
             if let Some(guard) = guard {
                 // Worker closure raced registration. Reuse the exact audit
@@ -353,7 +364,10 @@ impl GoalExecutionSupervisor {
                 ingress,
                 command: Some(command),
                 guard,
-                resource: Some(WaitResource::Boundary(checkpoint)),
+                resource: Some(WaitResource::Boundary {
+                    checkpoint,
+                    settle_predecessor,
+                }),
                 custody,
             },
         })
@@ -524,36 +538,49 @@ impl GoalDeferredControl {
                 self.validate_lease(&lease)?;
                 Ok((lease, None))
             }
-            WaitResource::Boundary(checkpoint) => loop {
-                let lease = tokio::select! {
-                    biased;
-                    () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
-                    lease = self.driver.bind(&self.ingress) => lease?,
-                };
-                if lease.binding().session_key() != self.ingress.session_key()
-                    || self.driver.session_key() != self.ingress.session_key()
-                {
-                    bail!("Goal deferred binding does not match trusted ingress");
-                }
-                if let Some(boundary) = self.driver.try_turn_boundary(&self.ingress).await? {
-                    // Custody and both leases are still held. Finish this
-                    // registration now rather than scheduling its removal on
-                    // Drop, which would make an idle supervisor look busy.
-                    if let Some((_, session, generation)) = self.guard.cleanup.as_ref() {
-                        self.supervisor
-                            .remove_pending_boundary(session, *generation)
-                            .await;
+            WaitResource::Boundary {
+                checkpoint,
+                settle_predecessor,
+            } => {
+                if *settle_predecessor {
+                    let session_id = self.ingress.session_key().durable_id();
+                    tokio::select! {
+                        biased;
+                        () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
+                        result = self.supervisor.settle_failed_predecessor(&session_id) => result?,
                     }
-                    self.guard.cleanup = None;
-                    return Ok((lease, Some(boundary)));
                 }
-                drop(lease);
-                let boundary = self
-                    .driver
-                    .await_turn_boundary(&self.ingress, checkpoint)
-                    .await?;
-                drop(boundary);
-            },
+                loop {
+                    let lease = tokio::select! {
+                        biased;
+                        () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
+                        lease = self.driver.bind(&self.ingress) => lease?,
+                    };
+                    if lease.binding().session_key() != self.ingress.session_key()
+                        || self.driver.session_key() != self.ingress.session_key()
+                    {
+                        bail!("Goal deferred binding does not match trusted ingress");
+                    }
+                    if let Some(boundary) = self.driver.try_turn_boundary(&self.ingress).await? {
+                        // Custody and both leases are still held. Finish this
+                        // registration now rather than scheduling its removal on
+                        // Drop, which would make an idle supervisor look busy.
+                        if let Some((_, session, generation)) = self.guard.cleanup.as_ref() {
+                            self.supervisor
+                                .remove_pending_boundary(session, *generation)
+                                .await;
+                        }
+                        self.guard.cleanup = None;
+                        return Ok((lease, Some(boundary)));
+                    }
+                    drop(lease);
+                    let boundary = self
+                        .driver
+                        .await_turn_boundary(&self.ingress, checkpoint)
+                        .await?;
+                    drop(boundary);
+                }
+            }
         }
     }
 
