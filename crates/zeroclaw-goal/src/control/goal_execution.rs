@@ -32,9 +32,18 @@ use crate::{
 
 use super::{
     GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext, GoalParentTurn,
-    GoalResponse, GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease,
-    GoalVerifierAttribution, GoalVerifierTurn, goal_verifier_feedback_message,
+    GoalResponse, GoalRuntime, GoalRuntimeSubmission, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionLease, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierTurn,
+    goal_verifier_feedback_message,
 };
+
+mod deferred_control;
+mod launch_guard;
+pub use deferred_control::{
+    GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
+    GoalDeferredControl, GoalDeferredReady,
+};
+use launch_guard::GoalLaunchGuard;
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
@@ -54,9 +63,10 @@ pub enum GoalExecutionOutcome {
 /// A Goal command result whose surface lease remains held until the transport
 /// has finished the post-transition lifecycle work for that exact command.
 ///
-/// The response is intentionally separate from the lease: an adapter may
-/// render or retire a supervisor while this value is alive, but a following
-/// command cannot enter the same session until it is dropped.
+/// The response is intentionally separate from the lease so an adapter can
+/// render it while retaining command ownership. A newly admitted execution also
+/// retains supervisor custody until launch or pre-launch pause settles; the
+/// supervisor cannot retire while that custody remains held.
 pub struct GoalExecutionSubmission {
     response: GoalResponse,
     /// A newly admitted epoch is held until its representation surface has
@@ -71,9 +81,10 @@ pub struct GoalExecutionSubmission {
     driver: Arc<dyn GoalSessionDriver>,
     ingress: GoalIngressContext,
     _lease: Option<GoalSessionLease>,
-    /// Keeps daemon-restart admission closed across the durable Running
-    /// transition and its acknowledgement-to-worker handoff.
-    _admission: Option<GoalExecutionAdmission>,
+    /// Idle ordinary-turn ownership remains held through response delivery.
+    boundary: Option<GoalTurnBoundary>,
+    /// Owns cancellation cleanup and restart admission until worker handoff.
+    launch_guard: GoalLaunchGuard,
 }
 
 impl std::fmt::Debug for GoalExecutionSubmission {
@@ -122,13 +133,45 @@ pub struct GoalExecutionEngine {
 /// Process-local owner for the workers that execute durable Goal epochs.
 ///
 /// The control plane remains the lifecycle source of truth. This supervisor
-/// owns only the matching join handles, which lets a session lifecycle path
-/// drain an exact fenced epoch before it permits a successor to launch.
+/// owns the matching workers, pending controls, and admission/launch custody,
+/// which lets a session lifecycle path drain an exact fenced epoch before it
+/// permits a successor to launch. Retirement permanently rejects new admission
+/// but leaves disposal, restart, and drain operations available.
 /// It deliberately knows neither transport routing nor provider policy.
 pub struct GoalExecutionSupervisor {
     engine: Arc<GoalExecutionEngine>,
     workers: Mutex<HashMap<String, Arc<Mutex<GoalWorker>>>>,
     restart_gate: Option<Arc<GoalExecutionRestartGate>>,
+    /// Process-local cancellation only; task rows remain lifecycle authority.
+    pending_boundaries: Mutex<HashMap<String, Vec<GoalParentTurnCheckpoint>>>,
+    custody_gate: GoalSupervisorCustodyGate,
+}
+
+/// The selected process-local supervisor retired before this admission began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalSupervisorRetired;
+
+impl std::fmt::Display for GoalSupervisorRetired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Goal supervisor was retired before admission")
+    }
+}
+
+impl std::error::Error for GoalSupervisorRetired {}
+
+/// Admission custody, not a duplicate of durable Goal lifecycle state.
+struct GoalSupervisorCustodyGate {
+    retired: AtomicBool,
+    barrier: Arc<RwLock<()>>,
+}
+
+impl GoalSupervisorCustodyGate {
+    fn new() -> Self {
+        Self {
+            retired: AtomicBool::new(false),
+            barrier: Arc::new(RwLock::new(())),
+        }
+    }
 }
 
 /// Process-local coordinator for the Goal executors admitted by one daemon.
@@ -295,6 +338,8 @@ impl GoalExecutionSupervisor {
             engine,
             workers: Mutex::new(HashMap::new()),
             restart_gate: None,
+            pending_boundaries: Mutex::new(HashMap::new()),
+            custody_gate: GoalSupervisorCustodyGate::new(),
         }
     }
 
@@ -306,7 +351,32 @@ impl GoalExecutionSupervisor {
             engine,
             workers: Mutex::new(HashMap::new()),
             restart_gate: Some(restart_gate),
+            pending_boundaries: Mutex::new(HashMap::new()),
+            custody_gate: GoalSupervisorCustodyGate::new(),
         }
+    }
+
+    async fn enter_custody(&self) -> Result<OwnedRwLockReadGuard<()>> {
+        let guard = self.custody_gate.barrier.clone().read_owned().await;
+        if self.custody_gate.retired.load(Ordering::Acquire) {
+            return Err(GoalSupervisorRetired.into());
+        }
+        Ok(guard)
+    }
+
+    /// Retire an idle supervisor atomically with admission. This does not wait
+    /// for custody or queue a writer behind active controls or launch handoffs.
+    /// A retired supervisor still permits disposal, restart fencing and drains.
+    pub async fn try_retire(&self) -> bool {
+        let Ok(_barrier) = self.custody_gate.barrier.clone().try_write_owned() else {
+            return false;
+        };
+        if !self.workers.lock().await.is_empty() || !self.pending_boundaries.lock().await.is_empty()
+        {
+            return false;
+        }
+        self.custody_gate.retired.store(true, Ordering::Release);
+        true
     }
 
     /// Launch one newly admitted Goal epoch.
@@ -315,6 +385,7 @@ impl GoalExecutionSupervisor {
     /// epoch remains supervisor-owned. Lifecycle callers must drain the old
     /// epoch first, preserving the durable epoch fence instead of relying on
     /// a best-effort detached task.
+    /// The caller must retain admission custody until worker registration.
     pub async fn launch(
         &self,
         settings: GoalHostSettings,
@@ -370,12 +441,18 @@ impl GoalExecutionSupervisor {
     }
 
     /// Admit one typed Goal command and retain any execution it starts.
+    /// Representation surfaces use [`Self::admit_control`] for ordinary
+    /// controls; this primitive retains immediate transition behavior.
     ///
     /// A started/resumed worker is deliberately not launched here. The caller
     /// must first make the returned lifecycle response observable, then call
     /// [`Self::launch_after_response`]. The restart admission guard remains
     /// held across that gap so restart cannot strand a durable Running row
     /// without a worker to fence.
+    ///
+    /// A retired supervisor returns [`GoalSupervisorRetired`] before admission
+    /// has any effects. The adapter must select a current supervisor before
+    /// retrying the command.
     pub async fn submit(
         &self,
         settings: GoalHostSettings,
@@ -383,6 +460,20 @@ impl GoalExecutionSupervisor {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalExecutionSubmission> {
+        let custody = self.enter_custody().await?;
+        self.submit_with_custody(settings, ingress, driver, command, custody)
+            .await
+    }
+
+    async fn submit_with_custody(
+        &self,
+        settings: GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+        custody: OwnedRwLockReadGuard<()>,
+    ) -> Result<GoalExecutionSubmission> {
+        let mut custody = Some(custody);
         let admission = match &self.restart_gate {
             Some(gate) => gate.admit(&command).await?,
             None => None,
@@ -390,12 +481,33 @@ impl GoalExecutionSupervisor {
         let previous = self.scope_for_session(&ingress).await?;
         let retained_driver = Arc::clone(&driver);
         let retained_ingress = ingress.clone();
-        let (mut response, execution, lease) = self
+        let runtime_submission = self
             .engine
             .runtime
             .submit(&settings, ingress, driver, command)
-            .await?
-            .into_parts_with_lease();
+            .await?;
+        Ok(self.execution_submission(
+            runtime_submission,
+            previous,
+            retained_driver,
+            retained_ingress,
+            admission,
+            None,
+            &mut custody,
+        ))
+    }
+
+    fn execution_submission(
+        &self,
+        runtime_submission: GoalRuntimeSubmission,
+        previous: Option<GoalExecutionScope>,
+        driver: Arc<dyn GoalSessionDriver>,
+        ingress: GoalIngressContext,
+        admission: Option<GoalExecutionAdmission>,
+        boundary: Option<GoalTurnBoundary>,
+        custody: &mut Option<OwnedRwLockReadGuard<()>>,
+    ) -> GoalExecutionSubmission {
+        let (mut response, execution, lease) = runtime_submission.into_parts_with_lease();
 
         let needs_predecessor_drain = execution.is_some()
             || matches!(
@@ -419,15 +531,23 @@ impl GoalExecutionSupervisor {
             };
         }
 
-        Ok(GoalExecutionSubmission {
+        let launch_custody = execution.as_ref().and_then(|_| custody.take());
+        let launch_guard = GoalLaunchGuard::new(
+            self.engine.clone(),
+            execution.as_ref(),
+            admission,
+            launch_custody,
+        );
+        GoalExecutionSubmission {
             response,
             execution,
             predecessor,
-            driver: retained_driver,
-            ingress: retained_ingress,
+            driver,
+            ingress,
             _lease: lease,
-            _admission: admission,
-        })
+            boundary,
+            launch_guard,
+        }
     }
 
     /// Start a newly admitted Goal only after its owning surface has delivered
@@ -437,11 +557,14 @@ impl GoalExecutionSupervisor {
         settings: GoalHostSettings,
         submission: &mut GoalExecutionSubmission,
     ) -> Result<Option<GoalResponse>> {
+        let mut launch_guard = submission.launch_guard.take();
+        let execution = submission.execution.take();
         let result = async {
             // The surface has already made the lifecycle response observable.
             // Release command serialization before waiting for the admitted
             // operation so an immediate pause/cancel remains available.
             drop(submission._lease.take());
+            drop(submission.boundary.take());
 
             if let Some(predecessor) = submission.predecessor.take() {
                 let response = self.drain_lifecycle_fence(&predecessor).await?;
@@ -450,14 +573,13 @@ impl GoalExecutionSupervisor {
                 }
             }
 
-            let Some(request) = submission.execution.take() else {
+            let Some(request) = execution else {
                 return Ok(None);
             };
             let scope = request.scope().clone();
             let lease = match submission.driver.bind(&submission.ingress).await {
                 Ok(lease) => lease,
                 Err(error) => {
-                    self.reconcile_launch_failure(&scope).await?;
                     return Err(error).context("revalidate Goal session before executor launch");
                 }
             };
@@ -465,7 +587,6 @@ impl GoalExecutionSupervisor {
                 return Ok(None);
             }
             if let Err(error) = self.launch(settings, request).await {
-                self.reconcile_launch_failure(&scope).await?;
                 return Err(error).context("Goal executor launch failed");
             }
             drop(lease);
@@ -475,7 +596,13 @@ impl GoalExecutionSupervisor {
         // Once launch/failure handling is settled, restart may close admission
         // and fence the now-registered worker even if the surface keeps the
         // submission around while finishing its request handler.
-        submission._admission.take();
+        if result.is_err() {
+            launch_guard.failed();
+            if let Some(scope) = launch_guard.scope() {
+                self.reconcile_launch_failure(scope).await?;
+            }
+        }
+        launch_guard.settled();
         result
     }
 
@@ -495,8 +622,11 @@ impl GoalExecutionSupervisor {
         submission: &mut GoalExecutionSubmission,
         reason: GoalPauseReason,
     ) -> Result<()> {
+        let mut launch_guard = submission.launch_guard.take();
+        let execution = submission.execution.take();
+        launch_guard.pausing(reason);
         let result = async {
-            if let Some(request) = submission.execution.take() {
+            if let Some(request) = execution {
                 let scope = request.scope();
                 match self
                     .engine
@@ -528,7 +658,11 @@ impl GoalExecutionSupervisor {
             Ok(())
         }
         .await;
-        submission._admission.take();
+        if result.is_ok() {
+            launch_guard.settled();
+        } else {
+            launch_guard.failed();
+        }
         result
     }
 
@@ -544,6 +678,7 @@ impl GoalExecutionSupervisor {
             !session_id.trim().is_empty(),
             "Goal disposal session id must be nonblank"
         );
+        self.close_pending_boundaries(Some(session_id)).await;
         let Some(current) = self
             .engine
             .registry
@@ -649,6 +784,7 @@ impl GoalExecutionSupervisor {
     /// Fence every resident epoch without waiting for any worker. The restart
     /// coordinator uses this first phase across all transport hosts.
     async fn fence_for_restart(&self) -> GoalRestartFence {
+        self.close_pending_boundaries(None).await;
         let workers = {
             let workers = self.workers.lock().await;
             workers
@@ -751,6 +887,7 @@ impl GoalExecutionSupervisor {
     /// recorded by the existing control plane. A missing, stale, or completed
     /// worker means the caller should revalidate and apply the command without
     /// waiting for a Goal parent-turn boundary.
+    /// The caller must retain admission custody through registration.
     pub async fn register_deferred_control(
         &self,
         scope: &GoalExecutionScope,
@@ -1900,6 +2037,118 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ready_control_removes_pending_registration_before_commit() {
+        use crate::test_support::{NoModelAccounting, Registry};
+        use crate::{GoalIngressPrincipal, GoalSessionBinding, GoalSessionKey};
+
+        struct BoundaryDriver {
+            key: GoalSessionKey,
+            command: Arc<Mutex<()>>,
+            boundary: Arc<Mutex<()>>,
+        }
+
+        #[async_trait::async_trait]
+        impl GoalSessionDriver for BoundaryDriver {
+            fn session_key(&self) -> &GoalSessionKey {
+                &self.key
+            }
+
+            async fn bind(&self, _: &GoalIngressContext) -> Result<GoalSessionLease> {
+                Ok(GoalSessionLease::new(
+                    GoalSessionBinding::new(self.key.clone()),
+                    self.command.clone().lock_owned().await,
+                ))
+            }
+
+            async fn try_turn_boundary(
+                &self,
+                _: &GoalIngressContext,
+            ) -> Result<Option<GoalTurnBoundary>> {
+                Ok(self
+                    .boundary
+                    .clone()
+                    .try_lock_owned()
+                    .ok()
+                    .map(GoalTurnBoundary::new))
+            }
+
+            async fn acquire_execution(
+                &self,
+                _: &GoalIngressContext,
+                _: &GoalExecutionScope,
+                _: &GoalParentTurnCheckpoint,
+            ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+                bail!("private boundary fixture must not launch execution")
+            }
+        }
+
+        let key = GoalSessionKey::zero_code("pending-boundary-fixture").unwrap();
+        let session = key.durable_id();
+        let ingress = GoalIngressContext::trusted(
+            key.clone(),
+            "fixture-agent",
+            "fixture-route",
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: "fixture-client".into(),
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(Registry::default());
+        registry.seed(&session, TaskStatus::Running);
+        let runtime = GoalRuntime::new(registry.clone());
+        let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+            runtime.execution_engine(Arc::new(NoModelAccounting)),
+        )));
+        let settings = GoalHostSettings::new(
+            true,
+            zeroclaw_commands::goal::GoalBudgetLimits {
+                token_limit: Some(1000),
+                cost_limit_usd: None,
+            },
+            1,
+            "fixture-boot",
+        )
+        .unwrap();
+        let driver = Arc::new(BoundaryDriver {
+            key,
+            command: Arc::new(Mutex::new(())),
+            boundary: Arc::new(Mutex::new(())),
+        });
+        let ordinary = driver.boundary.clone().lock_owned().await;
+        let GoalControlAdmission::Queued { deferred, .. } = supervisor
+            .admit_control(
+                settings.clone(),
+                ingress,
+                driver.clone(),
+                GoalCommand::Pause { immediate: false },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("held ordinary turn must queue pause");
+        };
+        assert_eq!(
+            supervisor.pending_boundaries.lock().await[&session].len(),
+            1
+        );
+        drop(ordinary);
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(1), deferred.wait())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Observe the real ready boundary before any commit or release can
+        // hide delayed cleanup. Lifecycle state must still be unchanged.
+        assert!(supervisor.pending_boundaries.lock().await.is_empty());
+        assert!(driver.command.try_lock().is_err());
+        assert!(driver.boundary.try_lock().is_err());
+        assert!(registry.0.lock().unwrap().transitions.is_empty());
+        let committed = ready.commit(settings).await.unwrap();
+        drop(committed.release());
+        assert!(supervisor.try_retire().await);
+    }
 
     #[test]
     fn verifier_continuation_feedback_is_user_role_data() {
