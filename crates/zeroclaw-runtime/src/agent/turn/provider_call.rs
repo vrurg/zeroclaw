@@ -374,6 +374,19 @@ pub(crate) async fn call_provider(
                                 {
                                     scope.record_stream_interruption_usage(usage);
                                 }
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "model": active_model,
+                                            "iteration": iteration + 1,
+                                            "error": scrub_credentials(&stream_err.to_string()),
+                                            "trace_id": ctx.turn_id,
+                                        })),
+                                    "llm_stream_terminal: provider stream error is terminal, not falling back to non-streaming chat"
+                                );
                                 false
                             } else if let Some(terminal) = stream_err
                                 .downcast_ref::<StreamTerminalCompletion>()
