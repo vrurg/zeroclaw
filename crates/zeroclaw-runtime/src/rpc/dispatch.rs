@@ -16744,6 +16744,7 @@ pub(crate) mod connection_test_support {
                     token_limit: Some(1), cost_limit_usd: None,
                     accounting_state: zeroclaw_goal::GoalAccountingState::Complete,
                     pause_reason: None, resumable: false,
+                    usage_totals: None,
                 }),
             },
         });
