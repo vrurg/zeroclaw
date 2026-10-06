@@ -159,6 +159,20 @@ impl std::fmt::Display for GoalSupervisorRetired {
 
 impl std::error::Error for GoalSupervisorRetired {}
 
+/// A launch failure was durably classified and its lifecycle notice attempted.
+/// Surfaces use this typed context to avoid a second command-level failure;
+/// the original error remains available in the causal chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalLaunchFailureReported;
+
+impl std::fmt::Display for GoalLaunchFailureReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Goal launch failure was classified and reported")
+    }
+}
+
+impl std::error::Error for GoalLaunchFailureReported {}
+
 /// Admission custody, not a duplicate of durable Goal lifecycle state.
 struct GoalSupervisorCustodyGate {
     retired: AtomicBool,
@@ -658,6 +672,7 @@ impl GoalExecutionSupervisor {
     ) -> Result<Option<GoalResponse>> {
         let mut launch_guard = submission.launch_guard.take();
         let execution = submission.execution.take();
+        let mut failure_reported = false;
         let result = async {
             // The surface has already made the lifecycle response observable.
             // Release command serialization before waiting for the admitted
@@ -680,12 +695,13 @@ impl GoalExecutionSupervisor {
                 Ok(lease) => lease,
                 Err(error) => {
                     launch_guard.failed();
-                    self.reconcile_launch_failure(
-                        &scope,
-                        submission.driver.as_ref(),
-                        &submission.ingress,
-                    )
-                    .await?;
+                    failure_reported |= self
+                        .reconcile_launch_failure(
+                            &scope,
+                            submission.driver.as_ref(),
+                            &submission.ingress,
+                        )
+                        .await?;
                     return Err(error).context("revalidate Goal session before executor launch");
                 }
             };
@@ -702,12 +718,13 @@ impl GoalExecutionSupervisor {
                 .await
             {
                 launch_guard.failed();
-                self.reconcile_launch_failure(
-                    &scope,
-                    submission.driver.as_ref(),
-                    &submission.ingress,
-                )
-                .await?;
+                failure_reported |= self
+                    .reconcile_launch_failure(
+                        &scope,
+                        submission.driver.as_ref(),
+                        &submission.ingress,
+                    )
+                    .await?;
                 return Err(error).context("Goal executor launch failed");
             }
             drop(lease);
@@ -720,16 +737,21 @@ impl GoalExecutionSupervisor {
         if result.is_err() {
             launch_guard.failed();
             if let Some(scope) = launch_guard.scope() {
-                self.reconcile_launch_failure(
-                    scope,
-                    submission.driver.as_ref(),
-                    &submission.ingress,
-                )
-                .await?;
+                failure_reported |= self
+                    .reconcile_launch_failure(
+                        scope,
+                        submission.driver.as_ref(),
+                        &submission.ingress,
+                    )
+                    .await?;
             }
         }
         launch_guard.settled();
-        result
+        if failure_reported {
+            result.map_err(|error| error.context(GoalLaunchFailureReported))
+        } else {
+            result
+        }
     }
 
     async fn reconcile_launch_failure(
@@ -737,9 +759,9 @@ impl GoalExecutionSupervisor {
         scope: &GoalExecutionScope,
         driver: &dyn GoalSessionDriver,
         ingress: &GoalIngressContext,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.execution_is_current(scope).await? {
-            return Ok(());
+            return Ok(false);
         }
         self.engine.fail(scope, "executor_start_failed").await?;
         let failure_publication = Mutex::new(GoalFailurePublication::default());
@@ -756,7 +778,7 @@ impl GoalExecutionSupervisor {
         {
             log_failure_notice_delivery_failure(scope);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Pause a newly admitted Goal without running its first model call when

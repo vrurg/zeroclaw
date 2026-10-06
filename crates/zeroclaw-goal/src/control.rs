@@ -39,7 +39,7 @@ pub use goal_execution::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
     GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
     GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
-    GoalExecutionSupervisor, GoalSupervisorRetired,
+    GoalExecutionSupervisor, GoalLaunchFailureReported, GoalSupervisorRetired,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 
