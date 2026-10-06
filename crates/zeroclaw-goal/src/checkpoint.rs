@@ -69,6 +69,7 @@ impl GoalParentTurnTicketId {
 /// also releases the worker, so cancellation cannot strand the checkpoint.
 pub struct GoalDeferredControlTicket {
     id: GoalParentTurnTicketId,
+    checkpoint: GoalParentTurnCheckpoint,
     scheduled: Option<oneshot::Receiver<()>>,
     settled: Option<oneshot::Sender<()>>,
 }
@@ -95,6 +96,13 @@ impl GoalDeferredControlTicket {
             return Err(GoalCheckpointClosed);
         };
         scheduled.await.map_err(|_| GoalCheckpointClosed)
+    }
+
+    /// Observe closure of the issuing generation, including after scheduling.
+    /// A control waiting for command serialization must select against this
+    /// future so a lifecycle fence can release the worker without deadlock.
+    pub async fn wait_closed(&self) {
+        self.checkpoint.wait_closed().await;
     }
 
     /// Mark this ticket's transition as settled and release the worker.
@@ -219,6 +227,7 @@ impl GoalParentTurnCheckpoint {
         });
         Ok(GoalDeferredControlTicket {
             id,
+            checkpoint: self.clone(),
             scheduled: Some(scheduled_rx),
             settled: Some(settled_tx),
         })
@@ -254,10 +263,14 @@ impl GoalParentTurnCheckpoint {
                 });
             };
             if ticket.scheduled.send(()).is_ok() {
-                // A dropped submitter resolves its ticket in Drop. If the
-                // worker itself is being cancelled, the closed receiver also
-                // releases this wait rather than deadlocking shutdown.
-                let _ = ticket.settled.await;
+                // An immediate fence must not depend on the control owner
+                // finishing acknowledgement or acquiring the command lock.
+                // No operation has been admitted while this ticket is pending.
+                tokio::select! {
+                    biased;
+                    () = self.wait_closed() => return Err(GoalCheckpointClosed),
+                    _ = ticket.settled => {}
+                }
             }
         }
     }
@@ -287,6 +300,33 @@ impl CheckpointInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn close_releases_a_worker_waiting_for_a_scheduled_control() {
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let mut ticket = checkpoint.register_control().unwrap();
+        let worker_checkpoint = checkpoint.clone();
+        let worker =
+            zeroclaw_spawn::spawn!(async move { worker_checkpoint.admit_operation().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), ticket.wait_until_turn())
+            .await
+            .unwrap()
+            .unwrap();
+        checkpoint.close();
+        tokio::time::timeout(std::time::Duration::from_secs(1), ticket.wait_closed())
+            .await
+            .unwrap();
+        // The owner stays alive throughout the drain: closure, not owner Drop,
+        // must release an operation waiting on this already-scheduled ticket.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+                .await
+                .expect("checkpoint closure must release the fenced worker")
+                .unwrap()
+                .is_err()
+        );
+        drop(ticket);
+    }
     use tokio::sync::oneshot;
 
     #[tokio::test]

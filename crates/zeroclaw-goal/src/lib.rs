@@ -4,6 +4,14 @@
 //! provider routing, agent execution, and transport presentation remain with
 //! their existing owners.
 
+// Share the integration fixtures with private boundary tests without exposing
+// production inspection APIs or maintaining a second registry implementation.
+#[cfg(test)]
+extern crate self as zeroclaw_goal;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 pub mod accounting;
 pub mod checkpoint;
 pub mod control;
@@ -14,13 +22,16 @@ pub use checkpoint::{
     GoalParentTurnOperation, GoalParentTurnTicketId,
 };
 pub use control::{
-    GoalController, GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost,
-    GoalExecutionOutcome, GoalExecutionRequest, GoalExecutionRestartCoordinator,
-    GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalParentTurn, GoalPendingAction, GoalResponse,
+    GoalControlAbandonReason, GoalControlAdmission, GoalControlClass, GoalController,
+    GoalDeferredClosed, GoalDeferredCommit, GoalDeferredControl, GoalDeferredReady,
+    GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost, GoalExecutionOutcome,
+    GoalExecutionRequest, GoalExecutionRestartCoordinator, GoalExecutionScope,
+    GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalParentTurn, GoalPendingAction, GoalQueuedControl, GoalResponse,
     GoalRuntime, GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver,
     GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
-    GoalSubmission, GoalSurface, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalSubmission, GoalSupervisorRetired, GoalSurface, GoalTurnBoundary, GoalVerifierAttribution,
+    GoalVerifierResult, GoalVerifierTurn, classify_goal_control,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
