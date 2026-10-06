@@ -315,9 +315,9 @@ pub(super) async fn submit_matrix_goal(
     command: zeroclaw_commands::goal::GoalCommand,
 ) -> Result<MatrixGoalCommandSubmission> {
     // Acquire this before reading durable state or selecting a supervisor.
-    // In particular, a terminal predecessor must be drained by the same
-    // serialized lifecycle operation before another command can install a
-    // successor supervisor for this session.
+    // Terminal workers are consumed by successor admission's predecessor
+    // settlement or launch_after_response drain, outside this command lease.
+    // This path must not wait for worker completion or failure delivery.
     let command_lock = goal_command_lock(&context.persist_locks, &history_key);
     let command_lease = command_lock.lock_owned().await;
     if matches!(classify_goal_control(&command), GoalControlClass::Normal(_))
@@ -369,13 +369,9 @@ async fn submit_matrix_goal_with_command_lease(
     } else {
         None
     };
-    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope) {
-        if retired_supervisor.owns_scope(&scope).await {
-            retired_supervisor
-                .drain(&scope)
-                .await
-                .context("drain terminal Matrix Goal worker before replacement")?;
-        }
+    if let Some(retired_supervisor) = retired_supervisor {
+        // Retire only an idle slot: a resident predecessor keeps its supervisor
+        // until settlement, so no successor owner is installed alongside it.
         retire_supervisor_slot_if_idle(&supervisor_slot, &retired_supervisor).await;
     }
     let ingress = GoalIngressContext::trusted(
