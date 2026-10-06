@@ -22,6 +22,8 @@ struct Script {
     hold_verifier: AtomicBool,
     verifier_entered: Semaphore,
     verifier_release: Semaphore,
+    fail_launch_bind: AtomicBool,
+    fail_notice: AtomicBool,
 }
 
 impl Default for Script {
@@ -35,6 +37,8 @@ impl Default for Script {
             hold_verifier: AtomicBool::new(false),
             verifier_entered: Semaphore::new(0),
             verifier_release: Semaphore::new(0),
+            fail_launch_bind: AtomicBool::new(false),
+            fail_notice: AtomicBool::new(false),
         }
     }
 }
@@ -76,6 +80,9 @@ impl GoalSessionDriver for WorkerDriver {
     }
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
+        if self.script.fail_launch_bind.swap(false, Ordering::SeqCst) {
+            bail!("fixture launch rebind unavailable");
+        }
         self.ordinary.bind(ingress).await
     }
 
@@ -166,6 +173,9 @@ impl GoalSessionExecutionLease for WorkerLease {
 
     async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
         self.script.notices.fetch_add(1, Ordering::SeqCst);
+        if self.script.fail_notice.load(Ordering::SeqCst) {
+            bail!("fixture notice delivery unavailable");
+        }
         Ok(())
     }
 }
@@ -208,6 +218,192 @@ async fn running_worker() -> (
         .unwrap()
         .forget();
     (driver, ingress, registry, supervisor)
+}
+
+/// Exercise launch reporting through the public handoff, without admitting a
+/// provider call or replacing the native failure-notice lease path.
+async fn admitted_launch() -> (
+    Arc<WorkerDriver>,
+    Arc<Registry>,
+    Arc<GoalExecutionSupervisor>,
+    zeroclaw_goal::GoalExecutionSubmission,
+) {
+    let (ordinary, ingress) = serialized_fixture();
+    let driver = Arc::new(WorkerDriver {
+        ordinary,
+        script: Arc::new(Script::default()),
+    });
+    let registry = Arc::new(Registry::default());
+    let runtime = GoalRuntime::new(registry.clone());
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime.execution_engine(Arc::new(NoPhysicalAttempts)),
+    )));
+    let submission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.submit(settings(), ingress, driver.clone(), launch_command(false)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (driver, registry, supervisor, submission)
+}
+
+#[tokio::test]
+async fn launch_failure_marker_requires_committed_failure_and_one_notice() {
+    let (driver, registry, supervisor, mut submission) = admitted_launch().await;
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(
+        error.to_string(),
+        "Goal launch failure was classified and reported"
+    );
+    assert!(format!("{error:#}").contains("fixture launch rebind unavailable"));
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.0.lock().unwrap().transitions, ["start", "finish"]);
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn launch_failure_marker_records_a_notice_attempt_not_delivery_success() {
+    let (driver, registry, supervisor, mut submission) = admitted_launch().await;
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    driver.script.fail_notice.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert!(format!("{error:#}").contains("fixture launch rebind unavailable"));
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.0.lock().unwrap().transitions, ["start", "finish"]);
+}
+
+#[tokio::test]
+async fn launch_failure_for_noncurrent_execution_has_no_marker_or_notice() {
+    let (driver, registry, supervisor, mut submission) = admitted_launch().await;
+    // A competing durable fence wins before the launch bind fails.
+    registry
+        .0
+        .lock()
+        .unwrap()
+        .task
+        .as_mut()
+        .unwrap()
+        .execution_epoch += 1;
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert!(format!("{error:#}").contains("fixture launch rebind unavailable"));
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.0.lock().unwrap().transitions, ["start"]);
+}
+
+#[tokio::test]
+async fn launch_failure_reconciliation_error_remains_unmarked() {
+    let (driver, registry, supervisor, mut submission) = admitted_launch().await;
+    registry.0.lock().unwrap().fail_finish = true;
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert!(format!("{error:#}").contains("fixture lifecycle settlement unavailable"));
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn transition_pending_drain_error_remains_unmarked() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let mut submission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.submit(settings(), ingress, driver.clone(), GoalCommand::Cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        submission.response(),
+        GoalResponse::TransitionPending(_)
+    ));
+    // Remove the extension only after the fence is admitted, so its real
+    // predecessor drain fails instead of constructing a malformed command.
+    registry.0.lock().unwrap().goal.take();
+    driver.script.release.add_permits(1);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn launch_failure_outer_reconciliation_also_marks_a_reported_failure() {
+    let (_, registry, supervisor, mut submission) = admitted_launch().await;
+    {
+        let mut state = registry.0.lock().unwrap();
+        state.fail_lookup_at = Some(state.session_lookups + 1);
+    }
+    // The launch's currentness check fails before either inner reconciliation;
+    // only the outer recovery commits and attempts the lifecycle notice.
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert!(format!("{error:#}").contains("fixture session lookup unavailable"));
+    assert_eq!(registry.0.lock().unwrap().transitions, ["start", "finish"]);
+}
+
+#[tokio::test]
+async fn launch_failure_outer_reconciliation_error_overrides_the_inner_marker() {
+    let (driver, registry, supervisor, mut submission) = admitted_launch().await;
+    {
+        let mut state = registry.0.lock().unwrap();
+        // Inner currentness, two notice checks, then outer reconciliation.
+        state.fail_lookup_at = Some(state.session_lookups + 4);
+    }
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert!(format!("{error:#}").contains("fixture session lookup unavailable"));
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.0.lock().unwrap().transitions, ["start", "finish"]);
 }
 
 #[tokio::test]
