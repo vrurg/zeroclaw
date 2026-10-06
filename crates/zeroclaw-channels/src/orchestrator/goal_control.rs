@@ -108,7 +108,7 @@ pub(super) fn should_drop_channel_message(
     false
 }
 
-fn log_control_error(context: &str, error: &anyhow::Error) {
+pub(super) fn log_control_error(context: &str, error: &anyhow::Error) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)

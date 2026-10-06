@@ -148,8 +148,8 @@ use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{
-    deliver_matrix_goal_command, deliver_matrix_goal_stop, dispose_matrix_goal, submit_matrix_goal,
-    submit_matrix_goal_stop,
+    deliver_matrix_goal_command, deliver_matrix_goal_stop, dispose_matrix_goal_with_command_lease,
+    submit_matrix_goal, submit_matrix_goal_stop,
 };
 mod goal_control;
 use self::goal_control::{
@@ -839,6 +839,13 @@ struct PendingTurn {
     /// separate from the execution permit: waiting hooks and queued lanes do
     /// not consume execution capacity, but they still retain bounded memory.
     pending_work: tokio::sync::OwnedSemaphorePermit,
+    /// Reset admission owns this until native reset delivery or any early exit.
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
+}
+
+struct MatrixGoalResetReservation {
+    guard: foreground::MatrixGoalResetGuard,
+    completion: tokio::sync::oneshot::Receiver<std::result::Result<(), ()>>,
 }
 
 /// A turn waiting for debounce resolution and post-hook routing.
@@ -1542,6 +1549,72 @@ async fn route_inbound_slot(
             deliver_prepared_matrix_goal_command(ctx, original, prepared).await;
         });
         return;
+    }
+    if is_matrix_channel_name(&turn.msg.channel)
+        && !turn.msg.passive_context
+        && matches!(
+            parse_runtime_command(&turn.msg.channel, &turn.msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+        && !should_drop_channel_message(
+            find_channel_for_message(&ctx.channels_by_name, &turn.msg),
+            &turn.msg,
+        )
+    {
+        let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        let history_key = runtime_conversation_history_key(ctx.as_ref(), &turn.msg);
+        let guard = foreground::reserve_matrix_goal_reset(&ctx.persist_locks, &history_key);
+        let command_lease = foreground::goal_command_lock(&ctx.persist_locks, &history_key)
+            .lock_owned()
+            .await;
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let disposal_context = Arc::clone(&ctx);
+        busy_notice_tasks.spawn(async move {
+            let result = dispose_matrix_goal_with_command_lease(
+                disposal_context.as_ref(),
+                &history_key,
+                &command_lease,
+            )
+            .await;
+            if let Err(error) = &result {
+                goal_control::log_control_error("Matrix Goal disposal failed", error);
+            }
+            #[cfg(test)]
+            if foreground::take_goal_test_drop_reset_completion(
+                &disposal_context.persist_locks,
+                &history_key,
+            ) {
+                // Exercise sender loss after real disposal, before publication.
+                drop(completed);
+                return;
+            }
+            // Publish the outcome before releasing lifecycle serialization.
+            let _ = completed.send(result.map_err(|_| ()));
+            drop(command_lease);
+        });
+        turn.matrix_goal_reset = Some(MatrixGoalResetReservation { guard, completion });
+        #[cfg(test)]
+        if foreground::take_goal_test_drop_reset_admission(
+            &ctx.persist_locks,
+            &runtime_conversation_history_key(ctx.as_ref(), &turn.msg),
+        ) {
+            return;
+        }
+        #[cfg(test)]
+        if foreground::take_goal_test_cancel_reset_admission(
+            &ctx.persist_locks,
+            &runtime_conversation_history_key(ctx.as_ref(), &turn.msg),
+        ) {
+            // Cancel after reservation, so the real enqueue/drop path releases it.
+            turn.registration
+                .as_ref()
+                .expect("reset ingress fixture must have a turn registration")
+                .cancellation
+                .cancel();
+        }
     }
     // The final cancellation check lives inside `enqueue`, under the registry
     // lock: checked here, a cancellation landing between the check and the
@@ -7975,6 +8048,7 @@ async fn process_channel_message(
         cancellation_token,
         delivery_message_id,
         None,
+        None,
     )
     .await;
 }
@@ -7985,6 +8059,7 @@ async fn process_channel_message_with_delivery_id(
     cancellation_token: CancellationToken,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -8012,6 +8087,7 @@ async fn process_channel_message_with_delivery_id(
                 composite_for_body,
                 delivery_message_id,
                 turn_lease,
+                matrix_goal_reset,
             )
             .await;
         }
@@ -8973,6 +9049,7 @@ async fn process_channel_message_body(
     channel_composite: String,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
 ) {
     // Capture Goal command authority before mutable hooks. A hook can cancel
     // the message, but it cannot rewrite its principal, session, route, or
@@ -9069,26 +9146,40 @@ async fn process_channel_message_body(
             Some(ChannelRuntimeCommand::NewSession)
         )
     {
-        if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
+        let (reset_guard, command_lease, disposed) = if let Some(reservation) = matrix_goal_reset {
+            let MatrixGoalResetReservation { guard, completion } = reservation;
+            let disposed = match completion.await {
+                Ok(result) => result.is_ok(),
+                Err(error) => {
+                    goal_control::log_control_error(
+                        "Matrix Goal disposal completion was lost",
+                        &error.into(),
+                    );
+                    false
+                }
+            };
+            (Some(guard), None, disposed)
+        } else {
+            // Direct callers have no ingress reservation. Keep serialization
+            // through history reset, not merely through durable disposal.
+            let command_lease = foreground::goal_command_lock(&ctx.persist_locks, &history_key)
+                .lock_owned()
+                .await;
+            let result =
+                dispose_matrix_goal_with_command_lease(ctx.as_ref(), &history_key, &command_lease)
+                    .await;
+            if let Err(error) = &result {
+                goal_control::log_control_error("Matrix Goal disposal failed", error);
+            }
+            (None, Some(command_lease), result.is_ok())
+        };
+        if !disposed {
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::reply_to(&msg, {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": zeroclaw_providers::sanitize_api_error(
-                                    &error.to_string(),
-                                ),
-                            })),
-                            "Matrix Goal disposal failed"
-                        );
-                        channel_runtime_cli_string("goal-mode-command-failed")
-                    }))
+                    .send(&SendMessage::reply_to(
+                        &msg,
+                        channel_runtime_cli_string("goal-mode-command-failed"),
+                    ))
                     .await;
             }
             return;
@@ -9100,6 +9191,8 @@ async fn process_channel_message_body(
             &delivery_message_id,
         )
         .await;
+        drop(command_lease);
+        drop(reset_guard);
         return;
     }
 
@@ -11351,6 +11444,7 @@ async fn run_conversation_turn(
         dispatch_ownership,
         registration,
         pending_work,
+        matrix_goal_reset,
         ..
     } = turn;
     let execution_permit = permit;
@@ -11362,6 +11456,7 @@ async fn run_conversation_turn(
             generation_cancel,
             delivery_message_id,
             Some(Arc::clone(&turn_lease)),
+            matrix_goal_reset,
         )
         .await;
         drop(dispatch_ownership);
@@ -11386,6 +11481,7 @@ async fn run_conversation_turn(
         registration.cancellation.clone(),
         delivery_message_id,
         Some(Arc::clone(&turn_lease)),
+        matrix_goal_reset,
     )
     .await;
     drop(registration);
@@ -12221,9 +12317,24 @@ async fn run_message_dispatch_loop_until_cancelled(
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             if let Some(error) = goal_pause_error {
-                let detail = zeroclaw_providers::sanitize_api_error(&error.to_string());
+                use zeroclaw_goal::GoalDiagnosticTextGuard as _;
+                use zeroclaw_runtime::goal_accounting::RuntimeGoalDiagnosticTextGuard;
+
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_providers::sanitize_api_error(
+                                &RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(
+                                    &format!("{error:#}"),
+                                ),
+                            ),
+                        })),
+                    "Goal /stop pause could not be admitted"
+                );
                 reply = format!(
-                    "{reply}\n{}\n{detail}",
+                    "{reply}\n{}",
                     channel_runtime_cli_string("goal-mode-command-failed")
                 );
             }
@@ -12396,6 +12507,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            matrix_goal_reset: None,
                             agent_generation: router
                                 .turn_generations
                                 .get(ctx.agent_alias.as_str())
@@ -12468,6 +12580,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    matrix_goal_reset: None,
                     agent_generation: router
                         .turn_generations
                         .get(ctx.agent_alias.as_str())
@@ -39522,6 +39635,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let msg = shared_topic_message("alice", "m1", "canceled during admission");
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx,
             agent_generation: 0,
             msg,
@@ -39586,6 +39700,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack
         };
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx: Arc::clone(&ctx),
             agent_generation: generation,
             msg,
@@ -43507,6 +43622,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let pending_work = Arc::clone(&pending_budget).acquire_owned().await.unwrap();
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx: Arc::clone(&runtime_ctx),
             agent_generation: 0,
             msg: selection.clone(),

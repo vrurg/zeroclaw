@@ -22,8 +22,10 @@ use zeroclaw_goal::{
     GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
     GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason, GoalResponse, GoalRuntime,
     GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalSurface, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult,
-    GoalVerifierTurn, checkpoint::GoalParentTurnCheckpoint, control::goal_parent_turn_input,
+    GoalSessionLease, GoalSupervisorRetired, GoalSurface, GoalTurnBoundary,
+    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    checkpoint::GoalParentTurnCheckpoint,
+    control::{GoalControlClass, classify_goal_control, goal_parent_turn_input},
 };
 
 mod control_delivery;
@@ -43,7 +45,9 @@ use zeroclaw_runtime::{
     },
 };
 
-use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
+use super::foreground::{
+    foreground_lock, goal_command_lock, goal_supervisor_slot, matrix_goal_reset_pending,
+};
 use super::{
     ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn_durably,
     build_channel_system_prompt_for_message_with_signal,
@@ -175,7 +179,7 @@ impl MatrixGoalCommandSubmission {
         let pending_was_finalized = matches!(self.response(), GoalResponse::TransitionPending(_))
             && late_response.is_some();
         if initial_is_final || pending_was_finalized {
-            clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+            retire_supervisor_slot_if_idle(&self.supervisor_slot, &self.supervisor).await;
         }
     }
 
@@ -187,7 +191,7 @@ impl MatrixGoalCommandSubmission {
                 self.supervisor
                     .pause_before_launch(&mut submission, GoalPauseReason::ExternalDependency)
                     .await?;
-                clear_supervisor_slot_if_current(&self.supervisor_slot, &self.supervisor).await;
+                retire_supervisor_slot_if_idle(&self.supervisor_slot, &self.supervisor).await;
             }
             GoalControlAdmission::Queued { deferred, .. } => {
                 deferred
@@ -258,10 +262,13 @@ pub(super) async fn deliver_matrix_goal_stop(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
-                        "error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&error.to_string())),
+                        "error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}"))),
                     })),
                 "Goal /stop pause could not be finalized after acknowledgement"
             );
+            if !error.is::<zeroclaw_goal::GoalLaunchFailureReported>() {
+                control_delivery::send_command_failed(Some(&channel), &message).await;
+            }
             return;
         }
     };
@@ -288,6 +295,18 @@ pub(super) async fn deliver_matrix_goal_stop(
         .await;
 }
 
+/// Fixed diagnostic for controls refused before any Goal admission effect.
+#[derive(Debug)]
+struct MatrixGoalResetPending;
+
+impl std::fmt::Display for MatrixGoalResetPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Matrix session reset is pending")
+    }
+}
+
+impl std::error::Error for MatrixGoalResetPending {}
+
 /// Submit an already parsed Goal command using immutable Matrix ingress facts.
 pub(super) async fn submit_matrix_goal(
     context: Arc<ChannelRuntimeContext>,
@@ -301,6 +320,11 @@ pub(super) async fn submit_matrix_goal(
     // successor supervisor for this session.
     let command_lock = goal_command_lock(&context.persist_locks, &history_key);
     let command_lease = command_lock.lock_owned().await;
+    if matches!(classify_goal_control(&command), GoalControlClass::Normal(_))
+        && matrix_goal_reset_pending(&context.persist_locks, &history_key)
+    {
+        return Err(MatrixGoalResetPending.into());
+    }
     submit_matrix_goal_with_command_lease(context, history_key, original, command, command_lease)
         .await
 }
@@ -341,47 +365,19 @@ async fn submit_matrix_goal_with_command_lease(
         })
         .transpose()?;
     let retired_supervisor = if retired_scope.is_some() {
-        supervisor_slot.lock().await.take()
+        supervisor_slot.lock().await.as_ref().cloned()
     } else {
         None
     };
-    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope)
-        && retired_supervisor.owns_scope(&scope).await
-    {
-        retired_supervisor
-            .drain(&scope)
-            .await
-            .context("drain terminal Matrix Goal worker before replacement")?;
-    }
-    let supervisor = {
-        let mut slot = supervisor_slot.lock().await;
-        if let Some(supervisor) = slot.as_ref() {
-            Arc::clone(supervisor)
-        } else {
-            let runtime = GoalRuntime::new(Arc::clone(&registry));
-            let tracker = CostTracker::get_or_init_global_required(
-                defaults.config.cost.clone(),
-                &defaults.config.data_dir,
-            )?;
-            let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
-                build_type_level_model_provider_pricing(defaults.config.as_ref()),
-            )));
-            let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
-                Arc::clone(&registry),
-                tracker,
-                context.agent_alias.to_string(),
-                pricer,
-            )?);
-            let engine = Arc::new(
-                runtime
-                    .execution_engine(accounting)
-                    .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
-            );
-            let supervisor = restart_coordinator.new_supervisor(engine).await;
-            *slot = Some(Arc::clone(&supervisor));
-            supervisor
+    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope) {
+        if retired_supervisor.owns_scope(&scope).await {
+            retired_supervisor
+                .drain(&scope)
+                .await
+                .context("drain terminal Matrix Goal worker before replacement")?;
         }
-    };
+        retire_supervisor_slot_if_idle(&supervisor_slot, &retired_supervisor).await;
+    }
     let ingress = GoalIngressContext::trusted(
         GoalSessionKey::matrix(history_key.clone())?,
         context.agent_alias.to_string(),
@@ -390,17 +386,63 @@ async fn submit_matrix_goal_with_command_lease(
             raw_mxid: driver.raw_mxid.clone(),
         },
     )?;
-    let submission = supervisor
-        .admit_control(settings.clone(), ingress, driver, command)
-        .await?;
-    Ok(MatrixGoalCommandSubmission {
-        supervisor,
-        supervisor_slot,
-        settings,
-        context,
-        submission,
-        history_key,
-    })
+    loop {
+        let supervisor = {
+            let mut slot = supervisor_slot.lock().await;
+            if let Some(supervisor) = slot.as_ref() {
+                Arc::clone(supervisor)
+            } else {
+                let runtime = GoalRuntime::new(Arc::clone(&registry));
+                let tracker = CostTracker::get_or_init_global_required(
+                    defaults.config.cost.clone(),
+                    &defaults.config.data_dir,
+                )?;
+                let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
+                    build_type_level_model_provider_pricing(context.prompt_config.as_ref()),
+                )));
+                let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
+                    Arc::clone(&registry),
+                    tracker,
+                    context.agent_alias.to_string(),
+                    pricer,
+                )?);
+                let engine = Arc::new(
+                    runtime
+                        .execution_engine(accounting)
+                        .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
+                );
+                let supervisor = restart_coordinator.new_supervisor(engine).await;
+                *slot = Some(Arc::clone(&supervisor));
+                supervisor
+            }
+        };
+        let submission = match supervisor
+            .admit_control(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                command.clone(),
+            )
+            .await
+        {
+            Ok(submission) => submission,
+            Err(error) if error.is::<GoalSupervisorRetired>() => {
+                // Retirement won before admission acquired custody. Remove
+                // only that owner and retry with the original command lease.
+                clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        return Ok(MatrixGoalCommandSubmission {
+            supervisor,
+            supervisor_slot,
+            settings,
+            context,
+            submission,
+            history_key,
+        });
+    }
 }
 
 fn matrix_goal_control_plane(
@@ -491,6 +533,7 @@ fn goal_stop_command_for_status(
 /// this process has no worker (for example after restart), the durable row is
 /// already the sole live authority and can be fenced, classified, and deleted
 /// directly without recreating a worker merely to dispose it.
+#[cfg(test)]
 pub(super) async fn dispose_matrix_goal(
     context: &ChannelRuntimeContext,
     history_key: &str,
@@ -499,9 +542,21 @@ pub(super) async fn dispose_matrix_goal(
     // clear a supervisor installed by a concurrent start while disposal was
     // awaiting a durable fence or worker drain.
     let command_lock = goal_command_lock(&context.persist_locks, history_key);
-    let _command_lease = command_lock.lock_owned().await;
+    let command_lease = command_lock.lock_owned().await;
+    dispose_matrix_goal_with_command_lease(context, history_key, &command_lease).await
+}
+
+/// The caller retains command serialization through disposal and any reset.
+pub(super) async fn dispose_matrix_goal_with_command_lease(
+    context: &ChannelRuntimeContext,
+    history_key: &str,
+    _command_lease: &tokio::sync::OwnedMutexGuard<()>,
+) -> Result<()> {
     let slot = goal_supervisor_slot(&context.persist_locks, history_key);
-    if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
+    // End the slot guard before disposal awaits or exact-pointer removal
+    // reacquires it; an if-let scrutinee would retain it through the body.
+    let resident = slot.lock().await.as_ref().cloned();
+    if let Some(supervisor) = resident {
         supervisor.dispose_session(history_key).await?;
         clear_supervisor_slot_if_current(&slot, &supervisor).await;
         return Ok(());
@@ -759,10 +814,8 @@ async fn publish_matrix_goal_core_error(
 /// Clear a session's resident supervisor only if it is still the one that
 /// performed the lifecycle transition.
 ///
-/// The submission lease remains held through this cleanup, so another Goal
-/// command cannot reuse or replace the supervisor while its predecessor is
-/// retiring. Pointer comparison additionally protects disposal and other
-/// lifecycle paths that do not own that command lease.
+/// Retirement has already fenced admission, or disposal has settled this
+/// owner's obligations. Pointer comparison preserves a concurrent successor.
 async fn clear_supervisor_slot_if_current(
     slot: &Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
     supervisor: &Arc<GoalExecutionSupervisor>,
@@ -776,6 +829,18 @@ async fn clear_supervisor_slot_if_current(
     }
 }
 
+/// Preserve the discoverable owner while a queued control, admitted launch,
+/// or undrained worker still needs it. Retirement never waits for that work,
+/// and no slot lock is held while checking the supervisor's custody gate.
+async fn retire_supervisor_slot_if_idle(
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
+    supervisor: &Arc<GoalExecutionSupervisor>,
+) {
+    if supervisor.try_retire().await {
+        clear_supervisor_slot_if_current(slot, supervisor).await;
+    }
+}
+
 #[async_trait]
 impl GoalSessionDriver for MatrixGoalSessionDriver {
     fn session_key(&self) -> &GoalSessionKey {
@@ -784,6 +849,12 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
         self.assert_ingress(ingress)?;
+        #[cfg(test)]
+        super::foreground::await_goal_test_bind_barrier(
+            &self.context.persist_locks,
+            &self.session_key.durable_id(),
+        )
+        .await?;
         let admitted = self
             .command_lease
             .lock()
