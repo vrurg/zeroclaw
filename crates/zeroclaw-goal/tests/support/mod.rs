@@ -27,10 +27,12 @@ pub struct RegistryState {
     pub reject_claim: bool,
     pub fail_record: bool,
     pub fail_settlement: bool,
+    pub fail_finish: bool,
     pub settlement_wait: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_entered: Option<Arc<tokio::sync::Semaphore>>,
     pub transitions: Vec<&'static str>,
     pub session_lookups: usize,
+    pub fail_lookup_at: Option<usize>,
 }
 
 #[derive(Default)]
@@ -218,6 +220,9 @@ impl GoalTaskRegistry for Registry {
     async fn current_goal_for_session(&self, session: &str) -> Result<Option<TaskRecord>> {
         let mut state = self.0.lock().unwrap();
         state.session_lookups += 1;
+        if state.fail_lookup_at == Some(state.session_lookups) {
+            bail!("fixture session lookup unavailable");
+        }
         Ok(state
             .task
             .clone()
@@ -294,6 +299,9 @@ impl GoalTaskRegistry for Registry {
         status: TaskStatus,
         _error: Option<String>,
     ) -> Result<GoalTransitionResult> {
+        if self.0.lock().unwrap().fail_finish {
+            bail!("fixture lifecycle settlement unavailable");
+        }
         Ok(self.guarded(id, session, epoch, |state| {
             let task = state.task.as_mut().unwrap();
             task.status = status;
