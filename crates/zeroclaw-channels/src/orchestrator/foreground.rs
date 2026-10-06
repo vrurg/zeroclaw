@@ -6,7 +6,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use tokio_util::sync::CancellationToken;
@@ -19,15 +22,45 @@ pub(crate) struct ConversationLocks {
     // initializing the daemon singleton shared by unrelated unit tests.
     #[cfg(test)]
     goal_test_control_plane: OnceLock<zeroclaw_runtime::control_plane::ControlPlaneHandle>,
+    #[cfg(test)]
+    goal_test_bind_barrier: Mutex<Option<Arc<GoalTestBindBarrier>>>,
+    #[cfg(test)]
+    goal_test_drop_reset_completion: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    goal_test_cancel_reset_admission: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    goal_test_drop_reset_admission: std::sync::atomic::AtomicBool,
+}
+
+/// A one-shot fixture barrier at the real driver's admission boundary.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct GoalTestBindBarrier {
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
+    fail_after_release: bool,
 }
 
 /// Locks required only after a Matrix conversation enters the Goal control
 /// path. Ordinary channel traffic retains the historical persistence lock
-/// without paying for three unused async mutex allocations per conversation.
+/// without paying for three unused async mutexes and a reset counter.
 struct MatrixGoalLocks {
     goal_command: Arc<tokio::sync::Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
     goal_supervisor: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
+    pending_resets: Arc<AtomicUsize>,
+}
+
+/// Canonical process-local reset participation, not durable Goal state.
+/// A queued turn owns this reservation through reset delivery or abandonment.
+pub(super) struct MatrixGoalResetGuard {
+    pending_resets: Arc<AtomicUsize>,
+}
+
+impl Drop for MatrixGoalResetGuard {
+    fn drop(&mut self) {
+        self.pending_resets.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ConversationLocks {
@@ -37,6 +70,14 @@ impl ConversationLocks {
             matrix_goal: OnceLock::new(),
             #[cfg(test)]
             goal_test_control_plane: OnceLock::new(),
+            #[cfg(test)]
+            goal_test_bind_barrier: Mutex::new(None),
+            #[cfg(test)]
+            goal_test_drop_reset_completion: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            goal_test_cancel_reset_admission: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            goal_test_drop_reset_admission: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -45,6 +86,7 @@ impl ConversationLocks {
             goal_command: Arc::new(tokio::sync::Mutex::new(())),
             foreground: Arc::new(tokio::sync::Mutex::new(())),
             goal_supervisor: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_resets: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -79,6 +121,111 @@ pub(super) fn goal_test_control_plane(
         .cloned()
 }
 
+#[cfg(test)]
+pub(super) fn drop_next_goal_test_reset_completion(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) {
+    assert!(
+        !locks_for_key(locks, key)
+            .goal_test_drop_reset_completion
+            .swap(true, Ordering::SeqCst)
+    );
+}
+
+#[cfg(test)]
+pub(super) fn take_goal_test_drop_reset_completion(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> bool {
+    locks_for_key(locks, key)
+        .goal_test_drop_reset_completion
+        .swap(false, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(super) fn cancel_next_goal_test_reset_admission(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) {
+    assert!(
+        !locks_for_key(locks, key)
+            .goal_test_cancel_reset_admission
+            .swap(true, Ordering::SeqCst)
+    );
+}
+
+#[cfg(test)]
+pub(super) fn take_goal_test_cancel_reset_admission(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> bool {
+    locks_for_key(locks, key)
+        .goal_test_cancel_reset_admission
+        .swap(false, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(super) fn drop_next_goal_test_reset_admission(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) {
+    assert!(
+        !locks_for_key(locks, key)
+            .goal_test_drop_reset_admission
+            .swap(true, Ordering::SeqCst)
+    );
+}
+
+#[cfg(test)]
+pub(super) fn take_goal_test_drop_reset_admission(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> bool {
+    locks_for_key(locks, key)
+        .goal_test_drop_reset_admission
+        .swap(false, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(super) fn install_goal_test_bind_barrier(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+    fail_after_release: bool,
+) -> Arc<GoalTestBindBarrier> {
+    let barrier = Arc::new(GoalTestBindBarrier {
+        fail_after_release,
+        ..Default::default()
+    });
+    let entry = locks_for_key(locks, key);
+    assert!(
+        entry
+            .goal_test_bind_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier.clone())
+            .is_none()
+    );
+    barrier
+}
+
+#[cfg(test)]
+pub(super) async fn await_goal_test_bind_barrier(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> anyhow::Result<()> {
+    let entry = locks_for_key(locks, key);
+    let barrier = entry.goal_test_bind_barrier.lock().unwrap().take();
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+        if barrier.fail_after_release {
+            anyhow::bail!("fixture launch rebind unavailable");
+        }
+    }
+    Ok(())
+}
+
 fn locks_for_key(
     locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
@@ -109,6 +256,26 @@ pub(crate) fn goal_command_lock(
     key: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(&locks_for_key(locks, key).matrix_goal().goal_command)
+}
+
+pub(super) fn reserve_matrix_goal_reset(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> MatrixGoalResetGuard {
+    let pending_resets = Arc::clone(&locks_for_key(locks, key).matrix_goal().pending_resets);
+    pending_resets.fetch_add(1, Ordering::SeqCst);
+    MatrixGoalResetGuard { pending_resets }
+}
+
+pub(super) fn matrix_goal_reset_pending(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> bool {
+    locks_for_key(locks, key)
+        .matrix_goal()
+        .pending_resets
+        .load(Ordering::SeqCst)
+        != 0
 }
 
 pub(crate) fn goal_supervisor_slot(

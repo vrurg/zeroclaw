@@ -116,7 +116,9 @@ async fn finish_after_response(
         }
         Err(error) => {
             log_delivery_error("Goal command launch or drain could not finish", &error);
-            send_command_failed(channel, message).await;
+            if !error.is::<zeroclaw_goal::GoalLaunchFailureReported>() {
+                send_command_failed(channel, message).await;
+            }
         }
     }
 }
@@ -135,7 +137,10 @@ async fn send_response(
         .await
 }
 
-async fn send_command_failed(channel: Option<&Arc<dyn Channel>>, message: &ChannelMessage) {
+pub(super) async fn send_command_failed(
+    channel: Option<&Arc<dyn Channel>>,
+    message: &ChannelMessage,
+) {
     if let Some(channel) = channel
         && let Err(error) = channel
             .send(&SendMessage::reply_to(
