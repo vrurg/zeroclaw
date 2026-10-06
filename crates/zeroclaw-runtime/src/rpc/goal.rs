@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use zeroclaw_api::{
     jsonrpc::{JsonRpcNotification, RpcOutbound},
-    model_provider::{ChatMessage, ChatRequest},
+    model_provider::{ChatMessage, ChatRequest, TokenUsage},
 };
 
 use crate::{
     agent::agent::{Agent, IsolatedTranscriptSource, build_session_model_provider},
-    agent::cost::build_type_level_model_provider_pricing,
+    agent::cost::build_model_provider_pricing,
     control_plane::control_plane,
     cost::CostTracker,
     goal_accounting::{
@@ -28,17 +28,36 @@ use crate::{
 };
 
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalCommand};
+use zeroclaw_goal::accounting::{GoalUsagePrice, GoalUsagePricer};
 use zeroclaw_goal::control::{
-    GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalParentTurnKind, GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, dispose_unowned_session_goal,
-    goal_parent_turn_input,
+    GoalControlAbandonReason, GoalControlAdmission, GoalExecutionNotice, GoalExecutionScope,
+    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
+    GoalLaunchFailureReported, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
+    GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSupervisorRetired,
+    GoalSurface, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    dispose_unowned_session_goal, goal_parent_turn_input,
 };
 use zeroclaw_goal::{GoalParentTurnCheckpoint, GoalPauseReason};
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
+
+/// Resolve each priced attempt from the ordinary ZeroCode pricing source.
+/// Retain live config rather than RpcContext so a resident supervisor neither
+/// caches pricing policy nor forms a context-to-supervisor ownership cycle.
+struct ZeroCodeGoalUsagePricer {
+    config: zeroclaw_config::live::LiveConfigHandle,
+}
+
+impl GoalUsagePricer for ZeroCodeGoalUsagePricer {
+    fn price(&self, provider_ref: &str, model: &str, usage: &TokenUsage) -> Result<GoalUsagePrice> {
+        let pricing = {
+            let config = self.config.read();
+            Arc::new(build_model_provider_pricing(&config))
+        };
+        ModelProviderGoalUsagePricer::new(pricing).price(provider_ref, model, usage)
+    }
+}
 
 async fn acquire_zero_code_goal_session_guard(
     session_queue: Arc<zeroclaw_infra::session_queue::SessionActorQueue>,
@@ -72,12 +91,59 @@ impl std::fmt::Debug for RpcGoalCommandSubmission {
 
 struct RpcGoalPostResponse {
     runtime: Arc<RpcGoalRuntime>,
+    context: Arc<RpcContext>,
     session_id: String,
     supervisor: Arc<GoalExecutionSupervisor>,
     settings: GoalHostSettings,
-    submission: GoalExecutionSubmission,
+    admission: GoalControlAdmission,
     outbound: Arc<RpcOutbound>,
-    starts_execution: bool,
+}
+
+async fn publish_goal_lifecycle(
+    outbound: &RpcOutbound,
+    session_id: &str,
+    response: &GoalResponse,
+) -> Result<()> {
+    publish_goal_update(
+        outbound,
+        crate::rpc::types::SessionGoalUpdate::Lifecycle {
+            session_id: session_id.to_owned(),
+            response: response.clone(),
+        },
+    )
+    .await
+}
+
+async fn publish_goal_update(
+    outbound: &RpcOutbound,
+    update: crate::rpc::types::SessionGoalUpdate,
+) -> Result<()> {
+    let params = serde_json::to_value(update)?;
+    let notification =
+        serde_json::to_string(&JsonRpcNotification::new(GOAL_UPDATE_METHOD, params))?;
+    ensure!(
+        outbound.send_raw(notification).await,
+        "ZeroCode Goal lifecycle response could not be queued"
+    );
+    Ok(())
+}
+
+async fn report_goal_command_failure(
+    outbound: &RpcOutbound,
+    session_id: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match publish_goal_update(
+        outbound,
+        crate::rpc::types::SessionGoalUpdate::CommandFailed {
+            session_id: session_id.to_owned(),
+        },
+    )
+    .await
+    {
+        Ok(()) => error,
+        Err(delivery) => error.context(delivery),
+    }
 }
 
 impl RpcGoalCommandSubmission {
@@ -89,35 +155,94 @@ impl RpcGoalCommandSubmission {
     /// same queue preserves response-before-agent-event ordering for both
     /// local IPC and WSS.
     pub(super) async fn after_response(self) -> Result<()> {
-        let initial_response = self.response;
         let Some(post_response) = self.post_response else {
             return Ok(());
         };
         let RpcGoalPostResponse {
             runtime,
+            context,
             session_id,
             supervisor,
-            settings,
-            mut submission,
+            mut settings,
+            admission,
             outbound,
-            ..
         } = post_response;
-        let late_response = supervisor
-            .launch_after_response(settings, &mut submission)
-            .await?;
-        let lifecycle_delivery_result = async {
-            if let Some(response) = late_response.as_ref() {
-                let params =
-                    serde_json::to_value(crate::rpc::types::SessionGoalUpdate::Lifecycle {
-                        session_id: session_id.clone(),
-                        response: response.clone(),
-                    })?;
-                let notification =
-                    serde_json::to_string(&JsonRpcNotification::new(GOAL_UPDATE_METHOD, params))?;
-                ensure!(
-                    outbound.send_raw(notification).await,
-                    "ZeroCode Goal lifecycle response could not be queued"
+        let (mut submission, publish_initial) = match admission {
+            GoalControlAdmission::Direct(submission) => (submission, false),
+            GoalControlAdmission::Queued { deferred, .. } => {
+                let ready = match deferred.wait().await {
+                    Ok(ready) => ready,
+                    Err(closed) => {
+                        publish_goal_lifecycle(&outbound, &session_id, closed.response()).await?;
+                        return Err(closed.into());
+                    }
+                };
+                let ready = ready.with_abandon_reason(GoalControlAbandonReason::ControlDropped);
+                #[cfg(test)]
+                runtime.wait_test_deferred_commit_pause(&session_id).await;
+                // Config is live authority; the queued command's earlier
+                // settings cannot authorize its eventual transition.
+                settings = match runtime.current_settings(&context) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        return Err(
+                            report_goal_command_failure(&outbound, &session_id, error).await
+                        );
+                    }
+                };
+                let commit = match ready.commit(settings.clone()).await {
+                    Ok(commit) => commit,
+                    Err(error) => {
+                        return Err(
+                            report_goal_command_failure(&outbound, &session_id, error).await
+                        );
+                    }
+                };
+                let before_release = matches!(
+                    commit.response(),
+                    GoalResponse::Started(_) | GoalResponse::Resumed(_)
                 );
+                if before_release {
+                    let delivery =
+                        publish_goal_lifecycle(&outbound, &session_id, commit.response()).await;
+                    let mut submission = commit.release();
+                    if let Err(error) = delivery {
+                        supervisor
+                            .pause_before_launch(
+                                &mut submission,
+                                GoalPauseReason::ExternalDependency,
+                            )
+                            .await?;
+                        runtime
+                            .retire_supervisor_if_idle(&session_id, &supervisor)
+                            .await;
+                        return Err(error);
+                    }
+                    (submission, false)
+                } else {
+                    // A fenced worker can drain only after its checkpoint
+                    // and command lease are released by this control task.
+                    (commit.release(), true)
+                }
+            }
+        };
+        let initial_response = submission.response().clone();
+        let late_response = match supervisor
+            .launch_after_response(settings, &mut submission)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is::<GoalLaunchFailureReported>() => return Err(error),
+            Err(error) => {
+                return Err(report_goal_command_failure(&outbound, &session_id, error).await);
+            }
+        };
+        let lifecycle_delivery_result = async {
+            if let Some(response) = late_response
+                .as_ref()
+                .or_else(|| publish_initial.then_some(&initial_response))
+            {
+                publish_goal_lifecycle(&outbound, &session_id, response).await?;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -134,7 +259,7 @@ impl RpcGoalCommandSubmission {
             && late_response.is_some();
         if initial_is_final || pending_was_finalized {
             runtime
-                .remove_supervisor_if_current(&session_id, &supervisor)
+                .retire_supervisor_if_idle(&session_id, &supervisor)
                 .await;
         }
         lifecycle_delivery_result?;
@@ -144,24 +269,35 @@ impl RpcGoalCommandSubmission {
     /// If a start/resume acknowledgement cannot be queued, pause before any
     /// parent model call so an unseen Goal cannot begin running.
     pub(super) async fn response_delivery_failed(self) -> Result<()> {
-        if let Some(mut post_response) = self.post_response
-            && (post_response.starts_execution
-                || matches!(
-                    post_response.submission.response(),
-                    GoalResponse::TransitionPending(_)
-                ))
-        {
-            post_response
-                .supervisor
-                .pause_before_launch(
-                    &mut post_response.submission,
-                    GoalPauseReason::ExternalDependency,
-                )
-                .await?;
-            post_response
-                .runtime
-                .remove_supervisor_if_current(&post_response.session_id, &post_response.supervisor)
-                .await;
+        let Some(post_response) = self.post_response else {
+            return Ok(());
+        };
+        match post_response.admission {
+            GoalControlAdmission::Queued { deferred, .. } => {
+                deferred
+                    .abandon(GoalControlAbandonReason::DeliveryFailed)
+                    .await?;
+            }
+            GoalControlAdmission::Direct(mut submission) => {
+                if matches!(
+                    submission.response(),
+                    GoalResponse::Started(_)
+                        | GoalResponse::Resumed(_)
+                        | GoalResponse::TransitionPending(_)
+                ) {
+                    post_response
+                        .supervisor
+                        .pause_before_launch(&mut submission, GoalPauseReason::ExternalDependency)
+                        .await?;
+                    post_response
+                        .runtime
+                        .retire_supervisor_if_idle(
+                            &post_response.session_id,
+                            &post_response.supervisor,
+                        )
+                        .await;
+                }
+            }
         }
         Ok(())
     }
@@ -311,10 +447,66 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         self.authorization
             .admit_execution(grants.as_ref(), &snapshot.reaction_channels)
             .await?;
+        #[cfg(test)]
+        self.context
+            .goal_runtime
+            .check_test_launch_bind_failure(&self.session_key)
+            .await?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
         ))
+    }
+
+    async fn try_turn_boundary(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<Option<GoalTurnBoundary>> {
+        self.assert_ingress(ingress)?;
+        self.revalidate_session().await?;
+        let guard = self
+            .context
+            .sessions
+            .session_queue
+            .try_acquire(self.raw_session_id())
+            .await
+            .context("ZeroCode Goal turn boundary could not be admitted")?;
+        self.revalidate_session().await?;
+        Ok(guard.map(GoalTurnBoundary::new))
+    }
+
+    async fn await_turn_boundary(
+        &self,
+        ingress: &GoalIngressContext,
+        checkpoint: &GoalParentTurnCheckpoint,
+    ) -> Result<GoalTurnBoundary> {
+        self.assert_ingress(ingress)?;
+        loop {
+            self.revalidate_session().await?;
+            let admission = tokio::select! {
+                biased;
+                () = checkpoint.wait_closed() => return Err(zeroclaw_goal::GoalCheckpointClosed.into()),
+                admission = self.context.sessions.session_queue.reserve(self.raw_session_id()) => {
+                    admission.context("ZeroCode Goal turn boundary could not be reserved")?
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                () = checkpoint.wait_closed() => return Err(zeroclaw_goal::GoalCheckpointClosed.into()),
+                result = admission.acquire() => result,
+            };
+            match result {
+                Ok(guard) => {
+                    self.revalidate_session().await?;
+                    return Ok(GoalTurnBoundary::new(guard));
+                }
+                Err(zeroclaw_infra::session_queue::SessionQueueError::Timeout { .. }) => {
+                    // Ordinary turns keep their configured queue timeout. A
+                    // deferred control waits until its boundary or fence.
+                }
+                Err(error) => return Err(error).context("ZeroCode Goal turn boundary failed"),
+            }
+        }
     }
 
     async fn acquire_execution(
@@ -785,13 +977,136 @@ mod zero_code_session_admission_tests {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+enum GoalTestBindFailure {
+    RunningEpoch { key: String, epoch: i64 },
+    NextBind { key: String },
+}
+
+#[cfg(test)]
+pub(super) struct GoalTestDeferredCommitPause {
+    pub session_id: String,
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
 /// ZeroCode's process-local Goal worker registry.
 #[derive(Default)]
 pub struct RpcGoalRuntime {
     supervisors: Mutex<HashMap<String, Arc<GoalExecutionSupervisor>>>,
+    #[cfg(test)]
+    test_control_plane: std::sync::OnceLock<crate::control_plane::ControlPlaneHandle>,
+    #[cfg(test)]
+    test_launch_bind_failure: std::sync::Mutex<Option<GoalTestBindFailure>>,
+    #[cfg(test)]
+    pub(super) test_deferred_commit_pause: std::sync::Mutex<Option<GoalTestDeferredCommitPause>>,
 }
 
 impl RpcGoalRuntime {
+    #[cfg(test)]
+    async fn wait_test_deferred_commit_pause(&self, session_id: &str) {
+        let pause = {
+            let mut pending = self.test_deferred_commit_pause.lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|pause| pause.session_id == session_id)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    /// Inject one launch-bind failure without revoking notice-delivery authority.
+    #[cfg(test)]
+    pub(super) fn fail_test_launch_bind(&self, key: String, epoch: i64) {
+        *self.test_launch_bind_failure.lock().unwrap() =
+            Some(GoalTestBindFailure::RunningEpoch { key, epoch });
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_test_next_bind(&self, key: String) {
+        *self.test_launch_bind_failure.lock().unwrap() =
+            Some(GoalTestBindFailure::NextBind { key });
+    }
+
+    #[cfg(test)]
+    async fn check_test_launch_bind_failure(&self, session: &GoalSessionKey) -> Result<()> {
+        let expected = self.test_launch_bind_failure.lock().unwrap().clone();
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let key = match &expected {
+            GoalTestBindFailure::RunningEpoch { key, .. }
+            | GoalTestBindFailure::NextBind { key } => key,
+        };
+        if key != &session.durable_id() {
+            return Ok(());
+        }
+        let should_fail = match &expected {
+            GoalTestBindFailure::RunningEpoch { epoch, .. } => {
+                let registry = self.current_control_plane().unwrap().goal_store()?;
+                registry
+                    .current_goal_for_session(key)
+                    .await?
+                    .is_some_and(|task| {
+                        task.status == zeroclaw_api::task::TaskStatus::Running
+                            && task.execution_epoch == *epoch
+                    })
+            }
+            GoalTestBindFailure::NextBind { .. } => true,
+        };
+        if should_fail {
+            let mut fault = self.test_launch_bind_failure.lock().unwrap();
+            if fault.as_ref() == Some(&expected) {
+                fault.take();
+                bail!("private fixture launch bind detail");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_control_plane(
+        &self,
+        handle: crate::control_plane::ControlPlaneHandle,
+    ) {
+        assert!(self.test_control_plane.set(handle).is_ok());
+    }
+
+    fn current_control_plane(&self) -> Option<crate::control_plane::ControlPlaneHandle> {
+        #[cfg(test)]
+        if let Some(handle) = self.test_control_plane.get() {
+            return Some(handle.clone());
+        }
+        control_plane().cloned()
+    }
+
+    fn current_settings(&self, context: &RpcContext) -> Result<GoalHostSettings> {
+        let config = context.config.read();
+        let control_plane = self
+            .current_control_plane()
+            .context("Goal control plane is unavailable")?;
+        let limits = config.goal.effective_limits().map_err(|error| {
+            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
+        })?;
+        GoalHostSettings::from_validated_limits(
+            config.goal.enabled,
+            GoalBudgetLimits {
+                token_limit: limits.token_limit,
+                cost_limit_usd: limits.cost_limit_usd,
+            },
+            std::process::id(),
+            control_plane.boot_id,
+        )
+    }
+
     /// Whether this session's Goal can be safely disposed without waiting for
     /// a process-local worker. LRU eviction is nonblocking: resumable Goals
     /// and sessions with a live resident worker stay attached rather than
@@ -807,7 +1122,7 @@ impl RpcGoalRuntime {
         {
             return Ok(false);
         }
-        let Some(control_plane) = control_plane() else {
+        let Some(control_plane) = self.current_control_plane() else {
             return Ok(supervisor.is_none());
         };
         let registry = control_plane.goal_store()?;
@@ -832,7 +1147,7 @@ impl RpcGoalRuntime {
                 .await?;
             self.remove_supervisor_if_current(session_id, &supervisor)
                 .await;
-        } else if let Some(control_plane) = control_plane() {
+        } else if let Some(control_plane) = self.current_control_plane() {
             let registry = control_plane.goal_store()?;
             let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
             let _ = dispose_unowned_session_goal(registry.as_ref(), &durable_session_id).await?;
@@ -854,50 +1169,14 @@ impl RpcGoalRuntime {
                 post_response: None,
             });
         }
-        let control_plane = control_plane().context("Goal control plane is unavailable")?;
+        let control_plane = self
+            .current_control_plane()
+            .context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
         let restart_coordinator = control_plane.goal_execution_restart();
-        let effective_limits = config.goal.effective_limits().map_err(|error| {
-            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
-        })?;
-        let settings = GoalHostSettings::from_validated_limits(
-            config.goal.enabled,
-            GoalBudgetLimits {
-                token_limit: effective_limits.token_limit,
-                cost_limit_usd: effective_limits.cost_limit_usd,
-            },
-            std::process::id(),
-            control_plane.boot_id.clone(),
-        )?;
+        let settings = self.current_settings(&context)?;
         let session_id = driver.raw_session_id().to_owned();
         let outbound = Arc::clone(&driver.outbound);
-        let supervisor = match self.supervisor(&session_id).await {
-            Some(supervisor) => supervisor,
-            None => {
-                let runtime = GoalRuntime::new(Arc::clone(&registry));
-                let tracker = CostTracker::get_or_init_global_required(
-                    config.cost.clone(),
-                    &config.data_dir,
-                )?;
-                let pricer = Arc::new(ModelProviderGoalUsagePricer::new(Arc::new(
-                    build_type_level_model_provider_pricing(&config),
-                )));
-                let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
-                    Arc::clone(&registry),
-                    tracker,
-                    driver.agent_alias().to_owned(),
-                    pricer,
-                )?);
-                let engine = Arc::new(
-                    runtime
-                        .execution_engine(accounting)
-                        .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
-                );
-                let candidate = restart_coordinator.new_supervisor(engine).await;
-                self.install_supervisor_if_absent(session_id.clone(), candidate)
-                    .await
-            }
-        };
         let ingress = GoalIngressContext::trusted(
             driver.session_key().clone(),
             driver.agent_alias().to_owned(),
@@ -906,29 +1185,94 @@ impl RpcGoalRuntime {
                 tui_id: driver.tui_id.clone(),
             },
         )?;
-        let submission = supervisor
-            .submit(settings.clone(), ingress, driver, command)
-            .await?;
-        let starts_execution = matches!(
-            submission.response(),
-            GoalResponse::Started(_) | GoalResponse::Resumed(_)
-        );
+        let (supervisor, admission) = loop {
+            let supervisor = match self.supervisor(&session_id).await {
+                Some(supervisor) => supervisor,
+                None => {
+                    let runtime = GoalRuntime::new(Arc::clone(&registry));
+                    let tracker = CostTracker::get_or_init_global_required(
+                        config.cost.clone(),
+                        &config.data_dir,
+                    )?;
+                    let pricer = Arc::new(ZeroCodeGoalUsagePricer {
+                        config: context.config.clone(),
+                    });
+                    let accounting = Arc::new(RuntimeGoalOperationAccountingFactory::new(
+                        Arc::clone(&registry),
+                        tracker,
+                        driver.agent_alias().to_owned(),
+                        pricer,
+                    )?);
+                    let engine = Arc::new(
+                        runtime
+                            .execution_engine(accounting)
+                            .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
+                    );
+                    let candidate = restart_coordinator.new_supervisor(engine).await;
+                    self.install_supervisor_if_absent(session_id.clone(), candidate)
+                        .await
+                }
+            };
+            match supervisor
+                .admit_control(
+                    settings.clone(),
+                    ingress.clone(),
+                    driver.clone(),
+                    command.clone(),
+                )
+                .await
+            {
+                Ok(admission) => break (supervisor, admission),
+                Err(error) if error.is::<GoalSupervisorRetired>() => {
+                    // Retirement preceded custody admission, so this command
+                    // has made no effects and can select the resident owner again.
+                    self.remove_supervisor_if_current(&session_id, &supervisor)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let (response, admission) = match admission {
+            GoalControlAdmission::Direct(submission) => (
+                submission.response().clone(),
+                GoalControlAdmission::Direct(submission),
+            ),
+            GoalControlAdmission::Queued { response, deferred } => (
+                response.clone(),
+                GoalControlAdmission::Queued {
+                    response,
+                    deferred: deferred
+                        .with_abandon_reason(GoalControlAbandonReason::ConnectionClosed),
+                },
+            ),
+        };
         Ok(RpcGoalCommandSubmission {
-            response: submission.response().clone(),
+            response,
             post_response: Some(RpcGoalPostResponse {
                 runtime: Arc::clone(self),
+                context,
                 session_id,
                 supervisor,
                 settings,
-                submission,
+                admission,
                 outbound,
-                starts_execution,
             }),
         })
     }
     /// Return a resident supervisor for this session, if it has one.
     pub async fn supervisor(&self, session_id: &str) -> Option<Arc<GoalExecutionSupervisor>> {
         self.supervisors.lock().await.get(session_id).cloned()
+    }
+
+    async fn retire_supervisor_if_idle(
+        &self,
+        session_id: &str,
+        supervisor: &Arc<GoalExecutionSupervisor>,
+    ) {
+        if supervisor.try_retire().await {
+            self.remove_supervisor_if_current(session_id, supervisor)
+                .await;
+        }
     }
 
     /// Atomically retain one supervisor for a session and return the resident

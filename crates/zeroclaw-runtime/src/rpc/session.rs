@@ -378,6 +378,10 @@ pub struct SessionStore {
     #[cfg(test)]
     pub(crate) test_construction_publication_pause:
         std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only gate after session/new captures its authorized incarnation.
+    #[cfg(test)]
+    pub(crate) test_goal_replacement_capture_pause:
+        std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
@@ -475,6 +479,8 @@ impl SessionStore {
             test_rehydration_published_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_construction_publication_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_goal_replacement_capture_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]

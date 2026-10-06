@@ -314,6 +314,7 @@ rpc_type! {
     /// Asynchronous Goal lifecycle update. Ordinary agent events, including
     /// parent-turn chunks and failures, use the normal `session/update` stream.
     pub enum SessionGoalUpdate {
+        CommandFailed { session_id: String },
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
