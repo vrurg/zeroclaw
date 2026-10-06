@@ -110,6 +110,12 @@ The current chat session receives three tools when the feature is enabled:
 | `session_prompt_set` | Create or replace an attachment by symbolic ID. |
 | `session_prompt_delete` | Remove one attachment by symbolic ID. |
 
+These tools are direct-only: builtin/MCP skill aliases cannot target them,
+and pipelines cannot execute them as child steps, even when their names are
+explicitly included in the pipeline allowlist. Ordinary skill aliases and
+pipelines remain available. Direct calls retain the approval and privacy
+protections described below, including when mutation approval is disabled.
+
 `session_prompt_set` accepts `id` and `content`. IDs must match
 `[a-z][a-z0-9_.-]{0,63}`. A session may hold at most four attachments; each
 content value is at most 2 KiB and their combined content is at most 8 KiB.

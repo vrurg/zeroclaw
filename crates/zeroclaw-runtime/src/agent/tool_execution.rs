@@ -105,6 +105,7 @@ fn unavailable_tool_outcome(
         duration,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -116,6 +117,10 @@ pub struct ToolExecutionOutcome {
     /// fold a tool's detailed error body (which can reflect a token or signed
     /// URL) into this text and credential-scrub it before storing it here.
     pub output: String,
+    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
+    /// They reach history through the carrier grammar and are never recovered
+    /// by scanning `output`.
+    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`. Stored raw — consumers scrub at their own rendering boundary.
@@ -227,6 +232,7 @@ pub(crate) async fn execute_one_tool(
             duration,
             receipt: None,
             output_data: None,
+            attachments: Vec::new(),
         });
     };
 
@@ -420,6 +426,7 @@ pub(crate) async fn execute_one_tool(
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
+                        attachments: r.output.attachments().to_vec(),
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
@@ -437,6 +444,7 @@ pub(crate) async fn execute_one_tool(
                     // it. Tools that already put everything into `error` and
                     // leave `output` empty (the common case) are unaffected.
                     let output_text = r.output.as_str().to_string();
+                    let attachments = r.output.attachments().to_vec();
                     let output_data = r.output.into_data();
                     let reason = r.error.unwrap_or_else(|| output_text.clone());
                     let full_output = if !output_text.is_empty() && output_text != reason {
@@ -473,6 +481,7 @@ pub(crate) async fn execute_one_tool(
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
+                        attachments,
                         output_data,
                     })
                 }
@@ -534,6 +543,7 @@ pub(crate) async fn execute_one_tool(
                     duration,
                     receipt: None,
                     output_data: None,
+                    attachments: Vec::new(),
                 })
             }
         }
@@ -2346,6 +2356,7 @@ mod tests {
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
         use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
         use crate::agent::turn::history_append::append_tool_round_to_history;
+        use crate::agent::turn::results_collect::ToolRoundResult;
         use crate::agent::turn::results_collect::collect_tool_results;
         use std::collections::HashSet;
         use zeroclaw_providers::ChatMessage;
@@ -2414,11 +2425,11 @@ mod tests {
             "prompt-mode <tool_result> block must be scrubbed: {}",
             collected.tool_results
         );
-        for collected_result in &collected.individual_results {
-            let result = &collected_result.output;
+        for result in &collected.individual_results {
             assert!(
-                !result.contains(secret) && result.contains("[REDACTED]"),
-                "native role=tool content must be scrubbed: {result}"
+                !result.output.contains(secret) && result.output.contains("[REDACTED]"),
+                "native role=tool content must be scrubbed: {}",
+                result.output
             );
         }
 
@@ -2443,9 +2454,10 @@ mod tests {
             "the native tool-result message must carry the scrubbed body"
         );
 
-        let prompt_results = vec![crate::agent::turn::results_collect::CollectedToolResult {
+        let prompt_results = vec![ToolRoundResult {
             tool_call_id: None,
             output: collected.individual_results[0].output.clone(),
+            attachments: Vec::new(),
             sensitive_session_prompt: collected.individual_results[0].sensitive_session_prompt,
         }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();

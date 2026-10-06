@@ -172,15 +172,20 @@ pub fn redact_session_prompt_history_for_export(
         // partial export must not depend on a preceding assistant surviving.
         // This is reserved host protocol, not a flag in arbitrary user JSON.
         let host_marked_text_result = is_text_protocol_result
-            && message
+            && (message
                 .content
-                .strip_prefix(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
-                .is_some_and(|body| body.starts_with(SESSION_PROMPT_TEXT_RESULT_MARKER));
+                .strip_prefix(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+                .is_some_and(|body| body.starts_with(SESSION_PROMPT_TEXT_RESULT_MARKER))
+                || zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&message.content)
+                    .is_some_and(|carrier| {
+                        carrier.declared
+                            && carrier.text.starts_with(SESSION_PROMPT_TEXT_RESULT_MARKER)
+                    }));
         let host_marked_result = host_marked_native_result || host_marked_text_result;
         let has_text_protocol_result_prefix = is_text_protocol_result
             && message
                 .content
-                .starts_with(crate::agent::history_trim::TOOL_RESULTS_PREFIX);
+                .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX);
         let redact = host_marked_result
             || is_sensitive_call
             || (redact_native_tool_results && is_native_result)
@@ -225,7 +230,7 @@ pub fn redact_session_prompt_history_for_export(
                 // Redaction removes opaque text, not the carrier's turn role.
                 format!(
                     "{}\n{SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER}",
-                    crate::agent::history_trim::TOOL_RESULTS_PREFIX
+                    zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX
                 )
             } else {
                 SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string()

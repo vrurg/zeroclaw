@@ -10,6 +10,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
@@ -587,8 +588,9 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
-    /// Pre-boxed Arcs of every tool (before policy filter). Used by
-    /// skill-scoped builtin elevation to resolve targets at registration.
+    /// Pre-boxed Arcs eligible for indirect execution (before policy filter).
+    /// Used by pipeline construction and skill-scoped builtin elevation.
+    /// Direct-only session-prompt tools are deliberately absent.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
@@ -1003,7 +1005,6 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
@@ -2304,7 +2305,7 @@ fn all_tools_with_runtime_on_thread(
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
                 return AllToolsResult {
-                    unfiltered_tool_arcs: tool_arcs.clone(),
+                    unfiltered_tool_arcs: indirect_tool_registry(&tool_arcs),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
                     #[cfg(test)]
@@ -2527,7 +2528,7 @@ fn all_tools_with_runtime_on_thread(
     // effective per-agent policy and optional caller allowlist are both known.
 
     AllToolsResult {
-        unfiltered_tool_arcs: tool_arcs.clone(),
+        unfiltered_tool_arcs: indirect_tool_registry(&tool_arcs),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         ask_user_handle,
@@ -2538,6 +2539,23 @@ fn all_tools_with_runtime_on_thread(
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
     }
+}
+
+fn indirect_tool_registry(tools: &[Arc<dyn Tool>]) -> Vec<Arc<dyn Tool>> {
+    // Session-prompt calls must reach the top-level dispatcher under their
+    // canonical names for exact mutation approval and sensitive-egress masking.
+    // Skill aliases and pipeline children call execute directly, bypassing both.
+    // Propagation is possible, but would require guarded child dispatch after
+    // locked-argument merging or pipeline interpolation, exact one-time approval,
+    // cancellation handling, and privacy protection for intermediate/aggregate
+    // results and pre-execution exports. That cross-wrapper redesign is not
+    // justified for this bounded feature; keep indirect invocation unavailable
+    // unless a separate design establishes and tests those guarantees.
+    tools
+        .iter()
+        .filter(|tool| !SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -3242,7 +3260,7 @@ permissions = ["http_client"]
     }
 
     #[test]
-    fn session_prompt_tools_follow_the_feature_gate() {
+    fn session_prompt_tools_are_direct_only_through_production_assembly() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let memory: Arc<dyn Memory> = Arc::from(
@@ -3250,7 +3268,13 @@ permissions = ["http_client"]
         );
         let mut config = test_config(&tmp);
         config.channels.session_prompts_enabled = true;
-        let tools = all_tools_with_runtime(
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = SESSION_PROMPT_TOOL_NAMES
+            .into_iter()
+            .chain(["calculator"])
+            .map(str::to_owned)
+            .collect();
+        let built = all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -3273,12 +3297,135 @@ permissions = ["http_client"]
             None,
             None,
         )
-        .expect("test tools should build")
-        .tools;
-        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
-        assert!(names.contains(&"session_prompt_list"));
-        assert!(names.contains(&"session_prompt_set"));
-        assert!(names.contains(&"session_prompt_delete"));
+        .expect("test tools should build");
+        let names: Vec<_> = built.tools.iter().map(|tool| tool.name()).collect();
+        for name in SESSION_PROMPT_TOOL_NAMES {
+            assert!(names.contains(&name), "direct tool {name} must remain");
+            assert!(
+                built
+                    .unfiltered_tool_arcs
+                    .iter()
+                    .all(|tool| tool.name() != name)
+            );
+        }
+
+        let mut skill_tools = Vec::new();
+        for kind in ["builtin", "mcp"] {
+            for target in SESSION_PROMPT_TOOL_NAMES {
+                skill_tools.push(crate::skills::SkillTool {
+                    name: format!("{kind}_{target}"),
+                    description: "synthetic prompt alias".into(),
+                    kind: kind.into(),
+                    command: String::new(),
+                    args: Default::default(),
+                    target: Some(target.into()),
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                });
+            }
+        }
+        for target in ["calculator", PipelineTool::NAME] {
+            skill_tools.push(crate::skills::SkillTool {
+                name: target.into(),
+                description: "ordinary wrapper control".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(target.into()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            });
+        }
+        let skill = crate::skills::Skill {
+            name: "synthetic".into(),
+            description: "direct-only registration regression".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: skill_tools,
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test-agent",
+                security: &security,
+                built,
+                skills: std::slice::from_ref(&skill),
+                runtime: Arc::new(NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            })
+            .await;
+            for name in SESSION_PROMPT_TOOL_NAMES {
+                assert!(assembled.registry.iter().any(|tool| tool.name() == name));
+                for kind in ["builtin", "mcp"] {
+                    let alias = format!("synthetic__{kind}_{name}");
+                    assert!(assembled.registry.iter().all(|tool| tool.name() != alias));
+                }
+            }
+            let calculator = assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == "synthetic__calculator")
+                .unwrap();
+            assert!(
+                calculator
+                    .execute(serde_json::json!({
+                        "function": "add", "values": [2, 3]
+                    }))
+                    .await
+                    .unwrap()
+                    .success
+            );
+            for wrapper in [PipelineTool::NAME, "synthetic__execute_pipeline"] {
+                let pipeline = assembled
+                    .registry
+                    .iter()
+                    .find(|tool| tool.name() == wrapper)
+                    .unwrap();
+                for parallel in [false, true] {
+                    for name in SESSION_PROMPT_TOOL_NAMES {
+                        let result = pipeline
+                            .execute(serde_json::json!({
+                                "parallel": parallel,
+                                "steps": [{"tool": name, "args": {
+                                    "id": "task", "content": "synthetic indirect canary"
+                                }}]
+                            }))
+                            .await
+                            .unwrap();
+                        assert!(!result.success, "{wrapper} must reject {name}");
+                        assert!(result.error.as_deref().unwrap().contains(name));
+                        assert!(!result.output.as_str().contains("synthetic indirect canary"));
+                    }
+                    let result = pipeline
+                        .execute(serde_json::json!({
+                            "parallel": parallel,
+                            "steps": [{"tool": "calculator", "args": {
+                                "function": "add", "values": [2, 3]
+                            }}]
+                        }))
+                        .await
+                        .unwrap();
+                    assert!(result.success, "ordinary pipeline must remain available");
+                }
+            }
+        });
     }
 
     #[cfg(feature = "plugins-wasm")]

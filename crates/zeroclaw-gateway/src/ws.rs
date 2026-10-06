@@ -5533,7 +5533,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{secret}\"}}}}</tool_call>"
             )),
             ChatMessage::user(format!(
-                "[Tool results]\n[Session-prompt tool result]\nstored {secret}"
+                "[Tool results]\n[Tool attachments: 0]\n\n[Session-prompt tool result]\nstored {secret}"
             )),
             ChatMessage::assistant("first turn complete"),
         ];

@@ -251,6 +251,7 @@ pub(crate) async fn gate_tool_approval(
             }
             return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
                 output: denied.clone(),
+                attachments: Vec::new(),
                 success: false,
                 error_reason: Some(denied),
                 duration: Duration::ZERO,
@@ -290,6 +291,7 @@ pub(crate) async fn gate_tool_approval(
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
                 output: crate::approval::sanitize_tool_replacement(replacement),
+                attachments: Vec::new(),
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,
@@ -460,6 +462,7 @@ async fn gate_session_prompt_approval(
             duration: Duration::ZERO,
             receipt: None,
             output_data: None,
+            attachments: Vec::new(),
         })
     };
     let Ok(summary) = session_prompt_approval_summary(tool_name, tool_args) else {

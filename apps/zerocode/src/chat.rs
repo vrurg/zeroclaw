@@ -41,6 +41,16 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
+mod context_menu;
+#[cfg(test)]
+use context_menu::{
+    CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
+    URL_WITH_COPY_CONTEXT_ACTIONS,
+};
+use context_menu::{
+    ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
+};
+
 mod transcript_layout;
 use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
 
@@ -2708,6 +2718,7 @@ impl Chat {
                         }
                     }
                 }
+                Ok(_) => continue,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
                     continue;
@@ -9416,123 +9427,6 @@ struct CachedCodeBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatContextMenuAction {
-    SendNow,
-    Copy,
-    AddToChat,
-    OpenLink,
-    CopyLink,
-    Edit,
-    Delete,
-}
-
-const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
-const CHARACTER_SELECTION_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::AddToChat,
-    ChatContextMenuAction::Copy,
-];
-const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-];
-const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-    ChatContextMenuAction::Copy,
-];
-const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::SendNow,
-    ChatContextMenuAction::Copy,
-    ChatContextMenuAction::Edit,
-    ChatContextMenuAction::Delete,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuTarget {
-    Transcript(CopyHitRegion),
-    Url(UrlHitRegion),
-    UrlWithCopy {
-        url: UrlHitRegion,
-        copy: CopyHitRegion,
-    },
-    Queue(u64),
-}
-
-impl ChatContextMenuTarget {
-    fn actions(&self) -> &'static [ChatContextMenuAction] {
-        match self {
-            Self::Transcript(target) if target.kind == CopyHitKind::Transcript => {
-                CHARACTER_SELECTION_CONTEXT_ACTIONS
-            }
-            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
-            Self::Url(_) => URL_CONTEXT_ACTIONS,
-            Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
-            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
-        }
-    }
-
-    fn copy_kind(&self) -> Option<CopyHitKind> {
-        match self {
-            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
-            Self::Url(_) | Self::Queue(_) => None,
-        }
-    }
-
-    fn is_url(&self) -> bool {
-        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatContextMenu {
-    rect: Rect,
-    target: ChatContextMenuTarget,
-    selected: usize,
-}
-
-impl ChatContextMenu {
-    fn selected_action(&self) -> Option<ChatContextMenuAction> {
-        self.target.actions().get(self.selected).copied()
-    }
-
-    fn select_step(&mut self, delta: isize) {
-        let count = self.target.actions().len();
-        if count > 0 {
-            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
-        }
-    }
-
-    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
-        if self.rect.width <= 2 || self.rect.height <= 2 {
-            return None;
-        }
-        let inner = Rect::new(
-            self.rect.x + 1,
-            self.rect.y + 1,
-            self.rect.width - 2,
-            self.rect.height - 2,
-        );
-        if !mouse::in_rect(column, row, inner) {
-            return None;
-        }
-        let index = usize::from(row.saturating_sub(inner.y));
-        (index < self.target.actions().len()).then_some(index)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuRequest {
-    AddToChat(CopyHitRegion),
-    CopyTranscript(CopyHitRegion),
-    OpenUrl(String),
-    CopyUrl(String),
-    Queue {
-        id: u64,
-        action: ChatContextMenuAction,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyFeedbackTarget {
     Code(usize),
     Overlay(Rect),
@@ -10384,11 +10278,7 @@ impl ChatState {
         let Some(menu) = self.context_menu.as_mut() else {
             return false;
         };
-        let Some(index) = menu.action_at(column, row) else {
-            return false;
-        };
-        menu.selected = index;
-        true
+        menu.select_at(column, row)
     }
 
     fn handle_context_menu_key(&mut self, key: &KeyEvent) -> Option<ChatContextMenuRequest> {
@@ -10413,35 +10303,8 @@ impl ChatState {
     }
 
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
-        let action = self.context_menu.as_ref()?.selected_action()?;
-        let menu = self.context_menu.take()?;
-        match (menu.target, action) {
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(target))
-            }
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::AddToChat)
-                if target.kind == CopyHitKind::Transcript =>
-            {
-                Some(ChatContextMenuRequest::AddToChat(target))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenLink) => {
-                Some(ChatContextMenuRequest::OpenUrl(url.url))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
-                Some(ChatContextMenuRequest::CopyUrl(url.url))
-            }
-            (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(copy))
-            }
-            (ChatContextMenuTarget::Queue(id), action) => {
-                Some(ChatContextMenuRequest::Queue { id, action })
-            }
-            (ChatContextMenuTarget::Transcript(_), _)
-            | (ChatContextMenuTarget::Url(_), _)
-            | (ChatContextMenuTarget::UrlWithCopy { .. }, _) => None,
-        }
+        self.context_menu.as_ref()?.selected_action()?;
+        self.context_menu.take()?.into_request()
     }
 
     fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
@@ -17352,6 +17215,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_notifications_do_not_delay_session_updates() {
+        for sid in ["sess-a", "sess-b"] {
+            let (tx, _rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = two_session_chat(&rpc);
+            chat.state_for_session_mut(sid).unwrap().turn_in_flight = true;
+
+            for (method, params) in [
+                ("logs/event", serde_json::json!({"message": "before text"})),
+                (
+                    "session/update",
+                    serde_json::json!({
+                        "type": "agent_message_chunk", "session_id": sid, "text": "done",
+                    }),
+                ),
+                (
+                    "logs/event",
+                    serde_json::json!({"message": "before completion"}),
+                ),
+                (
+                    "session/update",
+                    serde_json::json!({
+                        "type": "turn_complete", "session_id": sid,
+                        "outcome": "completed", "content": "",
+                    }),
+                ),
+            ] {
+                chat.rpc.push_notification_for_test(method, params);
+            }
+
+            chat.tick_transport_events();
+
+            let state = chat.state_for_session_mut(sid).unwrap();
+            assert!(
+                state.entries.iter().any(|entry| {
+                    matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "done")
+                }),
+                "{sid}: response must arrive in one tick despite unrelated logs"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "{sid}: completion must arrive in that tick"
+            );
+            assert_eq!(state.turn_status, TurnStatus::Idle);
+        }
+    }
+
+    #[tokio::test]
     async fn notifications_route_to_background_sessions() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -17530,9 +17441,8 @@ mod tests {
 
         // The test client's notification channel holds 64 frames. Put the
         // terminal frame first, then overflow it with unparsable
-        // `session/update` frames so `try_recv` reports Lagged while the
-        // drain still consumes the backlog (a foreign method would stop the
-        // drain loop and strand later frames behind it).
+        // `session/update` frames so `try_recv` reports Lagged and the
+        // drain then consumes the retained backlog.
         chat.rpc.push_notification_for_test(
             "session/update",
             serde_json::json!({
