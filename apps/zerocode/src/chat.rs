@@ -12820,7 +12820,12 @@ mod tests {
             panic!("expected the final budget result");
         };
         assert_eq!(status.token_limit, Some(100));
-        assert_eq!(goal_response_message(&response), "Goal budget updated.");
+        let rendered = goal_response_message(&response);
+        assert_eq!(rendered.lines().next(), Some("Goal budget updated."));
+        assert_eq!(
+            rendered,
+            format!("Goal budget updated.\n{}", goal_projection_message(status))
+        );
     }
 
     /// Async env-lock for `#[tokio::test]` cases that resolve config through
