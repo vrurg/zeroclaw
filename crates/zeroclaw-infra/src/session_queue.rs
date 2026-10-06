@@ -212,6 +212,23 @@ impl SessionActorQueue {
         self.reserve(session_id).await?.acquire().await
     }
 
+    /// Try exclusive session access without waiting for the turn permit.
+    ///
+    /// Uses the same FIFO registration, depth limit and eviction checks as
+    /// [`Self::reserve`]. A busy session returns `Ok(None)` and retains no
+    /// waiter or queue capacity. Acquiring the internal bookkeeping locks may
+    /// suspend; this does not wait for the active session turn to end.
+    pub async fn try_acquire(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionGuard>, SessionQueueError> {
+        let admission = self.reserve(session_id).await?;
+        if admission.permit.is_none() {
+            return Ok(None);
+        }
+        admission.acquire().await.map(Some)
+    }
+
     /// Register a session admission in semaphore FIFO order without waiting
     /// for the permit. This lets lifecycle callers reserve their place before
     /// draining work that may itself need the session permit to finish.
@@ -375,6 +392,81 @@ impl SessionActorQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn try_acquire_retains_the_existing_session_permit() {
+        let queue = SessionActorQueue::new(8, 5, 600);
+        let guard = queue.try_acquire("s1").await.unwrap().unwrap();
+        assert_eq!(guard.session_id(), "s1");
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        assert!(queue.try_acquire("s1").await.unwrap().is_none());
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        assert!(queue.try_begin_eviction("s1").await.is_none());
+        drop(guard);
+        assert_eq!(queue.queue_depth("s1").await, 0);
+        assert!(queue.try_acquire("s1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_busy_drops_its_waiter_without_waiting_for_timeout() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        let active = queue.acquire("s1").await.unwrap();
+        for _ in 0..8 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), queue.try_acquire("s1"))
+                    .await
+                    .expect("a busy try must not wait for the turn permit")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(queue.queue_depth("s1").await, 1);
+        }
+        drop(active);
+        assert!(queue.try_acquire("s1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_respects_depth_and_eviction_refusals() {
+        let queue = SessionActorQueue::new(1, 5, 600);
+        let active = queue.acquire("s1").await.unwrap();
+        assert!(matches!(
+            queue.try_acquire("s1").await,
+            Err(SessionQueueError::QueueFull { session_id, depth: 1 }) if session_id == "s1"
+        ));
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        drop(active);
+        let eviction = queue.try_begin_eviction("s1").await.unwrap();
+        assert!(matches!(
+            queue.try_acquire("s1").await,
+            Err(SessionQueueError::Evicting { session_id }) if session_id == "s1"
+        ));
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        drop(eviction);
+        assert_eq!(queue.queue_depth("s1").await, 0);
+        assert!(queue.try_acquire("s1").await.unwrap().is_some());
+
+        let disabled = SessionActorQueue::new(0, 5, 600);
+        assert!(matches!(
+            disabled.try_acquire("s1").await,
+            Err(SessionQueueError::QueueFull { depth: 0, .. })
+        ));
+        assert_eq!(disabled.queue_depth("s1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_cannot_overtake_a_reserved_fifo_position() {
+        let queue = SessionActorQueue::new(8, 5, 600);
+        let active = queue.acquire("s1").await.unwrap();
+        let earlier = queue.reserve("s1").await.unwrap();
+        drop(active);
+        assert!(queue.try_acquire("s1").await.unwrap().is_none());
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        let guard = earlier.acquire().await.unwrap();
+        assert!(queue.try_acquire("s1").await.unwrap().is_none());
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        drop(guard);
+        assert!(queue.try_acquire("s1").await.unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn serializes_same_session() {

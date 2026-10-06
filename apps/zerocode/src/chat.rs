@@ -68,11 +68,15 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
 }
 
 fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
-    use crate::wire::{GoalPendingAction, GoalResponse};
+    use crate::wire::{GoalPendingAction, GoalQueuedControl, GoalResponse};
 
     let key = match response {
         GoalResponse::Help => "zc-goal-help",
         GoalResponse::Disabled => "zc-goal-disabled",
+        GoalResponse::Queued(GoalQueuedControl::Start) => "zc-goal-queued-start",
+        GoalResponse::Queued(GoalQueuedControl::Resume) => "zc-goal-queued-resume",
+        GoalResponse::Queued(GoalQueuedControl::Pause) => "zc-goal-queued-pause",
+        GoalResponse::Queued(GoalQueuedControl::Budget) => "zc-goal-queued-budget",
         GoalResponse::Started(_) => "zc-goal-started",
         GoalResponse::Status(_) => "zc-goal-status",
         GoalResponse::Budget(_) => "zc-goal-budget",
@@ -129,6 +133,7 @@ fn notification_session_id(notif: &RpcNotification) -> Option<String> {
             | GoalUpdate::Completed { session_id }
             | GoalUpdate::PausedForBlocker { session_id }
             | GoalUpdate::Failed { session_id, .. }
+            | GoalUpdate::CommandFailed { session_id }
             | GoalUpdate::Lifecycle { session_id, .. } => session_id.to_string(),
         }),
         _ => None,
@@ -139,6 +144,9 @@ fn notification_session_id(notif: &RpcNotification) -> Option<String> {
 /// Reject ambiguous or malformed notifications instead of treating an
 /// arbitrary object member as an update chosen by the daemon.
 enum GoalUpdate<'a> {
+    CommandFailed {
+        session_id: &'a str,
+    },
     VerifiedCandidate {
         session_id: &'a str,
         candidate: &'a str,
@@ -168,6 +176,7 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
     let payload = payload.as_object()?;
     let session_id = payload.get("session_id")?.as_str()?;
     match kind.as_str() {
+        "command_failed" if payload.len() == 1 => Some(GoalUpdate::CommandFailed { session_id }),
         "verified_candidate" => Some(GoalUpdate::VerifiedCandidate {
             session_id,
             candidate: payload.get("candidate")?.as_str()?,
@@ -2890,6 +2899,7 @@ impl Chat {
             | GoalUpdate::Completed { session_id }
             | GoalUpdate::PausedForBlocker { session_id }
             | GoalUpdate::Failed { session_id, .. }
+            | GoalUpdate::CommandFailed { session_id }
             | GoalUpdate::Lifecycle { session_id, .. } => *session_id,
         };
         let Some(state) = self.state_for_session_mut(session_id) else {
@@ -2897,6 +2907,14 @@ impl Chat {
         };
 
         match update {
+            GoalUpdate::CommandFailed { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-command-failed",
+                    ))));
+                state.mark_dirty_append();
+            }
             GoalUpdate::VerifiedCandidate { candidate, .. } => {
                 // Ordinary session/update chunks are authoritative when present;
                 // the full candidate is a fallback for clients that missed them.
@@ -12734,6 +12752,66 @@ mod tests {
         let rendered = goal_response_message(&crate::wire::GoalResponse::Status(projection));
 
         assert_eq!(rendered.lines().next(), Some("Goal status is available."));
+    }
+
+    #[test]
+    fn goal_queued_controls_round_trip_and_render() {
+        for (control, message) in [
+            (
+                "start",
+                "Goal start queued; it begins after the current turn.",
+            ),
+            (
+                "resume",
+                "Goal resume queued; it continues after the current turn.",
+            ),
+            (
+                "pause",
+                "Goal pause queued; it applies after the current step.",
+            ),
+            (
+                "budget",
+                "Goal budget change queued; it applies after the current step.",
+            ),
+        ] {
+            let value = serde_json::json!({"kind": "queued", "status": control});
+            let response: crate::wire::GoalResponse =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            assert_eq!(goal_response_message(&response), message);
+        }
+        assert!(
+            serde_json::from_value::<crate::wire::GoalResponse>(
+                serde_json::json!({"kind": "queued", "status": "unknown"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_late_budget_lifecycle_uses_the_native_renderer() {
+        let value = serde_json::json!({"lifecycle": {
+            "session_id": "goal-fixture",
+            "response": {"kind": "budget_updated", "status": {
+                "task_id": "goal-task", "status": "paused", "execution_epoch": 2,
+                "token_limit": 100, "cost_limit_usd": null,
+                "accounting_state": "complete", "pause_reason": "operator_paused",
+                "resumable": true
+            }}
+        }});
+        let GoalUpdate::Lifecycle {
+            session_id,
+            response,
+        } = parse_goal_update(&value).unwrap()
+        else {
+            panic!("expected the native late lifecycle update");
+        };
+        assert_eq!(session_id, "goal-fixture");
+        let crate::wire::GoalResponse::BudgetUpdated(status) = &response else {
+            panic!("expected the final budget result");
+        };
+        assert_eq!(status.token_limit, Some(100));
+        assert_eq!(goal_response_message(&response), "Goal budget updated.");
     }
 
     /// Async env-lock for `#[tokio::test]` cases that resolve config through
@@ -30143,6 +30221,35 @@ mod tests {
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_command_failure_is_strict_and_session_scoped() {
+        for invalid in [
+            serde_json::json!({"command_failed": {}}),
+            serde_json::json!({"command_failed": {"session_id": 1}}),
+            serde_json::json!({"command_failed": {"session_id": "sess-1", "error": "private detail"}}),
+            serde_json::json!({"command_failed": {"session_id": "sess-1"}, "completed": {"session_id": "sess-1"}}),
+        ] {
+            assert!(parse_goal_update(&invalid).is_none(), "{invalid}");
+        }
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        for session_id in ["other-session", "sess-1"] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".into(),
+                    params: serde_json::json!({"command_failed": {"session_id": session_id}}),
+                })
+                .unwrap();
+        }
+        chat.drain_notifications();
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], ChatEntry::SystemMessage(text)
+            if text.as_ref() == crate::i18n::t("zc-goal-command-failed")));
     }
 
     #[tokio::test]
