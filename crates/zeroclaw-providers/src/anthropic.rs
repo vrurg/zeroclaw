@@ -24,16 +24,10 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -2258,8 +2252,11 @@ impl AnthropicModelProvider {
             return None;
         }
 
+        let any_input_reported = input_tokens.is_some()
+            || cached_input_tokens.is_some()
+            || cache_creation_input_tokens.is_some();
         Some(TokenUsage {
-            input_tokens: Some(
+            input_tokens: any_input_reported.then_some(
                 input_tokens
                     .unwrap_or(0)
                     .saturating_add(cached_input_tokens.unwrap_or(0))
@@ -4466,7 +4463,13 @@ impl ModelProvider for AnthropicModelProvider {
                 let response = req
                     .send()
                     .await
-                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                    .map_err(|e| {
+                        if e.is_connect() {
+                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                        } else {
+                            StreamError::Http(super::format_error_chain(&e))
+                        }
+                    })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response
@@ -8945,6 +8948,70 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn cache_control_ttl_serialization_pinned() {
+        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        assert_eq!(
+            serde_json::to_string(&five_minutes).unwrap(),
+            r#"{"type":"ephemeral"}"#,
+            "the default cache lifetime must retain the established wire form"
+        );
+        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        assert_eq!(
+            serde_json::to_string(&one_hour).unwrap(),
+            r#"{"type":"ephemeral","ttl":"1h"}"#,
+            "the extended cache lifetime must carry its explicit wire marker"
+        );
+    }
+
+    #[test]
+    fn convert_messages_replays_sanitized_envelope_thinking_and_signature_byte_for_byte() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let thinking_text = format!("look at {marker} first");
+        let reasoning = format!(r#"{{"thinking":"{thinking_text}","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": format!("saved {marker}"),
+            "tool_calls": [{
+                "id": "toolu_1",
+                "name": "shell",
+                "arguments": "{}",
+                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+            }],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("describe the screenshot"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({"content": "done", "tool_call_id": "toolu_1"}).to_string(),
+            ),
+        ];
+        let sanitized = crate::multimodal::sanitize_image_markers(&messages);
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&sanitized);
+        let assistant = native_messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant message survives conversion");
+        match &assistant.content[0] {
+            NativeContentOut::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(
+                    thinking, &thinking_text,
+                    "thinking text must replay byte-for-byte, marker included"
+                );
+                assert_eq!(
+                    signature,
+                    &Some("sig_abc".to_string()),
+                    "the thinking signature must round-trip unchanged"
+                );
+            }
+            other => panic!("expected a leading thinking block, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn system_prompt_string_variant_serializes() {
         let prompt = SystemPrompt::String("You are a helpful assistant".to_string());
         let json = serde_json::to_string(&prompt).unwrap();
@@ -10078,6 +10145,63 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("independently valid token counters must survive");
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn malformed_native_partial_usage_preserves_unknown_input() {
+        for (reported, expected_input) in [
+            (serde_json::json!({"output_tokens": 7}), None),
+            (serde_json::json!({"cache_read_input_tokens": 8}), Some(8)),
+            (serde_json::json!({"input_tokens": 0}), Some(0)),
+        ] {
+            let error = AnthropicModelProvider::decode_native_response(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [{"type": "server_tool_use", "id": 7}],
+                "usage": reported,
+            }))
+            .expect_err("malformed content must retain independently reported usage");
+            let usage = crate::terminal::terminal_completion_context(&error)
+                .expect("malformed content retains typed terminal context")
+                .failure()
+                .usage
+                .as_ref()
+                .expect("at least one usage counter was reported");
+            assert_eq!(usage.input_tokens, expected_input, "reported: {reported}");
+            assert_eq!(usage.output_tokens, reported["output_tokens"].as_u64());
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_partial_usage_preserves_unknown_input() {
+        for (reported_input, expected_input) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"cache_read_input_tokens": 8}), Some(8)),
+            (serde_json::json!({"input_tokens": 0}), Some(0)),
+        ] {
+            let bytes = format!(
+                "event: message_start\ndata: {}\n\nevent: message_delta\ndata: {}\n\n",
+                serde_json::json!({"type": "message_start", "message": {"usage": reported_input}}),
+                serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 7}}),
+            );
+            let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+            let mut failure = None;
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, Ok(StreamEvent::Final)));
+                if let Err(StreamError::TerminalCompletion(terminal)) = event {
+                    failure = Some(terminal);
+                }
+            }
+            let failure = failure.expect("incomplete EOF retains the captured terminal reason");
+            assert_eq!(failure.reason, TerminalCompletionError::OutputTokenLimit);
+            let usage = failure.usage.expect("reported output must survive EOF");
+            assert_eq!(
+                usage.input_tokens, expected_input,
+                "reported: {reported_input}"
+            );
+            assert_eq!(usage.output_tokens, Some(7));
+        }
     }
 
     #[test]
@@ -13688,6 +13812,150 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             !carries_server_fallback_beta(&headers),
             "a thinking direct-chat request must not carry the server-side-fallback beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_thinking_stream_connect_failure_is_typed() {
+        use futures_util::StreamExt;
+
+        // Native thinking uses a non-SSE request internally, but it is still a
+        // stream entrypoint. Its send-site connection failure must therefore
+        // retain the same typed recovery fact as the ordinary SSE path.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1_024,
+                display: None,
+            }),
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port native-thinking stream must fail immediately")
+            .expect("closed-port native-thinking stream must yield an item");
+
+        match first {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!(
+                "native-thinking connect failure must be tagged ConnectFailed, got {other:?}"
+            ),
+            Ok(_) => panic!("a closed port cannot produce native-thinking stream events"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_connect_failure_is_typed_but_accepted_sse_errors_are_not() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = refusal_test_provider(closed_addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately")
+            .expect("closed-port stream must yield an item");
+        assert!(
+            matches!(first, Err(StreamError::ConnectFailed(_))),
+            "only the send-site connection failure earns ConnectFailed: {first:?}"
+        );
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed to resolve backend\"}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let error = loop {
+            if let Err(error) = stream
+                .next()
+                .await
+                .expect("accepted SSE response must yield an event")
+            {
+                break error;
+            }
+        };
+        server.abort();
+        assert!(
+            matches!(error, StreamError::ModelProvider(ref message) if message.contains("failed to resolve backend")),
+            "accepted SSE error text must remain a provider error, not a retry grant: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_hop_connect_failure_remains_typed_but_is_not_delivery_proof() {
+        use futures_util::StreamExt;
+
+        // The redirected-to port has no listener. The initial hop accepted
+        // the request before redirecting, so ConnectFailed is deliberately a
+        // transport classification, not evidence that no delivery occurred.
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                axum::response::Redirect::to(&format!("http://{closed_addr}/v1/messages"))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("redirect-following stream must fail")
+            .expect("redirect-following stream must yield an item");
+        server.abort();
+
+        assert!(
+            matches!(first, Err(StreamError::ConnectFailed(_))),
+            "a failed redirect hop remains a typed connection failure: {first:?}"
         );
     }
 

@@ -544,8 +544,10 @@ pub(crate) async fn call_provider(
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
-    use super::announce_llm_request;
+    use super::{announce_llm_request, prefix_fingerprint};
+    use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
+    use crate::tools::ToolSpec;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits, StreamReasoningMode};
@@ -696,6 +698,99 @@ mod payload_capture_tests {
     // tail below must NOT survive into the captured payload.
     const SECRET_TAIL: &str = "ABCDEF1234567890SECRET";
 
+    fn test_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec::new(name, "test tool", serde_json::json!({}))
+    }
+
+    #[test]
+    fn prefix_fingerprint_tracks_system_and_tools_separately() {
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+
+        let base = prefix_fingerprint(&messages, Some(&tools));
+        let repeat = prefix_fingerprint(&messages, Some(&tools));
+        assert_eq!(
+            base.system_chars,
+            "You are a helpful assistant.".chars().count()
+        );
+        assert_eq!(base.system_sha256, repeat.system_sha256);
+        assert_eq!(base.tools_count, 2);
+        assert_eq!(base.tools_sha256, repeat.tools_sha256);
+
+        let mut edited_system = messages.clone();
+        edited_system[0].content.pop();
+        edited_system[0].content.push('!');
+        let system_changed = prefix_fingerprint(&edited_system, Some(&tools));
+        assert_ne!(system_changed.system_sha256, base.system_sha256);
+        assert_eq!(system_changed.tools_sha256, base.tools_sha256);
+
+        let reordered_tools = vec![test_tool_spec("beta"), test_tool_spec("alpha")];
+        let tools_changed = prefix_fingerprint(&messages, Some(&reordered_tools));
+        assert_ne!(tools_changed.tools_sha256, base.tools_sha256);
+        assert_eq!(tools_changed.system_sha256, base.system_sha256);
+
+        let no_system = prefix_fingerprint(&[ChatMessage::user("hello")], Some(&tools));
+        assert_eq!(no_system.system_chars, 0);
+        assert!(no_system.system_sha256.is_none());
+
+        let no_tools = prefix_fingerprint(&messages, None);
+        assert_eq!(no_tools.tools_count, 0);
+        assert!(no_tools.tools_sha256.is_none());
+    }
+
+    #[test]
+    fn prefix_fingerprint_covers_every_leading_system_message() {
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let single = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let base = prefix_fingerprint(&single, Some(&tools));
+
+        let doubled = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system("Always cite your sources."),
+            ChatMessage::user("hello"),
+        ];
+        let two_leading = prefix_fingerprint(&doubled, Some(&tools));
+        assert_eq!(
+            two_leading.system_chars,
+            "You are a helpful assistant.".chars().count()
+                + "Always cite your sources.".chars().count()
+        );
+        assert_ne!(two_leading.system_sha256, base.system_sha256);
+
+        let mut edited_second = doubled.clone();
+        edited_second[1].content.push('!');
+        let second_changed = prefix_fingerprint(&edited_second, Some(&tools));
+        assert_ne!(second_changed.system_sha256, two_leading.system_sha256);
+        assert_eq!(second_changed.tools_sha256, two_leading.tools_sha256);
+
+        let trailing = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+            ChatMessage::system("mid-conversation reminder"),
+        ];
+        let non_leading = prefix_fingerprint(&trailing, Some(&tools));
+        assert_eq!(non_leading.system_chars, base.system_chars);
+        assert_eq!(non_leading.system_sha256, base.system_sha256);
+        assert_eq!(non_leading.tools_sha256, base.tools_sha256);
+
+        let joined = vec![ChatMessage::system("a\n\nb"), ChatMessage::user("hello")];
+        let split = vec![
+            ChatMessage::system("a"),
+            ChatMessage::system("b"),
+            ChatMessage::user("hello"),
+        ];
+        assert_ne!(
+            prefix_fingerprint(&joined, Some(&tools)).system_sha256,
+            prefix_fingerprint(&split, Some(&tools)).system_sha256
+        );
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn llm_request_payload_redacts_truncates_and_off_omits() {
@@ -783,6 +878,116 @@ mod payload_capture_tests {
 
         zeroclaw_log::clear_broadcast_hook();
     }
+
+    /// Inserts a second leading system message at index 1, as a before-call
+    /// hook is allowed to do before the provider sees the request.
+    struct SystemInjectingHook;
+
+    #[async_trait]
+    impl HookHandler for SystemInjectingHook {
+        fn name(&self) -> &str {
+            "inject-second-system"
+        }
+
+        fn priority(&self) -> i32 {
+            0
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            messages.insert(1, ChatMessage::system("injected guidance"));
+            HookResult::Continue(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_inserting_system_message_moves_system_fingerprint() {
+        let tools = vec![test_tool_spec("alpha")];
+        let mut messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let before = prefix_fingerprint(&messages, Some(&tools));
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(SystemInjectingHook));
+        let mut model = String::from("stub-model");
+        assert!(matches!(
+            runner.run_before_llm_call(&mut messages, &mut model).await,
+            HookResult::Continue(())
+        ));
+
+        let after = prefix_fingerprint(&messages, Some(&tools));
+        assert_eq!(messages.len(), 3);
+        assert_ne!(after.system_sha256, before.system_sha256);
+        assert_eq!(
+            after.system_chars,
+            before.system_chars + "injected guidance".chars().count()
+        );
+        assert_eq!(after.tools_sha256, before.tools_sha256);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_payload_off_still_carries_prefix_fingerprints() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        install_writer("off");
+        while rx.try_recv().is_ok() {}
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let provider = StubProvider;
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let expected = prefix_fingerprint(&history, Some(&tools));
+
+        let ctx = test_ctx(&observer, &pacing);
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            Some(&tools),
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+        )
+        .await;
+        let attrs = next_llm_request(&mut rx)
+            .await
+            .get("attributes")
+            .cloned()
+            .expect("llm_request record carries attributes");
+
+        assert!(attrs.get("request_messages").is_none());
+        assert_eq!(
+            attrs.get("system_chars").and_then(|v| v.as_u64()),
+            Some(expected.system_chars as u64)
+        );
+        assert_eq!(
+            attrs.get("system_sha256").and_then(|v| v.as_str()),
+            expected.system_sha256.as_deref()
+        );
+        assert_eq!(
+            attrs.get("tools_count").and_then(|v| v.as_u64()),
+            Some(expected.tools_count as u64)
+        );
+        assert_eq!(
+            attrs.get("tools_sha256").and_then(|v| v.as_str()),
+            expected.tools_sha256.as_deref()
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
 }
 
 #[cfg(test)]
@@ -840,6 +1045,288 @@ mod streaming_fallback_tests {
 
     struct NonStreamingFallbackProvider {
         calls: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum UsageTerminalKind {
+        OutputLimit,
+        Refusal,
+        SemanticEmpty,
+    }
+
+    struct UsageBeforeTerminalProvider {
+        kind: UsageTerminalKind,
+        terminal_usage: Option<TokenUsage>,
+        recover: bool,
+        non_stream_calls: AtomicUsize,
+    }
+
+    impl Attributable for UsageBeforeTerminalProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "usage-before-terminal"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for UsageBeforeTerminalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused string projection")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            if !self.recover {
+                return Err(
+                    zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        None,
+                    )
+                    .into(),
+                );
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(1),
+                    ..TokenUsage::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let terminal = match self.kind {
+                UsageTerminalKind::OutputLimit => {
+                    zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                        zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                            self.terminal_usage.clone(),
+                        ),
+                    )
+                }
+                UsageTerminalKind::Refusal => {
+                    zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
+                        zeroclaw_api::model_provider::ModelRefusalError {
+                            requested_model: "requested-model".into(),
+                            category: None,
+                            usage: self.terminal_usage.clone().map(Box::new),
+                            provider_executed_tool_activity: false,
+                            attempted_candidate: None,
+                            attempted_candidate_index: None,
+                        },
+                    ))
+                }
+                UsageTerminalKind::SemanticEmpty => {
+                    zeroclaw_api::model_provider::StreamError::SemanticEmpty(
+                        zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(
+                            self.terminal_usage.clone(),
+                        ),
+                    )
+                }
+            };
+            let mut events = vec![Ok(StreamEvent::Usage(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                ..TokenUsage::default()
+            }))];
+            if matches!(self.kind, UsageTerminalKind::Refusal) {
+                // Buffered, unexposed text makes this refusal billable without
+                // closing safe recovery. Informational refusals have separate
+                // accounting tests and must not be forced into this assertion.
+                events.push(Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("buffered text"),
+                )));
+            }
+            events.push(Err(terminal));
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn event_usage_survives_terminal_recovery_and_exhaustion_once() {
+        for kind in [
+            UsageTerminalKind::OutputLimit,
+            UsageTerminalKind::Refusal,
+            UsageTerminalKind::SemanticEmpty,
+        ] {
+            for recover in [true, false] {
+                for (terminal_usage, expected_input, expected_output) in [
+                    (None, 10, 2),
+                    (
+                        Some(TokenUsage {
+                            input_tokens: Some(12),
+                            output_tokens: Some(4),
+                            ..TokenUsage::default()
+                        }),
+                        12,
+                        4,
+                    ),
+                    (
+                        Some(TokenUsage {
+                            output_tokens: Some(4),
+                            ..TokenUsage::default()
+                        }),
+                        10,
+                        4,
+                    ),
+                ] {
+                    let selected = Arc::new(UsageBeforeTerminalProvider {
+                        kind,
+                        terminal_usage,
+                        recover,
+                        non_stream_calls: AtomicUsize::new(0),
+                    });
+                    // Prove the typed handoff independently of the dispatch
+                    // collector, which can retain earlier lower-bound usage even
+                    // when a runtime error wrapper accidentally omits it.
+                    let error = consume_provider_streaming_response(
+                        selected.as_ref(),
+                        &[ChatMessage::user("go")],
+                        None,
+                        "requested-model",
+                        Some(0.0),
+                        None,
+                        None,
+                        None,
+                        false,
+                        StreamReasoningMode::Status,
+                    )
+                    .await
+                    .expect_err("explicit output limit is not a successful final response");
+                    let usage = match kind {
+                        UsageTerminalKind::OutputLimit | UsageTerminalKind::Refusal => error
+                            .downcast_ref::<StreamTerminalCompletion>()
+                            .expect("typed terminal handoff survives")
+                            .failure
+                            .usage
+                            .as_ref(),
+                        UsageTerminalKind::SemanticEmpty => error
+                            .downcast_ref::<StreamSemanticEmptyCompletion>()
+                            .expect("semantic empty handoff survives")
+                            .usage
+                            .as_ref(),
+                    }
+                    .expect("observed usage survives");
+                    assert_eq!(usage.input_tokens, Some(expected_input));
+                    assert_eq!(usage.output_tokens, Some(expected_output));
+                    let mut candidates = vec![(
+                        "primary".to_string(),
+                        Box::new(Arc::clone(&selected)) as Box<dyn ModelProvider>,
+                    )];
+                    if matches!(kind, UsageTerminalKind::Refusal) {
+                        // Refusal skips the exact physical candidate even in
+                        // a one-entry configuration. Recovery therefore needs
+                        // a distinct configured entry, not same-entry replay.
+                        candidates.push((
+                            "backup".to_string(),
+                            Box::new(Arc::clone(&selected)) as Box<dyn ModelProvider>,
+                        ));
+                    }
+                    let provider = ReliableModelProvider::new("test", candidates, 0, 0);
+                    let observer = NoopObserver;
+                    let pacing = PacingConfig::default();
+                    let ctx = TurnCtx {
+                        observer: &observer,
+                        provider_name: "requested-provider",
+                        model: "requested-model",
+                        context_limits: ResolvedContextLimits::legacy_fallback(0),
+                        serving_provider_name: None,
+                        serving_model: None,
+                        temperature: Some(0.0),
+                        approval: None,
+                        channel_name: "test",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        event_tx: None,
+                        hooks: None,
+                        dedup_exempt_tools: &[],
+                        pacing: &pacing,
+                        strict_tool_parsing: false,
+                        channel: None,
+                        draft_reasoning: StreamReasoningMode::Status,
+                        turn_id: "test-turn",
+                        agent_alias: None,
+                        parent_agent_alias: None,
+                    };
+                    let outcome = call_provider(
+                        &ctx,
+                        &provider,
+                        "requested-provider",
+                        "requested-model",
+                        "requested-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await
+                    .expect("terminal failure remains a provider-call outcome");
+                    assert_eq!(selected.non_stream_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        outcome.attempts.len(),
+                        2,
+                        "one rejected stream and one recovery leaf"
+                    );
+                    assert!(
+                        matches!(
+                            outcome.attempts[0].outcome(),
+                            zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+                                if usage.input_tokens == Some(expected_input)
+                                    && usage.output_tokens == Some(expected_output)
+                        ),
+                        "rejected usage must be reconciled once: {:?}",
+                        outcome.attempts
+                    );
+                    if recover {
+                        let response = outcome.chat_result.expect("recovery succeeds");
+                        let usage = response.usage.expect("accepted usage exists");
+                        assert_eq!(usage.input_tokens, Some(3));
+                        assert_eq!(usage.output_tokens, Some(1));
+                        let route = outcome.accepted_route.expect("accepted route exists");
+                        assert_eq!(
+                            route.provider_ref(),
+                            if matches!(kind, UsageTerminalKind::Refusal) {
+                                "backup"
+                            } else {
+                                "primary"
+                            }
+                        );
+                        assert_eq!(route.model(), "requested-model");
+                    } else {
+                        assert!(outcome.chat_result.is_err());
+                        assert!(outcome.accepted_route.is_none());
+                    }
+                }
+            }
+        }
     }
 
     async fn anthropic_refusal_provider(

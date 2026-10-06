@@ -17,6 +17,28 @@ use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
+fn reconcile_terminal_stream_usage(
+    event_usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    terminal_usage: Option<zeroclaw_providers::traits::TokenUsage>,
+) -> Option<zeroclaw_providers::traits::TokenUsage> {
+    match (event_usage, terminal_usage) {
+        (None, usage) | (usage, None) => usage,
+        (Some(event), Some(terminal)) => {
+            // Both observations describe one physical attempt, not additive
+            // consumption. The later terminal counters supersede earlier
+            // values; omitted counters do not erase independently known facts.
+            Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: terminal.input_tokens.or(event.input_tokens),
+                output_tokens: terminal.output_tokens.or(event.output_tokens),
+                cached_input_tokens: terminal.cached_input_tokens.or(event.cached_input_tokens),
+                cache_creation_input_tokens: terminal
+                    .cache_creation_input_tokens
+                    .or(event.cache_creation_input_tokens),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
     pub(crate) response_text: String,
@@ -192,18 +214,20 @@ pub(crate) async fn consume_provider_streaming_response(
                     })
                     .or_else(|| zeroclaw_providers::model_refusal_from_error(&err).cloned());
                 if let Some(refusal) = streamed_refusal {
-                    let usage = outcome
-                        .usage
-                        .clone()
-                        .or_else(|| refusal.usage.as_deref().cloned());
+                    let usage = reconcile_terminal_stream_usage(
+                        outcome.usage.clone(),
+                        refusal.usage.as_deref().cloned(),
+                    );
                     let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
                         zeroclaw_api::model_provider::TerminalCompletionError::Refusal,
                         usage,
                     );
-                    let policy = zeroclaw_providers::terminal_completion_context(&err)
+                    let mut policy = zeroclaw_providers::terminal_completion_context(&err)
                         .map(zeroclaw_providers::TerminalCompletionContext::policy)
                         .unwrap_or_else(|| {
-                            if refusal.provider_executed_tool_activity {
+                            if refusal.provider_executed_tool_activity
+                                || outcome.saw_pre_executed_tool_activity
+                            {
                                 zeroclaw_providers::TerminalCompletionPolicy::new(
                                     zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
                                     zeroclaw_providers::TerminalUsageChargeability::Billable,
@@ -229,6 +253,15 @@ pub(crate) async fn consume_provider_streaming_response(
                                 )
                             }
                         });
+                    // Observed activity is authoritative even when an adapter
+                    // omits it from its typed failure or no sink receives it.
+                    // Recovery safety must not redefine usage chargeability.
+                    if !outcome.tool_calls.is_empty() || outcome.saw_pre_executed_tool_activity {
+                        policy = zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            policy.usage_chargeability(),
+                        );
+                    }
                     if visible_event_output {
                         return Err(StreamInterruptedAfterOutput::terminal_with_source(
                             forwarded_text,
@@ -246,9 +279,14 @@ pub(crate) async fn consume_provider_streaming_response(
                 if let Some(failure) =
                     zeroclaw_api::model_provider::semantic_empty_terminal_failure(&err)
                 {
-                    let usage = outcome.usage.clone().or_else(|| failure.usage.clone());
+                    let usage = reconcile_terminal_stream_usage(
+                        outcome.usage.clone(),
+                        failure.usage.clone(),
+                    );
+                    let provider_executed_tool_activity = failure.has_pre_executed_tool_activity()
+                        || outcome.saw_pre_executed_tool_activity;
                     if visible_event_output {
-                        let failure = if failure.has_pre_executed_tool_activity() {
+                        let failure = if provider_executed_tool_activity {
                             zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(usage)
                         } else {
                             zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(usage)
@@ -259,7 +297,7 @@ pub(crate) async fn consume_provider_streaming_response(
                         )
                         .into());
                     }
-                    if failure.has_pre_executed_tool_activity() {
+                    if provider_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
                             usage,
                             cause: None,
@@ -272,9 +310,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     .into());
                 }
-                if let Some(failure) =
+                if let Some(mut failure) =
                     zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
                 {
+                    failure.usage =
+                        reconcile_terminal_stream_usage(outcome.usage.clone(), failure.usage);
                     let mut policy = zeroclaw_providers::terminal_completion_context(&err)
                         .map(zeroclaw_providers::TerminalCompletionContext::policy)
                         .unwrap_or_else(|| {
@@ -287,10 +327,6 @@ pub(crate) async fn consume_provider_streaming_response(
                         );
                     }
                     if visible_event_output {
-                        let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
-                            failure.reason,
-                            outcome.usage.clone().or(failure.usage),
-                        );
                         // Immutable progress (including readable thinking)
                         // closes recovery, but must not overwrite the
                         // provider-owned chargeability of this terminal
@@ -308,7 +344,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     if outcome.saw_pre_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
-                            usage: outcome.usage.clone().or(failure.usage.clone()),
+                            usage: failure.usage.clone(),
                             cause: Some(StreamPreExecutedToolsCause::Terminal(failure)),
                         }
                         .into());
@@ -2365,6 +2401,183 @@ mod tests {
             outcome.response_text, "A large answer",
             "the final accumulated response strips the terminal marker"
         );
+    }
+
+    struct TypedTerminalProvider {
+        events: Vec<StreamEvent>,
+        usage: Option<TokenUsage>,
+        refusal: bool,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TypedTerminalProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TypedTerminalProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TypedTerminalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            use zeroclaw_api::model_provider::{
+                ModelRefusalError, SemanticEmptyTerminalFailure, StreamError,
+            };
+            let terminal = if self.refusal {
+                StreamError::ModelRefusal(Box::new(ModelRefusalError {
+                    requested_model: "mock-model".into(),
+                    category: None,
+                    usage: self.usage.clone().map(Box::new),
+                    provider_executed_tool_activity: false,
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                }))
+            } else {
+                StreamError::SemanticEmpty(SemanticEmptyTerminalFailure::new(self.usage.clone()))
+            };
+            Box::pin(futures_util::stream::iter(
+                self.events
+                    .clone()
+                    .into_iter()
+                    .map(Ok)
+                    .chain([Err(terminal)]),
+            ))
+        }
+    }
+
+    async fn consume_typed_terminal(
+        provider: &TypedTerminalProvider,
+        event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    ) -> anyhow::Error {
+        consume_provider_streaming_response(
+            provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            event_tx,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("typed terminal must reject the attempt")
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_observed_tools_prevent_replay_without_delivery() {
+        for refusal in [false, true] {
+            for disconnected in [false, true] {
+                for event in [
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "tool-1".into(),
+                        name: "search".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }),
+                    StreamEvent::PreExecutedToolCall {
+                        name: "search".into(),
+                        args: "{}".into(),
+                    },
+                    StreamEvent::PreExecutedToolResult {
+                        name: "search".into(),
+                        output: "result".into(),
+                    },
+                ] {
+                    let provider_work = !matches!(event, StreamEvent::ToolCall(_));
+                    let provider = TypedTerminalProvider {
+                        events: vec![event],
+                        usage: None,
+                        refusal,
+                    };
+                    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+                    drop(event_rx);
+                    let err =
+                        consume_typed_terminal(&provider, disconnected.then_some(&event_tx)).await;
+                    if refusal {
+                        let terminal = err.downcast_ref::<StreamTerminalCompletion>().unwrap();
+                        assert_eq!(
+                            terminal.policy.recovery(),
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            "observed tools prevent refusal replay independent of delivery"
+                        );
+                    } else if provider_work {
+                        assert!(err.is::<StreamPreExecutedToolsWithoutFinalResponse>());
+                    } else {
+                        assert!(
+                            !err.downcast_ref::<StreamSemanticEmptyCompletion>()
+                                .unwrap()
+                                .replayable
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_reconciles_usage_and_preserves_safe_recovery() {
+        for refusal in [false, true] {
+            let provider = TypedTerminalProvider {
+                events: vec![StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(10),
+                    cache_creation_input_tokens: None,
+                })],
+                usage: Some(TokenUsage {
+                    input_tokens: None,
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: Some(3),
+                }),
+                refusal,
+            };
+            let err = consume_typed_terminal(&provider, None).await;
+            let usage = if refusal {
+                let terminal = err.downcast_ref::<StreamTerminalCompletion>().unwrap();
+                assert_eq!(
+                    terminal.policy.recovery(),
+                    zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
+                );
+                terminal.failure.usage.as_ref().unwrap()
+            } else {
+                let terminal = err.downcast_ref::<StreamSemanticEmptyCompletion>().unwrap();
+                assert!(terminal.replayable);
+                terminal.usage.as_ref().unwrap()
+            };
+            assert_eq!(usage.input_tokens, Some(100));
+            assert_eq!(usage.output_tokens, Some(7));
+            assert_eq!(usage.cached_input_tokens, Some(10));
+            assert_eq!(usage.cache_creation_input_tokens, Some(3));
+        }
     }
 
     struct VisibleOutputThenRefusalProvider {

@@ -16431,6 +16431,51 @@ command = "rm independent-delegate-marker"
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_timeout_keeps_completed_rejected_usage() {
+        let (primary, primary_requests) = start_scripted_chat_server(&[json!({
+            "choices": [{"message": {"content": "   "}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        })])
+        .await;
+        let (backup, backup_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
+        let (fixture_config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let mut config = (*fixture_config).clone();
+        // Use a caller-owned accumulator instead of the process-global tracker.
+        config.cost.enabled = false;
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .delegation_timeout_secs = Some(1);
+        let tool = fallback_delegate_tool(Arc::new(config), None);
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+        turn_usage.lock().last_input_tokens = 999;
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                tool.execute(json!({"agent": "target", "prompt": "respond"})),
+            )
+            .await
+            .expect("delegate reports its timeout");
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Agent 'target' timed out after 1s")
+        );
+        assert_eq!(primary_requests.lock().unwrap().len(), 1);
+        assert_eq!(backup_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 999);
+    }
+
+    #[tokio::test]
     async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
         let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
         let (backup, backup_requests) = start_failing_chat_server(503).await;

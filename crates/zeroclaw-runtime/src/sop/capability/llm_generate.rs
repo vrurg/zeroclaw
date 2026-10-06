@@ -252,6 +252,17 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
     }
 
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
+        self.generate_with_timeout(system, prompt, GENERATE_TIMEOUT)
+    }
+}
+
+impl ProviderLlmAdapter {
+    fn generate_with_timeout(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String> {
         let provider = Arc::clone(&self.provider);
         let provider_name = self.provider_name.clone();
         let model = self.model.clone();
@@ -281,7 +292,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
                     )
                     .await
             },
-            GENERATE_TIMEOUT,
+            timeout,
             "model call",
         )
     }
@@ -675,5 +686,94 @@ mod tests {
         assert!(error.chain().any(|cause| {
             cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
         }));
+    }
+
+    struct RejectThenStallProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RejectThenStallProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return std::future::pending().await;
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for RejectThenStallProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "sop-timeout-test"
+        }
+    }
+
+    #[test]
+    fn provider_adapter_timeout_settles_rejected_usage_across_bridge() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(RejectThenStallProvider {
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(RejectThenStallProvider {
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let adapter = ProviderLlmAdapter::new(Arc::new(reliable), "test-model".into());
+        let ctx = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+        turn_usage.lock().last_input_tokens = 999;
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT.sync_scope(Some(ctx), || {
+            adapter
+                .generate_with_timeout(None, "prompt", Duration::from_millis(30))
+                .expect_err("the recovery candidate stalls")
+        });
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 999);
     }
 }
