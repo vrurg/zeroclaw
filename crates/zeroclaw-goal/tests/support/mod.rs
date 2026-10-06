@@ -28,11 +28,15 @@ pub struct RegistryState {
     pub fail_record: bool,
     pub fail_settlement: bool,
     pub fail_finish: bool,
+    pub fail_finish_once: bool,
     pub settlement_wait: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_entered: Option<Arc<tokio::sync::Semaphore>>,
     pub transitions: Vec<&'static str>,
     pub session_lookups: usize,
     pub fail_lookup_at: Option<usize>,
+    pub terminal_reason: Option<String>,
+    pub pending_settlements: Vec<GoalAccountingState>,
+    pub finish_calls: usize,
 }
 
 #[derive(Default)]
@@ -230,10 +234,15 @@ impl GoalTaskRegistry for Registry {
     }
     async fn terminal_reason_for_session_goal(
         &self,
-        _id: &str,
-        _session: &str,
+        id: &str,
+        session: &str,
     ) -> Result<Option<String>> {
-        Ok(None)
+        let state = self.0.lock().unwrap();
+        Ok(state
+            .task
+            .as_ref()
+            .filter(|task| task.id == id && task.session_id.as_deref() == Some(session))
+            .and(state.terminal_reason.clone()))
     }
     async fn create_or_replace_session_goal(
         &self,
@@ -250,6 +259,7 @@ impl GoalTaskRegistry for Registry {
         }
         state.task = Some(task);
         state.goal = Some(goal);
+        state.terminal_reason = None;
         state.transitions.push("start");
         Ok(GoalTransitionResult::Applied)
     }
@@ -297,15 +307,20 @@ impl GoalTaskRegistry for Registry {
         session: &str,
         epoch: i64,
         status: TaskStatus,
-        _error: Option<String>,
+        error: Option<String>,
     ) -> Result<GoalTransitionResult> {
-        if self.0.lock().unwrap().fail_finish {
-            bail!("fixture lifecycle settlement unavailable");
+        {
+            let mut state = self.0.lock().unwrap();
+            state.finish_calls += 1;
+            if state.fail_finish || std::mem::take(&mut state.fail_finish_once) {
+                bail!("fixture lifecycle settlement unavailable");
+            }
         }
         Ok(self.guarded(id, session, epoch, |state| {
             let task = state.task.as_mut().unwrap();
             task.status = status;
             task.execution_epoch += 1;
+            state.terminal_reason = error;
             state.transitions.push("finish");
         }))
     }
@@ -320,13 +335,36 @@ impl GoalTaskRegistry for Registry {
     }
     async fn settle_pending_operation(
         &self,
-        _id: &str,
-        _session: &str,
-        _epoch: i64,
-        _pending: &str,
-        _accounting: GoalAccountingState,
+        id: &str,
+        session: &str,
+        epoch: i64,
+        pending: &str,
+        accounting: GoalAccountingState,
     ) -> Result<GoalTransitionResult> {
-        bail!("fixture driver makes no physical provider attempt")
+        let mut state = self.0.lock().unwrap();
+        let Some(task) = state.task.as_ref() else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if task.id != id
+            || task.kind != TaskKind::Goal
+            || task.session_id.as_deref() != Some(session)
+        {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let goal = state.goal.as_mut().unwrap();
+        if goal.pending_call_id.is_none() {
+            bail!("fixture driver makes no physical provider attempt");
+        }
+        if goal.pending_call_id.as_deref() != Some(pending)
+            || goal.pending_call_epoch != Some(epoch)
+        {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        goal.pending_call_id = None;
+        goal.pending_call_epoch = None;
+        goal.accounting_state = accounting;
+        state.pending_settlements.push(accounting);
+        Ok(GoalTransitionResult::Applied)
     }
     async fn update_session_goal_limits(
         &self,

@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_goal::{
-    GoalExecutionNotice, GoalOperationScope, GoalParentTurn, GoalParentTurnResult,
-    GoalVerifierResult, GoalVerifierTurn,
+    GoalAccountingState, GoalExecutionNotice, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnResult, GoalVerifierResult, GoalVerifierTurn,
     accounting::{
         GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
         GoalOperationSettlement,
@@ -24,6 +24,19 @@ struct Script {
     verifier_release: Semaphore,
     fail_launch_bind: AtomicBool,
     fail_notice: AtomicBool,
+    fail_notice_once: AtomicBool,
+    fail_parent: AtomicBool,
+    reject_execution_incarnation: AtomicBool,
+    publication_entered: Semaphore,
+    publication_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    acquisitions: AtomicUsize,
+    events: std::sync::Mutex<Vec<FailureEvent>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum FailureEvent {
+    Original(String),
+    Notice(GoalExecutionNotice),
 }
 
 impl Default for Script {
@@ -39,6 +52,13 @@ impl Default for Script {
             verifier_release: Semaphore::new(0),
             fail_launch_bind: AtomicBool::new(false),
             fail_notice: AtomicBool::new(false),
+            fail_notice_once: AtomicBool::new(false),
+            fail_parent: AtomicBool::new(false),
+            reject_execution_incarnation: AtomicBool::new(false),
+            publication_entered: Semaphore::new(0),
+            publication_gate: std::sync::Mutex::new(None),
+            acquisitions: AtomicUsize::new(0),
+            events: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -107,11 +127,28 @@ impl GoalSessionDriver for WorkerDriver {
         _scope: &GoalExecutionScope,
         checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+        if self
+            .script
+            .reject_execution_incarnation
+            .load(Ordering::SeqCst)
+        {
+            bail!("fixture session incarnation was replaced");
+        }
+        let gate = self.script.publication_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            self.script.publication_entered.add_permits(1);
+            tokio::select! {
+                biased;
+                () = checkpoint.wait_closed() => bail!("script publication withdrawn"),
+                result = gate => result?,
+            }
+        }
         let guard = tokio::select! {
             biased;
             () = checkpoint.wait_closed() => bail!("script execution admission closed"),
             guard = self.ordinary.boundary.clone().lock_owned() => guard,
         };
+        self.script.acquisitions.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(WorkerLease {
             key: self.session_key().clone(),
             script: self.script.clone(),
@@ -143,6 +180,9 @@ impl GoalSessionExecutionLease for WorkerLease {
     ) -> Result<GoalParentTurnResult> {
         self.script.entered.add_permits(1);
         self.script.release.acquire().await?.forget();
+        if self.script.fail_parent.load(Ordering::SeqCst) {
+            bail!("fixture parent failed after its lifecycle fence");
+        }
         let candidate = "The bounded fixture is complete.";
         GoalParentTurnResult::from_completed_agent_turn(
             candidate.into(),
@@ -171,16 +211,43 @@ impl GoalSessionExecutionLease for WorkerLease {
         })
     }
 
-    async fn publish_goal_notice(&mut self, _notice: GoalExecutionNotice) -> Result<()> {
+    async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
         self.script.notices.fetch_add(1, Ordering::SeqCst);
-        if self.script.fail_notice.load(Ordering::SeqCst) {
+        if self.script.fail_notice.load(Ordering::SeqCst)
+            || self.script.fail_notice_once.swap(false, Ordering::SeqCst)
+        {
             bail!("fixture notice delivery unavailable");
         }
+        self.script
+            .events
+            .lock()
+            .unwrap()
+            .push(FailureEvent::Notice(notice));
+        Ok(())
+    }
+
+    async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        self.script
+            .events
+            .lock()
+            .unwrap()
+            .push(FailureEvent::Original(format!("{error:#}")));
         Ok(())
     }
 }
 
 async fn running_worker() -> (
+    Arc<WorkerDriver>,
+    GoalIngressContext,
+    Arc<Registry>,
+    Arc<GoalExecutionSupervisor>,
+) {
+    running_worker_on(None).await
+}
+
+async fn running_worker_on(
+    coordinator: Option<&zeroclaw_goal::GoalExecutionRestartCoordinator>,
+) -> (
     Arc<WorkerDriver>,
     GoalIngressContext,
     Arc<Registry>,
@@ -193,9 +260,11 @@ async fn running_worker() -> (
     });
     let registry = Arc::new(Registry::default());
     let runtime = GoalRuntime::new(registry.clone());
-    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
-        runtime.execution_engine(Arc::new(NoPhysicalAttempts)),
-    )));
+    let engine = Arc::new(runtime.execution_engine(Arc::new(NoPhysicalAttempts)));
+    let supervisor = match coordinator {
+        Some(coordinator) => coordinator.new_supervisor(engine).await,
+        None => Arc::new(GoalExecutionSupervisor::new(engine)),
+    };
     let mut submission = supervisor
         .submit(
             settings(),
@@ -218,6 +287,773 @@ async fn running_worker() -> (
         .unwrap()
         .forget();
     (driver, ingress, registry, supervisor)
+}
+
+#[tokio::test]
+async fn fenced_parent_failure_delivers_notice_before_late_terminal_response() {
+    assert_fenced_parent_failure_delivery(false).await;
+}
+
+#[tokio::test]
+async fn fenced_unsettled_call_delivers_accounting_notice_before_late_terminal_response() {
+    assert_fenced_parent_failure_delivery(true).await;
+}
+
+fn seed_unsettled_call(registry: &Registry) {
+    let mut state = registry.0.lock().unwrap();
+    let epoch = state.task.as_ref().unwrap().execution_epoch;
+    let goal = state.goal.as_mut().unwrap();
+    // Seed only durable evidence of an outcome-unknown operation. This is
+    // not a fabricated physical attempt or a claim that usage was settled.
+    goal.pending_call_id = Some("fixture-unsettled-operation".into());
+    goal.pending_call_epoch = Some(epoch);
+}
+
+async fn assert_fenced_parent_failure_delivery(unsettled: bool) {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    if unsettled {
+        seed_unsettled_call(&registry);
+    }
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress,
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        pause.response(),
+        GoalResponse::TransitionPending(_)
+    ));
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Paused
+    );
+    driver.script.release.add_permits(1);
+    let late = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut pause),
+    )
+    .await
+    .expect("classified parent must settle without another model call")
+    .unwrap();
+    assert!(matches!(late, Some(GoalResponse::Terminal(_))));
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.published.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.0.lock().unwrap().terminal_reason.as_deref(),
+        Some(if unsettled {
+            "accounting_outcome_unknown"
+        } else {
+            "executor_failed"
+        })
+    );
+    assert_eq!(
+        driver.script.notices.load(Ordering::SeqCst),
+        1,
+        "the closed admission checkpoint must not swallow the drainer's failure notice"
+    );
+    assert_eq!(
+        driver.script.events.lock().unwrap().last(),
+        Some(&FailureEvent::Notice(GoalExecutionNotice::Failed(
+            if unsettled {
+                zeroclaw_goal::GoalFailureReason::OperationOutcomeUnknown
+            } else {
+                zeroclaw_goal::GoalFailureReason::ExecutorFailed
+            }
+        )))
+    );
+    let state = registry.0.lock().unwrap();
+    if unsettled {
+        let goal = state.goal.as_ref().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(
+            state.pending_settlements,
+            [GoalAccountingState::OutcomeUnknown]
+        );
+    } else {
+        assert!(state.pending_settlements.is_empty());
+    }
+}
+
+fn hold_publication(script: &Script) -> tokio::sync::oneshot::Sender<()> {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *script.publication_gate.lock().unwrap() = Some(gate);
+    release
+}
+
+async fn await_publication(script: &Script) {
+    tokio::time::timeout(Duration::from_secs(1), script.publication_entered.acquire())
+        .await
+        .expect("publication must reach the pre-FIFO gate")
+        .unwrap()
+        .forget();
+}
+
+fn assert_original_then_executor_notice(script: &Script) {
+    let events = script.events.lock().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "one original and one notice, without duplication"
+    );
+    assert!(matches!(&events[0], FailureEvent::Original(error)
+        if error.contains("fixture lifecycle settlement unavailable")));
+    assert_eq!(
+        events[1],
+        FailureEvent::Notice(GoalExecutionNotice::Failed(
+            zeroclaw_goal::GoalFailureReason::ExecutorFailed
+        ))
+    );
+}
+
+#[tokio::test]
+async fn failed_tail_before_fifo_queues_start_until_original_and_notice_settle() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish_once = true;
+    let release = hold_publication(&driver.script);
+    driver.script.release.add_permits(1);
+    await_publication(&driver.script).await;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    assert_eq!(
+        registry.0.lock().unwrap().terminal_reason.as_deref(),
+        Some("executor_failed")
+    );
+    let snapshot = serde_json::to_value(&predecessor).unwrap();
+    for command in [
+        GoalCommand::Status,
+        GoalCommand::Help,
+        GoalCommand::Budget,
+        GoalCommand::Resume { response: None },
+        GoalCommand::Pause { immediate: false },
+        GoalCommand::SetBudget(GoalBudgetSelection::Unlimited),
+        GoalCommand::Cancel,
+        GoalCommand::Pause { immediate: true },
+    ] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.admit_control(settings(), ingress.clone(), driver.clone(), command),
+        )
+        .await
+        .expect("unsettled publication must not defer other controls")
+        .unwrap();
+        assert!(matches!(result, GoalControlAdmission::Direct(_)));
+        drop(result);
+        assert_eq!(
+            serde_json::to_value(registry.0.lock().unwrap().task.as_ref().unwrap()).unwrap(),
+            snapshot
+        );
+        assert!(registry.0.lock().unwrap().intents.is_empty());
+        assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    }
+    // The publication has not joined the real foreground FIFO. Admission must
+    // therefore consult publication custody, not just an available turn permit.
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                settings(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded successor".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().id,
+        predecessor.id
+    );
+    let mut wait = Box::pin(deferred.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut wait)
+            .await
+            .is_err()
+    );
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_original_then_executor_notice(&driver.script);
+    let committed = ready.commit(settings()).await.unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    let successor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_ne!(successor.id, predecessor.id);
+    assert_eq!(
+        registry.0.lock().unwrap().transitions,
+        ["start", "finish", "start"]
+    );
+    let mut launch = committed.release();
+    driver.script.fail_parent.store(false, Ordering::SeqCst);
+    supervisor
+        .launch_after_response(settings(), &mut launch)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), driver.script.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 3);
+    let mut cancel = supervisor
+        .submit(settings(), ingress, driver.clone(), GoalCommand::Cancel)
+        .await
+        .unwrap();
+    driver.script.release.add_permits(1);
+    supervisor
+        .launch_after_response(settings(), &mut cancel)
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_original_then_executor_notice(&driver.script);
+}
+
+#[tokio::test]
+async fn drainer_delivery_before_fifo_queues_start_without_holding_command_authority() {
+    assert_drainer_delivery_queues_start(false).await;
+}
+
+#[tokio::test]
+async fn unsettled_drainer_delivery_before_fifo_queues_start_until_accounting_notice() {
+    assert_drainer_delivery_queues_start(true).await;
+}
+
+async fn assert_drainer_delivery_queues_start(unsettled: bool) {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    if unsettled {
+        seed_unsettled_call(&registry);
+    }
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let release = hold_publication(&driver.script);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    driver.script.release.add_permits(1);
+    let draining_supervisor = Arc::clone(&supervisor);
+    let drain = zeroclaw_spawn::spawn!(async move {
+        draining_supervisor
+            .launch_after_response(settings(), &mut pause)
+            .await
+    });
+    await_publication(&driver.script).await;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetSelection::Defaults,
+                objective: "bounded successor".into(),
+            },
+        ),
+    )
+    .await
+    .expect("delivery must not own command authority")
+    .unwrap();
+    let predecessor_retained =
+        registry.0.lock().unwrap().task.as_ref().unwrap().id == predecessor.id;
+    // Release a defective direct admission's lease too, so the baseline reaches
+    // the missing-notice observation instead of stopping at the earlier race.
+    let deferred = match admission {
+        GoalControlAdmission::Queued { response, deferred } => Some((response, deferred)),
+        GoalControlAdmission::Direct(direct) => {
+            drop(direct);
+            None
+        }
+    };
+    let publication_released = release.send(()).is_ok();
+    let late = tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert!(
+        publication_released,
+        "the pending publication must retain its gate"
+    );
+    assert!(matches!(late, Some(GoalResponse::Terminal(_))));
+    assert_eq!(
+        driver.script.events.lock().unwrap().last(),
+        Some(&FailureEvent::Notice(GoalExecutionNotice::Failed(
+            if unsettled {
+                zeroclaw_goal::GoalFailureReason::OperationOutcomeUnknown
+            } else {
+                zeroclaw_goal::GoalFailureReason::ExecutorFailed
+            }
+        )))
+    );
+    assert_eq!(
+        registry.0.lock().unwrap().pending_settlements.len(),
+        usize::from(unsettled)
+    );
+    assert!(
+        predecessor_retained,
+        "Start must retain the failed predecessor"
+    );
+    let (response, deferred) =
+        deferred.expect("Start must be Queued until failure delivery settles");
+    assert_eq!(response, GoalResponse::Queued(GoalQueuedControl::Start));
+    let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let committed = ready.commit(settings()).await.unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    let mut launch = committed.release();
+    supervisor
+        .pause_before_launch(&mut launch, zeroclaw_goal::GoalPauseReason::OperatorPaused)
+        .await
+        .unwrap();
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn disposal_withdraws_failed_tail_and_closes_its_queued_start() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish_once = true;
+    let release = hold_publication(&driver.script);
+    driver.script.release.add_permits(1);
+    await_publication(&driver.script).await;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                settings(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded successor".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.dispose_session(&ingress.session_key().durable_id()),
+        )
+        .await
+        .expect("disposal must withdraw the tail without waiting on its held gate")
+        .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Applied
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .expect("disposal must close the queued Start")
+        .unwrap_err();
+    assert!(matches!(closed.response(), GoalResponse::NoCurrentGoal));
+    drop(release);
+    assert!(registry.0.lock().unwrap().task.is_none());
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn restart_closes_queued_start_while_failed_tail_publication_is_pending() {
+    let coordinator = zeroclaw_goal::GoalExecutionRestartCoordinator::new();
+    let (driver, ingress, registry, supervisor) = running_worker_on(Some(&coordinator)).await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish_once = true;
+    let release = hold_publication(&driver.script);
+    driver.script.release.add_permits(1);
+    await_publication(&driver.script).await;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                settings(),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded successor".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    tokio::time::timeout(Duration::from_secs(1), coordinator.quiesce_for_restart())
+        .await
+        .expect("restart must close queued controls and settle the failed tail")
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .expect("restart must close the queued Start")
+        .unwrap_err();
+    assert!(matches!(closed.response(), GoalResponse::Terminal(_)));
+    drop(release);
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().id, predecessor.id);
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+    }
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 2);
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    {
+        let events = driver.script.events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [FailureEvent::Original(_), FailureEvent::Notice(_)]
+        ));
+    }
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn foreground_blocked_failure_delivery_does_not_hold_lifecycle_finalization() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    driver.script.release.add_permits(1);
+    let holder = tokio::time::timeout(
+        Duration::from_secs(1),
+        driver.ordinary.boundary.clone().lock_owned(),
+    )
+    .await
+    .expect("the admitted parent must release the real foreground");
+    let draining_supervisor = Arc::clone(&supervisor);
+    let mut drain = zeroclaw_spawn::spawn!(async move {
+        draining_supervisor
+            .launch_after_response(settings(), &mut pause)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut drain)
+            .await
+            .is_err(),
+        "classified failure delivery must wait for the actual foreground holder"
+    );
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.dispose_session(&ingress.session_key().durable_id()),
+        )
+        .await
+        .expect("foreground-blocked publication must release lifecycle finalization")
+        .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Applied
+    );
+    drop(holder);
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .expect("withdrawn delivery must terminate after disposal")
+        .unwrap()
+        .unwrap();
+    assert!(registry.0.lock().unwrap().task.is_none());
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn disposal_withdraws_inflight_drainer_delivery_without_waiting_on_its_latch() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let release = hold_publication(&driver.script);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    driver.script.release.add_permits(1);
+    let draining_supervisor = Arc::clone(&supervisor);
+    let drain = zeroclaw_spawn::spawn!(async move {
+        draining_supervisor
+            .launch_after_response(settings(), &mut pause)
+            .await
+    });
+    await_publication(&driver.script).await;
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Failed
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.dispose_session(&ingress.session_key().durable_id()),
+    )
+    .await
+    .expect("disposal must not wait for the delivery's held latch or lifecycle lock")
+    .unwrap();
+    assert_eq!(result, zeroclaw_goal::GoalTransitionResult::Applied);
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(release);
+    assert!(registry.0.lock().unwrap().task.is_none());
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn restart_drains_all_hosts_before_waiting_for_failure_delivery() {
+    let coordinator = Arc::new(zeroclaw_goal::GoalExecutionRestartCoordinator::new());
+    let (first, _, first_registry, first_supervisor) = running_worker_on(Some(&coordinator)).await;
+    let (second, second_ingress, second_registry, second_supervisor) =
+        running_worker_on(Some(&coordinator)).await;
+    first.script.fail_parent.store(true, Ordering::SeqCst);
+    let second_task = second_registry
+        .0
+        .lock()
+        .unwrap()
+        .task
+        .as_ref()
+        .unwrap()
+        .clone();
+    let second_scope = GoalExecutionScope::new(
+        second_task.id,
+        second_ingress.session_key().durable_id(),
+        second_task.execution_epoch,
+    )
+    .unwrap();
+    let mut holder = Box::pin(first.ordinary.boundary.clone().lock_owned());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut holder)
+            .await
+            .is_err()
+    );
+    let restarting = Arc::clone(&coordinator);
+    let mut restart = zeroclaw_spawn::spawn!(async move { restarting.quiesce_for_restart().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while first_registry
+            .0
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .status
+            != TaskStatus::Paused
+            || second_registry
+                .0
+                .lock()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .status
+                != TaskStatus::Paused
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.script.release.add_permits(1);
+    second.script.release.add_permits(1);
+    let holder = tokio::time::timeout(Duration::from_secs(1), holder)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while second_supervisor.owns_scope(&second_scope).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("host two must drain while host one's delivery is blocked");
+    assert_eq!(
+        first_registry
+            .0
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        second_registry
+            .0
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .status,
+        TaskStatus::Paused
+    );
+    assert_eq!(
+        second_registry
+            .0
+            .lock()
+            .unwrap()
+            .goal
+            .as_ref()
+            .unwrap()
+            .pause_reason,
+        Some(zeroclaw_goal::GoalPauseReason::DaemonRestart)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut restart)
+            .await
+            .is_err()
+    );
+    assert_eq!(first.script.notices.load(Ordering::SeqCst), 0);
+    drop(holder);
+    tokio::time::timeout(Duration::from_secs(1), restart)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(second.script.notices.load(Ordering::SeqCst), 0);
+    assert!(first_supervisor.try_retire().await);
+    assert!(second_supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn failed_tail_notice_is_retried_once_without_repeating_the_parked_original() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    driver.script.fail_notice_once.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish_once = true;
+    let release = hold_publication(&driver.script);
+    driver.script.release.add_permits(1);
+    await_publication(&driver.script).await;
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                settings(),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded retry successor".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    release.send(()).unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_original_then_executor_notice(&driver.script);
+    assert_eq!(
+        driver.script.notices.load(Ordering::SeqCst),
+        2,
+        "one failed attempt, one successful retry"
+    );
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 3);
+    let committed = ready.commit(settings()).await.unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    let mut launch = committed.release();
+    supervisor
+        .pause_before_launch(&mut launch, zeroclaw_goal::GoalPauseReason::OperatorPaused)
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 2);
+    assert_original_then_executor_notice(&driver.script);
+    let state = registry.0.lock().unwrap();
+    assert_eq!(
+        state.finish_calls, 2,
+        "one rejected finish, one durable fallback"
+    );
+    assert!(state.pending_settlements.is_empty());
+}
+
+#[tokio::test]
+async fn published_failed_tail_is_consumed_once_and_allows_direct_successor() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let task = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    let scope = GoalExecutionScope::new(
+        task.id,
+        ingress.session_key().durable_id(),
+        task.execution_epoch,
+    )
+    .unwrap();
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    driver.script.release.add_permits(1);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), supervisor.drain(&scope))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert!(!supervisor.owns_scope(&scope).await);
+    let GoalControlAdmission::Direct(mut successor) = supervisor
+        .admit_control(
+            settings(),
+            ingress,
+            driver.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetSelection::Defaults,
+                objective: "settled successor".into(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("settled failure must not defer Start");
+    };
+    assert!(matches!(successor.response(), GoalResponse::Started(_)));
+    supervisor
+        .pause_before_launch(
+            &mut successor,
+            zeroclaw_goal::GoalPauseReason::OperatorPaused,
+        )
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
 }
 
 /// Exercise launch reporting through the public handoff, without admitting a
@@ -716,6 +1552,191 @@ async fn dropping_a_worker_control_abandons_the_intent_and_releases_execution() 
     assert!(matches!(
         &registry.0.lock().unwrap().intents[0].1,
         IntentState::Settled(GoalControlIntentSettlement::Abandoned { .. })
+    ));
+}
+
+#[tokio::test]
+async fn settled_pause_and_cancel_do_not_publish_failure_output() {
+    for (command, status) in [
+        (GoalCommand::Pause { immediate: true }, TaskStatus::Paused),
+        (GoalCommand::Cancel, TaskStatus::Cancelled),
+    ] {
+        let (driver, ingress, registry, supervisor) = running_worker().await;
+        let mut submission = supervisor
+            .submit(settings(), ingress, driver.clone(), command)
+            .await
+            .unwrap();
+        driver.script.release.add_permits(1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.launch_after_response(settings(), &mut submission),
+        )
+        .await
+        .expect("settled immediate controls must retire their worker")
+        .unwrap();
+        assert_eq!(
+            registry.0.lock().unwrap().task.as_ref().unwrap().status,
+            status
+        );
+        assert!(driver.script.events.lock().unwrap().is_empty());
+        assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+        assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
+        assert!(supervisor.try_retire().await);
+    }
+}
+
+#[tokio::test]
+async fn foreign_task_epoch_and_session_drains_preserve_the_exact_running_owner() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    seed_unsettled_call(&registry);
+    let original = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    let snapshot = serde_json::to_value(&original).unwrap();
+    for scope in [
+        GoalExecutionScope::new(
+            "foreign-task",
+            original.session_id.clone().unwrap(),
+            original.execution_epoch,
+        )
+        .unwrap(),
+        GoalExecutionScope::new(
+            original.id.clone(),
+            original.session_id.clone().unwrap(),
+            original.execution_epoch + 2,
+        )
+        .unwrap(),
+        GoalExecutionScope::new(
+            original.id.clone(),
+            "foreign-session",
+            original.execution_epoch,
+        )
+        .unwrap(),
+    ] {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), supervisor.drain(&scope))
+                .await
+                .expect("a foreign drain must not wait on the admitted parent")
+                .is_err()
+        );
+        let state = registry.0.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(state.task.as_ref().unwrap()).unwrap(),
+            snapshot
+        );
+        assert!(state.pending_settlements.is_empty());
+        assert_eq!(
+            state.goal.as_ref().unwrap().pending_call_id.as_deref(),
+            Some("fixture-unsettled-operation")
+        );
+        assert_eq!(
+            state.goal.as_ref().unwrap().pending_call_epoch,
+            Some(original.execution_epoch)
+        );
+        assert!(driver.script.events.lock().unwrap().is_empty());
+        assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    }
+    let mut cancel = supervisor
+        .submit(settings(), ingress, driver.clone(), GoalCommand::Cancel)
+        .await
+        .unwrap();
+    driver.script.release.add_permits(1);
+    supervisor
+        .launch_after_response(settings(), &mut cancel)
+        .await
+        .unwrap();
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn stale_driver_incarnation_rejects_failure_delivery_without_output() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress,
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    // Generation checks belong to the ordinary driver. Replace its incarnation
+    // after the admitted call, before any publication can acquire a fresh lease.
+    driver
+        .script
+        .reject_execution_incarnation
+        .store(true, Ordering::SeqCst);
+    driver.script.release.add_permits(1);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.launch_after_response(settings(), &mut pause)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        Some(GoalResponse::Terminal(_))
+    ));
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(state.terminal_reason.as_deref(), Some("executor_failed"));
+        assert!(state.pending_settlements.is_empty());
+    }
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn completed_predecessor_allows_direct_start_without_failure_delivery() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while registry.0.lock().unwrap().task.as_ref().unwrap().status != TaskStatus::Completed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().id.clone();
+    let GoalControlAdmission::Direct(mut successor) = supervisor
+        .admit_control(
+            settings(),
+            ingress,
+            driver.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetSelection::Defaults,
+                objective: "next bounded fixture".into(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a completed predecessor with a free boundary must not queue Start");
+    };
+    assert!(matches!(successor.response(), GoalResponse::Started(_)));
+    {
+        let state = registry.0.lock().unwrap();
+        assert_ne!(state.task.as_ref().unwrap().id, predecessor);
+        assert!(state.intents.is_empty());
+    }
+    supervisor
+        .pause_before_launch(
+            &mut successor,
+            zeroclaw_goal::GoalPauseReason::OperatorPaused,
+        )
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.published.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.verified.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        driver.script.events.lock().unwrap().as_slice(),
+        [FailureEvent::Notice(GoalExecutionNotice::Completed)]
     ));
 }
 
