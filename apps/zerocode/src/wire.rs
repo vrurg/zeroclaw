@@ -41,6 +41,7 @@ pub enum GoalFailureReason {
 pub enum GoalResponse {
     Help,
     Disabled,
+    Queued(GoalQueuedControl),
     Started(GoalStatusProjection),
     Status(GoalStatusProjection),
     Budget(GoalStatusProjection),
@@ -61,6 +62,16 @@ pub enum GoalResponse {
 pub enum GoalPendingAction {
     Pause,
     Cancel,
+}
+
+/// Candidate-only mirror of the daemon's deferred-control acknowledgement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalQueuedControl {
+    Start,
+    Resume,
+    Pause,
+    Budget,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionGoalResult {

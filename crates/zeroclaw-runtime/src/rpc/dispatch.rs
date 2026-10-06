@@ -2971,6 +2971,22 @@ impl RpcDispatcher {
         }
     }
 
+    fn goal_disposal_error(&self, error: &anyhow::Error) -> JsonRpcError {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error": zeroclaw_providers::sanitize_api_error(&RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&error.to_string())),
+                })),
+            "ZeroCode Goal session disposal failed"
+        );
+        rpc_err(
+            INTERNAL_ERROR,
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.",
+        )
+    }
+
     async fn ensure_method_session_access(
         &self,
         method: Method,
@@ -4500,6 +4516,20 @@ impl RpcDispatcher {
             Some(session_id) => self.capture_session_access(session_id).await?,
             None => None,
         };
+        #[cfg(test)]
+        {
+            let pause = self
+                .ctx
+                .sessions
+                .test_goal_replacement_capture_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
@@ -4569,14 +4599,64 @@ impl RpcDispatcher {
         // now. A scoped mismatch surfaces as the uniform ownership denial.
         let resume_scope = self.scoped_principal_id();
         let mut retained_remote_admission = None;
+        let mut _replacement_goal_lifecycle_guard = None;
+        let mut remote_replacement_checked = false;
         if resuming {
             let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
             if non_local {
-                let guard = self
+                let reservation = self
                     .ctx
                     .sessions
                     .session_queue
-                    .acquire(&session_id)
+                    .reserve(&session_id)
+                    .await
+                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                if let Some(snapshot) = self.ctx.sessions.goal_session_snapshot(&session_id).await
+                    && snapshot.chat_mode != chat_mode
+                {
+                    let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                    if let Some(grants) = grants.as_ref() {
+                        self.selector_session_agent_with_grants(
+                            Method::SessionNew,
+                            grants,
+                            &req.agent_alias,
+                        )?;
+                    }
+                    self.revalidate_admitted_session(&session_id, authorized_resume.as_ref())
+                        .await?;
+                    if let Some(has_environment) = self
+                        .ctx
+                        .sessions
+                        .has_forwarded_environment(&session_id)
+                        .await
+                    {
+                        self.authorize_session_environment(
+                            Method::SessionNew,
+                            grants.as_ref(),
+                            has_environment,
+                        )?;
+                    }
+                    self.ensure_reaction_channel_access(&snapshot.reaction_channels)?;
+                    // Close pending Goal controls before waiting for their FIFO
+                    // actor position, but never dispose a successor incarnation.
+                    remote_replacement_checked = true;
+                    if Some(snapshot.generation) == expected_generation
+                        && let Some(guard) = self
+                            .ctx
+                            .sessions
+                            .lock_goal_lifecycle(&session_id, snapshot.generation)
+                            .await
+                    {
+                        self.ctx
+                            .goal_runtime
+                            .dispose_session(&session_id)
+                            .await
+                            .map_err(|error| self.goal_disposal_error(&error))?;
+                        _replacement_goal_lifecycle_guard = Some(guard);
+                    }
+                }
+                let guard = reservation
+                    .acquire()
                     .await
                     .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
@@ -4655,34 +4735,38 @@ impl RpcDispatcher {
         // binding. Serialize its disposal with Goal commands before awaiting
         // the reserved actor permit, because disposal may need the active Goal
         // worker to finish an already-admitted turn.
-        let _replacement_goal_lifecycle_guard = if let Some(snapshot) =
-            self.ctx.sessions.goal_session_snapshot(&session_id).await
-            && snapshot.chat_mode != chat_mode
-        {
-            let generation = snapshot.generation;
-            if let Some(guard) = self
-                .ctx
-                .sessions
-                .lock_goal_lifecycle(&session_id, generation)
-                .await
+        if !remote_replacement_checked {
+            _replacement_goal_lifecycle_guard = if let Some(snapshot) =
+                self.ctx.sessions.goal_session_snapshot(&session_id).await
+                && snapshot.chat_mode != chat_mode
+                && (self.access_policy != RpcAccessPolicy::RemoteSessionOwner
+                    || Some(snapshot.generation) == expected_generation)
             {
-                self.ctx
-                    .goal_runtime
-                    .dispose_session(&session_id)
+                let generation = snapshot.generation;
+                if let Some(guard) = self
+                    .ctx
+                    .sessions
+                    .lock_goal_lifecycle(&session_id, generation)
                     .await
-                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-                Some(guard)
+                {
+                    self.ctx
+                        .goal_runtime
+                        .dispose_session(&session_id)
+                        .await
+                        .map_err(|error| self.goal_disposal_error(&error))?;
+                    Some(guard)
+                } else {
+                    // An earlier same-target replacement may have changed the
+                    // captured generation while this request waited for the
+                    // lifecycle lock. Keep this request's queue position and
+                    // decide against the admitted incarnation below; never dispose
+                    // that successor through the stale snapshot.
+                    None
+                }
             } else {
-                // An earlier same-target replacement may have changed the
-                // captured generation while this request waited for the
-                // lifecycle lock. Keep this request's queue position and
-                // decide against the admitted incarnation below; never dispose
-                // that successor through the stale snapshot.
                 None
-            }
-        } else {
-            None
-        };
+            };
+        }
 
         // Session replacement and prompt execution share one admission
         // permit. Acquire the reserved position BEFORE any durable state is
@@ -5534,7 +5618,7 @@ impl RpcDispatcher {
                     .goal_runtime
                     .dispose_session(&candidate.id)
                     .await
-                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                    .map_err(|error| self.goal_disposal_error(&error))?;
                 if let Some(evicted_session) = self
                     .ctx
                     .sessions
@@ -5669,7 +5753,7 @@ impl RpcDispatcher {
                 .goal_runtime
                 .dispose_session(&req.session_id)
                 .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                .map_err(|error| self.goal_disposal_error(&error))?;
         }
         let _guard = session_admission
             .acquire()
@@ -5888,7 +5972,7 @@ impl RpcDispatcher {
             .goal_runtime
             .dispose_session(sid)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            .map_err(|error| self.goal_disposal_error(&error))?;
         let _guard = if let Some(guard) = reaped_session_guard {
             guard
         } else {
@@ -8609,7 +8693,7 @@ impl RpcDispatcher {
             .goal_runtime
             .dispose_session(&req.session_id)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            .map_err(|error| self.goal_disposal_error(&error))?;
         let _guard = if let Some(guard) = reaped_session_guard {
             guard
         } else {
@@ -13619,6 +13703,1302 @@ pub(crate) mod connection_test_support {
         }
     }
 
+    #[derive(Clone, Default)]
+    pub(crate) struct HeldOrdinaryTurn {
+        pub(crate) started: Arc<Notify>,
+        pub(crate) release: Arc<Notify>,
+        pub(crate) exited: Arc<AtomicBool>,
+        pub(crate) completed: Arc<AtomicBool>,
+        pub(crate) calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct HeldOrdinaryProvider(HeldOrdinaryTurn);
+
+    #[async_trait]
+    impl ModelProvider for HeldOrdinaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let _exit = DropSignal(Arc::clone(&self.0.exited));
+            self.0.calls.fetch_add(1, Ordering::AcqRel);
+            self.0.started.notify_one();
+            self.0.release.notified().await;
+            self.0.completed.store(true, Ordering::Release);
+            Ok("ordinary answer".into())
+        }
+    }
+
+    impl Attributable for HeldOrdinaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-held-ordinary"
+        }
+    }
+
+    pub(crate) struct HeldGoalParent {
+        pub(crate) turn: HeldOrdinaryTurn,
+        pub(crate) ordinary: Option<HeldOrdinaryTurn>,
+        pub(crate) boot_id: String,
+        pub(crate) restart: Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+        pub(crate) messages: Arc<std::sync::Mutex<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
+        recovery_owner: Option<crate::control_plane::boot::ControlPlaneRecoveryOwner>,
+    }
+
+    impl HeldGoalParent {
+        pub(crate) async fn attach_recovered_provider(&self, ctx: &RpcContext, session_id: &str) {
+            assert!(self.recovery_owner.is_some());
+            let agent = ctx.sessions.get_agent(session_id).await.unwrap();
+            let mut agent = agent.lock().await;
+            let restored = zeroclaw_providers::durable_chat_messages(agent.history());
+            assert_eq!(
+                restored
+                    .iter()
+                    .map(|message| (message.role.as_str(), message.content.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("user", "Choose a bounded repair."),
+                    ("assistant", "Which option should I use?")
+                ]
+            );
+            agent.set_model_provider(Box::new(HeldGoalProvider {
+                provider: HeldOrdinaryProvider(self.turn.clone()),
+                ordinary: std::sync::Mutex::new(None),
+                messages: Arc::clone(&self.messages),
+            }));
+            agent.set_turn_datetime_for_test(held_goal_fixture_datetime);
+            assert_eq!(self.turn.calls.load(Ordering::Acquire), 0);
+        }
+
+        pub(crate) async fn begin_restart(
+            &self,
+            registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+            task: &zeroclaw_api::task::TaskRecord,
+        ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+            let coordinator = Arc::clone(&self.restart);
+            let quiesce =
+                zeroclaw_spawn::spawn!(async move { coordinator.quiesce_for_restart().await });
+            let fenced = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let current = registry
+                        .current_goal_for_session(task.session_id.as_deref().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if current.status == zeroclaw_api::task::TaskStatus::Paused {
+                        break current;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original restart coordinator must fence its held parent");
+            assert_eq!(fenced.id, task.id);
+            assert_eq!(fenced.execution_epoch, task.execution_epoch + 1);
+            let extension = registry.get_goal_task(&task.id).await.unwrap().unwrap();
+            assert_eq!(
+                extension.pause_reason,
+                Some(zeroclaw_goal::GoalPauseReason::DaemonRestart)
+            );
+            assert!(extension.pending_call_id.is_some());
+            assert_eq!(extension.pending_call_epoch, Some(task.execution_epoch));
+            assert!(
+                !quiesce.is_finished(),
+                "quiescence must await admitted usage settlement"
+            );
+            quiesce
+        }
+
+        pub(crate) fn assert_restart_input(&self, response: &str) {
+            let messages = self.messages.lock().unwrap();
+            let questions: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message.role == "assistant" && message.content == "Which option should I use?"
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let candidates: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message.role == "assistant" && message.content == "ordinary answer"
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let answers: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.role == "user" && message.content == response)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(questions.len(), 1);
+            assert_eq!(candidates.len(), 1 + usize::from(self.ordinary.is_some()));
+            assert_eq!(answers.len(), 1);
+            assert!(questions[0] < candidates[0]);
+            assert!(candidates.last().unwrap() < &answers[0]);
+        }
+
+        pub(crate) fn assert_resume_input(&self, response: Option<&str>) {
+            let messages = self.messages.lock().unwrap();
+            let original_inputs: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message.role == "user" && message.content == "Choose a bounded repair."
+                })
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(original_inputs.len(), 1);
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.role == "assistant"
+                        && message.content == "Which option should I use?")
+                    .count(),
+                1
+            );
+            let question_index = messages
+                .iter()
+                .position(|message| {
+                    message.role == "assistant" && message.content == "Which option should I use?"
+                })
+                .unwrap();
+            assert!(original_inputs[0] < question_index);
+            if self.ordinary.is_some() {
+                let ordinary_prompt = held_goal_ordinary_prompt();
+                let matching: Vec<_> = messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| {
+                        message.role == "user" && message.content == ordinary_prompt
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "ordinary input must reach the Goal request once"
+                );
+                let answers: Vec<_> = messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| {
+                        message.role == "assistant" && message.content == "ordinary answer"
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(
+                    answers.len(),
+                    1,
+                    "ordinary output must reach the Goal request once"
+                );
+                assert!(matching[0] < answers[0]);
+                if let Some(response) = response {
+                    let response_index = messages
+                        .iter()
+                        .position(|message| message.role == "user" && message.content == response)
+                        .expect("resume response must follow ordinary completion");
+                    assert!(answers[0] < response_index);
+                }
+            }
+            if let Some(response) = response {
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| message.role == "user" && message.content == response)
+                        .count(),
+                    1
+                );
+                let response_index = messages
+                    .iter()
+                    .position(|message| message.role == "user" && message.content == response)
+                    .unwrap();
+                assert!(question_index < response_index);
+            }
+        }
+    }
+
+    pub(crate) fn assert_resume_history(
+        history: &[zeroclaw_api::model_provider::ChatMessage],
+        case: GoalParentAdmissionCase,
+    ) {
+        let mut expected = vec![
+            ("user", "Choose a bounded repair."),
+            ("assistant", "Which option should I use?"),
+        ];
+        let ordinary_prompt = held_goal_ordinary_prompt();
+        if case.queued().is_some() {
+            expected.push(("user", ordinary_prompt.as_str()));
+            expected.push(("assistant", "ordinary answer"));
+        }
+        if let Some(response) = case.response() {
+            expected.push(("user", response));
+        }
+        expected.push(("assistant", "ordinary answer"));
+        let actual: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn held_goal_fixture_datetime() -> chrono::DateTime<chrono::Local> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+    }
+
+    fn held_goal_ordinary_prompt() -> String {
+        format!(
+            "[CURRENT DATE & TIME: {}]\n\nordinary work",
+            held_goal_fixture_datetime().format("%Y-%m-%d %H:%M:%S %Z")
+        )
+    }
+
+    struct HeldGoalProvider {
+        provider: HeldOrdinaryProvider,
+        ordinary: std::sync::Mutex<Option<HeldOrdinaryProvider>>,
+        messages: Arc<std::sync::Mutex<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for HeldGoalProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let provider = self
+                .ordinary
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| self.provider.clone());
+            provider
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            let ordinary = self.ordinary.lock().unwrap().take();
+            let usage = if ordinary.is_some() {
+                None
+            } else {
+                *self.messages.lock().unwrap() = request.messages.to_vec();
+                Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    ..Default::default()
+                })
+            };
+            let provider = ordinary.unwrap_or_else(|| self.provider.clone());
+            let text = provider
+                .chat_with_system(None, "", model, temperature)
+                .await?;
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for HeldGoalProvider {
+        fn role(&self) -> Role {
+            self.provider.role()
+        }
+
+        fn alias(&self) -> &str {
+            "connection-held-goal-parent"
+        }
+    }
+
+    pub(crate) async fn prepare_held_goal_parent_fixture(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner_tui_id: &str,
+        case: GoalParentAdmissionCase,
+    ) -> (Arc<dyn zeroclaw_goal::GoalTaskRegistry>, HeldGoalParent) {
+        if let GoalParentAdmissionCase::RecoveredResume(was_paused)
+        | GoalParentAdmissionCase::RecoveredAttachedResume(was_paused) = case
+        {
+            return prepare_cold_goal_recovery_fixture(ctx, path, session_id, was_paused).await;
+        }
+        Arc::get_mut(ctx).unwrap().session_backend = Some(Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(path).unwrap(),
+        ));
+        let turn = HeldOrdinaryTurn::default();
+        let ordinary = case.queued().map(|_| HeldOrdinaryTurn::default());
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        insert_session_with_owner(
+            ctx,
+            path,
+            session_id,
+            Box::new(HeldGoalProvider {
+                provider: HeldOrdinaryProvider(turn.clone()),
+                ordinary: std::sync::Mutex::new(ordinary.clone().map(HeldOrdinaryProvider)),
+                messages: Arc::clone(&messages),
+            }),
+            Some(owner_tui_id),
+        )
+        .await;
+        let history = [
+            zeroclaw_api::model_provider::ChatMessage::user("Choose a bounded repair."),
+            zeroclaw_api::model_provider::ChatMessage::assistant("Which option should I use?"),
+        ];
+        let backend = Arc::clone(ctx.session_backend.as_ref().unwrap());
+        let session_key = format!("rpc_{session_id}");
+        let persisted_history = history.clone();
+        tokio::task::spawn_blocking(move || {
+            for message in &persisted_history {
+                backend.append(&session_key, message).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let agent = ctx.sessions.get_agent(session_id).await.unwrap();
+        let mut agent = agent.lock().await;
+        if matches!(case, GoalParentAdmissionCase::UnpricedResume) {
+            agent.set_model_name("unpriced-goal-fixture".into());
+        }
+        agent.seed_history(&history);
+        agent.set_turn_datetime_for_test(held_goal_fixture_datetime);
+        drop(agent);
+        let (registry, restart) =
+            install_paused_goal_control_fixture_with_restart(ctx, path, session_id).await;
+        let boot_id = registry
+            .current_goal_for_session(
+                &zeroclaw_goal::control::GoalSessionKey::zero_code(session_id)
+                    .unwrap()
+                    .durable_id(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_boot_id;
+        (
+            registry,
+            HeldGoalParent {
+                turn,
+                ordinary,
+                boot_id,
+                restart,
+                messages,
+                recovery_owner: None,
+            },
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum GoalParentAdmissionCase {
+        DirectResume,
+        UnpricedResume,
+        RecoveredResume(bool),
+        RecoveredAttachedResume(bool),
+        QueuedResume(Option<&'static str>),
+        QueuedStart,
+        QueuedFirstStart,
+    }
+
+    impl GoalParentAdmissionCase {
+        pub(crate) fn response(self) -> Option<&'static str> {
+            match self {
+                Self::QueuedResume(response) => response,
+                Self::RecoveredResume(_) | Self::RecoveredAttachedResume(_) => {
+                    Some("Use option B.\nKeep the repair bounded.")
+                }
+                _ => None,
+            }
+        }
+
+        pub(crate) fn queued(self) -> Option<zeroclaw_goal::control::GoalQueuedControl> {
+            use zeroclaw_goal::control::GoalQueuedControl;
+            match self {
+                Self::DirectResume
+                | Self::UnpricedResume
+                | Self::RecoveredResume(_)
+                | Self::RecoveredAttachedResume(_) => None,
+                Self::QueuedResume(_) => Some(GoalQueuedControl::Resume),
+                Self::QueuedStart | Self::QueuedFirstStart => Some(GoalQueuedControl::Start),
+            }
+        }
+
+        pub(crate) fn command(self) -> String {
+            match self {
+                Self::QueuedStart | Self::QueuedFirstStart => {
+                    "/goal start --unlimited repair the bounded fixture".into()
+                }
+                _ => self.response().map_or_else(
+                    || "/goal resume".into(),
+                    |response| format!("/goal resume {response}"),
+                ),
+            }
+        }
+
+        pub(crate) async fn predecessor(
+            self,
+            registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+            key: &str,
+        ) -> Option<zeroclaw_api::task::TaskRecord> {
+            let task = registry
+                .current_goal_for_session(key)
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(self, Self::QueuedStart | Self::QueuedFirstStart) {
+                assert_eq!(
+                    registry
+                        .finish_session_goal(
+                            &task.id,
+                            key,
+                            task.execution_epoch,
+                            zeroclaw_api::task::TaskStatus::Cancelled,
+                            Some("fixture_predecessor_finished".into()),
+                        )
+                        .await
+                        .unwrap(),
+                    zeroclaw_goal::GoalTransitionResult::Applied
+                );
+            }
+            if matches!(self, Self::QueuedFirstStart) {
+                let terminal = registry
+                    .current_goal_for_session(key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    registry
+                        .delete_session_goal(&terminal.id, key, terminal.execution_epoch)
+                        .await
+                        .unwrap(),
+                    zeroclaw_goal::GoalTransitionResult::Applied
+                );
+            }
+            registry.current_goal_for_session(key).await.unwrap()
+        }
+
+        pub(crate) async fn assert_intent(
+            self,
+            path: &Path,
+            key: &str,
+            predecessor: Option<&zeroclaw_api::task::TaskRecord>,
+            boot_id: &str,
+            state: &'static str,
+        ) {
+            match self {
+                Self::QueuedResume(_) => {
+                    assert_resume_intent_state(path, key, predecessor.unwrap(), state).await
+                }
+                Self::QueuedStart | Self::QueuedFirstStart => {
+                    assert_start_intent_state(path, key, predecessor, boot_id, state).await
+                }
+                Self::DirectResume
+                | Self::UnpricedResume
+                | Self::RecoveredResume(_)
+                | Self::RecoveredAttachedResume(_) => {
+                    panic!("a direct control has no deferred intent")
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GoalParentEnding {
+        DeferredPause,
+        BudgetFence,
+        ImmediatePause,
+        ImmediatePauseDrainFailure,
+        SupersededBudget,
+        BudgetThenPause,
+        VerifierPause,
+        CancelQueuedResume,
+        Restart,
+        Replacement,
+    }
+
+    impl GoalParentEnding {
+        pub(crate) fn command(self) -> &'static str {
+            match self {
+                Self::DeferredPause | Self::BudgetThenPause | Self::VerifierPause => "/goal pause",
+                Self::BudgetFence => "/goal budget set --tokens 1",
+                Self::ImmediatePause
+                | Self::ImmediatePauseDrainFailure
+                | Self::SupersededBudget => "/goal pause now",
+                Self::CancelQueuedResume => "/goal cancel",
+                Self::Restart => "/goal status",
+                Self::Replacement => panic!("replacement uses session/new, not a Goal command"),
+            }
+        }
+    }
+
+    pub(crate) async fn assert_running_goal_replacement_fence(
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        key: &str,
+        before: &zeroclaw_api::task::TaskRecord,
+        parent: &HeldGoalParent,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let task = registry
+                    .current_goal_for_session(key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task.id, before.id);
+                if task.status == zeroclaw_api::task::TaskStatus::Cancelled {
+                    assert_eq!(task.execution_epoch, before.execution_epoch + 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement must fence while the parent call is held");
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&before.id, key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("session_disposed")
+        );
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+        assert!(!parent.turn.completed.load(Ordering::Acquire));
+        assert!(!parent.turn.exited.load(Ordering::Acquire));
+    }
+
+    pub(crate) async fn assert_running_goal_replacement_completed(
+        ctx: &RpcContext,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        path: &Path,
+        session_id: &str,
+        generation: u64,
+        before: &zeroclaw_api::task::TaskRecord,
+        parent: &HeldGoalParent,
+    ) {
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(session_id)
+            .unwrap()
+            .durable_id();
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_ne!(
+            ctx.sessions.get_generation(session_id).await,
+            Some(generation)
+        );
+        assert_eq!(
+            ctx.sessions.chat_mode(session_id).await,
+            Some(crate::rpc::types::ChatMode::Acp)
+        );
+        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+        assert!(parent.turn.completed.load(Ordering::Acquire));
+        assert!(parent.turn.exited.load(Ordering::Acquire));
+        assert_held_goal_usage(path, &before.id).await;
+    }
+
+    pub(crate) fn assert_held_goal_query(
+        command: &str,
+        response: &zeroclaw_goal::control::GoalResponse,
+        task: &zeroclaw_api::task::TaskRecord,
+        extension: &zeroclaw_goal::task::GoalTaskRecord,
+    ) {
+        use zeroclaw_goal::control::GoalResponse;
+        let status = match (command, response) {
+            ("/goal help", GoalResponse::Help) => return,
+            ("/goal status", GoalResponse::Status(status))
+            | ("/goal budget", GoalResponse::Budget(status)) => status,
+            other => panic!("unexpected held-parent query response: {other:?}"),
+        };
+        assert_eq!(status.task_id, task.id);
+        assert_eq!(status.status, task.status);
+        assert_eq!(status.execution_epoch, task.execution_epoch);
+        assert_eq!(status.token_limit, extension.effective_token_limit);
+        assert_eq!(status.cost_limit_usd, extension.effective_cost_limit_usd);
+        assert_eq!(status.accounting_state, extension.accounting_state);
+        assert_eq!(status.pause_reason, extension.pause_reason);
+        assert!(!status.resumable);
+    }
+
+    #[derive(Default)]
+    pub(crate) struct CancelledResumeEvents {
+        pub(crate) cancelled: Option<zeroclaw_goal::control::GoalStatusProjection>,
+        pub(crate) terminal: Option<zeroclaw_goal::control::GoalStatusProjection>,
+        pub(crate) ordinary_text: String,
+        ordinary_ack: bool,
+        ordinary_completed: bool,
+    }
+
+    impl CancelledResumeEvents {
+        pub(crate) fn observe(&mut self, frame: &serde_json::Value, session_id: &str) {
+            use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate};
+            use zeroclaw_goal::control::GoalResponse;
+            assert!(frame["error"].is_null(), "{frame}");
+            if frame["id"] == 24 {
+                let result: SessionGoalResult =
+                    serde_json::from_value(frame["result"].clone()).unwrap();
+                let GoalResponse::Cancelled(status) = result.response else {
+                    panic!("immediate cancel must report Cancelled");
+                };
+                assert!(self.cancelled.replace(status).is_none());
+            } else if frame["id"] == 4 {
+                assert!(!self.ordinary_ack);
+                assert_ordinary_prompt_acknowledgement(frame, session_id);
+                self.ordinary_ack = true;
+            } else if frame["method"] == "session/update" {
+                assert!(!self.ordinary_completed);
+                self.ordinary_completed =
+                    observe_ordinary_turn_update(frame, session_id, &mut self.ordinary_text);
+            } else {
+                assert_eq!(frame["method"], "session/goal_update", "{frame}");
+                let update: SessionGoalUpdate =
+                    serde_json::from_value(frame["params"].clone()).unwrap();
+                let SessionGoalUpdate::Lifecycle {
+                    session_id: actual,
+                    response: GoalResponse::Terminal(status),
+                } = update
+                else {
+                    panic!(
+                        "cancelled queued resume must not launch or hide its result: {update:?}"
+                    );
+                };
+                assert_eq!(actual, session_id);
+                assert!(self.terminal.replace(status).is_none());
+            }
+        }
+
+        pub(crate) fn settled(&self) -> bool {
+            self.cancelled.is_some()
+                && self.terminal.is_some()
+                && self.ordinary_ack
+                && self.ordinary_completed
+        }
+    }
+
+    pub(crate) async fn assert_cancelled_queued_resume(
+        ctx: &RpcContext,
+        path: &Path,
+        session_id: &str,
+        before: &zeroclaw_api::task::TaskRecord,
+        parent: &HeldGoalParent,
+        events: &CancelledResumeEvents,
+    ) {
+        assert!(events.settled());
+        assert_eq!(events.ordinary_text, "ordinary answer");
+        for status in [
+            events.cancelled.as_ref().unwrap(),
+            events.terminal.as_ref().unwrap(),
+        ] {
+            assert_eq!(status.task_id, before.id);
+            assert_eq!(status.status, zeroclaw_api::task::TaskStatus::Cancelled);
+            assert_eq!(status.execution_epoch, before.execution_epoch + 1);
+            assert_eq!(
+                status.accounting_state,
+                zeroclaw_goal::GoalAccountingState::Complete
+            );
+            assert_eq!(status.token_limit, Some(10));
+            assert!(!status.resumable);
+        }
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 0);
+        assert!(parent.messages.lock().unwrap().is_empty());
+        let ordinary = parent.ordinary.as_ref().unwrap();
+        assert_eq!(ordinary.calls.load(Ordering::Acquire), 1);
+        assert!(ordinary.completed.load(Ordering::Acquire));
+        let backend = Arc::clone(ctx.session_backend.as_ref().unwrap());
+        let key = format!("rpc_{session_id}");
+        let history = tokio::task::spawn_blocking(move || backend.load(&key))
+            .await
+            .unwrap();
+        let expected = vec![
+            zeroclaw_api::model_provider::ChatMessage::user("Choose a bounded repair."),
+            zeroclaw_api::model_provider::ChatMessage::assistant("Which option should I use?"),
+            zeroclaw_api::model_provider::ChatMessage::user(held_goal_ordinary_prompt()),
+            zeroclaw_api::model_provider::ChatMessage::assistant("ordinary answer"),
+        ];
+        assert_eq!(
+            serde_json::to_value(history).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let durable_key = zeroclaw_goal::control::GoalSessionKey::zero_code(session_id)
+            .unwrap()
+            .durable_id();
+        assert_resume_intent_state(path, &durable_key, before, "superseded").await;
+        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
+    }
+
+    pub(crate) struct GoalParentPauseEvents {
+        pub(crate) announced: bool,
+        pub(crate) text: String,
+        pub(crate) candidates: Vec<String>,
+        pub(crate) expect_superseded_budget: bool,
+        pub(crate) superseded_budget: Option<zeroclaw_goal::control::GoalStatusProjection>,
+        pub(crate) queued_budget_limit: Option<u64>,
+        pub(crate) applied_budget: Option<zeroclaw_goal::control::GoalStatusProjection>,
+        initial_control: zeroclaw_goal::control::GoalQueuedControl,
+    }
+
+    impl GoalParentPauseEvents {
+        pub(crate) fn new(case: GoalParentAdmissionCase) -> Self {
+            Self {
+                announced: false,
+                text: String::new(),
+                candidates: Vec::new(),
+                expect_superseded_budget: false,
+                superseded_budget: None,
+                queued_budget_limit: None,
+                applied_budget: None,
+                initial_control: case
+                    .queued()
+                    .unwrap_or(zeroclaw_goal::control::GoalQueuedControl::Resume),
+            }
+        }
+
+        fn announce(&mut self, control: zeroclaw_goal::control::GoalQueuedControl) {
+            assert_eq!(control, self.initial_control);
+            assert!(!self.announced, "only one initial notice is expected");
+            assert!(self.candidates.is_empty());
+            self.announced = true;
+        }
+
+        pub(crate) fn observe(
+            &mut self,
+            frame: &serde_json::Value,
+            session_id: &str,
+        ) -> Option<zeroclaw_goal::control::GoalStatusProjection> {
+            use crate::rpc::types::{SessionGoalUpdate, SessionUpdateEvent};
+            use zeroclaw_goal::control::GoalResponse;
+
+            assert!(frame["error"].is_null(), "{frame}");
+            match frame["method"].as_str() {
+                Some("session/update") => {
+                    assert!(
+                        self.announced,
+                        "start/resume must be observable before parent events"
+                    );
+                    let event: SessionUpdateEvent =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    if let SessionUpdateEvent::AgentMessageChunk {
+                        session_id: actual,
+                        text,
+                    } = event
+                    {
+                        assert_eq!(actual, session_id);
+                        self.text.push_str(&text);
+                    }
+                    None
+                }
+                Some("session/goal_update") => {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    match update {
+                        SessionGoalUpdate::VerifiedCandidate {
+                            session_id: actual,
+                            candidate,
+                        } => {
+                            assert_eq!(actual, session_id);
+                            assert!(self.announced);
+                            self.candidates.push(candidate);
+                            None
+                        }
+                        SessionGoalUpdate::Lifecycle {
+                            session_id: actual,
+                            response,
+                        } => {
+                            assert_eq!(actual, session_id);
+                            match response {
+                                GoalResponse::Resumed(_) => {
+                                    self.announce(
+                                        zeroclaw_goal::control::GoalQueuedControl::Resume,
+                                    );
+                                    None
+                                }
+                                GoalResponse::Started(_) => {
+                                    self.announce(zeroclaw_goal::control::GoalQueuedControl::Start);
+                                    None
+                                }
+                                GoalResponse::Paused(status) => {
+                                    assert_eq!(self.candidates, ["ordinary answer"]);
+                                    Some(status)
+                                }
+                                GoalResponse::AlreadyPaused(status)
+                                    if self.expect_superseded_budget =>
+                                {
+                                    assert!(self.superseded_budget.replace(status).is_none());
+                                    None
+                                }
+                                GoalResponse::BudgetUpdated(status)
+                                    if self.queued_budget_limit.is_some() =>
+                                {
+                                    assert_eq!(self.candidates, ["ordinary answer"]);
+                                    assert_eq!(status.token_limit, self.queued_budget_limit);
+                                    assert!(self.applied_budget.replace(status).is_none());
+                                    None
+                                }
+                                other => panic!("unexpected parent control result: {other:?}"),
+                            }
+                        }
+                        other => panic!("unexpected Goal outcome before operator pause: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected native parent event: {other:?}"),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct GoalBudgetEvents {
+        pub(crate) text: String,
+        candidates: usize,
+        budget_updated: bool,
+        core_error: bool,
+    }
+
+    pub(crate) async fn prepare_goal_budget_verifier(
+        ctx: &Arc<RpcContext>,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut config = ctx.config.write();
+        let verifier = config.providers.models.ensure("openai", "fixture").unwrap();
+        verifier.api_key = Some("synthetic-key".into());
+        verifier.uri = Some(server.uri());
+        verifier.kind = Some("openai-compatible".into());
+        verifier.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        verifier.model = Some("fixture-verifier".into());
+        verifier.live_pricing = false;
+        server
+    }
+
+    pub(crate) struct HeldGoalVerifier {
+        pub(crate) turn: HeldOrdinaryTurn,
+        shutdown: tokio_util::sync::CancellationToken,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl HeldGoalVerifier {
+        pub(crate) async fn finish(mut self) {
+            self.shutdown.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.task.take().unwrap())
+                .await
+                .expect("the verifier fixture must shut down")
+                .unwrap();
+        }
+    }
+
+    impl Drop for HeldGoalVerifier {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn held_goal_verifier_response(
+        axum::extract::State(turn): axum::extract::State<HeldOrdinaryTurn>,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        assert!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("ordinary answer"))
+                })
+        );
+        assert_eq!(turn.calls.fetch_add(1, Ordering::AcqRel), 0);
+        turn.started.notify_one();
+        turn.release.notified().await;
+        turn.completed.store(true, Ordering::Release);
+        axum::Json(serde_json::json!({
+            "id": "fixture-verifier-response", "object": "chat.completion",
+            "model": "fixture-verifier",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": "{\"decision\":\"complete\",\"reason\":\"The declared criterion is satisfied.\",\"blockers\":[]}"
+            }}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        }))
+    }
+
+    pub(crate) async fn prepare_held_goal_verifier(ctx: &Arc<RpcContext>) -> HeldGoalVerifier {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let turn = HeldOrdinaryTurn::default();
+        let router = axum::Router::new()
+            .fallback(held_goal_verifier_response)
+            .with_state(turn.clone());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        {
+            let mut config = ctx.config.write();
+            let verifier = config.providers.models.ensure("openai", "fixture").unwrap();
+            verifier.api_key = Some("synthetic-key".into());
+            verifier.uri = Some(uri);
+            verifier.kind = Some("openai-compatible".into());
+            verifier.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            verifier.model = Some("fixture-verifier".into());
+            verifier.live_pricing = false;
+        }
+        HeldGoalVerifier {
+            turn,
+            shutdown,
+            task: Some(task),
+        }
+    }
+
+    pub(crate) async fn assert_held_parent_and_verifier_usage(path: &Path, task_id: &str) {
+        let path = path.join("state/costs.jsonl");
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let contents = std::fs::read_to_string(path).unwrap();
+            let records: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), 2);
+            assert_ne!(records[0].id, records[1].id);
+            for record in &records {
+                assert_eq!(record.task_id.as_deref(), Some(task_id.as_str()));
+            }
+            let usage: Vec<_> = records
+                .iter()
+                .map(|record| {
+                    (
+                        record.usage.input_tokens,
+                        record.usage.output_tokens,
+                        record.usage.total_tokens,
+                    )
+                })
+                .collect();
+            assert_eq!(usage, [(2, 1, 3), (4, 2, 6)]);
+        })
+        .await
+        .unwrap();
+    }
+
+    impl GoalBudgetEvents {
+        pub(crate) fn with_parent_text(text: String) -> Self {
+            Self {
+                text,
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn settled(&self) -> bool {
+            self.candidates == 1 && self.budget_updated && self.core_error
+        }
+
+        pub(crate) fn observe(&mut self, frame: &serde_json::Value, session_id: &str) {
+            use crate::rpc::types::{SessionGoalUpdate, SessionUpdateEvent, TurnCompletionOutcome};
+            use zeroclaw_goal::control::GoalResponse;
+
+            assert!(frame["error"].is_null(), "{frame}");
+            match frame["method"].as_str() {
+                Some("session/update") => {
+                    let event: SessionUpdateEvent =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    match event {
+                        SessionUpdateEvent::AgentMessageChunk {
+                            session_id: actual,
+                            text,
+                        } => {
+                            assert_eq!(actual, session_id);
+                            self.text.push_str(&text);
+                        }
+                        SessionUpdateEvent::TurnComplete {
+                            session_id: actual,
+                            outcome,
+                            content,
+                            ..
+                        } => {
+                            assert_eq!(actual, session_id);
+                            assert_eq!(outcome, TurnCompletionOutcome::Failed);
+                            assert_eq!(
+                                content,
+                                "turn failed: Agent turn failed: Goal budget is exhausted"
+                            );
+                            assert_eq!(self.candidates, 1);
+                            assert!(!self.core_error, "core refusal must be delivered once");
+                            self.core_error = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Some("session/goal_update") => {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    match update {
+                        SessionGoalUpdate::VerifiedCandidate {
+                            session_id: actual,
+                            candidate,
+                        } => {
+                            assert_eq!(actual, session_id);
+                            assert_eq!(candidate, "ordinary answer");
+                            assert_eq!(self.candidates, 0);
+                            assert!(!self.budget_updated && !self.core_error);
+                            self.candidates += 1;
+                        }
+                        SessionGoalUpdate::Lifecycle {
+                            session_id: actual,
+                            response: GoalResponse::BudgetUpdated(status),
+                        } => {
+                            assert_eq!(actual, session_id);
+                            assert_eq!(status.token_limit, Some(1));
+                            assert_eq!(
+                                status.accounting_state,
+                                zeroclaw_goal::GoalAccountingState::Complete
+                            );
+                            assert_eq!(self.candidates, 1);
+                            assert!(!self.budget_updated, "budget result must be delivered once");
+                            self.budget_updated = true;
+                        }
+                        other => panic!("unexpected Goal outcome at budget fence: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected native budget event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn goal_budget_events_preserve_core_error_without_terminal_goal_notice() {
+        use crate::rpc::types::{SessionGoalUpdate, SessionUpdateEvent, TurnCompletionOutcome};
+        use zeroclaw_goal::control::{GoalResponse, GoalStatusProjection};
+
+        const SID: &str = "budget-observer-session";
+        let candidate = serde_json::json!({
+            "method": "session/goal_update",
+            "params": SessionGoalUpdate::VerifiedCandidate {
+                session_id: SID.into(), candidate: "ordinary answer".into(),
+            },
+        });
+        let budget = serde_json::json!({
+            "method": "session/goal_update",
+            "params": SessionGoalUpdate::Lifecycle {
+                session_id: SID.into(),
+                response: GoalResponse::BudgetUpdated(GoalStatusProjection {
+                    task_id: "budget-observer-task".into(),
+                    status: zeroclaw_api::task::TaskStatus::Running,
+                    execution_epoch: 3,
+                    token_limit: Some(1), cost_limit_usd: None,
+                    accounting_state: zeroclaw_goal::GoalAccountingState::Complete,
+                    pause_reason: None, resumable: false,
+                }),
+            },
+        });
+        let error = serde_json::json!({
+            "method": "session/update",
+            "params": SessionUpdateEvent::TurnComplete {
+                session_id: SID.into(), outcome: TurnCompletionOutcome::Failed,
+                content: "turn failed: Agent turn failed: Goal budget is exhausted".into(),
+                client_turn_generation: None, message_count: None,
+            },
+        });
+        for tail in [[&budget, &error], [&error, &budget]] {
+            let mut events = GoalBudgetEvents::default();
+            events.observe(&candidate, SID);
+            assert!(!events.settled());
+            events.observe(tail[0], SID);
+            assert!(!events.settled());
+            events.observe(tail[1], SID);
+            assert!(events.settled());
+        }
+        let mut events = GoalBudgetEvents::default();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                events.observe(&error, SID);
+            }))
+            .is_err()
+        );
+        let mut events = GoalBudgetEvents::default();
+        events.observe(&candidate, SID);
+        events.observe(&error, SID);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                events.observe(&error, SID);
+            }))
+            .is_err()
+        );
+        let mut events = GoalBudgetEvents::default();
+        events.observe(&candidate, SID);
+        events.observe(&budget, SID);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                events.observe(&budget, SID);
+            }))
+            .is_err()
+        );
+        let failure = serde_json::json!({
+            "method": "session/goal_update",
+            "params": SessionGoalUpdate::Failed {
+                session_id: SID.into(),
+                reason: zeroclaw_goal::control::GoalFailureReason::VerifierOperationFailed,
+            },
+        });
+        let mut events = GoalBudgetEvents::default();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                events.observe(&failure, SID);
+            }))
+            .is_err()
+        );
+    }
+
+    pub(crate) async fn assert_held_goal_usage(path: &Path, task_id: &str) {
+        assert_held_goal_usage_attempts(path, task_id, 1).await;
+    }
+
+    pub(crate) async fn assert_unpriced_goal_usage(path: &Path, task_id: &str) {
+        let path = path.join("state/costs.jsonl");
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let contents = std::fs::read_to_string(path).unwrap();
+            let records: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.task_id.as_deref(), Some(task_id.as_str()));
+            assert_eq!(record.usage.model, "unpriced-goal-fixture");
+            assert_eq!(record.usage.total_tokens, 3);
+            assert_eq!(record.usage.unpriced_tokens, 3);
+            assert!(!record.usage.pricing_available);
+            assert_eq!(record.usage.cost_usd, 0.0);
+        })
+        .await
+        .unwrap();
+    }
+
+    pub(crate) async fn assert_held_goal_usage_attempts(
+        path: &Path,
+        task_id: &str,
+        expected_attempts: usize,
+    ) {
+        let path = path.join("state/costs.jsonl");
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let contents = std::fs::read_to_string(path).expect("parent usage must be durable");
+            let records: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                records.len(),
+                expected_attempts,
+                "every parent attempt must settle exactly once"
+            );
+            let record_ids: std::collections::BTreeSet<_> =
+                records.iter().map(|record| record.id.as_str()).collect();
+            assert_eq!(record_ids.len(), expected_attempts);
+            for record in &records {
+                assert_eq!(record.task_id.as_deref(), Some(task_id.as_str()));
+                assert_eq!(record.usage.input_tokens, 2);
+                assert_eq!(record.usage.output_tokens, 1);
+                assert_eq!(record.usage.total_tokens, 3);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    pub(crate) async fn insert_held_session_with_owner(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner_tui_id: &str,
+    ) -> HeldOrdinaryTurn {
+        let turn = HeldOrdinaryTurn::default();
+        insert_session_with_owner(
+            ctx,
+            path,
+            session_id,
+            Box::new(HeldOrdinaryProvider(turn.clone())),
+            Some(owner_tui_id),
+        )
+        .await;
+        turn
+    }
+
+    pub(crate) fn assert_ordinary_prompt_acknowledgement(
+        frame: &serde_json::Value,
+        session_id: &str,
+    ) {
+        assert!(frame["error"].is_null(), "{frame}");
+        assert_eq!(
+            frame["result"],
+            serde_json::json!({}),
+            "{session_id}: {frame}"
+        );
+    }
+
+    pub(crate) fn observe_ordinary_turn_update(
+        frame: &serde_json::Value,
+        session_id: &str,
+        text: &mut String,
+    ) -> bool {
+        use crate::rpc::types::{SessionUpdateEvent, TurnCompletionOutcome};
+
+        assert_eq!(frame["method"], "session/update", "{frame}");
+        match serde_json::from_value(frame["params"].clone()).unwrap() {
+            SessionUpdateEvent::AgentMessageChunk {
+                session_id: actual,
+                text: delta,
+            } => {
+                assert_eq!(actual, session_id);
+                text.push_str(&delta);
+                false
+            }
+            SessionUpdateEvent::TurnComplete {
+                session_id: actual,
+                outcome,
+                content,
+                ..
+            } => {
+                assert_eq!(actual, session_id);
+                assert!(matches!(outcome, TurnCompletionOutcome::Completed));
+                assert_eq!(content, "ordinary answer");
+                true
+            }
+            _ => false,
+        }
+    }
+
     struct CountingProvider(Arc<AtomicUsize>);
 
     #[async_trait]
@@ -13701,6 +15081,668 @@ pub(crate) mod connection_test_support {
         insert_session_with_owner(ctx, path, session_id, provider, None).await;
     }
 
+    pub(crate) enum GoalBoundaryCompletion {
+        ApplyBudget,
+        SettingsFailure,
+        LaunchFailure,
+        FinishOrdinaryTurn,
+        Dispose(super::Method),
+        Replace,
+        Shutdown,
+    }
+
+    pub(crate) async fn assert_goal_launch_failure(
+        ctx: &RpcContext,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        key: &str,
+        before: &zeroclaw_api::task::TaskRecord,
+        session_id: &str,
+        generation: u64,
+        frame: &serde_json::Value,
+    ) {
+        assert_eq!(frame["method"], "session/goal_update");
+        let update: crate::rpc::types::SessionGoalUpdate =
+            serde_json::from_value(frame["params"].clone()).unwrap();
+        assert!(matches!(update,
+            crate::rpc::types::SessionGoalUpdate::Failed { session_id: id, reason }
+            if id == session_id && reason == zeroclaw_goal::control::GoalFailureReason::ExecutorStartFailed
+        ));
+        assert!(
+            !frame
+                .to_string()
+                .contains("private fixture launch bind detail")
+        );
+        let after = registry
+            .current_goal_for_session(key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert!(after.execution_epoch > before.execution_epoch);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&after.id, key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_start_failed")
+        );
+        assert_eq!(
+            ctx.sessions.get_generation(session_id).await,
+            Some(generation)
+        );
+        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
+        let extension = registry.get_goal_task(&after.id).await.unwrap().unwrap();
+        assert!(extension.pending_call_id.is_none() && extension.pending_call_epoch.is_none());
+    }
+
+    pub(crate) fn prepare_goal_replacement_fixture(ctx: &mut Arc<RpcContext>, path: &Path) {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        Arc::get_mut(ctx).unwrap().acp_session_store = Some(Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(path).unwrap(),
+        ));
+        let mut config = ctx.config.write();
+        let provider = config.providers.models.ensure("openai", "fixture").unwrap();
+        provider.api_key = Some("synthetic-fixture-key".into());
+        provider.model = Some("fixture-model".into());
+        provider.uri = Some("http://127.0.0.1:1".into());
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.fixture".into(),
+                risk_profile: "goal-fixture".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("goal-fixture".into(), RiskProfileConfig::default());
+    }
+
+    pub(crate) async fn assert_goal_control_abandoned_on_shutdown(path: &Path, session_id: &str) {
+        assert_goal_control_abandoned(path, session_id, "connection_closed").await;
+    }
+
+    pub(crate) async fn assert_goal_control_dropped(path: &Path, session_id: &str) {
+        assert_goal_control_abandoned(path, session_id, "control_dropped").await;
+    }
+
+    async fn assert_goal_control_abandoned(path: &Path, session_id: &str, reason: &str) {
+        let connection = rusqlite::Connection::open_with_flags(
+            path.join("control_plane.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (count, abandoned): (i64, i64) = connection
+                    .query_row(
+                        "SELECT count(*), coalesce(sum(state = 'abandoned' AND
+                         outcome_reason = ?2), 0)
+                         FROM goal_control_intents WHERE session_id = ?1",
+                        [session_id, reason],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "the queued control must have exactly one audit row"
+                );
+                if abandoned == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pending control must be abandoned in the canonical ledger");
+    }
+
+    pub(crate) async fn assert_budget_intent_state(
+        path: &Path,
+        session_id: &str,
+        task: &zeroclaw_api::task::TaskRecord,
+        state: &'static str,
+    ) {
+        assert_control_intent_state(path, session_id, task, state, "set_budget").await;
+    }
+
+    pub(crate) async fn assert_resume_intent_state(
+        path: &Path,
+        session_id: &str,
+        task: &zeroclaw_api::task::TaskRecord,
+        state: &'static str,
+    ) {
+        assert_control_intent_state(path, session_id, task, state, "resume").await;
+    }
+
+    pub(crate) async fn assert_pause_intent_state(
+        path: &Path,
+        session_id: &str,
+        task: &zeroclaw_api::task::TaskRecord,
+        state: &'static str,
+    ) {
+        assert_control_intent_state(path, session_id, task, state, "pause").await;
+    }
+
+    pub(crate) async fn assert_budget_then_pause_intents(
+        path: &Path,
+        session_id: &str,
+        task: &zeroclaw_api::task::TaskRecord,
+        state: &'static str,
+    ) {
+        let database = path.join("control_plane.db");
+        let session_id = session_id.to_owned();
+        let task = task.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = rusqlite::Connection::open_with_flags(
+                database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let (count, matched, budgets, pauses): (i64, i64, i64, i64) = connection
+                .query_row(
+                    "SELECT count(*), coalesce(sum(state = ?2 AND task_id = ?3
+                     AND expected_epoch = ?4 AND owner_boot_id = ?5
+                     AND ((?2 = 'pending' AND claimed_at IS NULL AND settled_at IS NULL)
+                       OR (?2 = 'applied' AND claimed_at IS NOT NULL
+                           AND settled_at IS NOT NULL))), 0),
+                     coalesce(sum(kind = 'set_budget'), 0), coalesce(sum(kind = 'pause'), 0)
+                     FROM goal_control_intents WHERE session_id = ?1",
+                    rusqlite::params![
+                        session_id,
+                        state,
+                        task.id,
+                        task.execution_epoch,
+                        task.owner_boot_id,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!((count, matched, budgets, pauses), (2, 2, 1, 1));
+            if state == "applied" {
+                let ordered: bool = connection
+                    .query_row(
+                        "SELECT b.settled_at <= p.claimed_at FROM goal_control_intents b
+                         JOIN goal_control_intents p ON p.session_id = b.session_id
+                         WHERE b.session_id = ?1 AND b.kind = 'set_budget' AND p.kind = 'pause'",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    ordered,
+                    "the first control must settle before the next is claimed"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn assert_start_intent_state(
+        path: &Path,
+        session_id: &str,
+        predecessor: Option<&zeroclaw_api::task::TaskRecord>,
+        boot_id: &str,
+        state: &'static str,
+    ) {
+        let database = path.join("control_plane.db");
+        let session_id = session_id.to_owned();
+        let predecessor_id = predecessor.map(|task| task.id.clone());
+        let boot_id = boot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = rusqlite::Connection::open_with_flags(
+                database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let (count, matched): (i64, i64) = connection
+                .query_row(
+                    "SELECT count(*), coalesce(sum(kind = 'start' AND state = ?2
+                 AND task_id IS NULL AND expected_epoch IS NULL
+                 AND predecessor_task_id IS ?3 AND owner_boot_id = ?4
+                 AND ((?2 = 'pending' AND claimed_at IS NULL AND settled_at IS NULL)
+                   OR (?2 = 'applied' AND claimed_at IS NOT NULL AND settled_at IS NOT NULL))), 0)
+                 FROM goal_control_intents WHERE session_id = ?1",
+                    rusqlite::params![session_id, state, predecessor_id, boot_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "the Start must have exactly one audit intent");
+            assert_eq!(
+                matched, 1,
+                "the Start must retain its predecessor and {state} settlement"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn assert_control_intent_state(
+        path: &Path,
+        session_id: &str,
+        task: &zeroclaw_api::task::TaskRecord,
+        state: &'static str,
+        kind: &'static str,
+    ) {
+        let database = path.join("control_plane.db");
+        let session_id = session_id.to_owned();
+        let task = task.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = rusqlite::Connection::open_with_flags(
+                database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let (count, matched): (i64, i64) = connection
+                .query_row(
+                    "SELECT count(*), coalesce(sum(kind = ?6 AND state = ?2
+                     AND task_id = ?3 AND expected_epoch = ?4 AND owner_boot_id = ?5
+                     AND ((?2 = 'pending' AND claimed_at IS NULL AND settled_at IS NULL)
+                       OR (?2 = 'applied' AND claimed_at IS NOT NULL
+                           AND settled_at IS NOT NULL)
+                       OR (?2 = 'superseded' AND settled_at IS NOT NULL
+                           AND ((claimed_at IS NULL AND outcome_reason = 'checkpoint_closed')
+                             OR (claimed_at IS NOT NULL AND outcome_reason = 'binding_changed'))))), 0)
+                     FROM goal_control_intents WHERE session_id = ?1",
+                    rusqlite::params![
+                        session_id,
+                        state,
+                        task.id,
+                        task.execution_epoch,
+                        task.owner_boot_id,
+                        kind,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "the control must have exactly one canonical intent"
+            );
+            assert_eq!(
+                matched, 1,
+                "the intent must retain its exact binding and {state} settlement"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    pub(crate) async fn prepare_queued_goal_control_fixture(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        command: &str,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        zeroclaw_goal::control::GoalQueuedControl,
+    ) {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::control::{
+            GoalControlClass, GoalQueuedControl, GoalSessionKey, classify_goal_control,
+        };
+
+        let parsed = zeroclaw_commands::goal::parse_goal_command(command).unwrap();
+        let GoalControlClass::Normal(control) = classify_goal_control(&parsed) else {
+            panic!("fixture requires a deferred control");
+        };
+        let registry = install_paused_goal_control_fixture(ctx, path, session_id).await;
+        if control == GoalQueuedControl::Start {
+            let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+            let task = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                registry
+                    .finish_session_goal(
+                        &task.id,
+                        &key,
+                        task.execution_epoch,
+                        TaskStatus::Cancelled,
+                        Some("fixture_predecessor_finished".into()),
+                    )
+                    .await
+                    .unwrap(),
+                zeroclaw_goal::GoalTransitionResult::Applied
+            );
+        }
+        (registry, control)
+    }
+
+    pub(crate) async fn seed_goal_recovery_process() {
+        use zeroclaw_api::model_provider::ChatMessage;
+        use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
+        use zeroclaw_goal::{
+            GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTransitionResult,
+        };
+
+        let Ok(path) = std::env::var("ZEROCLAW_GOAL_RECOVERY_FIXTURE_PATH") else {
+            return;
+        };
+        let session_id = std::env::var("ZEROCLAW_GOAL_RECOVERY_FIXTURE_SESSION").unwrap();
+        let path = Path::new(&path);
+        let handle = crate::control_plane::ControlPlaneHandle::open(path).unwrap();
+        let registry = handle.goal_store().unwrap();
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(&session_id)
+            .unwrap()
+            .durable_id();
+        let task_id = format!("fixture-{session_id}");
+        assert_eq!(
+            registry
+                .create_or_replace_session_goal(
+                    TaskRecord {
+                        id: task_id.clone(),
+                        kind: TaskKind::Goal,
+                        agent: "test-agent".into(),
+                        status: TaskStatus::Running,
+                        owner_pid: std::process::id(),
+                        owner_boot_id: handle.boot_id,
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some(format!("zerocode:{session_id}")),
+                        originator_chain: vec![],
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        session_id: Some(key.clone()),
+                        execution_epoch: 1,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id: task_id.clone(),
+                        objective: "repair the bounded fixture".into(),
+                        effective_token_limit: Some(10),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        if std::env::var_os("ZEROCLAW_GOAL_RECOVERY_FIXTURE_PAUSED").is_some() {
+            assert_eq!(
+                registry
+                    .pause_session_goal(
+                        &task_id,
+                        &key,
+                        1,
+                        GoalPauseState {
+                            reason: GoalPauseReason::NeedsUserInput,
+                            description: Some("user_choice_required".into()),
+                            blockers: vec![],
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(path).unwrap();
+        use zeroclaw_infra::session_backend::SessionBackend;
+        for message in [
+            ChatMessage::user("Choose a bounded repair."),
+            ChatMessage::assistant("Which option should I use?"),
+        ] {
+            backend
+                .append(&format!("rpc_{session_id}"), &message)
+                .unwrap();
+        }
+    }
+
+    async fn prepare_cold_goal_recovery_fixture(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        was_paused: bool,
+    ) -> (Arc<dyn zeroclaw_goal::GoalTaskRegistry>, HeldGoalParent) {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+        use zeroclaw_goal::{GoalAccountingState, GoalPauseReason};
+
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "rpc::dispatch::tests::goal_restart_seed_process",
+            ])
+            .env("ZEROCLAW_GOAL_RECOVERY_FIXTURE_PATH", path)
+            .env("ZEROCLAW_GOAL_RECOVERY_FIXTURE_SESSION", session_id)
+            .env_remove("ZEROCLAW_GOAL_RECOVERY_FIXTURE_PAUSED")
+            .kill_on_drop(true);
+        if was_paused {
+            command.env("ZEROCLAW_GOAL_RECOVERY_FIXTURE_PAUSED", "1");
+        }
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+            .await
+            .expect("durable predecessor process must exit")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "predecessor failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(session_id)
+            .unwrap()
+            .durable_id();
+        let observer = crate::control_plane::ControlPlaneHandle::open(path).unwrap();
+        let before = observer
+            .goal_store()
+            .unwrap()
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.status,
+            if was_paused {
+                TaskStatus::Paused
+            } else {
+                TaskStatus::Running
+            }
+        );
+        assert_ne!(before.owner_pid, std::process::id());
+        drop(observer);
+        let owner = crate::control_plane::boot::ControlPlaneRecoveryOwner::start(path)
+            .await
+            .unwrap();
+        let recovered_registry = owner.handle().goal_store().unwrap();
+        let recovered = recovered_registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let extension = recovered_registry
+            .get_goal_task(&before.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, before.id);
+        assert_eq!(recovered.session_id, before.session_id);
+        assert_eq!(recovered.status, TaskStatus::Paused);
+        assert_eq!(
+            recovered.execution_epoch,
+            before.execution_epoch + i64::from(!was_paused)
+        );
+        assert_eq!(
+            extension.pause_reason,
+            Some(if was_paused {
+                GoalPauseReason::NeedsUserInput
+            } else {
+                GoalPauseReason::DaemonRestart
+            })
+        );
+        assert_eq!(extension.accounting_state, GoalAccountingState::Complete);
+        assert!(extension.pending_call_id.is_none() && extension.pending_call_epoch.is_none());
+        assert!(ctx.sessions.get_agent(session_id).await.is_none());
+        Arc::get_mut(ctx).unwrap().session_backend = Some(Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(path).unwrap(),
+        ));
+        {
+            let mut config = ctx.config.write();
+            config.goal.enabled = true;
+            config.goal.verifier.model_provider =
+                zeroclaw_config::providers::ModelProviderRef::new("openai.fixture");
+            let provider = config.providers.models.ensure("openai", "fixture").unwrap();
+            provider.api_key = Some("synthetic-fixture-key".into());
+            provider.model = Some("fixture-model".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.live_pricing = false;
+            config.agents.insert(
+                "test-agent".into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "openai.fixture".into(),
+                    risk_profile: "goal-fixture".into(),
+                    ..Default::default()
+                },
+            );
+            config
+                .risk_profiles
+                .insert("goal-fixture".into(), RiskProfileConfig::default());
+        }
+        let (registry, restart) =
+            install_goal_fixture_runtime(ctx, path, session_id, owner.handle().clone()).await;
+        let parent = HeldGoalParent {
+            turn: HeldOrdinaryTurn::default(),
+            ordinary: None,
+            boot_id: owner.handle().boot_id.clone(),
+            restart,
+            messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+            recovery_owner: Some(owner),
+        };
+        (registry, parent)
+    }
+
+    pub(crate) async fn install_paused_goal_control_fixture(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+    ) -> Arc<dyn zeroclaw_goal::GoalTaskRegistry> {
+        install_paused_goal_control_fixture_with_restart(ctx, path, session_id)
+            .await
+            .0
+    }
+
+    pub(super) async fn install_paused_goal_control_fixture_with_restart(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    ) {
+        use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
+        use zeroclaw_goal::control::GoalSessionKey;
+        use zeroclaw_goal::{
+            GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTransitionResult,
+        };
+
+        {
+            let mut config = ctx.config.write();
+            config.goal.enabled = true;
+            config.goal.verifier.model_provider =
+                zeroclaw_config::providers::ModelProviderRef::new("openai.fixture");
+        }
+        let handle = crate::control_plane::ControlPlaneHandle::open(path).unwrap();
+        let registry = handle.goal_store().unwrap();
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let task_id = format!("fixture-{session_id}");
+        let task = TaskRecord {
+            id: task_id.clone(),
+            kind: TaskKind::Goal,
+            agent: "test-agent".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: handle.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(format!("zerocode:{session_id}")),
+            originator_chain: vec![],
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(key.clone()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let extension = GoalTaskRecord {
+            task_id: task_id.clone(),
+            objective: "repair the bounded fixture".into(),
+            effective_token_limit: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            registry
+                .create_or_replace_session_goal(task, extension)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            registry
+                .pause_session_goal(
+                    &task_id,
+                    &key,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        install_goal_fixture_runtime(ctx, path, session_id, handle).await
+    }
+
+    async fn install_goal_fixture_runtime(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        handle: crate::control_plane::ControlPlaneHandle,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    ) {
+        use zeroclaw_goal::control::GoalRuntime;
+        let registry = handle.goal_store().unwrap();
+        let tracker = Arc::new(crate::cost::CostTracker::new(Default::default(), path).unwrap());
+        let accounting = Arc::new(
+            crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                registry.clone(),
+                tracker,
+                "test-agent",
+                Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                    Arc::default(),
+                )),
+            )
+            .unwrap(),
+        );
+        let engine = Arc::new(GoalRuntime::new(registry.clone()).execution_engine(accounting));
+        let restart = handle.goal_execution_restart();
+        let supervisor = restart.new_supervisor(engine).await;
+        ctx.goal_runtime.install_test_control_plane(handle);
+        ctx.goal_runtime
+            .install_supervisor_if_absent(session_id.into(), supervisor)
+            .await;
+        (registry, restart)
+    }
+
     pub(crate) async fn insert_session_with_owner(
         ctx: &Arc<RpcContext>,
         path: &Path,
@@ -13777,6 +15819,12 @@ pub(crate) mod connection_test_support {
 #[cfg(test)]
 mod tests {
     use zeroclaw_api::model_provider::ChatMessage;
+
+    #[tokio::test]
+    #[ignore]
+    async fn goal_restart_seed_process() {
+        super::connection_test_support::seed_goal_recovery_process().await;
+    }
 
     struct SessionFactoryStubChannel;
 
@@ -26724,6 +28772,1773 @@ mod tests {
             Some(true),
             "a refusal cannot rewrite the canonical environment",
         );
+    }
+
+    #[tokio::test]
+    async fn session_goal_boundary_try_does_not_admit_through_an_ordinary_turn() {
+        use zeroclaw_goal::control::GoalSessionDriver;
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let fixture = GoalAdmissionFixture::new(policy).await;
+            let driver = fixture
+                .driver("/goal start --unlimited Repair the bounded defect")
+                .await;
+            let queue = &fixture.dispatcher.ctx.sessions.session_queue;
+            let ordinary = queue.acquire(GoalAdmissionFixture::SESSION).await.unwrap();
+            assert!(
+                driver
+                    .try_turn_boundary(&fixture.ingress())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 1);
+            drop(ordinary);
+            let boundary = driver
+                .try_turn_boundary(&fixture.ingress())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 1);
+            assert!(
+                driver
+                    .try_turn_boundary(&fixture.ingress())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(boundary);
+            assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 0);
+            fixture.assert_no_provider_call();
+            assert!(fixture.receiver.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_pricing_matches_ordinary_alias_and_live_edit() {
+        use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, TokenUsage};
+        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+
+        const CHILD: &str = "ZEROCLAW_GOAL_PRICING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "rpc::dispatch::tests::session_goal_pricing_matches_ordinary_alias_and_live_edit"])
+                    .env(CHILD, "1").kill_on_drop(true).output(),
+            ).await.expect("isolated pricing fixture must finish").unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct PricingProvider {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl zeroclaw_api::attribution::Attributable for PricingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                DummyModelProvider.role()
+            }
+            fn alias(&self) -> &str {
+                "pricing-fixture"
+            }
+        }
+        #[async_trait]
+        impl zeroclaw_api::model_provider::ModelProvider for PricingProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("pricing fixture requires the usage-bearing chat path")
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(ChatResponse {
+                    text: Some("ordinary answer".into()),
+                    tool_calls: vec![],
+                    usage: Some(TokenUsage {
+                        input_tokens: Some(2),
+                        output_tokens: Some(1),
+                        ..Default::default()
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        struct PricingVerifier(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for PricingVerifier {
+            fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+                let decision = match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => "continue",
+                    1 => "complete",
+                    _ => panic!("no third verifier call is admitted"),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"pricing-verdict", "object":"chat.completion", "model":"fixture-verifier",
+                    "choices":[{"index":0,"finish_reason":"stop","message":{
+                        "role":"assistant", "content":json!({"decision":decision,
+                            "reason":"The declared bounded criterion is assessed.","blockers":[]}).to_string()
+                    }}], "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+                }))
+            }
+        }
+
+        let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let data_dir = fixture.dispatcher.ctx.config.read().data_dir.clone();
+        let verifier = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(PricingVerifier(std::sync::atomic::AtomicUsize::new(0)))
+            .expect(2)
+            .mount(&verifier)
+            .await;
+        {
+            let mut config = fixture.dispatcher.ctx.config.write();
+            config.cost.enabled = true;
+            config.goal.enabled = true;
+            config.goal.verifier.model_provider = "openai.fixture".into();
+            config.agents.get_mut("test-agent").unwrap().model_provider = "openai.a".into();
+            for (alias, rate) in [("a", 10.0), ("b", 20.0)] {
+                let profile = config.providers.models.ensure("openai", alias).unwrap();
+                profile.live_pricing = false;
+                profile.pricing = std::collections::HashMap::from([
+                    ("pricing-fixture.input".into(), rate),
+                    ("pricing-fixture.output".into(), rate),
+                ]);
+            }
+            let profile = config.providers.models.ensure("openai", "fixture").unwrap();
+            profile.api_key = Some("synthetic-key".into());
+            profile.uri = Some(verifier.uri());
+            profile.kind = Some("openai-compatible".into());
+            profile.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+            profile.model = Some("fixture-verifier".into());
+            profile.live_pricing = false;
+            profile.pricing = std::collections::HashMap::from([
+                ("fixture-verifier.input".into(), 1.0),
+                ("fixture-verifier.output".into(), 1.0),
+            ]);
+        }
+        let tracker = crate::cost::CostTracker::get_or_init_global_required(
+            fixture.dispatcher.ctx.config.read().cost.clone(),
+            &data_dir,
+        )
+        .unwrap();
+        Arc::get_mut(&mut fixture.dispatcher.ctx)
+            .unwrap()
+            .cost_tracker = Some(Arc::clone(&tracker));
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let handle = crate::control_plane::ControlPlaneHandle::open(&data_dir).unwrap();
+        let registry = handle.goal_store().unwrap();
+        context.goal_runtime.install_test_control_plane(handle);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(PricingProvider {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }))
+            .model_name("pricing-fixture".into())
+            .model_provider_name("openai.a".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(data_dir.clone())
+            .build()
+            .unwrap();
+        *context
+            .sessions
+            .get_agent(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap()
+            .lock()
+            .await = agent;
+
+        for after_goal in [false, true] {
+            let dispatcher = fixture.dispatcher.spawn_handle();
+            let prompt = zeroclaw_spawn::spawn!(async move {
+                dispatcher.handle_session_prompt(&json!({"session_id":GoalAdmissionFixture::SESSION,"prompt":"ordinary work"})).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(&fixture.receiver.recv().await.unwrap()).unwrap();
+                    if frame["method"] == "session/update" {
+                        let event: SessionUpdateEvent =
+                            serde_json::from_value(frame["params"].clone()).unwrap();
+                        if let SessionUpdateEvent::TurnComplete {
+                            session_id,
+                            outcome,
+                            ..
+                        } = event
+                        {
+                            assert_eq!(session_id, GoalAdmissionFixture::SESSION);
+                            assert_eq!(outcome, TurnCompletionOutcome::Completed);
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("ordinary completion must reach its normal surface");
+            if after_goal {
+                break;
+            }
+            let (value, command) = fixture.dispatcher.handle_session_goal(&json!({
+                "session_id":GoalAdmissionFixture::SESSION,"command":"/goal start --unlimited Complete two bounded checks.",
+            })).await.unwrap();
+            assert!(matches!(command.response(), GoalResponse::Started(_)));
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            tokio::time::timeout(std::time::Duration::from_secs(2), command.after_response())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let first_attempt = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let resident = context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            let second_attempt = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(second_attempt.id, first_attempt.id);
+            assert_eq!(
+                second_attempt.execution_epoch,
+                first_attempt.execution_epoch
+            );
+            assert_eq!(
+                second_attempt.status,
+                zeroclaw_api::task::TaskStatus::Running
+            );
+            assert!(Arc::ptr_eq(
+                &resident,
+                &context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap()
+            ));
+            // The first priced attempt has settled; the same epoch's second
+            // parent request is held while its live ordinary pricing changes.
+            {
+                let mut config = context.config.write();
+                let profile = config.providers.models.ensure("openai", "a").unwrap();
+                for value in profile.pricing.values_mut() {
+                    *value = 30.0;
+                }
+            }
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(&fixture.receiver.recv().await.unwrap()).unwrap();
+                    if frame["method"] == "session/goal_update" {
+                        let update: SessionGoalUpdate =
+                            serde_json::from_value(frame["params"].clone()).unwrap();
+                        match update {
+                            SessionGoalUpdate::Completed { session_id } => {
+                                assert_eq!(session_id, GoalAdmissionFixture::SESSION);
+                                break;
+                            }
+                            SessionGoalUpdate::Failed { .. } => {
+                                panic!("pricing fixture must not fail: {frame}");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("valid completion must stop the Goal before the next ordinary turn");
+        }
+        let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let task = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Completed);
+        let contents = std::fs::read_to_string(data_dir.join("state/costs.jsonl")).unwrap();
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let parent_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.usage.model == "pricing-fixture")
+            .collect();
+        assert_eq!(parent_records.len(), 4);
+        assert_eq!(
+            parent_records
+                .iter()
+                .map(|record| record.task_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some(task.id.as_str()), Some(task.id.as_str()), None]
+        );
+        for record in &parent_records {
+            assert_eq!(
+                (record.usage.input_tokens, record.usage.output_tokens),
+                (2, 1)
+            );
+            assert_eq!(record.agent_alias.as_deref(), Some("test-agent"));
+            // Ordinary lower-bound rows do not carry attempt metadata; Goal
+            // rows retain their explicit admitted provider reference.
+            assert_eq!(
+                record.provider_ref.as_deref(),
+                record.task_id.as_ref().map(|_| "openai.a")
+            );
+            assert!(record.usage.pricing_available);
+            assert_eq!(record.usage.unpriced_tokens, 0);
+            assert_eq!(record.session_id, parent_records[0].session_id);
+        }
+        assert_eq!(
+            parent_records[0].usage.cost_usd, parent_records[1].usage.cost_usd,
+            "the first Goal attempt must use its ordinary alias rate, not its sibling's"
+        );
+        assert_eq!(
+            parent_records[2].usage.cost_usd, parent_records[3].usage.cost_usd,
+            "the same resident supervisor must price the next attempt from live ordinary config"
+        );
+        assert!(parent_records[3].usage.cost_usd > parent_records[0].usage.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn session_goal_post_wait_restart_refusal_reports_once_after_acknowledgement() {
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let mut fixture = GoalAdmissionFixture::new(policy).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let (registry, restart) =
+                connection_test_support::install_paused_goal_control_fixture_with_restart(
+                    &context,
+                    &data_dir,
+                    GoalAdmissionFixture::SESSION,
+                )
+                .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let extension = registry.get_goal_task(&before.id).await.unwrap().unwrap();
+            let generation = context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await;
+            let ordinary = context
+                .sessions
+                .session_queue
+                .acquire(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let (value, control) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "command": "/goal resume",
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                control.response(),
+                &GoalResponse::Queued(GoalQueuedControl::Resume)
+            );
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            let acknowledgement: Value =
+                serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(acknowledgement["id"], 1);
+            assert!(fixture.receiver.is_empty());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *context
+                .goal_runtime
+                .test_deferred_commit_pause
+                .lock()
+                .unwrap() = Some(crate::rpc::goal::GoalTestDeferredCommitPause {
+                session_id: GoalAdmissionFixture::SESSION.into(),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+            drop(ordinary);
+            let continuation =
+                zeroclaw_spawn::spawn!(async move { control.after_response().await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                .await
+                .expect("deferred wait must acquire the actual boundary before restart");
+            assert!(
+                fixture.receiver.is_empty(),
+                "no final precedes the post-wait commit"
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                restart.quiesce_for_restart(),
+            )
+            .await
+            .expect("restart must not deadlock on a ready control")
+            .unwrap();
+            release.notify_one();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), continuation)
+                .await
+                .expect("restart refusal must settle the control")
+                .unwrap()
+                .expect_err("the actual restart gate must refuse the deferred resume commit");
+            assert!(format!("{error:#}").contains("quiescing for daemon restart"));
+            let final_frame: Value =
+                serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(final_frame["method"], "session/goal_update");
+            assert_eq!(
+                final_frame["params"],
+                json!({
+                    "command_failed": {"session_id": GoalAdmissionFixture::SESSION}
+                })
+            );
+            assert!(
+                fixture.receiver.is_empty(),
+                "one command final, no launch notice"
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(
+                registry.get_goal_task(&before.id).await.unwrap().unwrap(),
+                extension
+            );
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            let settled: (String, Option<String>) = connection
+                .query_row(
+                    "SELECT state, outcome_reason FROM goal_control_intents WHERE session_id = ?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                settled,
+                ("abandoned".into(), Some("refused_admission".into()))
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .get_generation(GoalAdmissionFixture::SESSION)
+                    .await,
+                generation
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+            fixture.assert_no_provider_call();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_deferred_settings_failure_reports_once_after_acknowledgement() {
+        assert_goal_deferred_failure_after_acknowledgement(GoalDeferredFixtureFailure::Settings)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_deferred_claim_failure_reports_once_after_acknowledgement() {
+        assert_goal_deferred_failure_after_acknowledgement(GoalDeferredFixtureFailure::Claim).await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_deferred_controller_failure_reports_once_after_acknowledgement() {
+        assert_goal_deferred_failure_after_acknowledgement(GoalDeferredFixtureFailure::Controller)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_disposal_failure_keeps_private_detail_out_of_rpc_errors() {
+        use zeroclaw_goal::control::GoalSessionKey;
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            for method in [
+                Method::SessionClose,
+                Method::SessionDelete,
+                Method::SessionKill,
+                Method::SessionNew,
+            ] {
+                let fixture = GoalAdmissionFixture::new(policy).await;
+                let context = Arc::clone(&fixture.dispatcher.ctx);
+                let data_dir = context.config.read().data_dir.clone();
+                let registry = connection_test_support::install_paused_goal_control_fixture(
+                    &context,
+                    &data_dir,
+                    GoalAdmissionFixture::SESSION,
+                )
+                .await;
+                let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                    .unwrap()
+                    .durable_id();
+                let before = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let generation = context
+                    .sessions
+                    .get_generation(GoalAdmissionFixture::SESSION)
+                    .await;
+                let supervisor = context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap();
+                let connection =
+                    rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fixture_refuse_goal_disposal
+                     BEFORE UPDATE OF status ON tasks
+                     WHEN NEW.kind = 'goal' AND NEW.status = 'cancelled'
+                     BEGIN SELECT RAISE(ABORT, 'private fixture disposal detail'); END;",
+                    )
+                    .unwrap();
+                let params = json!({"session_id": GoalAdmissionFixture::SESSION});
+                let result = match method {
+                    Method::SessionClose => fixture.dispatcher.handle_session_close(&params).await,
+                    Method::SessionDelete => {
+                        fixture.dispatcher.handle_session_delete(&params).await
+                    }
+                    Method::SessionKill => fixture.dispatcher.handle_session_kill(&params).await,
+                    Method::SessionNew => {
+                        fixture
+                            .dispatcher
+                            .handle_session_new_for_test(&json!({
+                                "agent_alias": "test-agent",
+                                "session_id": GoalAdmissionFixture::SESSION,
+                                "chat_mode": "acp",
+                            }))
+                            .await
+                    }
+                    _ => unreachable!("fixture covers removal and replacement handlers"),
+                };
+                let error = result
+                    .expect_err("the real disposal transition must reject the injected fault");
+                assert_eq!(error.code, INTERNAL_ERROR);
+                assert_eq!(
+                    error.message,
+                    "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+                );
+                assert!(
+                    !serde_json::to_string(&error)
+                        .unwrap()
+                        .contains("private fixture disposal detail")
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        registry
+                            .current_goal_for_session(&key)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert_eq!(
+                    context
+                        .sessions
+                        .get_generation(GoalAdmissionFixture::SESSION)
+                        .await,
+                    generation
+                );
+                assert!(Arc::ptr_eq(
+                    &supervisor,
+                    &context
+                        .goal_runtime
+                        .supervisor(GoalAdmissionFixture::SESSION)
+                        .await
+                        .unwrap()
+                ));
+                assert_eq!(
+                    context
+                        .sessions
+                        .session_queue
+                        .queue_depth(GoalAdmissionFixture::SESSION)
+                        .await,
+                    0
+                );
+                fixture.assert_no_provider_call();
+                assert!(
+                    fixture.receiver.is_empty(),
+                    "a refused disposal must not publish a lifecycle success"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_eviction_disposal_failure_preserves_sibling_and_private_detail() {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::control::GoalSessionKey;
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let mut fixture = GoalAdmissionFixture::new(policy).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let paused = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                registry
+                    .finish_session_goal(
+                        &paused.id,
+                        &key,
+                        paused.execution_epoch,
+                        TaskStatus::Completed,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                zeroclaw_goal::GoalTransitionResult::Applied
+            );
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let generation = context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await;
+            let supervisor = context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            assert!(supervisor.try_retire().await);
+            context
+                .goal_runtime
+                .remove_supervisor_if_current(GoalAdmissionFixture::SESSION, &supervisor)
+                .await;
+            assert!(
+                context
+                    .goal_runtime
+                    .can_evict_session_goal(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap()
+            );
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            assert_eq!(
+                connection
+                    .execute("DELETE FROM goal_tasks WHERE task_id = ?1", [&before.id])
+                    .unwrap(),
+                1
+            );
+            let error = fixture
+                .dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "chat",
+                }))
+                .await
+                .expect_err("the actual same-mode eviction must propagate disposal failure");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(
+                error.message,
+                "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+            );
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("Goal extension disappeared")
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .get_generation(GoalAdmissionFixture::SESSION)
+                    .await,
+                generation
+            );
+            assert!(
+                context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                context
+                    .sessions
+                    .get_agent(GoalAdmissionFixture::SESSION)
+                    .await
+                    .is_some()
+            );
+            // Session creation precedes the sibling sweep; disposal failure does
+            // not retroactively erase the newly created ordinary session.
+            let survivors = context.sessions.list_ids().await;
+            assert_eq!(survivors.len(), 2);
+            assert!(
+                survivors
+                    .iter()
+                    .any(|id| id != GoalAdmissionFixture::SESSION)
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+            fixture.assert_no_provider_call();
+            while let Ok(frame) = fixture.receiver.try_recv() {
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                assert_ne!(frame["method"], "session/goal_update");
+                assert_ne!(frame["method"], "session/closed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_stale_launch_failure_reports_only_command_error() {
+        assert_goal_unreported_launch_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_launch_reconciliation_failure_reports_only_command_error() {
+        assert_goal_unreported_launch_failure(false).await;
+    }
+
+    async fn assert_goal_unreported_launch_failure(stale: bool) {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let mut fixture = GoalAdmissionFixture::new(policy).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let generation = context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await;
+            let (value, control) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION, "command": "/goal resume",
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(control.response(), GoalResponse::Resumed(_)));
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            let acknowledgement: Value =
+                serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(acknowledgement["id"], 1);
+            assert!(fixture.receiver.is_empty());
+            let admitted = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(admitted.status, TaskStatus::Running);
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            if stale {
+                assert_eq!(
+                    registry
+                        .finish_session_goal(
+                            &admitted.id,
+                            &key,
+                            admitted.execution_epoch,
+                            TaskStatus::Cancelled,
+                            Some("fixture_competing_cancel".into()),
+                        )
+                        .await
+                        .unwrap(),
+                    zeroclaw_goal::GoalTransitionResult::Applied
+                );
+            } else {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fixture_refuse_goal_failure
+                     BEFORE UPDATE OF status ON tasks
+                     WHEN NEW.kind = 'goal' AND NEW.status = 'failed'
+                     BEGIN SELECT RAISE(ABORT, 'private fixture reconciliation detail'); END;",
+                    )
+                    .unwrap();
+            }
+            let before_failure = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            context.goal_runtime.fail_test_next_bind(key.clone());
+            let error =
+                tokio::time::timeout(std::time::Duration::from_secs(2), control.after_response())
+                    .await
+                    .expect("failed launch must settle the command")
+                    .expect_err("injected bind/reconciliation failure must be propagated");
+            assert!(!error.is::<zeroclaw_goal::control::GoalLaunchFailureReported>());
+            assert!(format!("{error:#}").contains(if stale {
+                "private fixture launch bind detail"
+            } else {
+                "private fixture reconciliation detail"
+            }));
+            let frame: Value = serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(frame["method"], "session/goal_update");
+            assert_eq!(
+                frame["params"],
+                json!({"command_failed": {"session_id": GoalAdmissionFixture::SESSION}})
+            );
+            assert!(
+                fixture.receiver.is_empty(),
+                "no failure notice or duplicate final is allowed"
+            );
+            let after = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before_failure).unwrap()
+            );
+            assert_eq!(
+                registry
+                    .terminal_reason_for_session_goal(&after.id, &key)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                stale.then_some("fixture_competing_cancel")
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .get_generation(GoalAdmissionFixture::SESSION)
+                    .await,
+                generation
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+            fixture.assert_no_provider_call();
+            if !stale {
+                connection
+                    .execute_batch("DROP TRIGGER fixture_refuse_goal_failure")
+                    .unwrap();
+                context
+                    .goal_runtime
+                    .dispose_session(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GoalDeferredFixtureFailure {
+        Settings,
+        Claim,
+        Controller,
+    }
+
+    async fn assert_goal_deferred_failure_after_acknowledgement(
+        failure: GoalDeferredFixtureFailure,
+    ) {
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let mut fixture = GoalAdmissionFixture::new(policy).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let extension = registry.get_goal_task(&before.id).await.unwrap().unwrap();
+            let ordinary = context
+                .sessions
+                .session_queue
+                .acquire(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let (value, control) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "command": "/goal budget set --tokens 100",
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                control.response(),
+                &GoalResponse::Queued(GoalQueuedControl::Budget)
+            );
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            let acknowledgement: Value =
+                serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(acknowledgement["id"], 1);
+            assert!(
+                fixture.receiver.is_empty(),
+                "no final may precede the turn boundary"
+            );
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            let expected_detail = match failure {
+                GoalDeferredFixtureFailure::Settings => {
+                    context.config.write().goal.default_cost_limit_usd = -1.0;
+                    "invalid Goal default limits"
+                }
+                GoalDeferredFixtureFailure::Claim => {
+                    connection
+                        .execute_batch(
+                            "CREATE TRIGGER fixture_refuse_goal_claim
+                         BEFORE UPDATE OF state ON goal_control_intents
+                         WHEN NEW.state = 'claimed'
+                         BEGIN SELECT RAISE(ABORT, 'private fixture claim detail'); END;",
+                        )
+                        .unwrap();
+                    "private fixture claim detail"
+                }
+                GoalDeferredFixtureFailure::Controller => {
+                    connection
+                        .execute_batch(
+                            "CREATE TRIGGER fixture_refuse_goal_budget
+                         BEFORE UPDATE OF effective_token_limit ON goal_tasks
+                         WHEN NEW.effective_token_limit = 100
+                         BEGIN SELECT RAISE(ABORT, 'private fixture budget detail'); END;",
+                        )
+                        .unwrap();
+                    "private fixture budget detail"
+                }
+            };
+            drop(ordinary);
+            let error =
+                tokio::time::timeout(std::time::Duration::from_secs(2), control.after_response())
+                    .await
+                    .expect("failed deferred control must finish without launching work")
+                    .expect_err("the injected boundary fault must reject the command");
+            assert!(format!("{error:#}").contains(expected_detail), "{error:#}");
+            let final_frame: Value = serde_json::from_str(
+                &fixture
+                    .receiver
+                    .try_recv()
+                    .expect("acknowledged command failure must reach the user"),
+            )
+            .unwrap();
+            assert_eq!(final_frame["method"], "session/goal_update");
+            assert_eq!(
+                final_frame["params"],
+                json!({"command_failed": {"session_id": GoalAdmissionFixture::SESSION}})
+            );
+            assert!(
+                fixture.receiver.is_empty(),
+                "the command failure must be reported once"
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(
+                registry
+                    .get_goal_task(&extension.task_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                extension
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let settled: (String, Option<String>) = connection.query_row(
+                        "SELECT state, outcome_reason FROM goal_control_intents WHERE session_id = ?1",
+                        [&key], |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    if settled.0 == "abandoned" {
+                        assert_eq!(settled.1.as_deref(), Some("control_dropped"));
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("post-wait failure must abandon its intent");
+            fixture.assert_no_provider_call();
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_remote_replacement_preserves_successor_custody() {
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        for successor_owner in [GoalAdmissionFixture::OWNER, "successor-owner"] {
+            let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let sessions = Arc::clone(&context.sessions);
+            let original_generation = sessions.get_generation(GoalAdmissionFixture::SESSION).await;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *sessions.test_goal_replacement_capture_pause.lock().unwrap() =
+                Some((Arc::clone(&entered), Arc::clone(&release)));
+            let dispatcher = fixture.dispatcher.spawn_handle();
+            let replacement = zeroclaw_spawn::spawn!(async move {
+                dispatcher
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "session_id": GoalAdmissionFixture::SESSION,
+                        "chat_mode": "acp",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                .await
+                .expect("replacement must capture the original incarnation");
+            assert!(sessions.remove(GoalAdmissionFixture::SESSION).await);
+            let data_dir = context.config.read().data_dir.clone();
+            connection_test_support::insert_session_with_owner(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+                Box::new(DummyModelProvider),
+                Some(successor_owner),
+            )
+            .await;
+            let generation = sessions.get_generation(GoalAdmissionFixture::SESSION).await;
+            assert_ne!(generation, original_generation);
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let owner = context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            fixture
+                .dispatcher
+                .set_tui_id_for_test(Some(successor_owner.into()));
+            let ordinary = sessions
+                .session_queue
+                .acquire(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let (_, control) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "command": "/goal budget set --tokens 100",
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                control.response(),
+                &GoalResponse::Queued(GoalQueuedControl::Budget)
+            );
+            release.notify_one();
+            if successor_owner == GoalAdmissionFixture::OWNER {
+                wait_for_session_admission_waiter(&context, GoalAdmissionFixture::SESSION).await;
+            }
+            drop(ordinary);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), replacement)
+                .await
+                .expect("stale replacement must finish")
+                .unwrap()
+                .expect_err("entry authority cannot authorize a successor incarnation");
+            assert_eq!(error.code, SESSION_NOT_OWNED);
+            assert_eq!(
+                sessions.get_generation(GoalAdmissionFixture::SESSION).await,
+                generation
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert!(Arc::ptr_eq(
+                &owner,
+                &context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap()
+            ));
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            let pending: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_control_intents WHERE state = 'pending'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                pending, 1,
+                "stale replacement must not close successor controls"
+            );
+            control.after_response().await.unwrap();
+            fixture.assert_no_provider_call();
+            assert_eq!(
+                sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_remote_replacement_refuses_before_disposal() {
+        use zeroclaw_goal::control::GoalSessionKey;
+
+        for local_capability in [false, true] {
+            let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+                .unwrap()
+                .durable_id();
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let owner = context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let generation = context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await;
+            if local_capability {
+                fixture.add_local_capability().await;
+            } else {
+                fixture
+                    .dispatcher
+                    .set_tui_id_for_test(Some("different-owner".into()));
+            }
+            let ordinary = context
+                .sessions
+                .session_queue
+                .acquire(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fixture.dispatcher.handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "chat_mode": "acp",
+                })),
+            )
+            .await
+            .expect("pre-check refusal must not wait for the held actor permit")
+            .expect_err("a refused remote replacement must not dispose the Goal");
+            assert_eq!(error.code, SESSION_NOT_OWNED);
+            if local_capability {
+                assert_eq!(
+                    error.message,
+                    "Remote caller cannot use this session's local capabilities"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(before).unwrap(),
+            );
+            assert!(Arc::ptr_eq(
+                &owner,
+                &context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap()
+            ));
+            assert_eq!(
+                context
+                    .sessions
+                    .get_generation(GoalAdmissionFixture::SESSION)
+                    .await,
+                generation
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                1
+            );
+            fixture.assert_no_provider_call();
+            assert!(fixture.receiver.is_empty());
+            drop(ordinary);
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_idle_pause_cleanup_preserves_a_pending_control_for_disposal() {
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let data_dir = context.config.read().data_dir.clone();
+        let registry = connection_test_support::install_paused_goal_control_fixture(
+            &context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let owner = context
+            .goal_runtime
+            .supervisor(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let ordinary = context
+            .sessions
+            .session_queue
+            .acquire(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let (value, queued) = fixture
+            .dispatcher
+            .handle_session_goal(&json!({
+                "session_id": GoalAdmissionFixture::SESSION,
+                "command": "/goal budget set --tokens 100",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            queued.response(),
+            &GoalResponse::Queued(GoalQueuedControl::Budget)
+        );
+        assert!(fixture.dispatcher.send_result(json!(1), value).await);
+        let mut waiting = Box::pin(queued.after_response());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut waiting => {
+                    panic!("queued control completed before boundary registration: {result:?}");
+                }
+                () = async {
+                    while context.sessions.session_queue
+                        .queue_depth(GoalAdmissionFixture::SESSION).await != 2
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            context
+                .sessions
+                .session_queue
+                .queue_depth(GoalAdmissionFixture::SESSION)
+                .await,
+            2
+        );
+
+        let (value, pause) = fixture
+            .dispatcher
+            .handle_session_goal(&json!({
+                "session_id": GoalAdmissionFixture::SESSION,
+                "command": "/goal pause now",
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(pause.response(), GoalResponse::AlreadyPaused(_)));
+        assert!(fixture.dispatcher.send_result(json!(2), value).await);
+        pause.after_response().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &owner,
+            &context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .expect("pending custody must keep its supervisor resident"),
+        ));
+
+        let generation = context
+            .sessions
+            .get_generation(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let lifecycle = context
+            .sessions
+            .lock_goal_lifecycle(GoalAdmissionFixture::SESSION, generation)
+            .await
+            .unwrap();
+        context
+            .goal_runtime
+            .dispose_session(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        drop(lifecycle);
+        let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiting.as_mut()).await;
+        assert!(
+            completion.is_ok(),
+            "disposal must close the queued control before the ordinary permit releases"
+        );
+        assert_eq!(
+            context
+                .sessions
+                .session_queue
+                .queue_depth(GoalAdmissionFixture::SESSION)
+                .await,
+            1
+        );
+        drop(waiting);
+        drop(ordinary);
+        assert_eq!(
+            context
+                .sessions
+                .session_queue
+                .queue_depth(GoalAdmissionFixture::SESSION)
+                .await,
+            0
+        );
+        fixture.assert_no_provider_call();
+    }
+
+    #[tokio::test]
+    async fn session_goal_idle_pause_cleanup_retires_an_idle_supervisor() {
+        use zeroclaw_goal::control::GoalResponse;
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let fixture = GoalAdmissionFixture::new(policy).await;
+            let context = &fixture.dispatcher.ctx;
+            let data_dir = context.config.read().data_dir.clone();
+            connection_test_support::install_paused_goal_control_fixture(
+                context,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let (value, pause) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "command": "/goal pause now",
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(pause.response(), GoalResponse::AlreadyPaused(_)));
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            pause.after_response().await.unwrap();
+            assert!(
+                context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                context
+                    .sessions
+                    .session_queue
+                    .queue_depth(GoalAdmissionFixture::SESSION)
+                    .await,
+                0
+            );
+            fixture.assert_no_provider_call();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_retired_owner_is_reselected_before_queued_intent_admission() {
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        const CHILD: &str = "ZEROCLAW_GOAL_RETIRED_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The production factory uses the canonical process-wide ledger;
+            // isolate its temporary directory from other tests' ledger owners.
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "rpc::dispatch::tests::session_goal_retired_owner_is_reselected_before_queued_intent_admission",
+                    ])
+                    .env(CHILD, "1")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("isolated admission must finish")
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = &fixture.dispatcher.ctx;
+        let data_dir = context.config.read().data_dir.clone();
+        connection_test_support::install_paused_goal_control_fixture(
+            context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let retired = context
+            .goal_runtime
+            .supervisor(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        assert!(retired.try_retire().await);
+        let ordinary = context
+            .sessions
+            .session_queue
+            .acquire(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let (value, budget) = fixture
+            .dispatcher
+            .handle_session_goal(&json!({
+                "session_id": GoalAdmissionFixture::SESSION,
+                "command": "/goal budget set --tokens 100",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            budget.response(),
+            &GoalResponse::Queued(GoalQueuedControl::Budget)
+        );
+        let replacement = context
+            .goal_runtime
+            .supervisor(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&retired, &replacement));
+        let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+        let (total, pending): (u64, u64) = connection.query_row(
+            "SELECT count(*), sum(state = 'pending') FROM goal_control_intents WHERE session_id = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((total, pending), (1, 1));
+        assert!(fixture.dispatcher.send_result(json!(1), value).await);
+        drop(ordinary);
+        tokio::time::timeout(std::time::Duration::from_secs(2), budget.after_response())
+            .await
+            .unwrap()
+            .unwrap();
+        let (total, applied): (u64, u64) = connection.query_row(
+            "SELECT count(*), sum(state = 'applied') FROM goal_control_intents WHERE session_id = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((total, applied), (1, 1));
+        assert_eq!(
+            context
+                .sessions
+                .session_queue
+                .queue_depth(GoalAdmissionFixture::SESSION)
+                .await,
+            0
+        );
+        fixture.assert_no_provider_call();
+    }
+
+    #[tokio::test]
+    async fn session_goal_boundary_wait_closure_releases_its_registration() {
+        use zeroclaw_goal::control::GoalSessionDriver;
+
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let driver = fixture.driver("/goal pause").await;
+        let queue = &fixture.dispatcher.ctx.sessions.session_queue;
+        let ordinary = queue.acquire(GoalAdmissionFixture::SESSION).await.unwrap();
+        let checkpoint = zeroclaw_goal::GoalParentTurnCheckpoint::new();
+        let ingress = fixture.ingress();
+        let mut waiting = Box::pin(driver.await_turn_boundary(&ingress, &checkpoint));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx))
+            })
+            .await
+            .is_pending()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 2);
+        checkpoint.close();
+        let Err(error) = waiting.await else {
+            panic!("a closed checkpoint must not admit a boundary");
+        };
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::GoalCheckpointClosed>()
+                .is_some()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 1);
+        drop(ordinary);
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 0);
+        let Err(error) = driver.await_turn_boundary(&ingress, &checkpoint).await else {
+            panic!("closure must win even when the session permit is free");
+        };
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::GoalCheckpointClosed>()
+                .is_some()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 0);
+        fixture.assert_no_provider_call();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_goal_boundary_wait_rereserves_after_the_ordinary_timeout() {
+        use zeroclaw_goal::control::GoalSessionDriver;
+
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let driver = fixture.driver("/goal pause").await;
+        let queue = &fixture.dispatcher.ctx.sessions.session_queue;
+        let ordinary = queue.acquire(GoalAdmissionFixture::SESSION).await.unwrap();
+        let checkpoint = zeroclaw_goal::GoalParentTurnCheckpoint::new();
+        let ingress = fixture.ingress();
+        let mut waiting = Box::pin(driver.await_turn_boundary(&ingress, &checkpoint));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx))
+            })
+            .await
+            .is_pending()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 2);
+
+        // The existing fixture queue times out at ten seconds. Each expiry
+        // must withdraw the old reservation before registering its successor.
+        for _ in 0..2 {
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx))
+                })
+                .await
+                .is_pending()
+            );
+            assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 2);
+        }
+        drop(ordinary);
+        let boundary = waiting.await.unwrap();
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 1);
+        drop(boundary);
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 0);
+        fixture.assert_no_provider_call();
+        assert!(fixture.receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_goal_boundary_wait_drop_withdraws_its_fifo_position() {
+        use zeroclaw_goal::control::GoalSessionDriver;
+
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let driver = fixture.driver("/goal pause").await;
+        let queue = &fixture.dispatcher.ctx.sessions.session_queue;
+        let ordinary = queue.acquire(GoalAdmissionFixture::SESSION).await.unwrap();
+        let checkpoint = zeroclaw_goal::GoalParentTurnCheckpoint::new();
+        let ingress = fixture.ingress();
+        let mut waiting = Box::pin(driver.await_turn_boundary(&ingress, &checkpoint));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx))
+            })
+            .await
+            .is_pending()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 2);
+        drop(waiting);
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 1);
+        drop(ordinary);
+        assert!(
+            queue
+                .try_acquire(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(queue.queue_depth(GoalAdmissionFixture::SESSION).await, 0);
+        fixture.assert_no_provider_call();
     }
 
     #[tokio::test]
