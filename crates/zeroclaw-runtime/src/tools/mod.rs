@@ -10,6 +10,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
@@ -996,7 +997,6 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 

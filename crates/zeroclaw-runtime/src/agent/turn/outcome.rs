@@ -97,7 +97,10 @@ enum StreamInterruptionCause {
         policy: zeroclaw_providers::TerminalCompletionPolicy,
         source: Option<anyhow::Error>,
     },
-    SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
+    SemanticEmpty {
+        failure: zeroclaw_api::model_provider::SemanticEmptyTerminalFailure,
+        source: Option<anyhow::Error>,
+    },
     ReliableProvider {
         message: String,
         usage: Option<zeroclaw_providers::traits::TokenUsage>,
@@ -162,7 +165,27 @@ impl StreamInterruptedAfterOutput {
     ) -> Self {
         Self {
             partial_text,
-            cause: StreamInterruptionCause::SemanticEmpty(failure),
+            cause: StreamInterruptionCause::SemanticEmpty {
+                failure,
+                source: None,
+            },
+        }
+    }
+
+    /// Keep the no-final-response projection authoritative for delivery and
+    /// accounting, while retaining the interrupted transport as diagnostic
+    /// evidence. Provider-side work cannot acquire replay permission from it.
+    pub(crate) fn semantic_empty_with_source(
+        partial_text: String,
+        failure: zeroclaw_api::model_provider::SemanticEmptyTerminalFailure,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::SemanticEmpty {
+                failure,
+                source: Some(source),
+            },
         }
     }
 
@@ -188,7 +211,7 @@ impl StreamInterruptedAfterOutput {
         match &self.cause {
             StreamInterruptionCause::Transport { usage, .. } => usage.as_ref(),
             StreamInterruptionCause::Terminal { failure, .. } => failure.usage.as_ref(),
-            StreamInterruptionCause::SemanticEmpty(failure) => failure.usage.as_ref(),
+            StreamInterruptionCause::SemanticEmpty { failure, .. } => failure.usage.as_ref(),
             StreamInterruptionCause::ReliableProvider { usage, .. } => usage.as_ref(),
         }
     }
@@ -201,7 +224,7 @@ impl StreamInterruptedAfterOutput {
         match &self.cause {
             StreamInterruptionCause::Terminal { policy, .. } => Some(*policy),
             StreamInterruptionCause::Transport { .. }
-            | StreamInterruptionCause::SemanticEmpty(_)
+            | StreamInterruptionCause::SemanticEmpty { .. }
             | StreamInterruptionCause::ReliableProvider { .. } => None,
         }
     }
@@ -212,7 +235,13 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
         match &self.cause {
             StreamInterruptionCause::Transport { message, .. } => f.write_str(message),
             StreamInterruptionCause::Terminal { failure, .. } => failure.fmt(f),
-            StreamInterruptionCause::SemanticEmpty(failure) => failure.fmt(f),
+            StreamInterruptionCause::SemanticEmpty { failure, source } => {
+                failure.fmt(f)?;
+                if let Some(source) = source {
+                    write!(f, ": {source:#}")?;
+                }
+                Ok(())
+            }
             StreamInterruptionCause::ReliableProvider { message, .. } => f.write_str(message),
         }
     }
@@ -228,7 +257,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
                 .as_deref()
                 .map(|source| source as &(dyn std::error::Error + 'static))
                 .or(Some(failure)),
-            StreamInterruptionCause::SemanticEmpty(failure) => Some(failure),
+            StreamInterruptionCause::SemanticEmpty { failure, .. } => Some(failure),
             StreamInterruptionCause::ReliableProvider { failure, .. } => Some(failure),
         }
     }
@@ -334,28 +363,6 @@ impl std::fmt::Display for StreamSemanticEmptyCompletion {
 }
 
 impl std::error::Error for StreamSemanticEmptyCompletion {}
-
-/// A stream failed before exposing output, after the provider reported usage.
-/// Keep that usage through the recovery boundary so the fallback cannot hide
-/// a billed failed attempt.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    pub(crate) source: anyhow::Error,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
 
 /// A non-streaming provider response that cannot complete a turn because it
 /// exposes neither a final answer nor a tool call. Keep this typed through the
@@ -1189,14 +1196,10 @@ mod tests {
 
     #[test]
     fn streamed_refusal_cause_projects_safety_guidance() {
-        let error = anyhow::Error::new(StreamErrorWithUsage {
-            message: "model_provider stream error: refusal".to_string(),
-            usage: None,
-            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
-                private_refusal(),
-            ))
-            .into(),
-        });
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ))
+        .context("model_provider stream error: refusal");
 
         let message = terminal_completion_error_message_in_english(&error, None)
             .expect("a streamed refusal must project a user-facing message");
