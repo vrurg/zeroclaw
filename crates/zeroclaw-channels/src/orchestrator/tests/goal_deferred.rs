@@ -1,5 +1,274 @@
 use super::*;
 
+/// Fail the predecessor through the ordinary model boundary, then hold a
+/// successor so the command's launch and cleanup can be observed separately.
+#[derive(Default)]
+struct GoalFailedPredecessorProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    successor_release: tokio::sync::Notify,
+}
+
+impl zeroclaw_api::attribution::Attributable for GoalFailedPredecessorProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Custom,
+        ))
+    }
+
+    fn alias(&self) -> &str {
+        "failed-predecessor-fixture"
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for GoalFailedPredecessorProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+        _: Option<f64>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("fixture requires the structured model boundary")
+    }
+
+    async fn chat(
+        &self,
+        _: zeroclaw_api::model_provider::ChatRequest<'_>,
+        _: &str,
+        _: Option<f64>,
+    ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+        match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => anyhow::bail!("scripted parent failure"),
+            1 => self.successor_release.notified().await,
+            _ => anyhow::bail!("fixture must admit no extra parent call"),
+        }
+        Ok(zeroclaw_api::model_provider::ChatResponse {
+            text: Some("successor candidate".into()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_record() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_record
+    ))
+    .await
+    {
+        return;
+    }
+    use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+    use zeroclaw_goal::{GoalExecutionScope, GoalResponse, GoalRuntime};
+    use zeroclaw_runtime::{
+        control_plane::{ControlPlaneHandle, TaskStatus},
+        cost::CostTracker,
+        goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let handle = ControlPlaneHandle::open(directory.path()).unwrap();
+    let registry = handle.goal_store().unwrap();
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(GoalFailedPredecessorProvider::default());
+    let mut config = matrix_control_test_config();
+    config.data_dir = directory.path().to_owned();
+    config.goal.enabled = true;
+    config.goal.verifier.model_provider = "custom.fixture".into();
+    config.reliability.provider_retries = 0;
+    let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        config,
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    Arc::get_mut(&mut context).unwrap().session_store = Some(Arc::new(
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
+    ));
+    let message = matrix_msg("@fixture:example.test");
+    let key = runtime_conversation_history_key(&context, &message);
+    foreground::install_goal_test_control_plane(&context.persist_locks, &key, handle.clone());
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            registry.clone(),
+            tracker,
+            context.agent_alias.to_string(),
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor = handle
+        .goal_execution_restart()
+        .new_supervisor(Arc::new(
+            GoalRuntime::new(registry.clone()).execution_engine(accounting),
+        ))
+        .await;
+    *foreground::goal_supervisor_slot(&context.persist_locks, &key)
+        .lock()
+        .await = Some(supervisor.clone());
+    let initial = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Start {
+            budget: GoalBudgetSelection::Unlimited,
+            objective: "bounded predecessor repair".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let GoalResponse::Started(started) = initial.response() else {
+        panic!("fixture must start directly");
+    };
+    let scope = GoalExecutionScope::new(&started.task_id, &key, started.execution_epoch).unwrap();
+    // Obtain the normal settled operator pause before seeding only the epoch.
+    drop(initial);
+    let mut paused = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Pause { immediate: true },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(paused.response(), GoalResponse::Paused(_)));
+    paused.after_response().await.unwrap();
+    drop(paused);
+    assert!(!supervisor.owns_scope(&scope).await);
+    let connection = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    assert_eq!(connection.execute(
+        "UPDATE tasks SET execution_epoch = 9223372036854775806 WHERE id = ?1 AND kind = 'goal'",
+        [&scope.task_id()],
+    ).unwrap(), 1);
+    drop(connection);
+    let seeded = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seeded.status, TaskStatus::Paused);
+    assert_eq!(seeded.execution_epoch, i64::MAX - 1);
+    let status = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Status,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(status.response(), GoalResponse::Status(projection)
+        if projection.resumable
+            && projection.pause_reason == Some(zeroclaw_goal::GoalPauseReason::OperatorPaused)));
+    drop(status);
+    let mut resumed = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Resume { response: None },
+    )
+    .await
+    .unwrap();
+    let GoalResponse::Resumed(projection) = resumed.response() else {
+        panic!("seeded predecessor must resume directly");
+    };
+    assert_eq!(projection.execution_epoch, i64::MAX);
+    let running = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.status, TaskStatus::Running);
+    assert_eq!(running.execution_epoch, i64::MAX);
+    resumed.after_response().await.unwrap();
+    let notice =
+        zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failure-agent-operation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count = channel
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .filter(|row| row.content == notice)
+                .count();
+            assert!(count <= 1);
+            if count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed worker must publish exactly one notice");
+    let predecessor = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    assert_eq!(predecessor.execution_epoch, i64::MAX);
+    assert_eq!(
+        registry
+            .terminal_reason_for_session_goal(&predecessor.id, &key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("parent_operation_failed")
+    );
+    let next = tokio::time::timeout(
+        Duration::from_secs(5),
+        goal_execution::submit_matrix_goal(
+            context.clone(),
+            key.clone(),
+            message,
+            GoalCommand::Status,
+        ),
+    )
+    .await
+    .expect("Status must not wait on the predecessor drain")
+    .unwrap_or_else(|error| panic!("Status must not inherit the predecessor failure: {error:#}"));
+    assert!(matches!(next.response(), GoalResponse::Terminal(projection)
+        if projection.task_id == predecessor.id && projection.status == TaskStatus::Failed));
+    assert_eq!(
+        serde_json::to_value(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&predecessor).unwrap()
+    );
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(next);
+    supervisor.dispose_session(&key).await.unwrap();
+    let sent = channel.sent_messages.lock().await;
+    assert_eq!(sent.iter().filter(|row| row.content == notice).count(), 1);
+    assert!(!sent.iter().any(|row| row.content
+        == zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-command-failed")));
+}
+
 #[derive(Default)]
 struct GoalIngressBoundaryProvider {
     requests: std::sync::Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
