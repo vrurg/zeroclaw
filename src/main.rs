@@ -12300,6 +12300,11 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+#[cfg(feature = "agent-runtime")]
+fn qualified_provider_identity(provider_type: impl std::fmt::Display, alias: &str) -> String {
+    format!("{provider_type}.{alias}")
+}
+
 /// Build the SOP channel-backed adapters from one shared channel map:
 /// - the approval ROUTE adapter, so a SOP that parks at a policied gate (or later
 ///   times out) can deliver its approval request / escalation notice to a real
@@ -12318,11 +12323,6 @@ fn gate_security_posture(
 /// behavior). MUST be called from within the tokio runtime: it captures
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
-#[cfg(feature = "agent-runtime")]
-fn qualified_provider_identity(provider_type: impl std::fmt::Display, alias: &str) -> String {
-    format!("{provider_type}.{alias}")
-}
-
 #[cfg(feature = "agent-runtime")]
 fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
     // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
