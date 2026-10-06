@@ -19140,7 +19140,7 @@ Let me check the result."#;
     #[test]
     fn capture_llm_messages_redacts_supported_session_prompt_envelopes_and_results() {
         const MARKER: &str = "session-prompt-private-marker";
-        const RESULT_PREFIX: &str = crate::agent::history_trim::TOOL_RESULTS_PREFIX;
+        const RESULT_PREFIX: &str = zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX;
         const RESULT_MARKER: &str = crate::agent::prompt::SESSION_PROMPT_TEXT_RESULT_MARKER;
         // Text results use the runtime's reserved carrier. Unmarked user
         // messages are ordinary input, even when they mention a tool result.
