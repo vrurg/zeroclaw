@@ -2617,6 +2617,133 @@ async fn launch_rebind_failure_settles_the_admitted_goal_before_returning() {
     assert_launch_rebind_failure_outcome(false).await;
 }
 
+async fn assert_post_commit_projection_failure_is_settled(resume: bool, cancelled: bool) {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let directory = TempDir::new().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let settings = host_settings(true);
+        let session_id = ingress.session_key().durable_id();
+        let driver = recording_driver(&ingress);
+        let start = GoalCommand::Start {
+            budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+            objective: "finish the bounded task".into(),
+        };
+        if resume {
+            let initial = runtime
+                .submit(&settings, ingress.clone(), driver.clone(), start.clone())
+                .await
+                .unwrap();
+            let GoalResponse::Started(projection) = initial.response() else {
+                panic!("expected initial start");
+            };
+            assert_eq!(
+                store
+                    .pause_session_goal(
+                        &projection.task_id,
+                        &session_id,
+                        projection.execution_epoch,
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: Some("operator pause".into()),
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+        let connection =
+            rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+        // Corrupt only the projection payload after the real transition.
+        // Neither injection substitutes the registry or introduces an await.
+        let transition = if cancelled {
+            "UPDATE tasks SET status = 'cancelled', execution_epoch = execution_epoch + 1,
+             finished_at = 'fixture-finished', error = 'fixture-cancelled'
+             WHERE id = NEW.task_id;"
+        } else {
+            ""
+        };
+        let trigger = if resume {
+            format!(
+                "CREATE TRIGGER fail_projection AFTER UPDATE OF pause_reason ON goal_tasks
+             WHEN NEW.pause_reason IS NULL
+             BEGIN UPDATE goal_tasks SET blockers_json = 'invalid-json'
+                   WHERE task_id = NEW.task_id; {transition} END;"
+            )
+        } else {
+            format!(
+                "CREATE TRIGGER fail_projection AFTER INSERT ON goal_tasks
+             BEGIN UPDATE goal_tasks SET blockers_json = 'invalid-json'
+                   WHERE task_id = NEW.task_id; {transition} END;"
+            )
+        };
+        connection.execute_batch(&trigger).unwrap();
+        let command = if resume {
+            GoalCommand::Resume { response: None }
+        } else {
+            start
+        };
+        let mut submission =
+            Box::pin(runtime.submit(&settings, ingress.clone(), driver.clone(), command));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) =
+            std::future::Future::poll(submission.as_mut(), &mut context)
+        else {
+            panic!("SQLite admission and projection must settle within one poll");
+        };
+        let error = result
+            .err()
+            .expect("post-commit projection must report its original read error");
+        assert!(format!("{error:#}").contains("get goal task"));
+        let current = store
+            .current_goal_for_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.status,
+            if cancelled {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Failed
+            },
+            "post-commit projection error must not leave an unowned running epoch"
+        );
+        assert_eq!(current.execution_epoch, if resume { 4 } else { 2 });
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&current.id, &session_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(if cancelled {
+                "fixture-cancelled"
+            } else {
+                "executor_start_failed"
+            })
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn start_projection_failure_settles_the_committed_epoch() {
+    assert_post_commit_projection_failure_is_settled(false, false).await;
+}
+
+#[tokio::test]
+async fn resume_projection_failure_settles_the_committed_epoch() {
+    assert_post_commit_projection_failure_is_settled(true, false).await;
+}
+
+#[tokio::test]
+async fn projection_failure_preserves_a_competing_cancellation() {
+    assert_post_commit_projection_failure_is_settled(false, true).await;
+    assert_post_commit_projection_failure_is_settled(true, true).await;
+}
+
 #[tokio::test]
 async fn launch_rebind_failure_preserves_a_competing_cancellation() {
     assert_launch_rebind_failure_outcome(true).await;

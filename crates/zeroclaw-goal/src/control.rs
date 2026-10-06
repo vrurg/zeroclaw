@@ -29,11 +29,16 @@ use zeroclaw_commands::goal::{
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
 
+mod deferred;
 mod goal_execution;
 
+pub use deferred::{GoalControlClass, GoalQueuedControl, GoalTurnBoundary, classify_goal_control};
+
 pub use goal_execution::{
-    GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionOutcome,
-    GoalExecutionRestartCoordinator, GoalExecutionSubmission, GoalExecutionSupervisor,
+    GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
+    GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
+    GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
+    GoalExecutionSupervisor, GoalSupervisorRetired,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
@@ -279,6 +284,31 @@ pub trait GoalSessionDriver: Send + Sync {
     /// I/O, so it must be async-safe and must not be a lock that a Goal
     /// lifecycle path needs to acquire again.
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease>;
+
+    /// Attempt to own the existing ordinary-turn boundary without waiting.
+    /// Surface drivers override this with their ordinary foreground permit.
+    /// The default is for drivers that have no independently running turns.
+    async fn try_turn_boundary(
+        &self,
+        _ingress: &GoalIngressContext,
+    ) -> Result<Option<GoalTurnBoundary>> {
+        Ok(Some(GoalTurnBoundary::new(())))
+    }
+
+    /// Wait for the ordinary-turn boundary without holding command serialization.
+    /// Surface overrides must select checkpoint closure against permit acquisition.
+    /// The default has no ordinary-turn contention, but still honors closure.
+    async fn await_turn_boundary(
+        &self,
+        _ingress: &GoalIngressContext,
+        checkpoint: &GoalParentTurnCheckpoint,
+    ) -> Result<GoalTurnBoundary> {
+        tokio::select! {
+            biased;
+            () = checkpoint.wait_closed() => Err(crate::GoalCheckpointClosed.into()),
+            boundary = std::future::ready(GoalTurnBoundary::new(())) => Ok(boundary),
+        }
+    }
 
     /// Acquire the exact session's foreground execution lease.
     ///
@@ -668,6 +698,28 @@ impl GoalExecutionHost {
         }
 
         let lease = driver.bind(&ingress).await?;
+        self.submit_bound(settings, ingress, driver, command, lease)
+    }
+
+    /// Reuse a live command lease held by deferred admission. Never rebind the
+    /// same driver while its command serialization is already owned.
+    fn submit_bound(
+        &self,
+        settings: &GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+        lease: GoalSessionLease,
+    ) -> Result<GoalSubmission> {
+        if !settings.enabled || matches!(command, GoalCommand::Help) {
+            return Ok(GoalSubmission(GoalSubmissionState::Unavailable {
+                ingress,
+                command,
+            }));
+        }
+        if driver.session_key() != ingress.session_key() {
+            bail!("Goal session driver does not match trusted ingress");
+        }
         if lease.binding().session_key() != ingress.session_key() {
             bail!("Goal session binding does not match trusted ingress");
         }
@@ -791,7 +843,9 @@ impl GoalExecutionRequest {
     }
 }
 
-/// Single runtime entry point for a typed Goal command.
+/// Guarded lifecycle primitive for typed Goal commands. Representation surfaces
+/// use [`GoalExecutionSupervisor::admit_control`] to respect turn boundaries;
+/// this lower-level API deliberately does not schedule ordinary session turns.
 #[derive(Clone)]
 pub struct GoalRuntime {
     host: GoalExecutionHost,
@@ -823,11 +877,33 @@ impl GoalRuntime {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalRuntimeSubmission> {
-        let resume_response = match &command {
+        let submission = self.host.submit(settings, ingress, driver, command).await?;
+        self.apply_submission(settings, submission).await
+    }
+
+    async fn submit_bound(
+        &self,
+        settings: &GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+        lease: GoalSessionLease,
+    ) -> Result<GoalRuntimeSubmission> {
+        let submission = self
+            .host
+            .submit_bound(settings, ingress, driver, command, lease)?;
+        self.apply_submission(settings, submission).await
+    }
+
+    async fn apply_submission(
+        &self,
+        settings: &GoalHostSettings,
+        submission: GoalSubmission,
+    ) -> Result<GoalRuntimeSubmission> {
+        let resume_response = match submission.command() {
             GoalCommand::Resume { response } => response.clone(),
             _ => None,
         };
-        let submission = self.host.submit(settings, ingress, driver, command).await?;
         let response = self.controller.submit(settings, &submission).await?;
         let (execution, lease) = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => (
@@ -982,6 +1058,8 @@ fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
 pub enum GoalResponse {
     Help,
     Disabled,
+    /// A durable control intent is registered; no lifecycle transition yet.
+    Queued(GoalQueuedControl),
     Started(GoalStatusProjection),
     Status(GoalStatusProjection),
     Budget(GoalStatusProjection),
@@ -1060,6 +1138,84 @@ pub struct GoalController {
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
         Self { registry }
+    }
+
+    /// Reject normal controls before recording an intent, using the same
+    /// ownership, validation and lifecycle predicates as the guarded paths.
+    /// The returned task is a binding for later revalidation, not authority.
+    async fn preflight_normal(
+        &self,
+        settings: &GoalHostSettings,
+        submission: &GoalSubmission,
+    ) -> Result<(Option<GoalResponse>, Option<TaskRecord>)> {
+        if !settings.enabled || submission.is_unavailable() {
+            return Ok((Some(GoalResponse::Disabled), None));
+        }
+        let ingress = submission.ingress();
+        let session_id = ingress.session_key().durable_id();
+        if let GoalCommand::Start { objective, budget } = submission.command() {
+            validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
+            select_limits(settings.default_limits, *budget)?;
+            let current = self.registry.current_goal_for_session(&session_id).await?;
+            let response = current.as_ref().and_then(|task| {
+                if !ingress_owns_task(ingress, task) {
+                    Some(GoalResponse::NoCurrentGoal)
+                } else if !task.status.is_terminal() {
+                    Some(GoalResponse::AlreadyActive)
+                } else {
+                    None
+                }
+            });
+            return Ok((response, current));
+        }
+        let Some(task) = self.current(ingress, &session_id).await? else {
+            return Ok((Some(GoalResponse::NoCurrentGoal), None));
+        };
+        let rejection = if task.status.is_terminal() {
+            Some(
+                self.projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::Terminal,
+                )
+                .await?,
+            )
+        } else {
+            match submission.command() {
+                GoalCommand::Pause { immediate: false } if task.status == TaskStatus::Paused => {
+                    Some(
+                        self.projection_response_for_current(
+                            ingress,
+                            &session_id,
+                            &task,
+                            GoalResponse::AlreadyPaused,
+                        )
+                        .await?,
+                    )
+                }
+                GoalCommand::Resume { .. } if task.status != TaskStatus::Paused => {
+                    Some(GoalResponse::AlreadyActive)
+                }
+                GoalCommand::Resume { .. } => {
+                    let projection = self.project_current(ingress, &session_id, &task).await?;
+                    match projection {
+                        Some(projection) if !projection.resumable => {
+                            Some(GoalResponse::Status(projection))
+                        }
+                        None => Some(GoalResponse::Stale),
+                        _ => None,
+                    }
+                }
+                GoalCommand::SetBudget(selection) => {
+                    select_budget_update_limits(*selection)?;
+                    None
+                }
+                GoalCommand::Pause { immediate: false } => None,
+                _ => bail!("normal Goal preflight received a non-normal control"),
+            }
+        };
+        Ok((rejection, Some(task)))
     }
 
     /// Apply a previously host-validated Goal submission through guarded
@@ -1158,8 +1314,14 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(ingress, &session_id, &task_id, GoalResponse::Started)
-                    .await
+                self.admitted_projection_response(
+                    ingress,
+                    &session_id,
+                    &task_id,
+                    1,
+                    GoalResponse::Started,
+                )
+                .await
             }
             GoalTransitionResult::Stale => self.start_stale_response(ingress, &session_id).await,
             GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
@@ -1331,8 +1493,14 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(ingress, &session_id, &task.id, GoalResponse::Resumed)
-                    .await
+                self.admitted_projection_response(
+                    ingress,
+                    &session_id,
+                    &task.id,
+                    task.execution_epoch.saturating_add(1),
+                    GoalResponse::Resumed,
+                )
+                .await
             }
             GoalTransitionResult::Stale => self.resume_stale_response(ingress, &session_id).await,
             GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
@@ -1453,6 +1621,59 @@ impl GoalController {
                     Ok(None)
                 } else {
                     bail!("Goal task extension is missing")
+                }
+            }
+        }
+    }
+
+    async fn admitted_projection_response(
+        &self,
+        ingress: &GoalIngressContext,
+        session_id: &str,
+        task_id: &str,
+        execution_epoch: i64,
+        response: impl FnOnce(GoalStatusProjection) -> GoalResponse,
+    ) -> Result<GoalResponse> {
+        match self
+            .projection_response(ingress, session_id, task_id, response)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // Admission committed, but no request can reach the executor
+                // without its projection. Settle only the admitted epoch;
+                // another transition's winner remains authoritative.
+                let settlement = self
+                    .registry
+                    .finish_session_goal(
+                        task_id,
+                        session_id,
+                        execution_epoch,
+                        TaskStatus::Failed,
+                        Some("executor_start_failed".into()),
+                    )
+                    .await;
+                match settlement {
+                    Ok(GoalTransitionResult::Applied) => Err(error),
+                    Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
+                        match self.registry.current_goal_for_session(session_id).await {
+                            Ok(Some(current))
+                                if current.id == task_id
+                                    && current.execution_epoch == execution_epoch
+                                    && current.status == TaskStatus::Running =>
+                            {
+                                Err(error
+                                    .context("Goal admission failure lost its execution fence"))
+                            }
+                            Ok(_) => Err(error),
+                            Err(reconcile) => Err(error.context(format!(
+                                "reconcile Goal admission failure: {reconcile:#}"
+                            ))),
+                        }
+                    }
+                    Err(settlement) => {
+                        Err(error.context(format!("settle Goal admission failure: {settlement:#}")))
+                    }
                 }
             }
         }
