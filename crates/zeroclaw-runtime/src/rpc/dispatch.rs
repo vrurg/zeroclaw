@@ -15201,13 +15201,22 @@ pub(crate) mod connection_test_support {
         assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
     }
 
-    /// A notification has no acknowledgement to deliver, but its predecessor
-    /// publication must release command authority while ordinary work owns FIFO.
+    /// The two accepted outcomes for notification acknowledgement failure.
+    pub(crate) enum AckFailureCase {
+        /// Publication waits behind ordinary work without retaining authority.
+        Delivery,
+        /// Disposal withdraws publication before removing the session.
+        Delete,
+    }
+
+    /// A notification has no acknowledgement to deliver. Its predecessor must
+    /// release command authority for ordinary delivery or session disposal.
     pub(crate) async fn exercise_ack_failure_predecessor_transport(
         ctx: &RpcContext,
         session_id: &str,
         registry: &dyn zeroclaw_goal::GoalTaskRegistry,
         turns: (&HeldGoalParent, &HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        case: AckFailureCase,
         mut send: impl std::ops::AsyncFnMut(serde_json::Value),
         mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
     ) {
@@ -15244,18 +15253,20 @@ pub(crate) mod connection_test_support {
         .await
         .unwrap();
         parent.assert_resume_input(None);
-        send(serde_json::json!({
-            "jsonrpc": "2.0", "method": "session/prompt", "id": 41,
-            "params": {"session_id": session_id, "prompt": "ordinary work"},
-        }))
-        .await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while ctx.sessions.session_queue.queue_depth(session_id).await == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("ordinary prompt must queue behind the Goal parent");
+        if matches!(case, AckFailureCase::Delivery) {
+            send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/prompt", "id": 41,
+                "params": {"session_id": session_id, "prompt": "ordinary work"},
+            }))
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while ctx.sessions.session_queue.queue_depth(session_id).await == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ordinary prompt must queue behind the Goal parent");
+        }
         send(serde_json::json!({
             "jsonrpc": "2.0", "method": "session/goal",
             "params": {"session_id": session_id, "command": "/goal pause now"},
@@ -15275,6 +15286,80 @@ pub(crate) mod connection_test_support {
         })
         .await
         .expect("notification must fence the held parent before release");
+        if matches!(case, AckFailureCase::Delete) {
+            send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/delete", "id": 41,
+                "params": {"session_id": session_id},
+            }))
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("delete must reserve FIFO while the parent is held");
+            parent.turn.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame = receive().await;
+                    assert!(frame["error"].is_null(), "{frame}");
+                    assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                    if frame["params"]["type"] == "turn_complete"
+                        && frame["params"]["outcome"] == "failed"
+                    {
+                        assert!(
+                            frame["params"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .contains("scripted failed predecessor"),
+                            "{frame}"
+                        );
+                    }
+                    if frame["id"] == 41 {
+                        let result: crate::rpc::types::SessionDeleteResult =
+                            serde_json::from_value(frame["result"].clone()).unwrap();
+                        assert_eq!(result.session_id, session_id);
+                        assert!(result.deleted);
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("delete must complete after the held parent settles");
+            assert!(ctx.sessions.get_agent(session_id).await.is_none());
+            assert!(ctx.goal_runtime.supervisor(session_id).await.is_none());
+            assert!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // A later response also drains preceding outbound frames: no Goal
+            // publication may have escaped disposal into the removed session.
+            send(request("/goal status", 42)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame = receive().await;
+                    assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                    assert_ne!(frame["params"]["outcome"], "failed", "{frame}");
+                    if frame["id"] == 42 {
+                        assert_eq!(
+                            frame["error"]["code"],
+                            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+                        );
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("deleted session Status must reject without a late notice");
+            assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+            assert_eq!(ordinary.calls.load(Ordering::Acquire), 0);
+            assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+            return;
+        }
         parent.turn.release.notify_one();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
