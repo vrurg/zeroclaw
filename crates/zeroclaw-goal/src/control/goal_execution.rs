@@ -827,6 +827,8 @@ impl GoalExecutionSupervisor {
     /// its lifecycle acknowledgement could not reach the representation
     /// surface. This is a resumable external dependency, not a provider,
     /// verifier, protocol, or accounting failure.
+    /// Release command serialization and the ordinary boundary after that
+    /// pause commits, before draining or delivering a predecessor's output.
     pub async fn pause_before_launch(
         &self,
         submission: &mut GoalExecutionSubmission,
@@ -859,6 +861,10 @@ impl GoalExecutionSupervisor {
                     }
                 }
             }
+            // The unseen launch is settled. As in launch_after_response,
+            // release command and turn custody before draining or publishing.
+            drop(submission._lease.take());
+            drop(submission.boundary.take());
             if let Some(predecessor) = submission.predecessor.take() {
                 self.drain_lifecycle_fence(&predecessor)
                     .await

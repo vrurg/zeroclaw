@@ -535,6 +535,294 @@ async fn unsettled_drainer_delivery_before_fifo_queues_start_until_accounting_no
     assert_drainer_delivery_queues_start(true).await;
 }
 
+#[tokio::test]
+async fn ack_failure_predecessor_delivery_releases_command_authority() {
+    assert_ack_failure_releases_command_authority(false).await;
+}
+
+#[tokio::test]
+async fn unsettled_ack_failure_predecessor_delivery_releases_command_authority() {
+    assert_ack_failure_releases_command_authority(true).await;
+}
+
+/// A failed acknowledgement must relinquish command authority before waiting
+/// for native failure publication, just like the delivered-response path.
+async fn assert_ack_failure_releases_command_authority(unsettled: bool) {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let admitted = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    let predecessor_scope = GoalExecutionScope::new(
+        admitted.id,
+        admitted.session_id.unwrap(),
+        admitted.execution_epoch,
+    )
+    .unwrap();
+    if unsettled {
+        seed_unsettled_call(&registry);
+    }
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let release = hold_publication(&driver.script);
+    let mut pause = supervisor
+        .submit(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause { immediate: true },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        pause.response(),
+        GoalResponse::TransitionPending(_)
+    ));
+    driver.script.release.add_permits(1);
+    let draining_supervisor = supervisor.clone();
+    let draining = zeroclaw_spawn::spawn!(async move {
+        draining_supervisor
+            .pause_before_launch(
+                &mut pause,
+                zeroclaw_goal::GoalPauseReason::ExternalDependency,
+            )
+            .await
+    });
+    await_publication(&driver.script).await;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    assert_eq!(predecessor.status, TaskStatus::Failed);
+    assert!(
+        driver.ordinary.command.try_lock().is_ok(),
+        "acknowledgement-failure delivery must not own command authority"
+    );
+    let deferred = queued(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.admit_control(
+                settings(),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "bounded successor".into(),
+                },
+            ),
+        )
+        .await
+        .expect("Start must be acknowledged while failure publication waits")
+        .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().id,
+        predecessor.id
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), draining)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        driver.script.events.lock().unwrap().last(),
+        Some(&FailureEvent::Notice(GoalExecutionNotice::Failed(
+            if unsettled {
+                zeroclaw_goal::GoalFailureReason::OperationOutcomeUnknown
+            } else {
+                zeroclaw_goal::GoalFailureReason::ExecutorFailed
+            }
+        )))
+    );
+    assert_eq!(
+        registry.0.lock().unwrap().pending_settlements.len(),
+        usize::from(unsettled)
+    );
+    assert!(!supervisor.owns_scope(&predecessor_scope).await);
+    let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let committed = ready.commit(settings()).await.unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    assert_ne!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().id,
+        predecessor.id
+    );
+    let mut launch = committed.release();
+    supervisor
+        .pause_before_launch(&mut launch, zeroclaw_goal::GoalPauseReason::OperatorPaused)
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unseen_terminal_status_consumes_owed_predecessor_notice() {
+    assert_unseen_terminal_consumes_owed_notice(GoalCommand::Status).await;
+}
+
+#[tokio::test]
+async fn ack_failure_direct_boundary_is_released_before_predecessor_delivery() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let task = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    let scope =
+        GoalExecutionScope::new(task.id, task.session_id.unwrap(), task.execution_epoch).unwrap();
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish = true;
+    driver.script.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let completed = supervisor
+                .register_deferred_control(&scope)
+                .await
+                .unwrap()
+                .is_none();
+            if completed && driver.ordinary.boundary.try_lock().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Running,
+        "VT114(b) requires a completed worker whose durable row remains Running"
+    );
+    let GoalControlAdmission::Direct(mut submission) = supervisor
+        .admit_control(
+            settings(),
+            ingress,
+            driver.clone(),
+            GoalCommand::Pause { immediate: false },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("VT114(b) requires a direct boundary-bearing admission");
+    };
+    assert!(
+        matches!(submission.response(), GoalResponse::TransitionPending(_)),
+        "VT114(b) requires a predecessor obligation after plain pause"
+    );
+    assert!(driver.ordinary.boundary.try_lock().is_err());
+    registry.0.lock().unwrap().fail_finish = false;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.pause_before_launch(
+            &mut submission,
+            zeroclaw_goal::GoalPauseReason::ExternalDependency,
+        ),
+    )
+    .await
+    .expect("acknowledgement failure must release the direct boundary before delivery")
+    .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        driver.script.events.lock().unwrap().last(),
+        Some(&FailureEvent::Notice(GoalExecutionNotice::Failed(
+            zeroclaw_goal::GoalFailureReason::ExecutorFailed
+        ),))
+    );
+    assert!(!supervisor.owns_scope(&scope).await);
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    assert!(driver.ordinary.command.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn unseen_terminal_pause_now_consumes_owed_predecessor_notice() {
+    assert_unseen_terminal_consumes_owed_notice(GoalCommand::Pause { immediate: true }).await;
+}
+
+/// The shared handoff already retries an owed notice without repeating the
+/// original error or changing durable state; both adapters must invoke it.
+async fn assert_unseen_terminal_consumes_owed_notice(command: GoalCommand) {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let task = registry.0.lock().unwrap().task.as_ref().unwrap().clone();
+    let scope =
+        GoalExecutionScope::new(task.id, task.session_id.unwrap(), task.execution_epoch).unwrap();
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    driver.script.fail_notice_once.store(true, Ordering::SeqCst);
+    registry.0.lock().unwrap().fail_finish_once = true;
+    driver.script.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while driver.script.notices.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        driver.script.events.lock().unwrap().as_slice(),
+        [FailureEvent::Original(_)]
+    ));
+    assert!(supervisor.owns_scope(&scope).await);
+    let before = {
+        let state = registry.0.lock().unwrap();
+        (
+            serde_json::to_value(&state.task).unwrap(),
+            state.terminal_reason.clone(),
+            state.transitions.clone(),
+            state.finish_calls,
+        )
+    };
+    let acquisitions = driver.script.acquisitions.load(Ordering::SeqCst);
+    let GoalControlAdmission::Direct(mut submission) = supervisor
+        .admit_control(settings(), ingress.clone(), driver.clone(), command)
+        .await
+        .unwrap()
+    else {
+        panic!("a terminal command must not queue");
+    };
+    assert!(matches!(submission.response(), GoalResponse::Terminal(_)));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.pause_before_launch(
+            &mut submission,
+            zeroclaw_goal::GoalPauseReason::ExternalDependency,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 2);
+    assert_original_then_executor_notice(&driver.script);
+    assert!(!supervisor.owns_scope(&scope).await);
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(
+            (
+                serde_json::to_value(&state.task).unwrap(),
+                state.terminal_reason.clone(),
+                state.transitions.clone(),
+                state.finish_calls
+            ),
+            before,
+        );
+        assert!(state.pending_settlements.is_empty());
+    }
+    assert_eq!(
+        driver.script.acquisitions.load(Ordering::SeqCst),
+        acquisitions + 1
+    );
+    // The adapter consumes the completed handoff before accepting another
+    // command. Preserve that lifetime on the pre-fix control too.
+    drop(submission);
+    let GoalControlAdmission::Direct(mut status) = supervisor
+        .admit_control(settings(), ingress, driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap()
+    else {
+        panic!("a settled terminal status must not queue");
+    };
+    supervisor
+        .pause_before_launch(
+            &mut status,
+            zeroclaw_goal::GoalPauseReason::ExternalDependency,
+        )
+        .await
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 2);
+}
+
 async fn assert_drainer_delivery_queues_start(unsettled: bool) {
     let (driver, ingress, registry, supervisor) = running_worker().await;
     if unsettled {
