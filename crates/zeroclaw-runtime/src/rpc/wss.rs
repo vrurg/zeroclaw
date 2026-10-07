@@ -2502,15 +2502,58 @@ mod accept_error_tests {
 
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_wss() {
-        exercise_failed_predecessor_wss(false).await;
+        exercise_failed_predecessor_wss(false, None).await;
     }
 
     #[tokio::test]
     async fn goal_ack_failure_delivery_releases_goal_command_wss() {
-        exercise_failed_predecessor_wss(true).await;
+        exercise_failed_predecessor_wss(true, None).await;
     }
 
-    async fn exercise_failed_predecessor_wss(ack_failure: bool) {
+    #[tokio::test]
+    async fn goal_unseen_terminal_retries_owed_notice_wss() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::wss::accept_error_tests::goal_unseen_terminal_retries_owed_notice_wss",
+        ).await { return; }
+        exercise_failed_predecessor_wss(
+            false,
+            Some(
+                crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Unseen,
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_unseen_terminal_request_control_wss() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::wss::accept_error_tests::goal_unseen_terminal_request_control_wss",
+        ).await { return; }
+        exercise_failed_predecessor_wss(
+            false,
+            Some(
+                crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Request,
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_unseen_terminal_pending_tail_control_wss() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::wss::accept_error_tests::goal_unseen_terminal_pending_tail_control_wss",
+        ).await { return; }
+        exercise_failed_predecessor_wss(false, Some(
+            crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::PendingTail,
+        )).await;
+    }
+
+    async fn exercise_failed_predecessor_wss(
+        ack_failure: bool,
+        terminal: Option<
+            crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase,
+        >,
+    ) {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::{
             exercise_failed_predecessor_transport, prepare_failed_predecessor_fixture,
@@ -2539,6 +2582,20 @@ mod accept_error_tests {
             Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
         let (registry, parent, ordinary, successor) =
             prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await;
+        let gate = if terminal.is_some() {
+            Some(
+                crate::rpc::dispatch::connection_test_support::gate_failed_predecessor_publication(
+                    &ctx,
+                    tmp.path(),
+                    SID,
+                    &registry,
+                    &parent,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
         let ca_pem = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
         let ca_key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
@@ -2594,7 +2651,28 @@ mod accept_error_tests {
         .unwrap();
         let initialized = read_response_with_id(&mut stream, 1).await;
         assert!(initialized["error"].is_null(), "{initialized}");
-        if ack_failure {
+        if let Some(case) = terminal {
+            crate::rpc::dispatch::connection_test_support::exercise_unseen_terminal_transport(
+                &ctx,
+                SID,
+                registry.as_ref(),
+                (&parent, gate.as_deref().unwrap(), case),
+                async |frame| {
+                    sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await
+                        .unwrap();
+                },
+                async || {
+                    loop {
+                        let message = stream.next().await.unwrap().unwrap();
+                        if let Ok(text) = message.to_text() {
+                            break serde_json::from_str(text).unwrap();
+                        }
+                    }
+                },
+            )
+            .await;
+        } else if ack_failure {
             crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
                 &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
                 async |frame| {
