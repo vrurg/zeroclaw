@@ -58,7 +58,9 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
                 Ok(commit) => commit,
                 Err(error) => {
                     log_delivery_error("Goal deferred command could not commit", &error);
-                    send_command_failed(channel.as_ref(), &message).await;
+                    if !error.is::<zeroclaw_goal::GoalLaunchFailureReported>() {
+                        send_command_failed(channel.as_ref(), &message).await;
+                    }
                     return;
                 }
             };

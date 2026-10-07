@@ -2796,6 +2796,38 @@ async fn matrix_goal_deferred_claim_failure_reports_once_and_abandons_intent() {
     .await;
 }
 
+#[tokio::test]
+async fn matrix_goal_deferred_audit_failure_reports_notice_without_command_error() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_deferred_audit_failure_reports_notice_without_command_error
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_goal_deferred_ingress(
+        GoalIngressAdmission::Start,
+        GoalIngressEnding::AuditFailure,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_deferred_audit_failure_competing_start_waits_for_notice() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_deferred_audit_failure_competing_start_waits_for_notice
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_goal_deferred_ingress(
+        GoalIngressAdmission::Start,
+        GoalIngressEnding::AuditFailureCompetingStart,
+    )
+    .await;
+}
+
 /// A real host owns one process-global ledger root. Isolate each install
 /// fixture so unrelated tests cannot select that immutable root first.
 async fn matrix_goal_ingress_delegated_to_fresh_process(test_name: &str) -> bool {
@@ -3112,6 +3144,8 @@ enum GoalIngressEnding {
     StopAdmissionFailure,
     SettingsFailure,
     ClaimFailure,
+    AuditFailure,
+    AuditFailureCompetingStart,
     CustodyDispose,
     BindCustodyDispose,
     TerminalCustodyDispose,
@@ -4565,6 +4599,67 @@ async fn route_matrix_goal_fixture_control(
     .expect("immediate control ingress and final delivery must settle before the held turn");
 }
 
+/// Hold one failed-row read before native failure publication joins the FIFO.
+#[derive(Default)]
+struct MatrixAuditFailureGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+struct MatrixAuditFailureRegistry {
+    registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+    gate: Arc<MatrixAuditFailureGate>,
+}
+
+// All methods still reach the concrete store; only one observational read waits.
+macro_rules! forward_matrix_audit_registry {
+    ($($name:ident($($argument:ident: $ty:ty),*) -> $result:ty;)*) => {
+        #[async_trait::async_trait]
+        impl zeroclaw_goal::GoalTaskRegistry for MatrixAuditFailureRegistry {
+            $(async fn $name(&self, $($argument: $ty),*) -> $result {
+                self.registry.$name($($argument),*).await
+            })*
+
+            async fn current_goal_for_session(
+                &self, session_id: &str,
+            ) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>> {
+                let task = self.registry.current_goal_for_session(session_id).await?;
+                if task.as_ref().is_some_and(|task| task.status == zeroclaw_api::task::TaskStatus::Failed)
+                    && !self.gate.claimed.swap(true, Ordering::AcqRel)
+                {
+                    self.gate.reached.notify_one();
+                    self.gate.release.notified().await;
+                }
+                Ok(task)
+            }
+        }
+    };
+}
+
+forward_matrix_audit_registry! {
+    record_control_intent(intent: &zeroclaw_goal::task::GoalControlIntent) -> anyhow::Result<()>;
+    claim_control_intent(intent_id: &str, owner_boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    settle_control_intent(intent_id: &str, settlement: zeroclaw_goal::task::GoalControlIntentSettlement) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    latest_active_goal_for_agent(agent: &str) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>>;
+    latest_active_goal_for_context(agent: &str, route: Option<&str>, principal: Option<&str>) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>>;
+    latest_active_goal_id_for_context(agent: &str, route: Option<&str>, principal: Option<&str>) -> anyhow::Result<Option<String>>;
+    get_goal_task(task_id: &str) -> anyhow::Result<Option<zeroclaw_goal::GoalTaskRecord>>;
+    update_goal_limits(task_id: &str, tokens: Option<u64>, cost: Option<f64>) -> anyhow::Result<()>;
+    update_goal_pause(task_id: &str, pause: Option<zeroclaw_goal::GoalPauseState>) -> anyhow::Result<()>;
+    set_continuation_context(task_id: &str, context: Option<zeroclaw_goal::task::TaskContinuationContext>) -> anyhow::Result<()>;
+    get_continuation_context(task_id: &str) -> anyhow::Result<Option<zeroclaw_goal::task::TaskContinuationContext>>;
+    terminal_reason_for_session_goal(task_id: &str, session_id: &str) -> anyhow::Result<Option<String>>;
+    create_or_replace_session_goal(task: zeroclaw_api::task::TaskRecord, goal: zeroclaw_goal::GoalTaskRecord) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    pause_session_goal(task_id: &str, session_id: &str, epoch: i64, pause: zeroclaw_goal::GoalPauseState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    resume_session_goal(task_id: &str, session_id: &str, epoch: i64, owner_pid: u32, boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    finish_session_goal(task_id: &str, session_id: &str, epoch: i64, status: zeroclaw_api::task::TaskStatus, error: Option<String>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    admit_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    settle_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str, state: zeroclaw_goal::GoalAccountingState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    update_session_goal_limits(task_id: &str, session_id: &str, epoch: i64, tokens: Option<u64>, cost: Option<f64>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    delete_session_goal(task_id: &str, session_id: &str, epoch: i64) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+}
+
 async fn assert_matrix_goal_deferred_ingress(
     admission: GoalIngressAdmission,
     ending: GoalIngressEnding,
@@ -4631,10 +4726,21 @@ async fn assert_matrix_goal_deferred_ingress(
         )
         .unwrap(),
     );
+    let audit_gate = matches!(ending, GoalIngressEnding::AuditFailureCompetingStart)
+        .then(|| Arc::new(MatrixAuditFailureGate::default()));
+    let execution_registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry> =
+        if let Some(gate) = audit_gate.as_ref() {
+            Arc::new(MatrixAuditFailureRegistry {
+                registry: registry.clone(),
+                gate: gate.clone(),
+            })
+        } else {
+            registry.clone()
+        };
     let supervisor = handle
         .goal_execution_restart()
         .new_supervisor(Arc::new(
-            GoalRuntime::new(registry.clone()).execution_engine(accounting),
+            GoalRuntime::new(execution_registry).execution_engine(accounting),
         ))
         .await;
     *foreground::goal_supervisor_slot(&context.persist_locks, &key)
@@ -4882,6 +4988,21 @@ async fn assert_matrix_goal_deferred_ingress(
                      BEFORE UPDATE OF state ON goal_control_intents
                      WHEN NEW.state = 'claimed'
                      BEGIN SELECT RAISE(ABORT, 'private fixture claim detail'); END;",
+                )
+                .unwrap();
+            return;
+        }
+        if matches!(
+            ending,
+            GoalIngressEnding::AuditFailure | GoalIngressEnding::AuditFailureCompetingStart
+        ) {
+            // Fail settlement after the real deferred transition, not admission.
+            audit
+                .execute_batch(
+                    "CREATE TRIGGER fixture_refuse_goal_audit
+                     BEFORE UPDATE OF state ON goal_control_intents
+                     WHEN NEW.state = 'applied'
+                     BEGIN SELECT RAISE(ABORT, 'private fixture audit detail'); END;",
                 )
                 .unwrap();
             return;
@@ -5185,6 +5306,8 @@ async fn assert_matrix_goal_deferred_ingress(
             | GoalIngressEnding::StopAdmissionFailure
             | GoalIngressEnding::SettingsFailure
             | GoalIngressEnding::ClaimFailure
+            | GoalIngressEnding::AuditFailure
+            | GoalIngressEnding::AuditFailureCompetingStart
             | GoalIngressEnding::BindCustodyDispose
             | GoalIngressEnding::TerminalCustodyDispose
             | GoalIngressEnding::IdleRetire => unreachable!(),
@@ -5205,6 +5328,8 @@ async fn assert_matrix_goal_deferred_ingress(
                 | GoalIngressEnding::StopAdmissionFailure
                 | GoalIngressEnding::SettingsFailure
                 | GoalIngressEnding::ClaimFailure
+                | GoalIngressEnding::AuditFailure
+                | GoalIngressEnding::AuditFailureCompetingStart
                 | GoalIngressEnding::CustodyDispose
                 | GoalIngressEnding::BindCustodyDispose
                 | GoalIngressEnding::TerminalCustodyDispose
@@ -5327,16 +5452,129 @@ async fn assert_matrix_goal_deferred_ingress(
         }
     };
     // Always release both provider gates before surfacing a failed assertion.
-    let result = std::panic::AssertUnwindSafe(outcome).catch_unwind().await;
+    let mut result = std::panic::AssertUnwindSafe(outcome).catch_unwind().await;
     if let Some(barrier) = bind_barrier.as_ref() {
         barrier.release.notify_one();
     }
     provider.ordinary_release.notify_one();
+    if let Some(gate) = audit_gate.as_ref() {
+        if result.is_ok() {
+            let publication = async {
+                tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
+                    .await
+                    .expect("failure must reach the pre-FIFO registry gate");
+                let predecessor = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(predecessor.status, TaskStatus::Failed);
+                assert_eq!(provider.requests.lock().unwrap().len(), 1);
+                assert_eq!(
+                    registry
+                        .terminal_reason_for_session_goal(&predecessor.id, &key)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("executor_start_failed")
+                );
+                audit
+                    .execute_batch("DROP TRIGGER fixture_refuse_goal_audit")
+                    .unwrap();
+                message.content = "/goal start --unlimited competing fixture objective".into();
+                sender.send(message.clone()).await.unwrap();
+                let queued = channel_runtime_cli_string("goal-mode-queued-start");
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let replies = channel.sent_messages.lock().await;
+                        if replies
+                            .iter()
+                            .filter(|reply| reply.content == queued)
+                            .count()
+                            == 2
+                        {
+                            assert!(
+                                replies
+                                    .iter()
+                                    .all(|reply| !reply.content.contains("Goal started."))
+                            );
+                            break;
+                        }
+                        drop(replies);
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("competing Start must acknowledge while the failure notice is gated");
+                assert_eq!(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                    predecessor.id
+                );
+                gate.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !channel
+                        .sent_messages
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|reply| reply.content.contains("Goal started."))
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("successor must start after predecessor notice settlement");
+                assert_ne!(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                    predecessor.id
+                );
+                message.content = "/goal cancel".into();
+                sender.send(message.clone()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        != TaskStatus::Cancelled
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("fixture must cancel the successor before parent release");
+            };
+            result = std::panic::AssertUnwindSafe(publication)
+                .catch_unwind()
+                .await;
+        }
+        // Release even when the pre-fix second acknowledgement assertion fails.
+        gate.release.notify_one();
+    }
     provider.goal_release.notify_one();
     drop(sender);
     let drained = tokio::time::timeout(Duration::from_secs(3), &mut dispatch).await;
     if drained.is_err() {
         dispatch.abort();
+    }
+    if audit_gate.is_some()
+        && let Err(panic) = result
+    {
+        if drained.is_err() {
+            let _ = dispatch.await;
+        }
+        std::panic::resume_unwind(panic);
     }
     assert!(
         drained.is_ok(),
@@ -5345,6 +5583,124 @@ async fn assert_matrix_goal_deferred_ingress(
     drained.unwrap().unwrap();
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
+    }
+    if matches!(ending, GoalIngressEnding::AuditFailureCompetingStart) {
+        assert!(
+            verifier_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let replies = channel.sent_messages.lock().await;
+        let queued = channel_runtime_cli_string("goal-mode-queued-start");
+        let notice = channel_runtime_cli_string("goal-mode-failure-executor-start");
+        let positions: Vec<_> = replies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, reply)| (reply.content == queued).then_some(index))
+            .collect();
+        assert_eq!(positions.len(), 2);
+        let notices: Vec<_> = replies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, reply)| (reply.content == notice).then_some(index))
+            .collect();
+        assert_eq!(notices.len(), 1);
+        let started = replies
+            .iter()
+            .position(|reply| reply.content.contains("Goal started."))
+            .unwrap();
+        assert!(positions[0] < positions[1] && positions[1] < notices[0] && notices[0] < started);
+        let generic = channel_runtime_cli_string("goal-mode-command-failed");
+        assert!(replies.iter().all(|reply| reply.content != generic
+            && !reply.content.contains("private fixture audit detail")));
+        assert!(
+            foreground::foreground_lock(&context.persist_locks, &key)
+                .try_lock()
+                .is_ok()
+        );
+        assert!(
+            foreground::goal_command_lock(&context.persist_locks, &key)
+                .try_lock()
+                .is_ok()
+        );
+        return;
+    }
+    if matches!(ending, GoalIngressEnding::AuditFailure) {
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(
+            verifier_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_start_failed")
+        );
+        assert_eq!(intent_state(), "abandoned");
+        let reason: String = audit
+            .query_row(
+                "SELECT outcome_reason FROM goal_control_intents WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "control_dropped");
+        let replies = channel.sent_messages.lock().await;
+        let queued = channel_runtime_cli_string("goal-mode-queued-start");
+        let notice = channel_runtime_cli_string("goal-mode-failure-executor-start");
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply.content == queued)
+                .count(),
+            1
+        );
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply.content == notice)
+                .count(),
+            1
+        );
+        assert!(
+            replies
+                .iter()
+                .position(|reply| reply.content == queued)
+                .unwrap()
+                < replies
+                    .iter()
+                    .position(|reply| reply.content == notice)
+                    .unwrap()
+        );
+        let generic = channel_runtime_cli_string("goal-mode-command-failed");
+        assert!(replies.iter().all(|reply| reply.content != generic
+            && !reply.content.contains("Goal started.")
+            && !reply.content.contains("private fixture audit detail")));
+        assert!(
+            foreground::foreground_lock(&context.persist_locks, &key)
+                .try_lock()
+                .is_ok()
+        );
+        assert!(
+            foreground::goal_command_lock(&context.persist_locks, &key)
+                .try_lock()
+                .is_ok()
+        );
+        return;
     }
     if matches!(
         ending,
@@ -5593,6 +5949,8 @@ async fn assert_matrix_goal_deferred_ingress(
             | GoalIngressEnding::StopAdmissionFailure
             | GoalIngressEnding::SettingsFailure
             | GoalIngressEnding::ClaimFailure
+            | GoalIngressEnding::AuditFailure
+            | GoalIngressEnding::AuditFailureCompetingStart
             | GoalIngressEnding::CustodyDispose
             | GoalIngressEnding::BindCustodyDispose
             | GoalIngressEnding::TerminalCustodyDispose
