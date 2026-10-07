@@ -2508,6 +2508,15 @@ mod accept_error_tests {
 
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_wss() {
+        exercise_failed_predecessor_wss(false).await;
+    }
+
+    #[tokio::test]
+    async fn goal_ack_failure_delivery_releases_goal_command_wss() {
+        exercise_failed_predecessor_wss(true).await;
+    }
+
+    async fn exercise_failed_predecessor_wss(ack_failure: bool) {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::{
             exercise_failed_predecessor_transport, prepare_failed_predecessor_fixture,
@@ -2591,27 +2600,45 @@ mod accept_error_tests {
         .unwrap();
         let initialized = read_response_with_id(&mut stream, 1).await;
         assert!(initialized["error"].is_null(), "{initialized}");
-        exercise_failed_predecessor_transport(
-            &ctx,
-            SID,
-            registry.as_ref(),
-            (&parent, &ordinary, &successor),
-            None,
-            async |frame| {
-                sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
-                    .await
-                    .unwrap();
-            },
-            async || {
-                loop {
-                    let message = stream.next().await.unwrap().unwrap();
-                    if let Ok(text) = message.to_text() {
-                        break serde_json::from_str(text).unwrap();
+        if ack_failure {
+            crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
+                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
+                async |frame| {
+                    sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await.unwrap();
+                },
+                async || {
+                    loop {
+                        let message = stream.next().await.unwrap().unwrap();
+                        if let Ok(text) = message.to_text() {
+                            break serde_json::from_str(text).unwrap();
+                        }
                     }
-                }
-            },
-        )
-        .await;
+                },
+            ).await;
+        } else {
+            exercise_failed_predecessor_transport(
+                &ctx,
+                SID,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                None,
+                async |frame| {
+                    sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await
+                        .unwrap();
+                },
+                async || {
+                    loop {
+                        let message = stream.next().await.unwrap().unwrap();
+                        if let Ok(text) = message.to_text() {
+                            break serde_json::from_str(text).unwrap();
+                        }
+                    }
+                },
+            )
+            .await;
+        }
         cancel.cancel();
         drop(sink);
         tokio::time::timeout(Duration::from_secs(2), server)

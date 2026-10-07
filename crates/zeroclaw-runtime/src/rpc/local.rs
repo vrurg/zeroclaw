@@ -1316,30 +1316,39 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_local_ipc() {
-        exercise_failed_predecessor_local_ipc(None).await;
+        exercise_failed_predecessor_local_ipc(None, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_ack_failure_delivery_releases_goal_command_local_ipc() {
+        exercise_failed_predecessor_local_ipc(None, true).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_parked_predecessor_original_before_successor_local_ipc() {
-        exercise_failed_predecessor_local_ipc(Some(
-            crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::TailQueued,
-        ))
+        exercise_failed_predecessor_local_ipc(
+            Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::TailQueued),
+            false,
+        )
         .await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_parked_predecessor_original_before_free_queue_successor_local_ipc() {
-        exercise_failed_predecessor_local_ipc(Some(
-            crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::FreeQueue,
-        ))
+        exercise_failed_predecessor_local_ipc(
+            Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::FreeQueue),
+            false,
+        )
         .await;
     }
 
     #[cfg(unix)]
     async fn exercise_failed_predecessor_local_ipc(
         parked: Option<crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase>,
+        ack_failure: bool,
     ) {
         use crate::rpc::dispatch::connection_test_support::{
             exercise_failed_predecessor_transport, gate_failed_predecessor_publication,
@@ -1389,23 +1398,38 @@ mod tests {
             .await
             .unwrap();
         let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
-        exercise_failed_predecessor_transport(
-            &ctx,
-            SID,
-            registry.as_ref(),
-            (&parent, &ordinary, &successor),
-            gate.as_deref().zip(parked),
-            async |frame| {
-                let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
-                writer.write_all(encoded.as_bytes()).await.unwrap();
-            },
-            async || {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
-                serde_json::from_str(&line).unwrap()
-            },
-        )
-        .await;
+        if ack_failure {
+            crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
+                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            ).await;
+        } else {
+            exercise_failed_predecessor_transport(
+                &ctx,
+                SID,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                gate.as_deref().zip(parked),
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            )
+            .await;
+        }
         cancel.cancel();
         drop(writer);
         tokio::time::timeout(Duration::from_secs(2), server)
