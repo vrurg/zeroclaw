@@ -192,6 +192,7 @@ impl RpcGoalCommandSubmission {
                 };
                 let commit = match ready.commit(settings.clone()).await {
                     Ok(commit) => commit,
+                    Err(error) if error.is::<GoalLaunchFailureReported>() => return Err(error),
                     Err(error) => {
                         return Err(
                             report_goal_command_failure(&outbound, &session_id, error).await
