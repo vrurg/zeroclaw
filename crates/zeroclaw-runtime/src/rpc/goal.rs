@@ -268,6 +268,8 @@ impl RpcGoalCommandSubmission {
 
     /// If a start/resume acknowledgement cannot be queued, pause before any
     /// parent model call so an unseen Goal cannot begin running.
+    /// Drain a resident predecessor and deliver its owed failure output just
+    /// as after a delivered acknowledgement.
     pub(super) async fn response_delivery_failed(self) -> Result<()> {
         let Some(post_response) = self.post_response else {
             return Ok(());
@@ -279,11 +281,13 @@ impl RpcGoalCommandSubmission {
                     .await?;
             }
             GoalControlAdmission::Direct(mut submission) => {
+                // Exactly these direct responses may carry execution or a resident predecessor.
                 if matches!(
                     submission.response(),
                     GoalResponse::Started(_)
                         | GoalResponse::Resumed(_)
                         | GoalResponse::TransitionPending(_)
+                        | GoalResponse::Terminal(_)
                 ) {
                     post_response
                         .supervisor
