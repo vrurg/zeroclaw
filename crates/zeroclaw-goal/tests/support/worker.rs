@@ -1750,12 +1750,16 @@ async fn external_pause_withdraws_failure_output_without_waiting_for_foreground(
     let holder = tokio::time::timeout(Duration::from_secs(1), holder_wait)
         .await
         .expect("ordinary holder must acquire the real foreground");
+    let external = tokio::time::timeout(Duration::from_secs(1), external)
+        .await
+        .expect("external pause must hand back rather than wait for output delivery")
+        .unwrap()
+        .unwrap();
+    if let Some(delivery) = external.failure_notice {
+        delivery.withdraw().await;
+    }
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), external)
-            .await
-            .expect("external pause must withdraw rather than wait for output delivery")
-            .unwrap()
-            .unwrap(),
+        external.transition,
         zeroclaw_goal::GoalTransitionResult::Applied
     );
     {
@@ -1769,11 +1773,15 @@ async fn external_pause_withdraws_failure_output_without_waiting_for_foreground(
     assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
     assert!(supervisor.try_retire().await);
     drop(holder);
+    let external = supervisor
+        .pause_for_external_cancellation(&session)
+        .await
+        .unwrap();
+    if let Some(delivery) = external.failure_notice {
+        delivery.withdraw().await;
+    }
     assert_eq!(
-        supervisor
-            .pause_for_external_cancellation(&session)
-            .await
-            .unwrap(),
+        external.transition,
         zeroclaw_goal::GoalTransitionResult::Missing
     );
     supervisor.dispose_session(&session).await.unwrap();

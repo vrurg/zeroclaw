@@ -2506,6 +2506,334 @@ mod accept_error_tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn goal_failed_predecessor_notice_before_successor_wss() {
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::dispatch::connection_test_support::{
+            exercise_failed_predecessor_transport, prepare_failed_predecessor_fixture,
+        };
+        use crate::rpc::session::SessionStore;
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const SID: &str = "failed-predecessor-wss";
+        const OWNER: &str = "failed-predecessor-owner";
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.gateway.paired_tokens = vec!["synthetic-fixture-token".into()];
+        let sessions = Arc::new(SessionStore::new(
+            64,
+            Arc::new(SessionActorQueue::new(4, 30, 60)),
+        ));
+        let mut ctx = RpcContext::minimal(config, sessions);
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().tui_registry =
+            Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
+        let (registry, parent, ordinary, successor) =
+            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await;
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key, "goal-fixture").unwrap();
+        let acceptor = super::build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(super::serve_wss_listener(
+            server_ctx,
+            server_cancel,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acceptor,
+            listener,
+            super::WssLimits::default(),
+        ));
+        let connector = test_client_connector(&client.cert_pem, &client.key_pem);
+        let (websocket, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &format!("wss://{addr}/"),
+                None,
+                false,
+                Some(connector),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut sink, mut stream) = websocket.split();
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(OWNER.into()),
+            tui_sig: Some(ctx.tui_registry.sign(OWNER).unwrap()),
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: Some("synthetic-fixture-token".into()),
+            auth_provider: None,
+        };
+        sink.send(Message::Text(
+            rpc_request(Method::Initialize, &init, 1).into(),
+        ))
+        .await
+        .unwrap();
+        let initialized = read_response_with_id(&mut stream, 1).await;
+        assert!(initialized["error"].is_null(), "{initialized}");
+        exercise_failed_predecessor_transport(
+            &ctx,
+            SID,
+            registry.as_ref(),
+            (&parent, &ordinary, &successor),
+            None,
+            async |frame| {
+                sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                    .await
+                    .unwrap();
+            },
+            async || {
+                loop {
+                    let message = stream.next().await.unwrap().unwrap();
+                    if let Ok(text) = message.to_text() {
+                        break serde_json::from_str(text).unwrap();
+                    }
+                }
+            },
+        )
+        .await;
+        cancel.cancel();
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    use crate::rpc::dispatch::connection_test_support::ExternalCancelScenario;
+
+    #[tokio::test]
+    async fn goal_external_cancel_failure_delivery_wss() {
+        exercise_external_cancel_delivery_wss(ExternalCancelScenario::Failure).await;
+    }
+
+    #[tokio::test]
+    async fn goal_external_cancel_outcome_unknown_delivery_wss() {
+        exercise_external_cancel_delivery_wss(ExternalCancelScenario::OutcomeUnknown).await;
+    }
+
+    #[tokio::test]
+    async fn goal_external_cancel_teardown_withdraws_delivery_wss() {
+        exercise_external_cancel_delivery_wss(ExternalCancelScenario::Teardown).await;
+    }
+
+    #[tokio::test]
+    async fn goal_external_cancel_moved_incarnation_publishes_nothing_wss() {
+        exercise_external_cancel_delivery_wss(ExternalCancelScenario::Moved).await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn exercise_external_cancel_delivery_wss(scenario: ExternalCancelScenario) {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        zeroclaw_log::clear_broadcast_hook();
+        let mut logs = zeroclaw_log::subscribe_or_install();
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::dispatch::connection_test_support::{
+            exercise_external_cancel_moved_transport,
+            exercise_goal_external_cancel_failure_transport, gate_external_cancel_failure,
+            prepare_failed_predecessor_fixture, prepare_unsettled_predecessor_fixture,
+            refuse_external_cancel_settlement,
+        };
+        use crate::rpc::session::SessionStore;
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const SID: &str = "external-cancel-failure-wss";
+        const OWNER: &str = "external-cancel-owner";
+        let outcome_unknown = scenario == ExternalCancelScenario::OutcomeUnknown;
+        let teardown = scenario == ExternalCancelScenario::Teardown;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.gateway.paired_tokens = vec!["synthetic-fixture-token".into()];
+        let sessions = Arc::new(SessionStore::new(
+            64,
+            Arc::new(SessionActorQueue::new(4, 30, 60)),
+        ));
+        let mut ctx = RpcContext::minimal(config, sessions);
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().tui_registry =
+            Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
+        let (registry, parent, ordinary, successor) = if outcome_unknown {
+            prepare_unsettled_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        } else {
+            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        };
+        let gate = gate_external_cancel_failure(&ctx, tmp.path(), SID, &registry, &parent).await;
+        if outcome_unknown {
+            refuse_external_cancel_settlement(tmp.path()).await;
+        }
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&materials.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&materials.ca_key_path).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key, "goal-fixture").unwrap();
+        let acceptor = super::build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(super::serve_wss_listener(
+            server_ctx,
+            server_cancel,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acceptor,
+            listener,
+            super::WssLimits::default(),
+        ));
+        let connector = test_client_connector(&client.cert_pem, &client.key_pem);
+        let (websocket, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &format!("wss://{addr}/"),
+                None,
+                false,
+                Some(connector),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut sink, mut stream) = websocket.split();
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(OWNER.into()),
+            tui_sig: Some(ctx.tui_registry.sign(OWNER).unwrap()),
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: Some("synthetic-fixture-token".into()),
+            auth_provider: None,
+        };
+        sink.send(Message::Text(
+            rpc_request(Method::Initialize, &init, 1).into(),
+        ))
+        .await
+        .unwrap();
+        let initialized = read_response_with_id(&mut stream, 1).await;
+        assert!(initialized["error"].is_null(), "{initialized}");
+        let held = if scenario == ExternalCancelScenario::Moved {
+            exercise_external_cancel_moved_transport(
+                &ctx,
+                tmp.path(),
+                SID,
+                OWNER,
+                true,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                (&gate, &mut logs),
+                async |frame| {
+                    sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await
+                        .unwrap();
+                },
+                async || {
+                    loop {
+                        let message = stream.next().await.unwrap().unwrap();
+                        if let Ok(text) = message.to_text() {
+                            break serde_json::from_str(text).unwrap();
+                        }
+                    }
+                },
+            )
+            .await;
+            None
+        } else {
+            exercise_goal_external_cancel_failure_transport(
+                &ctx,
+                tmp.path(),
+                SID,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                &gate,
+                scenario,
+                async |frame| {
+                    sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await
+                        .unwrap();
+                },
+                async || {
+                    loop {
+                        let message = stream.next().await.unwrap().unwrap();
+                        if let Ok(text) = message.to_text() {
+                            break serde_json::from_str(text).unwrap();
+                        }
+                    }
+                },
+            )
+            .await
+        };
+        cancel.cancel();
+        drop(sink);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if teardown {
+            crate::rpc::dispatch::connection_test_support::assert_external_cancel_teardown(
+                registry.as_ref(),
+                SID,
+                (&ordinary, &successor),
+                &mut logs,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(message) = stream.next().await {
+                    let message = message.unwrap();
+                    if message.is_close() {
+                        break;
+                    }
+                    if let Ok(text) = message.to_text() {
+                        let frame: serde_json::Value = serde_json::from_str(text).unwrap();
+                        assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                        assert!(
+                            !(frame["params"]["type"] == "turn_complete"
+                                && frame["params"]["outcome"] == "failed"),
+                            "{frame}"
+                        );
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     async fn exercise_goal_parent_control_ending_over_wss(
         case: crate::rpc::dispatch::connection_test_support::GoalParentAdmissionCase,
         ending: crate::rpc::dispatch::connection_test_support::GoalParentEnding,

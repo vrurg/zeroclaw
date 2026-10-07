@@ -4373,10 +4373,11 @@ async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settle
         "external cancellation must let the admitted operation settle before returning"
     );
     release_parent.notify_one();
-    assert_eq!(
-        cancel.await.unwrap().unwrap(),
-        GoalTransitionResult::Applied
-    );
+    let cancellation = cancel.await.unwrap().unwrap();
+    if let Some(delivery) = cancellation.failure_notice {
+        delivery.deliver().await;
+    }
+    assert_eq!(cancellation.transition, GoalTransitionResult::Applied);
     assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
     let current = store
         .current_goal_for_session(&ingress.session_key().durable_id())
@@ -4488,7 +4489,11 @@ async fn external_cancel_cannot_pause_a_newer_goal_epoch() {
         "external cancellation still drains its stale resident worker"
     );
     release_parent.notify_one();
-    assert_eq!(cancel.await.unwrap().unwrap(), GoalTransitionResult::Stale);
+    let cancellation = cancel.await.unwrap().unwrap();
+    if let Some(delivery) = cancellation.failure_notice {
+        delivery.withdraw().await;
+    }
+    assert_eq!(cancellation.transition, GoalTransitionResult::Stale);
     assert_eq!(
         store
             .current_goal_for_session(&ingress.session_key().durable_id())
