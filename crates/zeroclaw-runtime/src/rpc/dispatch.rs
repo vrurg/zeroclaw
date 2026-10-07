@@ -3753,7 +3753,28 @@ impl RpcDispatcher {
                 return;
             }
             Method::SessionConfigure => self.handle_session_configure(params).await,
-            Method::SessionCancel => self.handle_session_cancel(params).await,
+            Method::SessionCancel => {
+                let (result, failure_notice) = self.handle_session_cancel(params).await;
+                if !is_notification {
+                    match result {
+                        Ok(value) => {
+                            self.send_result(req_id, value).await;
+                        }
+                        Err(error) => {
+                            self.send_error(req_id, error.code, &error.message).await;
+                        }
+                    }
+                }
+                if let Some(delivery) = failure_notice {
+                    self.prompt_tasks.retain(|task| !task.is_finished());
+                    let cancel = self.connection_cancel.clone();
+                    let task = zeroclaw_spawn::spawn!(async move {
+                        delivery.deliver_or_withdraw(cancel.cancelled_owned()).await;
+                    });
+                    self.prompt_tasks.push(task);
+                }
+                return;
+            }
             Method::SessionGitBranch => self.handle_session_git_branch(params).await,
             Method::SessionList => self.handle_session_list(params).await,
             Method::SessionListAcp => self.handle_session_list_acp(params).await,
@@ -8069,77 +8090,86 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_owner(&req.session_id, Method::SessionCancel)
-            .await?;
-        let owner = self
-            .ctx
-            .sessions
-            .session_owner_tui_id(&req.session_id)
-            .await;
-        let expected_generation = match self.capture_session_access(&req.session_id).await {
-            Ok(generation) => generation,
-            Err(error) => {
-                let (agent_alias, model_provider, model) =
-                    match self.ctx.sessions.get_agent(&req.session_id).await {
-                        Some(agent) => agent.lock().await.attribution_fields(),
-                        None => (String::new(), String::new(), String::new()),
-                    };
-                let span = ::zeroclaw_log::info_span!(
-                    target: "zeroclaw_log_internal_scope",
-                    "zeroclaw_scope",
-                    session_key = %req.session_id,
-                    agent_alias = %agent_alias,
-                    model_provider = %model_provider,
-                    model = %model,
-                    channel = "rpc",
-                );
-                let _guard = span.enter();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "caller_tui_id": self.tui_id.as_deref().unwrap_or("<none>"),
-                            "owner_tui_id": owner
-                                .as_ref()
-                                .and_then(|o| o.as_deref())
-                                .unwrap_or("<none>"),
-                            "peer_label": &self.peer_label,
-                        })),
-                    "session/cancel refused: caller does not own the session"
-                );
-                return Err(error);
+    async fn handle_session_cancel(
+        &self,
+        params: &Value,
+    ) -> (RpcResult, Option<zeroclaw_goal::GoalFailureNoticeDelivery>) {
+        let mut failure_notice = None;
+        let result = async {
+            let req: SessionIdParams = parse_params(params)?;
+            self.authorize_session_owner(&req.session_id, Method::SessionCancel)
+                .await?;
+            let owner = self
+                .ctx
+                .sessions
+                .session_owner_tui_id(&req.session_id)
+                .await;
+            let expected_generation = match self.capture_session_access(&req.session_id).await {
+                Ok(generation) => generation,
+                Err(error) => {
+                    let (agent_alias, model_provider, model) =
+                        match self.ctx.sessions.get_agent(&req.session_id).await {
+                            Some(agent) => agent.lock().await.attribution_fields(),
+                            None => (String::new(), String::new(), String::new()),
+                        };
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        session_key = %req.session_id,
+                        agent_alias = %agent_alias,
+                        model_provider = %model_provider,
+                        model = %model,
+                        channel = "rpc",
+                    );
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "caller_tui_id": self.tui_id.as_deref().unwrap_or("<none>"),
+                                "owner_tui_id": owner
+                                    .as_ref()
+                                    .and_then(|o| o.as_deref())
+                                    .unwrap_or("<none>"),
+                                "peer_label": &self.peer_label,
+                            })),
+                        "session/cancel refused: caller does not own the session"
+                    );
+                    return Err(error);
+                }
+            };
+            let (goal_cancelled, notice) = self
+                .ctx
+                .goal_runtime
+                .pause_for_external_cancellation(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            failure_notice = notice;
+            let session_cancelled = self
+                .ctx
+                .sessions
+                .signal_cancellation_for_incarnation(
+                    &req.session_id,
+                    expected_generation,
+                    crate::rpc::session::CancelCause::ClientRpc,
+                )
+                .await
+                .ok_or_else(|| self.stale_session_incarnation_error())?;
+            if goal_cancelled || session_cancelled {
+                return to_result(SessionCancelResult {
+                    session_id: req.session_id,
+                    cancelled: true,
+                });
             }
-        };
-        let goal_cancelled = self
-            .ctx
-            .goal_runtime
-            .pause_for_external_cancellation(&req.session_id)
-            .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let session_cancelled = self
-            .ctx
-            .sessions
-            .signal_cancellation_for_incarnation(
-                &req.session_id,
-                expected_generation,
-                crate::rpc::session::CancelCause::ClientRpc,
-            )
-            .await
-            .ok_or_else(|| self.stale_session_incarnation_error())?;
-        if goal_cancelled || session_cancelled {
-            return to_result(SessionCancelResult {
-                session_id: req.session_id,
-                cancelled: true,
-            });
+            Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            ))
         }
-        Err(rpc_err(
-            SESSION_NOT_FOUND,
-            "No active turn for this session",
-        ))
+        .await;
+        (result, failure_notice)
     }
 
     async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {
@@ -13971,6 +14001,1318 @@ pub(crate) mod connection_test_support {
         provider: HeldOrdinaryProvider,
         ordinary: std::sync::Mutex<Option<HeldOrdinaryProvider>>,
         messages: Arc<std::sync::Mutex<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
+    }
+
+    struct FailedPredecessorProvider {
+        parent: HeldOrdinaryTurn,
+        ordinary: HeldOrdinaryTurn,
+        successor: HeldOrdinaryTurn,
+        succeed_parent: bool,
+        calls: AtomicUsize,
+        messages: Arc<std::sync::Mutex<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FailedPublicationGate {
+        reached: Notify,
+        release: Notify,
+        claimed: AtomicBool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ParkedPredecessorCase {
+        TailQueued,
+        FreeQueue,
+    }
+
+    struct GatedFailureRegistry {
+        registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        gate: Arc<FailedPublicationGate>,
+    }
+
+    macro_rules! forward_failure_registry {
+        ($($name:ident($($argument:ident: $ty:ty),*) -> $result:ty;)*) => {
+            #[async_trait]
+            impl zeroclaw_goal::GoalTaskRegistry for GatedFailureRegistry {
+                $(async fn $name(&self, $($argument: $ty),*) -> $result {
+                    self.registry.$name($($argument),*).await
+                })*
+
+                async fn current_goal_for_session(
+                    &self, session_id: &str,
+                ) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>> {
+                    let task = self.registry.current_goal_for_session(session_id).await?;
+                    if task.as_ref().is_some_and(|task| task.status == zeroclaw_api::task::TaskStatus::Failed)
+                        && !self.gate.claimed.swap(true, Ordering::AcqRel)
+                    {
+                        self.gate.reached.notify_one();
+                        self.gate.release.notified().await;
+                    }
+                    Ok(task)
+                }
+            }
+        };
+    }
+
+    forward_failure_registry! {
+        record_control_intent(intent: &zeroclaw_goal::task::GoalControlIntent) -> anyhow::Result<()>;
+        claim_control_intent(intent_id: &str, owner_boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        settle_control_intent(intent_id: &str, settlement: zeroclaw_goal::task::GoalControlIntentSettlement) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        latest_active_goal_for_agent(agent: &str) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>>;
+        latest_active_goal_for_context(agent: &str, route: Option<&str>, principal: Option<&str>) -> anyhow::Result<Option<zeroclaw_api::task::TaskRecord>>;
+        latest_active_goal_id_for_context(agent: &str, route: Option<&str>, principal: Option<&str>) -> anyhow::Result<Option<String>>;
+        get_goal_task(task_id: &str) -> anyhow::Result<Option<zeroclaw_goal::GoalTaskRecord>>;
+        update_goal_limits(task_id: &str, tokens: Option<u64>, cost: Option<f64>) -> anyhow::Result<()>;
+        update_goal_pause(task_id: &str, pause: Option<zeroclaw_goal::GoalPauseState>) -> anyhow::Result<()>;
+        set_continuation_context(task_id: &str, context: Option<zeroclaw_goal::task::TaskContinuationContext>) -> anyhow::Result<()>;
+        get_continuation_context(task_id: &str) -> anyhow::Result<Option<zeroclaw_goal::task::TaskContinuationContext>>;
+        terminal_reason_for_session_goal(task_id: &str, session_id: &str) -> anyhow::Result<Option<String>>;
+        create_or_replace_session_goal(task: zeroclaw_api::task::TaskRecord, goal: zeroclaw_goal::GoalTaskRecord) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        pause_session_goal(task_id: &str, session_id: &str, epoch: i64, pause: zeroclaw_goal::GoalPauseState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        resume_session_goal(task_id: &str, session_id: &str, epoch: i64, owner_pid: u32, boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        finish_session_goal(task_id: &str, session_id: &str, epoch: i64, status: zeroclaw_api::task::TaskStatus, error: Option<String>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        admit_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        settle_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str, state: zeroclaw_goal::GoalAccountingState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        update_session_goal_limits(task_id: &str, session_id: &str, epoch: i64, tokens: Option<u64>, cost: Option<f64>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+        delete_session_goal(task_id: &str, session_id: &str, epoch: i64) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    }
+
+    pub(crate) async fn gate_failed_predecessor_publication(
+        ctx: &RpcContext,
+        path: &Path,
+        session_id: &str,
+        registry: &Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        parent: &HeldGoalParent,
+    ) -> Arc<FailedPublicationGate> {
+        use zeroclaw_goal::control::GoalRuntime;
+        let gate = Arc::new(FailedPublicationGate::default());
+        let decorated: Arc<dyn zeroclaw_goal::GoalTaskRegistry> = Arc::new(GatedFailureRegistry {
+            registry: Arc::clone(registry),
+            gate: Arc::clone(&gate),
+        });
+        let tracker = Arc::new(crate::cost::CostTracker::new(Default::default(), path).unwrap());
+        let accounting = Arc::new(
+            crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                Arc::clone(&decorated),
+                tracker,
+                "test-agent",
+                Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                    Arc::default(),
+                )),
+            )
+            .unwrap(),
+        );
+        let existing = ctx.goal_runtime.supervisor(session_id).await.unwrap();
+        assert!(
+            existing.try_retire().await,
+            "fixture has not admitted a worker"
+        );
+        ctx.goal_runtime
+            .remove_supervisor_if_current(session_id, &existing)
+            .await;
+        let engine = Arc::new(GoalRuntime::new(decorated).execution_engine(accounting));
+        let supervisor = parent.restart.new_supervisor(engine).await;
+        ctx.goal_runtime
+            .install_supervisor_if_absent(session_id.into(), supervisor)
+            .await;
+        let db = path.join("control_plane.db");
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fixture_park_goal_finish_error
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.kind = 'goal' AND NEW.error = 'parent_operation_failed'
+                 BEGIN SELECT RAISE(ABORT, 'scripted Goal finish failure'); END;",
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+        gate
+    }
+
+    #[async_trait]
+    impl ModelProvider for FailedPredecessorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("failed predecessor fixture requires structured chat")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            let gate = match call {
+                0 => {
+                    *self.messages.lock().unwrap() = request.messages.to_vec();
+                    &self.parent
+                }
+                1 => &self.ordinary,
+                2 => &self.successor,
+                _ => anyhow::bail!("unexpected additional fixture model call"),
+            };
+            let text = HeldOrdinaryProvider(gate.clone())
+                .chat_with_system(None, "", model, temperature)
+                .await?;
+            if call == 0 && !self.succeed_parent {
+                anyhow::bail!("scripted failed predecessor")
+            }
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for FailedPredecessorProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-failed-predecessor"
+        }
+    }
+
+    pub(crate) async fn prepare_failed_predecessor_fixture(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner: &str,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        HeldGoalParent,
+        HeldOrdinaryTurn,
+        HeldOrdinaryTurn,
+    ) {
+        prepare_predecessor_fixture(ctx, path, session_id, owner, false).await
+    }
+
+    pub(crate) async fn prepare_unsettled_predecessor_fixture(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner: &str,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        HeldGoalParent,
+        HeldOrdinaryTurn,
+        HeldOrdinaryTurn,
+    ) {
+        prepare_predecessor_fixture(ctx, path, session_id, owner, true).await
+    }
+
+    async fn prepare_predecessor_fixture(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner: &str,
+        succeed_parent: bool,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        HeldGoalParent,
+        HeldOrdinaryTurn,
+        HeldOrdinaryTurn,
+    ) {
+        let (registry, parent) = prepare_held_goal_parent_fixture(
+            ctx,
+            path,
+            session_id,
+            owner,
+            GoalParentAdmissionCase::DirectResume,
+        )
+        .await;
+        let ordinary = HeldOrdinaryTurn::default();
+        let successor = HeldOrdinaryTurn::default();
+        ctx.sessions
+            .get_agent(session_id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .set_model_provider(Box::new(FailedPredecessorProvider {
+                parent: parent.turn.clone(),
+                ordinary: ordinary.clone(),
+                successor: successor.clone(),
+                succeed_parent,
+                calls: AtomicUsize::new(0),
+                messages: Arc::clone(&parent.messages),
+            }));
+        (registry, parent, ordinary, successor)
+    }
+
+    pub(crate) async fn gate_external_cancel_failure(
+        ctx: &RpcContext,
+        path: &Path,
+        session_id: &str,
+        registry: &Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        parent: &HeldGoalParent,
+    ) -> Arc<FailedPublicationGate> {
+        let gate =
+            gate_failed_predecessor_publication(ctx, path, session_id, registry, parent).await;
+        // This case parks the drainer only to prove that the real ordinary
+        // cancellation registration is live before the signal. Unlike W1 it
+        // needs no store refusal: the pause fence produces the Goal-only error.
+        let db = path.join("control_plane.db");
+        tokio::task::spawn_blocking(move || {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .execute_batch("DROP TRIGGER fixture_park_goal_finish_error;")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        gate
+    }
+
+    pub(crate) async fn assert_external_cancel_teardown(
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        session_id: &str,
+        turns: (&HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        logs: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    ) {
+        let key = zeroclaw_goal::GoalSessionKey::zero_code(session_id)
+            .unwrap()
+            .durable_id();
+        let task = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&task.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        let mut count = 0;
+        loop {
+            match logs.try_recv() {
+                Ok(event) => {
+                    if event["severity_text"] == "WARN"
+                        && event["attributes"]["task_id"] == task.id
+                        && event["attributes"]["phase"] == "failure_notice_delivery"
+                    {
+                        count += 1;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("delivery log capture failed: {error}"),
+            }
+        }
+        assert_eq!(count, 1);
+        assert!(turns.0.exited.load(Ordering::Acquire));
+        assert!(!turns.0.completed.load(Ordering::Acquire));
+        assert_eq!(turns.1.calls.load(Ordering::Acquire), 0);
+    }
+
+    pub(crate) async fn refuse_external_cancel_settlement(path: &std::path::Path) {
+        let db = path.join("control_plane.db");
+        tokio::task::spawn_blocking(move || {
+            rusqlite::Connection::open(db).unwrap().execute_batch(
+                "CREATE TRIGGER fixture_refuse_pending_settlement BEFORE UPDATE OF pending_call_id ON goal_tasks WHEN OLD.pending_call_id IS NOT NULL AND NEW.pending_call_id IS NULL AND NEW.accounting_state != 'outcome_unknown' BEGIN SELECT RAISE(ABORT, 'fixture pending settlement unavailable'); END;"
+            ).unwrap();
+        }).await.unwrap();
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExternalCancelScenario {
+        Failure,
+        OutcomeUnknown,
+        Teardown,
+        Start,
+        Moved,
+    }
+
+    pub(crate) async fn exercise_external_cancel_moved_transport(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        owner: &str,
+        remote: bool,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        turns: (&HeldGoalParent, &HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        observation: (
+            &FailedPublicationGate,
+            &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        ),
+        mut send: impl std::ops::AsyncFnMut(serde_json::Value),
+        mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
+    ) {
+        use zeroclaw_api::jsonrpc::error_codes::{SESSION_NOT_FOUND, SESSION_NOT_OWNED};
+        use zeroclaw_goal::{GoalSessionKey, control::GoalResponse};
+        let (gate, logs) = observation;
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let (parent, ordinary, successor) = turns;
+        let request = |method: &str, params: serde_json::Value, id| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": method, "params": params, "id": id,
+            })
+        };
+        send(request(
+            "session/goal",
+            serde_json::json!({"session_id": session_id, "command": "/goal resume"}),
+            40,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 40 {
+                    let result: crate::rpc::types::SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Resumed(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        let generation = ctx.sessions.get_generation(session_id).await.unwrap();
+        let before = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        send(request(
+            "session/cancel",
+            serde_json::json!({"session_id": session_id}),
+            42,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let task = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task.id, before.id);
+                if task.status == zeroclaw_api::task::TaskStatus::Paused {
+                    assert_eq!(task.execution_epoch, before.execution_epoch + 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let replacement = HeldOrdinaryTurn::default();
+        let replacement_provider = replacement.clone();
+        let insert_ctx = Arc::clone(ctx);
+        let insert_path = path.to_owned();
+        let insert_session = session_id.to_owned();
+        let insert_owner = owner.to_owned();
+        let insert = zeroclaw_spawn::spawn!(async move {
+            insert_session_with_owner(
+                &insert_ctx,
+                &insert_path,
+                &insert_session,
+                Box::new(HeldOrdinaryProvider(replacement_provider)),
+                Some(&insert_owner),
+            )
+            .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        parent.turn.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), insert)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            ctx.sessions.get_generation(session_id).await,
+            Some(generation)
+        );
+        gate.release.notify_one();
+        let mut originals = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                if frame["id"] == 42 {
+                    assert_eq!(
+                        frame["error"]["code"],
+                        if remote {
+                            SESSION_NOT_OWNED
+                        } else {
+                            SESSION_NOT_FOUND
+                        },
+                        "{frame}"
+                    );
+                    assert_eq!(
+                        frame["error"]["message"],
+                        if remote {
+                            "Caller no longer owns this session"
+                        } else {
+                            "Session changed while queued"
+                        },
+                        "{frame}"
+                    );
+                    break;
+                }
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["params"]["type"] == "turn_complete" {
+                    assert_eq!(frame["params"]["outcome"], "failed", "{frame}");
+                    assert_eq!(
+                        frame["params"]["content"],
+                        "turn failed: Agent turn failed: scripted failed predecessor",
+                        "{frame}"
+                    );
+                    originals += 1;
+                    assert_eq!(originals, 1);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(originals, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = logs.recv().await.unwrap();
+                if event["severity_text"] == "WARN"
+                    && event["attributes"]["task_id"] == before.id
+                    && event["attributes"]["phase"] == "failure_notice_delivery"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        loop {
+            match logs.try_recv() {
+                Ok(event) => assert!(
+                    !(event["severity_text"] == "WARN"
+                        && event["attributes"]["task_id"] == before.id
+                        && event["attributes"]["phase"] == "failure_notice_delivery"),
+                    "duplicate withdrawal: {event}"
+                ),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("delivery log capture failed: {error}"),
+            }
+        }
+        send(request("health", serde_json::json!({}), 43)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                assert_ne!(frame["params"]["type"], "turn_complete", "{frame}");
+                if frame["id"] == 43 {
+                    assert!(frame["error"].is_null(), "{frame}");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let task = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, before.id);
+        assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&task.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.calls.load(Ordering::Acquire), 0);
+        assert_eq!(ordinary.calls.load(Ordering::Acquire), 0);
+        assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+    }
+
+    pub(crate) async fn exercise_goal_external_cancel_failure_transport(
+        ctx: &RpcContext,
+        path: &Path,
+        session_id: &str,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        turns: (&HeldGoalParent, &HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        gate: &FailedPublicationGate,
+        scenario: ExternalCancelScenario,
+        mut send: impl std::ops::AsyncFnMut(serde_json::Value),
+        mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
+    ) -> Option<tokio::sync::OwnedMutexGuard<crate::agent::Agent>> {
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate};
+        use zeroclaw_goal::control::{
+            GoalFailureReason, GoalQueuedControl, GoalResponse, GoalSessionKey,
+        };
+
+        let (parent, ordinary, successor) = turns;
+        let outcome_unknown = scenario == ExternalCancelScenario::OutcomeUnknown;
+        let teardown = scenario == ExternalCancelScenario::Teardown;
+        let start_successor = scenario == ExternalCancelScenario::Start;
+        let expected_original = if outcome_unknown {
+            "turn failed: Agent turn failed: fixture pending settlement unavailable"
+        } else {
+            "turn failed: Agent turn failed: scripted failed predecessor"
+        };
+        let expected_reason = if outcome_unknown {
+            GoalFailureReason::OperationOutcomeUnknown
+        } else {
+            GoalFailureReason::ExecutorFailed
+        };
+        let expected_terminal = if outcome_unknown {
+            "accounting_outcome_unknown"
+        } else {
+            "executor_failed"
+        };
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let generation = ctx.sessions.get_generation(session_id).await.unwrap();
+        let request = |method: &str, params: serde_json::Value, id| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": method, "params": params, "id": id,
+            })
+        };
+        send(request(
+            "session/goal",
+            serde_json::json!({"session_id": session_id, "command": "/goal resume"}),
+            40,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 40 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Resumed(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("resume acknowledgement must precede the held parent");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        parent.assert_resume_input(None);
+        let before = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, zeroclaw_api::task::TaskStatus::Running);
+        send(request(
+            "session/prompt",
+            serde_json::json!({"session_id": session_id, "prompt": "ordinary work"}),
+            41,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary prompt must queue behind the actual Goal turn");
+        send(request(
+            "session/cancel",
+            serde_json::json!({"session_id": session_id}),
+            42,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let task = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task.id, before.id);
+                if task.status == zeroclaw_api::task::TaskStatus::Paused {
+                    assert_eq!(task.execution_epoch, before.execution_epoch + 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("external cancellation must fence before waiting for admitted settlement");
+        parent.turn.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ordinary.started.notified(),
+        )
+        .await
+        .expect("queued ordinary prompt must own the real lane before the signal");
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+            .await
+            .expect("drainer must classify the fenced failure before handing delivery back");
+        assert!(!ordinary.completed.load(Ordering::Acquire));
+        assert!(!ordinary.exited.load(Ordering::Acquire));
+        assert!(ctx.sessions.has_inflight_turn(session_id));
+        let agent = ctx.sessions.get_agent(session_id).await.unwrap();
+        assert!(agent.try_lock().is_err());
+        let mut persistence_hold = std::pin::pin!(Arc::clone(&agent).lock_owned());
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            _ = persistence_hold.as_mut() => {
+                panic!("ordinary turn must own the agent before cancellation");
+            }
+            () = std::future::ready(()) => {}
+        }
+        gate.release.notify_one();
+
+        let mut host_originals = 0;
+        let mut parked_originals = 0;
+        let mut notices = 0;
+        let mut ordinary_ack = false;
+        let mut ordinary_cancelled = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 41 {
+                    panic!("ordinary terminal response cannot precede cancellation acknowledgement while persistence is held: {frame}");
+                }
+                if frame["params"]["type"] == "turn_complete" {
+                    assert_eq!(frame["params"]["outcome"], "failed", "{frame}");
+                    assert_eq!(
+                        frame["params"]["content"],
+                        expected_original,
+                        "{frame}"
+                    );
+                    host_originals += 1;
+                    assert_eq!(host_originals, 1, "{frame}");
+                }
+                assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                if frame["id"] == 42 {
+                    assert_eq!(frame["result"]["session_id"], session_id, "{frame}");
+                    assert_eq!(frame["result"]["cancelled"], true, "{frame}");
+                    assert!(!ordinary.completed.load(Ordering::Acquire));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("session/cancel must acknowledge while the ordinary prompt owns the queue");
+        assert_eq!(host_originals, 1);
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.id, before.id);
+        assert_eq!(failed.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected_terminal)
+        );
+        if outcome_unknown {
+            let extension = registry.get_goal_task(&failed.id).await.unwrap().unwrap();
+            assert_eq!(
+                extension.accounting_state,
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            );
+            assert!(extension.pending_call_id.is_none());
+            assert!(extension.pending_call_epoch.is_none());
+            let ledger_path = path.join("state/costs.jsonl");
+            let task_id = failed.id.clone();
+            tokio::task::spawn_blocking(move || {
+                let contents = std::fs::read_to_string(ledger_path).unwrap();
+                let records: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .filter(|record: &zeroclaw_config::cost::types::CostRecord| {
+                        record.task_id.as_deref() == Some(task_id.as_str())
+                    })
+                    .collect();
+                assert_eq!(records.len(), 1);
+                let usage = &records[0].usage;
+                assert_eq!(
+                    (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+                    (2, 1, 3)
+                );
+            })
+            .await
+            .unwrap();
+        }
+        // The FIFO waiter parks the prompt's real post-turn persistence while
+        // its SessionGuard still owns the queue, without delaying the signal.
+        let held =
+            tokio::time::timeout(std::time::Duration::from_secs(7), persistence_hold.as_mut())
+                .await
+                .expect(
+                    "cancelled ordinary turn task must release the agent within turn::CANCEL_GRACE",
+                );
+        assert!(!ordinary.completed.load(Ordering::Acquire));
+        assert!(ctx.sessions.session_queue.queue_depth(session_id).await >= 1);
+        if teardown {
+            return Some(held);
+        }
+        if start_successor {
+            send(request(
+                "session/goal",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "command": "/goal start --unlimited successor repair",
+                }),
+                44,
+            ))
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame = receive().await;
+                    assert!(frame["error"].is_null(), "{frame}");
+                    assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                    assert_ne!(frame["params"]["type"], "turn_complete", "{frame}");
+                    assert_ne!(frame["id"], 41, "{frame}");
+                    if frame["id"] == 44 {
+                        let result: SessionGoalResult =
+                            serde_json::from_value(frame["result"].clone()).unwrap();
+                        assert!(
+                            matches!(
+                                result.response,
+                                GoalResponse::Queued(GoalQueuedControl::Start)
+                            ),
+                            "{frame}"
+                        );
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("Start must acknowledge while failure delivery is pending");
+            let current = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.id, failed.id);
+            assert_eq!(current.status, zeroclaw_api::task::TaskStatus::Failed);
+            assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+        }
+        drop(held);
+        let mut started = false;
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ordinary_ack || if start_successor { !started } else { !ordinary_cancelled || parked_originals != 1 || notices != 1 } {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 41 {
+                    assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                    assert!(ordinary_cancelled, "{frame}");
+                    assert!(!ordinary_ack, "{frame}");
+                    ordinary_ack = true;
+                }
+                if frame["params"]["type"] == "turn_complete" {
+                    assert_eq!(frame["params"]["session_id"], session_id, "{frame}");
+                    match frame["params"]["outcome"].as_str().unwrap() {
+                        "cancelled" => {
+                            assert!(ordinary.exited.load(Ordering::Acquire));
+                            assert!(!ordinary_cancelled, "{frame}");
+                            assert_eq!(parked_originals, 0, "{frame}");
+                            assert_eq!(notices, 0, "{frame}");
+                            assert_eq!(
+                                frame["params"]["content"],
+                                format!("turn cancelled via client_rpc in RPC_SESSION {session_id}"),
+                                "{frame}"
+                            );
+                            ordinary_cancelled = true;
+                        }
+                        "failed" => {
+                            assert!(ordinary_cancelled, "{frame}");
+                            assert_eq!(parked_originals, 0, "{frame}");
+                            assert_eq!(notices, 0, "{frame}");
+                            assert_eq!(
+                                frame["params"]["content"],
+                                "turn failed: Agent turn failed: Goal failure lost its execution fence",
+                                "{frame}"
+                            );
+                            parked_originals += 1;
+                        }
+                        other => panic!("unexpected completion {other}: {frame}"),
+                    }
+                }
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    match update {
+                        SessionGoalUpdate::Failed { session_id: actual, reason } => {
+                            assert_eq!(actual, session_id, "{frame}");
+                            assert_eq!(reason, expected_reason, "{frame}");
+                            assert!(ordinary_cancelled, "{frame}");
+                            assert_eq!(parked_originals, 1, "{frame}");
+                            notices += 1;
+                            assert_eq!(notices, 1, "{frame}");
+                        }
+                        SessionGoalUpdate::Lifecycle { response: GoalResponse::Started(_), .. } if start_successor => {
+                            assert_eq!(notices, 1, "VT112 cancellation RED point: Started must follow the failure notice: {frame}");
+                            assert_eq!(parked_originals, 1, "{frame}");
+                            assert!(ordinary_cancelled, "{frame}");
+                            assert!(!started, "{frame}");
+                            started = true;
+                        }
+                        other => panic!("unexpected cancellation lifecycle event: {other:?}"),
+                    }
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            delivered,
+            "VT110 RED point: cancelled={ordinary_cancelled} ack={ordinary_ack} parked={parked_originals} notices={notices}"
+        );
+        assert!(ordinary.exited.load(Ordering::Acquire));
+        assert!(!ordinary.completed.load(Ordering::Acquire));
+        assert_eq!(ordinary.calls.load(Ordering::Acquire), 1);
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+        if start_successor {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                successor.started.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(successor.calls.load(Ordering::Acquire), 1);
+            send(request(
+                "session/goal",
+                serde_json::json!({"session_id": session_id, "command": "/goal cancel"}),
+                45,
+            ))
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    != zeroclaw_api::task::TaskStatus::Cancelled
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            successor.release.notify_one();
+        } else {
+            assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(
+            ctx.sessions.get_generation(session_id).await,
+            Some(generation)
+        );
+        None
+    }
+
+    pub(crate) async fn exercise_failed_predecessor_transport(
+        ctx: &RpcContext,
+        session_id: &str,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        turns: (&HeldGoalParent, &HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        publication_gate: Option<(&FailedPublicationGate, ParkedPredecessorCase)>,
+        mut send: impl std::ops::AsyncFnMut(serde_json::Value),
+        mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
+    ) {
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate};
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        let (parent, ordinary, successor) = turns;
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let generation = ctx.sessions.get_generation(session_id).await.unwrap();
+        let request = |method: &str, params: serde_json::Value, id| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": method, "params": params, "id": id,
+            })
+        };
+        send(request(
+            "session/goal",
+            serde_json::json!({
+                "session_id": session_id, "command": "/goal resume",
+            }),
+            40,
+        ))
+        .await;
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 40 {
+                    break serde_json::from_value::<SessionGoalResult>(frame["result"].clone())
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(resumed.response, GoalResponse::Resumed(_)));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        parent.assert_resume_input(None);
+        let before = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, zeroclaw_api::task::TaskStatus::Running);
+        send(request(
+            "session/prompt",
+            serde_json::json!({
+                "session_id": session_id, "prompt": "ordinary work",
+            }),
+            41,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary prompt must queue behind the actual Goal turn");
+        let mut originals = 0;
+        let mut failures = 0;
+        let mut ordinary_ack = false;
+        let mut ordinary_complete = false;
+        let mut text = String::new();
+        if publication_gate.is_none() {
+            send(request(
+                "session/goal",
+                serde_json::json!({
+                    "session_id": session_id, "command": "/goal pause now",
+                }),
+                42,
+            ))
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let frame = receive().await;
+                    assert!(frame["error"].is_null(), "{frame}");
+                    if frame["id"] == 42 {
+                        let result: SessionGoalResult =
+                            serde_json::from_value(frame["result"].clone()).unwrap();
+                        assert!(matches!(
+                            result.response,
+                            GoalResponse::TransitionPending(_)
+                        ));
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("immediate pause must acknowledge before parent settlement");
+        }
+        parent.turn.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ordinary.started.notified(),
+        )
+        .await
+        .expect("the real queued ordinary prompt must acquire the session lane");
+        if let Some((gate, _)) = publication_gate {
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+                .await
+                .expect("failed worker tail must reach the pre-acquisition gate");
+        }
+        assert!(!ordinary.completed.load(Ordering::Acquire));
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
+        if let Some((gate, case)) = publication_gate {
+            match case {
+                ParkedPredecessorCase::TailQueued => {
+                    gate.release.notify_one();
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while ctx.sessions.session_queue.queue_depth(session_id).await != 2 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("ordinary holder and predecessor tail must reserve the real FIFO");
+                }
+                ParkedPredecessorCase::FreeQueue => {
+                    ordinary.release.notify_one();
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !ordinary_ack || !ordinary_complete || originals != 1 {
+                            let frame = receive().await;
+                            assert!(frame["error"].is_null(), "{frame}");
+                            assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                            if frame["id"] == 41 {
+                                assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                                ordinary_ack = true;
+                            }
+                            if frame["params"]["type"] == "turn_complete"
+                                && frame["params"]["outcome"] == "failed"
+                            {
+                                assert!(
+                                    frame["params"]["content"]
+                                        .as_str()
+                                        .unwrap()
+                                        .contains("scripted failed predecessor")
+                                );
+                                originals += 1;
+                            } else if frame["method"] == "session/update" {
+                                ordinary_complete |=
+                                    observe_ordinary_turn_update(&frame, session_id, &mut text);
+                            }
+                        }
+                        while ctx.sessions.session_queue.queue_depth(session_id).await != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("ordinary output must finish with the predecessor tail still held");
+                    assert_eq!(text, "ordinary answer");
+                    assert_eq!(ordinary.calls.load(Ordering::Acquire), 1);
+                    assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+                    assert_eq!(failures, 0);
+                    let failed = registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(failed.id, before.id);
+                    assert_eq!(failed.status, zeroclaw_api::task::TaskStatus::Failed);
+                    assert_eq!(
+                        registry
+                            .terminal_reason_for_session_goal(&failed.id, &key)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("executor_failed")
+                    );
+                }
+            }
+        }
+        send(request(
+            "session/goal",
+            serde_json::json!({
+                "session_id": session_id, "command": "/goal start --unlimited successor repair",
+            }),
+            43,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    assert!(
+                        frame["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("scripted failed predecessor")
+                    );
+                    originals += 1;
+                }
+                if frame["id"] == 41 {
+                    assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                    ordinary_ack = true;
+                }
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    if matches!(update, SessionGoalUpdate::Failed { .. }) {
+                        failures += 1;
+                    }
+                    assert!(
+                        !matches!(
+                            update,
+                            SessionGoalUpdate::Lifecycle {
+                                response: GoalResponse::Started(_),
+                                ..
+                            }
+                        ),
+                        "successor cannot precede failure delivery: {frame}"
+                    );
+                }
+                if frame["id"] == 43 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(
+                        matches!(
+                            result.response,
+                            GoalResponse::Queued(GoalQueuedControl::Start)
+                        ),
+                        "{result:?}"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Start must acknowledge while ordinary ownership is held");
+        assert_eq!(originals, 1);
+        assert_eq!(failures, 0);
+        assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.id, before.id);
+        assert_eq!(failed.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        if let Some((gate, ParkedPredecessorCase::FreeQueue)) = publication_gate {
+            gate.release.notify_one();
+        } else {
+            ordinary.release.notify_one();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 41 {
+                    assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                    ordinary_ack = true;
+                }
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    // BR32(d)/BR33: the epoch's one handed Goal-only original
+                    // follows ordinary output and precedes the failure notice.
+                    // The gated W1 variants park the scripted store refusal; the
+                    // plain pause-now W2 parks the fenced `parent_operation_failed`
+                    // transition error. Neither repeats the host-rendered frame.
+                    let parked = if publication_gate.is_some() {
+                        "scripted Goal finish failure"
+                    } else {
+                        "Goal failure lost its execution fence"
+                    };
+                    let content = frame["params"]["content"].as_str().unwrap();
+                    assert_eq!(originals, 1, "{frame}");
+                    assert_eq!(failures, 0, "{frame}");
+                    assert!(ordinary_complete, "{frame}");
+                    assert!(content.contains(parked), "{frame}");
+                    assert!(!content.contains("scripted failed predecessor"), "{frame}");
+                    originals += 1;
+                } else if frame["method"] == "session/update" {
+                    ordinary_complete |=
+                        observe_ordinary_turn_update(&frame, session_id, &mut text);
+                }
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    match update {
+                        SessionGoalUpdate::Failed {
+                            session_id: actual,
+                            reason,
+                        } => {
+                            assert_eq!(actual, session_id);
+                            assert_eq!(
+                                reason,
+                                zeroclaw_goal::control::GoalFailureReason::ExecutorFailed
+                            );
+                            assert!(ordinary_ack && ordinary_complete);
+                            failures += 1;
+                        }
+                        SessionGoalUpdate::Lifecycle {
+                            response: GoalResponse::Started(_),
+                            ..
+                        } => {
+                            assert_eq!(
+                                failures, 1,
+                                "the original failure notice must precede successor Started"
+                            );
+                            assert_eq!(originals, 2);
+                            break;
+                        }
+                        SessionGoalUpdate::Lifecycle {
+                            response: GoalResponse::Terminal(_),
+                            ..
+                        } => {
+                            assert_eq!(failures, 1);
+                        }
+                        other => panic!("unexpected predecessor event: {other:?}"),
+                    }
+                }
+            }
+        })
+        .await
+        .expect("failure delivery and successor admission must settle after ordinary output");
+        assert_eq!(text, "ordinary answer");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            successor.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.sessions.get_generation(session_id).await,
+            Some(generation)
+        );
+        assert_eq!(ordinary.calls.load(Ordering::Acquire), 1);
+        assert_eq!(successor.calls.load(Ordering::Acquire), 1);
+        send(request(
+            "session/goal",
+            serde_json::json!({"session_id": session_id, "command": "/goal cancel"}),
+            44,
+        ))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                != zeroclaw_api::task::TaskStatus::Cancelled
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        successor.release.notify_one();
     }
 
     #[async_trait]
@@ -30203,9 +31545,13 @@ mod tests {
             .durable_id();
         let cancelling = dispatcher.spawn_handle();
         let cancel = zeroclaw_spawn::spawn!(async move {
-            cancelling
+            let (result, delivery) = cancelling
                 .handle_session_cancel(&json!({"session_id": GoalAdmissionFixture::SESSION}))
-                .await
+                .await;
+            if let Some(delivery) = delivery {
+                delivery.withdraw().await;
+            }
+            result
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while registry
@@ -30348,13 +31694,15 @@ mod tests {
             .supervisor(GoalAdmissionFixture::SESSION)
             .await
             .unwrap();
-        assert!(
-            !context
-                .goal_runtime
-                .pause_for_external_cancellation(GoalAdmissionFixture::SESSION)
-                .await
-                .unwrap()
-        );
+        let (cancelled, delivery) = context
+            .goal_runtime
+            .pause_for_external_cancellation(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
+        assert!(!cancelled);
         assert!(Arc::ptr_eq(
             &owner,
             &context
@@ -39731,10 +41079,13 @@ mod tests {
             .expect("the first ACP partial response must be observed");
         tokio::task::yield_now().await;
 
-        let cancelled = dispatcher
+        let (cancelled, delivery) = dispatcher
             .handle_session_cancel(&json!({"session_id": sid}))
-            .await
-            .expect("the owning client must be allowed to cancel");
+            .await;
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
+        let cancelled = cancelled.expect("the owning client must be allowed to cancel");
         assert_eq!(cancelled["cancelled"], json!(true));
         let first_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
             .await
@@ -44630,12 +45981,14 @@ mod tests {
             create_session_with_owner(&mut dispatcher_a, &sessions, "tui-A").await;
 
         dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
-        let result = dispatcher_b
+        let (result, delivery) = dispatcher_b
             .handle_session_cancel(&json!({
                 "session_id": session_id,
             }))
             .await;
-
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
         let err = result.expect_err(
             "a cancel from a dispatcher whose tui_id does not match the \
              session's owner_tui_id must be refused",
@@ -44666,12 +46019,14 @@ mod tests {
         // dispatcher_b never set its tui_id — fresh connection, no
         // initialize handshake yet.
         dispatcher_b.set_tui_id_for_test(None);
-        let result = dispatcher_b
+        let (result, delivery) = dispatcher_b
             .handle_session_cancel(&json!({
                 "session_id": session_id,
             }))
             .await;
-
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
         let err = result.expect_err("anonymous cancel must be refused");
         assert_ne!(err.code, SESSION_NOT_FOUND);
         assert!(
@@ -44691,12 +46046,14 @@ mod tests {
             create_session_with_owner(&mut dispatcher_a, &sessions, "tui-A").await;
 
         // Same dispatcher, same tui_id that created the session.
-        let result = dispatcher_a
+        let (result, delivery) = dispatcher_a
             .handle_session_cancel(&json!({
                 "session_id": session_id,
             }))
             .await;
-
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
         assert!(
             result.is_ok(),
             "owner cancel must succeed; got: {:?}",
@@ -44722,10 +46079,13 @@ mod tests {
             tx,
             "unix:trusted-local".to_string(),
         );
-        local
+        let (result, delivery) = local
             .handle_session_cancel(&json!({"session_id": session_id}))
-            .await
-            .expect("trusted local control may cancel any live session");
+            .await;
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
+        result.expect("trusted local control may cancel any live session");
 
         assert!(token.is_cancelled());
     }
@@ -47202,10 +48562,14 @@ mod tests {
         assert_eq!(running.state, "running");
         assert!(running.turn_id.is_some());
 
-        let cancelled = dispatcher
+        let (cancelled, delivery) = dispatcher
             .handle_session_cancel(&json!({"session_id": sid}))
-            .await
-            .expect("the owning dispatcher must be allowed to cancel its turn");
+            .await;
+        if let Some(delivery) = delivery {
+            delivery.withdraw().await;
+        }
+        let cancelled =
+            cancelled.expect("the owning dispatcher must be allowed to cancel its turn");
         assert_eq!(cancelled["cancelled"], true);
 
         let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)

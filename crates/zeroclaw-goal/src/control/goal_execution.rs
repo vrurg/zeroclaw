@@ -44,7 +44,7 @@ pub use deferred_control::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
     GoalDeferredControl, GoalDeferredReady,
 };
-use failure_delivery::GoalFailureNoticeDelivery;
+pub use failure_delivery::GoalFailureNoticeDelivery;
 use launch_guard::GoalLaunchGuard;
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
@@ -60,6 +60,18 @@ pub enum GoalExecutionOutcome {
     VerifierBlocked,
     /// The admitted operation settled after its exact task/epoch was fenced.
     Fenced,
+}
+
+/// Durable external pause outcome and any outstanding failure publication.
+/// The caller must deliver or explicitly withdraw the notice without holding
+/// its session's foreground or command lease.
+#[derive(Debug)]
+#[must_use = "settle any returned failure publication"]
+pub struct GoalExternalCancellation {
+    /// Result of the exact task/epoch pause transition.
+    pub transition: GoalTransitionResult,
+    /// Publication custody retained after the admitted operation settles.
+    pub failure_notice: Option<GoalFailureNoticeDelivery>,
 }
 
 /// A Goal command result whose surface lease remains held until the transport
@@ -1048,12 +1060,16 @@ impl GoalExecutionSupervisor {
 
     /// Fence and drain the resident Goal owned by an externally cancelled
     /// session without interrupting an already-admitted model operation.
+    /// Return outstanding publication custody; never wait for its foreground.
     pub async fn pause_for_external_cancellation(
         &self,
         session_id: &str,
-    ) -> Result<GoalTransitionResult> {
+    ) -> Result<GoalExternalCancellation> {
         let Some(scope) = self.scope_for_session_id(session_id).await? else {
-            return Ok(GoalTransitionResult::Missing);
+            return Ok(GoalExternalCancellation {
+                transition: GoalTransitionResult::Missing,
+                failure_notice: None,
+            });
         };
         let transition = self
             .engine
@@ -1069,10 +1085,11 @@ impl GoalExecutionSupervisor {
                 },
             )
             .await?;
-        if let Some(delivery) = self.drain_lifecycle_fence(&scope).await?.failure_notice {
-            delivery.withdraw().await;
-        }
-        Ok(transition)
+        let failure_notice = self.drain_lifecycle_fence(&scope).await?.failure_notice;
+        Ok(GoalExternalCancellation {
+            transition,
+            failure_notice,
+        })
     }
 
     /// Fence every resident epoch without waiting for any worker. The restart
