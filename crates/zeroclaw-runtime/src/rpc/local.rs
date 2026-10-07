@@ -1314,6 +1314,279 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_failed_predecessor_notice_before_successor_local_ipc() {
+        exercise_failed_predecessor_local_ipc(None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_parked_predecessor_original_before_successor_local_ipc() {
+        exercise_failed_predecessor_local_ipc(Some(
+            crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::TailQueued,
+        ))
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_parked_predecessor_original_before_free_queue_successor_local_ipc() {
+        exercise_failed_predecessor_local_ipc(Some(
+            crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::FreeQueue,
+        ))
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_failed_predecessor_local_ipc(
+        parked: Option<crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase>,
+    ) {
+        use crate::rpc::dispatch::connection_test_support::{
+            exercise_failed_predecessor_transport, gate_failed_predecessor_publication,
+            prepare_failed_predecessor_fixture,
+        };
+        const SID: &str = "failed-predecessor-local";
+        const OWNER: &str = "failed-predecessor-owner";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let (registry, parent, ordinary, successor) =
+            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await;
+        let gate = if parked.is_some() {
+            Some(
+                gate_failed_predecessor_publication(&ctx, tmp.path(), SID, &registry, &parent)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let socket = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(run_local_listener(
+            server_ctx,
+            server_cancel,
+            test_client_count(),
+            None,
+        ));
+        wait_for_socket(&socket).await;
+        let (reader, mut writer) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        let mut reader = BufReader::new(reader);
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(OWNER.into()),
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &init, 1).as_bytes())
+            .await
+            .unwrap();
+        let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+        exercise_failed_predecessor_transport(
+            &ctx,
+            SID,
+            registry.as_ref(),
+            (&parent, &ordinary, &successor),
+            gate.as_deref().zip(parked),
+            async |frame| {
+                let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                writer.write_all(encoded.as_bytes()).await.unwrap();
+            },
+            async || {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                serde_json::from_str(&line).unwrap()
+            },
+        )
+        .await;
+        cancel.cancel();
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    use crate::rpc::dispatch::connection_test_support::ExternalCancelScenario;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_failure_delivery_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::Failure).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_outcome_unknown_delivery_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::OutcomeUnknown).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_teardown_withdraws_delivery_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::Teardown).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_start_queues_behind_failure_delivery_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::Start).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_moved_incarnation_publishes_nothing_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::Moved).await;
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn exercise_external_cancel_delivery_local_ipc(scenario: ExternalCancelScenario) {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        zeroclaw_log::clear_broadcast_hook();
+        let mut logs = zeroclaw_log::subscribe_or_install();
+        use crate::rpc::dispatch::connection_test_support::{
+            exercise_external_cancel_moved_transport,
+            exercise_goal_external_cancel_failure_transport, gate_external_cancel_failure,
+            prepare_failed_predecessor_fixture, prepare_unsettled_predecessor_fixture,
+            refuse_external_cancel_settlement,
+        };
+        const SID: &str = "external-cancel-failure-local";
+        const OWNER: &str = "external-cancel-owner";
+        let outcome_unknown = scenario == ExternalCancelScenario::OutcomeUnknown;
+        let teardown = scenario == ExternalCancelScenario::Teardown;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let (registry, parent, ordinary, successor) = if outcome_unknown {
+            prepare_unsettled_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        } else {
+            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        };
+        let gate = gate_external_cancel_failure(&ctx, tmp.path(), SID, &registry, &parent).await;
+        if outcome_unknown {
+            refuse_external_cancel_settlement(tmp.path()).await;
+        }
+        let socket = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(run_local_listener(
+            server_ctx,
+            server_cancel,
+            test_client_count(),
+            None,
+        ));
+        wait_for_socket(&socket).await;
+        let (reader, mut writer) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        let mut reader = BufReader::new(reader);
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(OWNER.into()),
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &init, 1).as_bytes())
+            .await
+            .unwrap();
+        let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+        let held = if scenario == ExternalCancelScenario::Moved {
+            exercise_external_cancel_moved_transport(
+                &ctx,
+                tmp.path(),
+                SID,
+                OWNER,
+                false,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                (&gate, &mut logs),
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            )
+            .await;
+            None
+        } else {
+            exercise_goal_external_cancel_failure_transport(
+                &ctx,
+                tmp.path(),
+                SID,
+                registry.as_ref(),
+                (&parent, &ordinary, &successor),
+                &gate,
+                scenario,
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            )
+            .await
+        };
+        cancel.cancel();
+        drop(writer);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if teardown {
+            crate::rpc::dispatch::connection_test_support::assert_external_cancel_teardown(
+                registry.as_ref(),
+                SID,
+                (&ordinary, &successor),
+                &mut logs,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                    assert!(
+                        !(frame["params"]["type"] == "turn_complete"
+                            && frame["params"]["outcome"] == "failed"),
+                        "{frame}"
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     fn test_ctx_with_event_tx(
         tmp: &std::path::Path,
         event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
