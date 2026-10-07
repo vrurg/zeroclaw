@@ -149,7 +149,7 @@ use self::foreground::{
 };
 use self::goal_execution::{
     deliver_matrix_goal_command, deliver_matrix_goal_stop, dispose_matrix_goal_with_command_lease,
-    submit_matrix_goal, submit_matrix_goal_stop,
+    submit_matrix_goal, submit_matrix_goal_stop_with_command_lease,
 };
 mod goal_control;
 use self::goal_control::{
@@ -2005,6 +2005,78 @@ fn is_stop_command(content: &str) -> bool {
 
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
     SendMessage::reply_to(msg, reply)
+}
+
+fn ordinary_stop_reply(
+    had_registered_turn: bool,
+    cancelled_bucket: bool,
+    folded_into_another_scope: bool,
+) -> String {
+    let key = if had_registered_turn || cancelled_bucket {
+        "channel-runtime-stop-sent"
+    } else if folded_into_another_scope {
+        "channel-runtime-stop-folded-followup"
+    } else {
+        "channel-runtime-stop-no-task"
+    };
+    zeroclaw_runtime::i18n::get_required_cli_string(key)
+}
+
+fn stop_reply_after_goal_error(mut reply: String, error: &anyhow::Error) -> String {
+    use zeroclaw_goal::GoalDiagnosticTextGuard as _;
+    use zeroclaw_runtime::goal_accounting::RuntimeGoalDiagnosticTextGuard;
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": zeroclaw_providers::sanitize_api_error(
+                    &RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}")),
+                ),
+            })),
+        "Goal /stop pause could not be admitted"
+    );
+    reply.push('\n');
+    reply.push_str(&channel_runtime_cli_string("goal-mode-command-failed"));
+    reply
+}
+
+/// Reserve reply capacity before spawning ordinary notices; Goal stop tasks
+/// already own their separate bounded lock-wait reservation.
+fn prepare_stop_acknowledgement(
+    context: &ChannelRuntimeContext,
+    message: &ChannelMessage,
+    reply: String,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Option<(
+    Arc<dyn Channel>,
+    SendMessage,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let Some(channel) = find_channel_for_message(&context.channels_by_name, message).cloned()
+    else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "stop command: no registered channel found for reply"
+        );
+        return None;
+    };
+    match Arc::clone(budget).try_acquire_owned() {
+        Ok(permit) => Some((channel, stop_reply_message(message, reply), permit)),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"sender": message.sender})),
+                "stop executed without acknowledgement: reply budget exhausted"
+            );
+            None
+        }
+    }
 }
 
 /// Every XML-ish element name that opens a tool-CALL envelope, longest first so
@@ -12331,91 +12403,100 @@ async fn run_message_dispatch_loop_until_cancelled(
             // the ordinary inbound-turn registry above. Route Matrix /stop
             // through the same immediate Goal pause command so it fences the
             // Goal before any successor operation can be admitted.
-            let goal_pause_error = if is_matrix_channel_name(&msg.channel) {
-                match submit_matrix_goal_stop(Arc::clone(&ctx), msg.clone()).await {
-                    Ok(Some(submission)) => {
-                        let channel =
-                            find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-                        let message = msg.clone();
-                        notice_tasks.spawn(async move {
-                            deliver_matrix_goal_stop(submission, channel, message).await;
-                        });
-                        continue;
+            if is_matrix_channel_name(&msg.channel) {
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                if let Some(stop_guard) =
+                    foreground::reserve_matrix_goal_stop(&ctx.persist_locks, &history_key)
+                {
+                    let command_lock =
+                        foreground::goal_command_lock(&ctx.persist_locks, &history_key);
+                    let context = Arc::clone(&ctx);
+                    let message = msg.clone();
+                    let reply_budget = Arc::clone(&stop_reply_budget);
+                    let (registered, registration) = tokio::sync::oneshot::channel();
+                    notice_tasks.spawn(async move {
+                        let lock_future = command_lock.lock_owned();
+                        tokio::pin!(lock_future);
+                        // Register in this tracked task's real polling context.
+                        // Keep the same future so later commands cannot overtake
+                        // the stop between registration and lease acquisition.
+                        let first_poll = std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(std::future::Future::poll(
+                                lock_future.as_mut(),
+                                cx,
+                            ))
+                        })
+                        .await;
+                        let _ = registered.send(());
+                        let command_lease = match first_poll {
+                            std::task::Poll::Ready(lease) => lease,
+                            std::task::Poll::Pending => lock_future.await,
+                        };
+                        drop(stop_guard);
+                        let goal_pause_error = match submit_matrix_goal_stop_with_command_lease(
+                            Arc::clone(&context),
+                            message.clone(),
+                            command_lease,
+                        )
+                        .await
+                        {
+                            Ok(Some(submission)) => {
+                                let channel =
+                                    find_channel_for_message(&context.channels_by_name, &message)
+                                        .cloned();
+                                deliver_matrix_goal_stop(submission, channel, message).await;
+                                return;
+                            }
+                            Ok(None) => None,
+                            Err(error) => Some(error),
+                        };
+                        let mut reply = ordinary_stop_reply(
+                            had_registered_turn,
+                            cancelled_bucket,
+                            folded_into_another_scope,
+                        );
+                        if let Some(error) = goal_pause_error {
+                            reply = stop_reply_after_goal_error(reply, &error);
+                        }
+                        if let Some((channel, send_msg, reply_permit)) =
+                            prepare_stop_acknowledgement(&context, &message, reply, &reply_budget)
+                        {
+                            let _reply_permit = reply_permit;
+                            send_notice_with_timeout(channel, send_msg, "stop_ack").await;
+                        }
+                    });
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => break true,
+                        _ = registration => {}
                     }
-                    Ok(None) => None,
-                    Err(error) => Some(error),
+                    continue;
                 }
-            } else {
-                None
-            };
-
-            let mut reply = if had_registered_turn || cancelled_bucket {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
-            } else if folded_into_another_scope {
-                zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-stop-folded-followup",
-                )
-            } else {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
-            };
-            if let Some(error) = goal_pause_error {
-                use zeroclaw_goal::GoalDiagnosticTextGuard as _;
-                use zeroclaw_runtime::goal_accounting::RuntimeGoalDiagnosticTextGuard;
-
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error": zeroclaw_providers::sanitize_api_error(
-                                &RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(
-                                    &format!("{error:#}"),
-                                ),
-                            ),
-                        })),
-                    "Goal /stop pause could not be admitted"
-                );
-                reply = format!(
-                    "{reply}\n{}",
-                    channel_runtime_cli_string("goal-mode-command-failed")
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal /stop pause refused: pending stop budget exhausted"
                 );
             }
-            let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(channel) = channel {
-                // `/stop` bypasses every admission budget so cancellation
-                // stays reachable, but its acknowledgement must not: a
-                // sender flooding `/stop` against a slow channel would
-                // otherwise accumulate detached reply tasks without bound.
-                // The cancellation above already ran; only the reply is
-                // skipped when the budget is exhausted.
-                match Arc::clone(&stop_reply_budget).try_acquire_owned() {
-                    Ok(reply_permit) => {
-                        let send_msg = stop_reply_message(&msg, reply);
-                        notice_tasks.spawn(async move {
-                            let _reply_permit = reply_permit;
-                            send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                        });
-                    }
-                    Err(_) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                            "stop executed without acknowledgement: reply budget exhausted"
-                        );
-                    }
-                }
-            } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "stop command: no registered channel found for reply"
-                );
+            let mut reply = ordinary_stop_reply(
+                had_registered_turn,
+                cancelled_bucket,
+                folded_into_another_scope,
+            );
+            // An admitted Matrix task continues above; reaching this branch
+            // means only its Goal part was refused by the waiter budget.
+            if is_matrix_channel_name(&msg.channel) {
+                reply.push('\n');
+                reply.push_str(&channel_runtime_cli_string("goal-mode-command-failed"));
+            }
+            if let Some((channel, send_msg, reply_permit)) =
+                prepare_stop_acknowledgement(&ctx, &msg, reply, &stop_reply_budget)
+            {
+                notice_tasks.spawn(async move {
+                    let _reply_permit = reply_permit;
+                    send_notice_with_timeout(channel, send_msg, "stop_ack").await;
+                });
             }
             continue;
         }

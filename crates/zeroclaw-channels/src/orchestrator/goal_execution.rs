@@ -483,6 +483,7 @@ fn matrix_goal_settings(
 /// process-local supervisor slot alone is not sufficient: it may be absent
 /// after recovery or retained briefly while a terminal transition is being
 /// delivered.
+#[cfg(test)]
 pub(super) async fn submit_matrix_goal_stop(
     context: Arc<ChannelRuntimeContext>,
     message: ChannelMessage,
@@ -498,6 +499,20 @@ pub(super) async fn submit_matrix_goal_stop(
     let command_lease = goal_command_lock(&context.persist_locks, &history_key)
         .lock_owned()
         .await;
+    submit_matrix_goal_stop_with_command_lease(context, message, command_lease).await
+}
+
+/// The dispatcher registers this lease's waiter before accepting later
+/// controls, then transfers the acquired lease to this admission boundary.
+pub(super) async fn submit_matrix_goal_stop_with_command_lease(
+    context: Arc<ChannelRuntimeContext>,
+    message: ChannelMessage,
+    command_lease: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<Option<MatrixGoalCommandSubmission>> {
+    if !message.channel.eq_ignore_ascii_case("matrix") {
+        return Ok(None);
+    }
+    let history_key = super::runtime_conversation_history_key(context.as_ref(), &message);
     let Some(control_plane) = matrix_goal_control_plane(context.as_ref(), &history_key) else {
         // Goal admission itself requires this control plane, so no live Goal
         // can be running when it is unavailable.
