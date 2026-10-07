@@ -1316,13 +1316,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_local_ipc() {
-        exercise_failed_predecessor_local_ipc(None, false).await;
+        exercise_failed_predecessor_local_ipc(None, false, None).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_ack_failure_delivery_releases_goal_command_local_ipc() {
-        exercise_failed_predecessor_local_ipc(None, true).await;
+        exercise_failed_predecessor_local_ipc(None, true, None).await;
     }
 
     #[cfg(unix)]
@@ -1331,6 +1331,7 @@ mod tests {
         exercise_failed_predecessor_local_ipc(
             Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::TailQueued),
             false,
+            None,
         )
         .await;
     }
@@ -1341,14 +1342,61 @@ mod tests {
         exercise_failed_predecessor_local_ipc(
             Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::FreeQueue),
             false,
+            None,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_unseen_terminal_retries_owed_notice_local_ipc() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::local::tests::goal_unseen_terminal_retries_owed_notice_local_ipc",
+        ).await { return; }
+        exercise_failed_predecessor_local_ipc(
+            None,
+            false,
+            Some(
+                crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Unseen,
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_unseen_terminal_request_control_local_ipc() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::local::tests::goal_unseen_terminal_request_control_local_ipc",
+        ).await { return; }
+        exercise_failed_predecessor_local_ipc(
+            None,
+            false,
+            Some(
+                crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Request,
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_unseen_terminal_pending_tail_control_local_ipc() {
+        if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
+            "rpc::local::tests::goal_unseen_terminal_pending_tail_control_local_ipc",
+        ).await { return; }
+        exercise_failed_predecessor_local_ipc(None, false, Some(
+            crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::PendingTail,
+        )).await;
     }
 
     #[cfg(unix)]
     async fn exercise_failed_predecessor_local_ipc(
         parked: Option<crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase>,
         ack_failure: bool,
+        terminal: Option<
+            crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase,
+        >,
     ) {
         use crate::rpc::dispatch::connection_test_support::{
             exercise_failed_predecessor_transport, gate_failed_predecessor_publication,
@@ -1360,7 +1408,7 @@ mod tests {
         let mut ctx = test_ctx(tmp.path());
         let (registry, parent, ordinary, successor) =
             prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await;
-        let gate = if parked.is_some() {
+        let gate = if parked.is_some() || terminal.is_some() {
             Some(
                 gate_failed_predecessor_publication(&ctx, tmp.path(), SID, &registry, &parent)
                     .await,
@@ -1398,7 +1446,24 @@ mod tests {
             .await
             .unwrap();
         let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
-        if ack_failure {
+        if let Some(case) = terminal {
+            crate::rpc::dispatch::connection_test_support::exercise_unseen_terminal_transport(
+                &ctx,
+                SID,
+                registry.as_ref(),
+                (&parent, gate.as_deref().unwrap(), case),
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            )
+            .await;
+        } else if ack_failure {
             crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
                 &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
                 async |frame| {

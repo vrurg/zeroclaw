@@ -14910,6 +14910,41 @@ pub(crate) mod connection_test_support {
         reached: Notify,
         release: Notify,
         claimed: AtomicBool,
+        fail_terminal_reason_once: AtomicBool,
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum TerminalAcknowledgementCase {
+        Unseen,
+        Request,
+        PendingTail,
+    }
+
+    /// Cold admission after retirement binds the process-global ledger. Give
+    /// each transport fixture its own process rather than changing that owner.
+    pub(crate) async fn terminal_fixture_delegated_to_fresh_process(test: &str) -> bool {
+        const CHILD: &str = "ZEROCLAW_GOAL_TERMINAL_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test])
+                .env(CHILD, "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated terminal fixture must finish")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14943,6 +14978,15 @@ pub(crate) mod connection_test_support {
                     }
                     Ok(task)
                 }
+
+                async fn terminal_reason_for_session_goal(
+                    &self, task_id: &str, session_id: &str,
+                ) -> anyhow::Result<Option<String>> {
+                    if self.gate.fail_terminal_reason_once.swap(false, Ordering::AcqRel) {
+                        anyhow::bail!("scripted terminal reason read failure");
+                    }
+                    self.registry.terminal_reason_for_session_goal(task_id, session_id).await
+                }
             }
         };
     }
@@ -14959,7 +15003,6 @@ pub(crate) mod connection_test_support {
         update_goal_pause(task_id: &str, pause: Option<zeroclaw_goal::GoalPauseState>) -> anyhow::Result<()>;
         set_continuation_context(task_id: &str, context: Option<zeroclaw_goal::task::TaskContinuationContext>) -> anyhow::Result<()>;
         get_continuation_context(task_id: &str) -> anyhow::Result<Option<zeroclaw_goal::task::TaskContinuationContext>>;
-        terminal_reason_for_session_goal(task_id: &str, session_id: &str) -> anyhow::Result<Option<String>>;
         create_or_replace_session_goal(task: zeroclaw_api::task::TaskRecord, goal: zeroclaw_goal::GoalTaskRecord) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
         pause_session_goal(task_id: &str, session_id: &str, epoch: i64, pause: zeroclaw_goal::GoalPauseState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
         resume_session_goal(task_id: &str, session_id: &str, epoch: i64, owner_pid: u32, boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
@@ -15834,6 +15877,221 @@ pub(crate) mod connection_test_support {
             Some(generation)
         );
         None
+    }
+
+    /// Delivered and unseen terminal commands consume the same owed output;
+    /// an independently publishing tail remains a separate green control.
+    pub(crate) async fn exercise_unseen_terminal_transport(
+        ctx: &RpcContext,
+        session_id: &str,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        fixture: (
+            &HeldGoalParent,
+            &FailedPublicationGate,
+            TerminalAcknowledgementCase,
+        ),
+        mut send: impl std::ops::AsyncFnMut(serde_json::Value),
+        mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
+    ) {
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate};
+        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+
+        let (parent, gate, case) = fixture;
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let request = |command: &str, id| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/goal", "id": id,
+                "params": {"session_id": session_id, "command": command},
+            })
+        };
+        send(request("/goal resume", 40)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 40 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Resumed(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        parent.turn.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+            .await
+            .unwrap();
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        let supervisor = ctx.goal_runtime.supervisor(session_id).await.unwrap();
+        // The ordinary host error is distinct from the parked Goal-only
+        // original. Consume it before checking the owed-publication contract.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    assert!(
+                        frame["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("scripted failed predecessor"),
+                        "{frame}"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let pending_tail = matches!(case, TerminalAcknowledgementCase::PendingTail);
+        let request_form = matches!(case, TerminalAcknowledgementCase::Request);
+        let status = if request_form {
+            request("/goal status", 41)
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/goal",
+                "params": {"session_id": session_id, "command": "/goal status"},
+            })
+        };
+        if pending_tail {
+            send(status).await;
+            gate.release.notify_one();
+        } else {
+            gate.fail_terminal_reason_once
+                .store(true, Ordering::Release);
+            gate.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !supervisor.worker_completed_for_session(&key).await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed native publication must leave a completed resident worker");
+            send(status).await;
+        }
+        let mut originals = 0;
+        let mut notices = 0;
+        let mut responded = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while originals != 1 || notices != 1 || (request_form && !responded) {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if !frame["id"].is_null() {
+                    assert!(request_form && frame["id"] == 41, "{frame}");
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Terminal(_)));
+                    responded = true;
+                }
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    assert!(
+                        frame["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("scripted Goal finish failure"),
+                        "{frame}"
+                    );
+                    assert_eq!(notices, 0);
+                    originals += 1;
+                }
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    assert_eq!(originals, 1);
+                    assert!(
+                        matches!(
+                            update,
+                            SessionGoalUpdate::Failed {
+                                reason: zeroclaw_goal::control::GoalFailureReason::ExecutorFailed,
+                                ..
+                            }
+                        ),
+                        "terminal command must not publish a lifecycle frame: {update:?}"
+                    );
+                    notices += 1;
+                }
+            }
+        })
+        .await
+        .expect("an unseen terminal command must consume its owed predecessor output");
+        // The pending-tail control deliberately need not retire through its
+        // notification before the independent tail completes; the next Status
+        // request consumes that completed tail and must publish nothing again.
+        if !pending_tail {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while ctx.goal_runtime.supervisor(session_id).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal command must retire the idle supervisor");
+        }
+        send(request("/goal status", 42)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                assert_ne!(
+                    frame["method"], "session/goal_update",
+                    "duplicate notice: {frame}"
+                );
+                assert_ne!(
+                    frame["params"]["type"], "turn_complete",
+                    "duplicate original: {frame}"
+                );
+                if frame["id"] == 42 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Terminal(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let after = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&failed).unwrap()
+        );
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&after.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
     }
 
     /// A notification has no acknowledgement to deliver, but its predecessor
