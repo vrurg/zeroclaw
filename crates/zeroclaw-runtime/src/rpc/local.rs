@@ -1294,6 +1294,8 @@ mod platform {
 mod tests {
     use super::*;
     use crate::rpc::dispatch::Method;
+    #[cfg(unix)]
+    use crate::rpc::dispatch::connection_test_support::AckFailureCase;
     use crate::rpc::session::SessionStore;
     use crate::rpc::types::InitializeParams;
     #[cfg(unix)]
@@ -1316,13 +1318,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_local_ipc() {
-        exercise_failed_predecessor_local_ipc(None, false, None).await;
+        exercise_failed_predecessor_local_ipc(None, None, None).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn goal_ack_failure_delivery_releases_goal_command_local_ipc() {
-        exercise_failed_predecessor_local_ipc(None, true, None).await;
+        exercise_failed_predecessor_local_ipc(None, Some(AckFailureCase::Delivery), None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_ack_failure_delete_withdraws_notice_local_ipc() {
+        exercise_failed_predecessor_local_ipc(None, Some(AckFailureCase::Delete), None).await;
     }
 
     #[cfg(unix)]
@@ -1330,7 +1338,7 @@ mod tests {
     async fn goal_parked_predecessor_original_before_successor_local_ipc() {
         exercise_failed_predecessor_local_ipc(
             Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::TailQueued),
-            false,
+            None,
             None,
         )
         .await;
@@ -1341,7 +1349,7 @@ mod tests {
     async fn goal_parked_predecessor_original_before_free_queue_successor_local_ipc() {
         exercise_failed_predecessor_local_ipc(
             Some(crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase::FreeQueue),
-            false,
+            None,
             None,
         )
         .await;
@@ -1355,7 +1363,7 @@ mod tests {
         ).await { return; }
         exercise_failed_predecessor_local_ipc(
             None,
-            false,
+            None,
             Some(
                 crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Unseen,
             ),
@@ -1371,7 +1379,7 @@ mod tests {
         ).await { return; }
         exercise_failed_predecessor_local_ipc(
             None,
-            false,
+            None,
             Some(
                 crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Request,
             ),
@@ -1385,7 +1393,7 @@ mod tests {
         if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
             "rpc::local::tests::goal_unseen_terminal_pending_tail_control_local_ipc",
         ).await { return; }
-        exercise_failed_predecessor_local_ipc(None, false, Some(
+        exercise_failed_predecessor_local_ipc(None, None, Some(
             crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::PendingTail,
         )).await;
     }
@@ -1393,7 +1401,7 @@ mod tests {
     #[cfg(unix)]
     async fn exercise_failed_predecessor_local_ipc(
         parked: Option<crate::rpc::dispatch::connection_test_support::ParkedPredecessorCase>,
-        ack_failure: bool,
+        ack_failure: Option<AckFailureCase>,
         terminal: Option<
             crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase,
         >,
@@ -1463,9 +1471,9 @@ mod tests {
                 },
             )
             .await;
-        } else if ack_failure {
+        } else if let Some(case) = ack_failure {
             crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
-                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
+                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor), case,
                 async |frame| {
                     let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
                     writer.write_all(encoded.as_bytes()).await.unwrap();

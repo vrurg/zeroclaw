@@ -1545,6 +1545,7 @@ mod accept_error_tests {
         Control, DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS, ScanningStream, WssTransport,
         is_recoverable_accept_error, run_writer,
     };
+    use crate::rpc::dispatch::connection_test_support::AckFailureCase;
     use crate::rpc::dispatch::{Method, RpcDispatcher};
     use crate::rpc::types::InitializeParams;
     use futures_util::{SinkExt, StreamExt};
@@ -2502,12 +2503,17 @@ mod accept_error_tests {
 
     #[tokio::test]
     async fn goal_failed_predecessor_notice_before_successor_wss() {
-        exercise_failed_predecessor_wss(false, None).await;
+        exercise_failed_predecessor_wss(None, None).await;
     }
 
     #[tokio::test]
     async fn goal_ack_failure_delivery_releases_goal_command_wss() {
-        exercise_failed_predecessor_wss(true, None).await;
+        exercise_failed_predecessor_wss(Some(AckFailureCase::Delivery), None).await;
+    }
+
+    #[tokio::test]
+    async fn goal_ack_failure_delete_withdraws_notice_wss() {
+        exercise_failed_predecessor_wss(Some(AckFailureCase::Delete), None).await;
     }
 
     #[tokio::test]
@@ -2516,7 +2522,7 @@ mod accept_error_tests {
             "rpc::wss::accept_error_tests::goal_unseen_terminal_retries_owed_notice_wss",
         ).await { return; }
         exercise_failed_predecessor_wss(
-            false,
+            None,
             Some(
                 crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Unseen,
             ),
@@ -2530,7 +2536,7 @@ mod accept_error_tests {
             "rpc::wss::accept_error_tests::goal_unseen_terminal_request_control_wss",
         ).await { return; }
         exercise_failed_predecessor_wss(
-            false,
+            None,
             Some(
                 crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::Request,
             ),
@@ -2543,13 +2549,13 @@ mod accept_error_tests {
         if crate::rpc::dispatch::connection_test_support::terminal_fixture_delegated_to_fresh_process(
             "rpc::wss::accept_error_tests::goal_unseen_terminal_pending_tail_control_wss",
         ).await { return; }
-        exercise_failed_predecessor_wss(false, Some(
+        exercise_failed_predecessor_wss(None, Some(
             crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase::PendingTail,
         )).await;
     }
 
     async fn exercise_failed_predecessor_wss(
-        ack_failure: bool,
+        ack_failure: Option<AckFailureCase>,
         terminal: Option<
             crate::rpc::dispatch::connection_test_support::TerminalAcknowledgementCase,
         >,
@@ -2672,9 +2678,9 @@ mod accept_error_tests {
                 },
             )
             .await;
-        } else if ack_failure {
+        } else if let Some(case) = ack_failure {
             crate::rpc::dispatch::connection_test_support::exercise_ack_failure_predecessor_transport(
-                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor),
+                &ctx, SID, registry.as_ref(), (&parent, &ordinary, &successor), case,
                 async |frame| {
                     sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
                         .await.unwrap();
