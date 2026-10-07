@@ -14174,6 +14174,60 @@ pub(crate) mod connection_test_support {
         gate
     }
 
+    /// Gate an unlaunched failure without injecting the worker-finish fault.
+    pub(crate) async fn gate_unlaunched_audit_failure_publication(
+        ctx: &RpcContext,
+        path: &Path,
+        session_id: &str,
+        registry: &Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        restart: &zeroclaw_goal::GoalExecutionRestartCoordinator,
+    ) -> Arc<FailedPublicationGate> {
+        use zeroclaw_goal::control::GoalRuntime;
+        let gate = Arc::new(FailedPublicationGate::default());
+        let decorated: Arc<dyn zeroclaw_goal::GoalTaskRegistry> = Arc::new(GatedFailureRegistry {
+            registry: Arc::clone(registry),
+            gate: Arc::clone(&gate),
+        });
+        let tracker = Arc::new(crate::cost::CostTracker::new(Default::default(), path).unwrap());
+        let accounting = Arc::new(
+            crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                Arc::clone(&decorated),
+                tracker,
+                "test-agent",
+                Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                    Arc::default(),
+                )),
+            )
+            .unwrap(),
+        );
+        let existing = ctx.goal_runtime.supervisor(session_id).await.unwrap();
+        assert!(
+            existing.try_retire().await,
+            "fixture has not admitted a worker"
+        );
+        ctx.goal_runtime
+            .remove_supervisor_if_current(session_id, &existing)
+            .await;
+        let engine = Arc::new(GoalRuntime::new(decorated).execution_engine(accounting));
+        let supervisor = restart.new_supervisor(engine).await;
+        ctx.goal_runtime
+            .install_supervisor_if_absent(session_id.into(), supervisor)
+            .await;
+        gate
+    }
+
+    /// Await the test-only registry read before the failure enters the FIFO.
+    pub(crate) async fn await_unlaunched_failure_publication(gate: &FailedPublicationGate) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+            .await
+            .expect("unlaunched audit failure must reach publication");
+    }
+
+    /// Release the test-only publication read after the competing acknowledgement.
+    pub(crate) fn release_unlaunched_failure_publication(gate: &FailedPublicationGate) {
+        gate.release.notify_one();
+    }
+
     #[async_trait]
     impl ModelProvider for FailedPredecessorProvider {
         async fn chat_with_system(
@@ -16957,21 +17011,16 @@ pub(crate) mod connection_test_support {
         ApplyBudget,
         SettingsFailure,
         LaunchFailure,
+        AuditFailure,
+        AuditFailureCompetingStart,
         FinishOrdinaryTurn,
         Dispose(super::Method),
         Replace,
         Shutdown,
     }
 
-    pub(crate) async fn assert_goal_launch_failure(
-        ctx: &RpcContext,
-        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
-        key: &str,
-        before: &zeroclaw_api::task::TaskRecord,
-        session_id: &str,
-        generation: u64,
-        frame: &serde_json::Value,
-    ) {
+    /// Checks the failure frame independently of later successor replacement.
+    pub(crate) fn assert_goal_launch_failure_frame(frame: &serde_json::Value, session_id: &str) {
         assert_eq!(frame["method"], "session/goal_update");
         let update: crate::rpc::types::SessionGoalUpdate =
             serde_json::from_value(frame["params"].clone()).unwrap();
@@ -16984,6 +17033,17 @@ pub(crate) mod connection_test_support {
                 .to_string()
                 .contains("private fixture launch bind detail")
         );
+    }
+
+    /// Checks predecessor state only while no successor can replace it.
+    pub(crate) async fn assert_goal_launch_failure_state(
+        ctx: &RpcContext,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        key: &str,
+        before: &zeroclaw_api::task::TaskRecord,
+        session_id: &str,
+        generation: u64,
+    ) {
         let after = registry
             .current_goal_for_session(key)
             .await
@@ -17007,6 +17067,20 @@ pub(crate) mod connection_test_support {
         assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
         let extension = registry.get_goal_task(&after.id).await.unwrap().unwrap();
         assert!(extension.pending_call_id.is_none() && extension.pending_call_epoch.is_none());
+    }
+
+    /// Checks both the frame and predecessor state only when no successor competes.
+    pub(crate) async fn assert_goal_launch_failure(
+        ctx: &RpcContext,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        key: &str,
+        before: &zeroclaw_api::task::TaskRecord,
+        session_id: &str,
+        generation: u64,
+        frame: &serde_json::Value,
+    ) {
+        assert_goal_launch_failure_frame(frame, session_id);
+        assert_goal_launch_failure_state(ctx, registry, key, before, session_id, generation).await;
     }
 
     pub(crate) fn prepare_goal_replacement_fixture(ctx: &mut Arc<RpcContext>, path: &Path) {
@@ -17254,6 +17328,22 @@ pub(crate) mod connection_test_support {
         Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
         zeroclaw_goal::control::GoalQueuedControl,
     ) {
+        let (registry, control, _) =
+            prepare_queued_goal_control_fixture_with_restart(ctx, path, session_id, command).await;
+        (registry, control)
+    }
+
+    /// Retain the fixture's original restart owner when decorating its registry.
+    pub(crate) async fn prepare_queued_goal_control_fixture_with_restart(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        command: &str,
+    ) -> (
+        Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        zeroclaw_goal::control::GoalQueuedControl,
+        Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    ) {
         use zeroclaw_api::task::TaskStatus;
         use zeroclaw_goal::control::{
             GoalControlClass, GoalQueuedControl, GoalSessionKey, classify_goal_control,
@@ -17263,7 +17353,8 @@ pub(crate) mod connection_test_support {
         let GoalControlClass::Normal(control) = classify_goal_control(&parsed) else {
             panic!("fixture requires a deferred control");
         };
-        let registry = install_paused_goal_control_fixture(ctx, path, session_id).await;
+        let (registry, restart) =
+            install_paused_goal_control_fixture_with_restart(ctx, path, session_id).await;
         if control == GoalQueuedControl::Start {
             let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
             let task = registry
@@ -17285,7 +17376,7 @@ pub(crate) mod connection_test_support {
                 zeroclaw_goal::GoalTransitionResult::Applied
             );
         }
-        (registry, control)
+        (registry, control, restart)
     }
 
     pub(crate) async fn seed_goal_recovery_process() {
