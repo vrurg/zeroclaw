@@ -245,6 +245,641 @@ async fn running_worker() -> (
     running_worker_on(None).await
 }
 
+/// Use the real command and boundary leases without launching a parent turn.
+/// A failed admission audit must publish through this same execution driver.
+fn unlaunched_worker_fixture() -> (
+    Arc<WorkerDriver>,
+    GoalIngressContext,
+    Arc<Registry>,
+    Arc<GoalExecutionSupervisor>,
+) {
+    let (ordinary, ingress) = serialized_fixture();
+    let driver = Arc::new(WorkerDriver {
+        ordinary,
+        script: Arc::new(Script::default()),
+    });
+    let registry = Arc::new(Registry::default());
+    let runtime = GoalRuntime::new(registry.clone());
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime.execution_engine(Arc::new(NoPhysicalAttempts)),
+    )));
+    (driver, ingress, registry, supervisor)
+}
+
+/// Reach the audit fault only after the queued control owns its real boundary.
+async fn deferred_audit_fixture() -> (
+    Arc<WorkerDriver>,
+    GoalIngressContext,
+    Arc<Registry>,
+    Arc<GoalExecutionSupervisor>,
+    zeroclaw_goal::GoalDeferredReady,
+) {
+    let (driver, ingress, registry, supervisor) = unlaunched_worker_fixture();
+    let ordinary = driver.ordinary.boundary.clone().lock_owned().await;
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                settings(),
+                ingress.clone(),
+                driver.clone(),
+                launch_command(false),
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    drop(ordinary);
+    let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(driver.ordinary.boundary.try_lock().is_err());
+    registry.0.lock().unwrap().fail_settlement = true;
+    (driver, ingress, registry, supervisor, ready)
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_does_not_self_wait_on_held_boundary() {
+    let (driver, _, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let result = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings())).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    let error = result
+        .expect("audit-failure publication must release the held boundary")
+        .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *driver.script.events.lock().unwrap(),
+        [FailureEvent::Notice(GoalExecutionNotice::Failed(
+            zeroclaw_goal::GoalFailureReason::ExecutorStartFailed
+        ))]
+    );
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            state.terminal_reason.as_deref(),
+            Some("executor_start_failed")
+        );
+        assert_eq!(state.transitions, ["start", "finish"]);
+    }
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    assert!(matches!(
+        wait_for_settlement(&registry).await,
+        IntentState::Settled(_)
+    ));
+    assert!(retire_without_waiting(&supervisor).await);
+}
+
+#[tokio::test]
+async fn unlaunched_failure_rebind_competing_start_waits_for_notice() {
+    let (driver, ingress, registry, supervisor) = unlaunched_worker_fixture();
+    let GoalControlAdmission::Direct(mut submission) = supervisor
+        .admit_control(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            launch_command(false),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("idle Start must apply directly");
+    };
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().id.clone();
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let release = hold_publication(&driver.script);
+    let failure = {
+        let supervisor = supervisor.clone();
+        zeroclaw_spawn::spawn!(async move {
+            supervisor
+                .launch_after_response(settings(), &mut submission)
+                .await
+        })
+    };
+    await_publication(&driver.script).await;
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver.clone(), launch_command(false)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let deferred = match admission {
+        GoalControlAdmission::Queued { response, deferred } => {
+            assert_eq!(response, GoalResponse::Queued(GoalQueuedControl::Start));
+            deferred
+        }
+        GoalControlAdmission::Direct(submission) => {
+            // Clean up the owned task before reporting the planned pre-fix RED.
+            drop(submission);
+            failure.abort();
+            let _ = failure.await;
+            drop(release);
+            panic!("a Start must not overtake an unlaunched failure notice");
+        }
+    };
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().id, predecessor);
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            state.terminal_reason.as_deref(),
+            Some("executor_start_failed")
+        );
+    }
+    let successor = zeroclaw_spawn::spawn!(async move { deferred.wait().await });
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), failure)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *driver.script.events.lock().unwrap(),
+        [FailureEvent::Notice(GoalExecutionNotice::Failed(
+            zeroclaw_goal::GoalFailureReason::ExecutorStartFailed
+        ))]
+    );
+    let ready = tokio::time::timeout(Duration::from_secs(1), successor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    assert_ne!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().id,
+        predecessor
+    );
+    drop(committed);
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_releases_command_and_boundary_before_notice() {
+    let (driver, ingress, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let release = hold_publication(&driver.script);
+    let committing = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    await_publication(&driver.script).await;
+    let authority_free =
+        driver.ordinary.command.try_lock().is_ok() && driver.ordinary.boundary.try_lock().is_ok();
+    if !authority_free {
+        // Release the fixture gate and consume its task before the red assertion.
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(1), committing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        registry.0.lock().unwrap().fail_settlement = false;
+        assert!(
+            authority_free,
+            "audit-failure publication must not own command authority or the ordinary boundary"
+        );
+        return;
+    }
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            state.terminal_reason.as_deref(),
+            Some("executor_start_failed")
+        );
+    }
+    let status = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver.clone(), GoalCommand::Status),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(status, GoalControlAdmission::Direct(_)));
+    drop(status);
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), committing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    registry.0.lock().unwrap().fail_settlement = false;
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_notice_delivery_failure_is_still_reported() {
+    let (driver, _, registry, _, ready) = deferred_audit_fixture().await;
+    driver.script.fail_notice.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings())).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    let error = result.unwrap().unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    let state = registry.0.lock().unwrap();
+    assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+    assert_eq!(
+        state.terminal_reason.as_deref(),
+        Some("executor_start_failed")
+    );
+    drop(state);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_terminal_commit_failure_reports_command_error() {
+    let (driver, _, registry, _, ready) = deferred_audit_fixture().await;
+    registry.0.lock().unwrap().fail_finish_once = true;
+    let error = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    registry.0.lock().unwrap().fail_settlement = false;
+    assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 0);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let finished = {
+                let state = registry.0.lock().unwrap();
+                state.task.as_ref().unwrap().status == TaskStatus::Failed && state.finish_calls == 2
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.0.lock().unwrap().terminal_reason.as_deref(),
+        Some("executor_start_failed")
+    );
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_abort_during_notice_releases_authority() {
+    let (driver, _, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let release = hold_publication(&driver.script);
+    let committing = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    await_publication(&driver.script).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    committing.abort();
+    assert!(committing.await.unwrap_err().is_cancelled());
+    drop(release);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !supervisor.try_retire().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let state = registry.0.lock().unwrap();
+    assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+    assert_eq!(
+        state.terminal_reason.as_deref(),
+        Some("executor_start_failed")
+    );
+    assert_eq!(state.transitions, ["start", "finish"]);
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_abort_during_audit_pauses_unlaunched_epoch() {
+    let (driver, _, registry, _, ready) = deferred_audit_fixture().await;
+    let entered = Arc::new(Semaphore::new(0));
+    let wait = Arc::new(Semaphore::new(0));
+    {
+        let mut state = registry.0.lock().unwrap();
+        state.fail_settlement = false;
+        state.settlement_entered = Some(entered.clone());
+        state.settlement_wait = Some(wait.clone());
+    }
+    let committing = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let task = registry.0.lock().unwrap().task.clone().unwrap();
+    assert_eq!(task.status, TaskStatus::Running);
+    committing.abort();
+    assert!(committing.await.unwrap_err().is_cancelled());
+    assert_unlaunched_epoch_paused(&registry, &task.id, task.execution_epoch).await;
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    wait.add_permits(1);
+    wait_for_settlement(&registry).await;
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_worker_ticket_controls_skip_reconciliation() {
+    for (command, kind) in [
+        (
+            GoalCommand::Pause { immediate: false },
+            GoalQueuedControl::Pause,
+        ),
+        (
+            GoalCommand::SetBudget(GoalBudgetSelection::Unlimited),
+            GoalQueuedControl::Budget,
+        ),
+    ] {
+        let (driver, ingress, registry, supervisor) = running_worker().await;
+        let scope = {
+            let state = registry.0.lock().unwrap();
+            let task = state.task.as_ref().unwrap();
+            GoalExecutionScope::new(
+                task.id.clone(),
+                task.session_id.clone().unwrap(),
+                task.execution_epoch,
+            )
+            .unwrap()
+        };
+        let deferred = queued(
+            supervisor
+                .admit_control(settings(), ingress, driver.clone(), command)
+                .await
+                .unwrap(),
+            kind,
+        );
+        let wait = zeroclaw_spawn::spawn!(async move { deferred.wait().await });
+        driver.script.release.add_permits(1);
+        let ready = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.script.published.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
+        registry.0.lock().unwrap().fail_settlement = true;
+        let error = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        registry.0.lock().unwrap().fail_settlement = false;
+        assert!(!error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+        assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+        assert!(driver.ordinary.command.try_lock().is_ok());
+        if kind == GoalQueuedControl::Pause {
+            assert_eq!(
+                registry.0.lock().unwrap().task.as_ref().unwrap().status,
+                TaskStatus::Paused
+            );
+        } else {
+            assert_eq!(
+                registry
+                    .0
+                    .lock()
+                    .unwrap()
+                    .goal
+                    .as_ref()
+                    .unwrap()
+                    .effective_token_limit,
+                None
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), supervisor.drain(&scope))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_competing_start_waits_for_notice() {
+    let (driver, ingress, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let release = hold_publication(&driver.script);
+    let failure = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    await_publication(&driver.script).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    let predecessor = registry.0.lock().unwrap().task.as_ref().unwrap().id.clone();
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver.clone(), launch_command(false)),
+    )
+    .await;
+    let deferred = match admission {
+        Ok(Ok(GoalControlAdmission::Queued { response, deferred })) => {
+            assert_eq!(response, GoalResponse::Queued(GoalQueuedControl::Start));
+            deferred
+        }
+        other => {
+            // Consume all owned work before exposing the planned pre-fix RED.
+            drop(other);
+            failure.abort();
+            let _ = failure.await;
+            drop(release);
+            panic!("a Start must not overtake an unlaunched failure notice");
+        }
+    };
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().id, predecessor);
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            state.terminal_reason.as_deref(),
+            Some("executor_start_failed")
+        );
+    }
+    let successor = zeroclaw_spawn::spawn!(async move { deferred.wait().await });
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), failure)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *driver.script.events.lock().unwrap(),
+        [FailureEvent::Notice(GoalExecutionNotice::Failed(
+            zeroclaw_goal::GoalFailureReason::ExecutorStartFailed
+        ))]
+    );
+    let ready = tokio::time::timeout(Duration::from_secs(1), successor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    assert_ne!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().id,
+        predecessor
+    );
+    drop(committed);
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_competing_start_disposal_withdraws_both() {
+    let (driver, ingress, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let release = hold_publication(&driver.script);
+    let failure = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    await_publication(&driver.script).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    let session = ingress.session_key().durable_id();
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver.clone(), launch_command(false)),
+    )
+    .await;
+    let deferred = match admission {
+        Ok(Ok(GoalControlAdmission::Queued { response, deferred })) => {
+            assert_eq!(response, GoalResponse::Queued(GoalQueuedControl::Start));
+            deferred
+        }
+        other => {
+            drop(other);
+            failure.abort();
+            let _ = failure.await;
+            drop(release);
+            panic!("disposal fixture requires a Start queued behind the failure notice");
+        }
+    };
+    let successor = zeroclaw_spawn::spawn!(async move { deferred.wait().await });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), supervisor.dispose_session(&session))
+            .await
+            .unwrap()
+            .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Applied
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), successor)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), failure)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert!(registry.0.lock().unwrap().task.is_none());
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn deferred_audit_failure_competing_start_proceeds_after_teardown() {
+    let (driver, ingress, registry, supervisor, ready) = deferred_audit_fixture().await;
+    let release = hold_publication(&driver.script);
+    let failure = zeroclaw_spawn::spawn!(async move { ready.commit(settings()).await });
+    await_publication(&driver.script).await;
+    registry.0.lock().unwrap().fail_settlement = false;
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver.clone(), launch_command(false)),
+    )
+    .await;
+    let deferred = match admission {
+        Ok(Ok(GoalControlAdmission::Queued { response, deferred })) => {
+            assert_eq!(response, GoalResponse::Queued(GoalQueuedControl::Start));
+            deferred
+        }
+        other => {
+            drop(other);
+            failure.abort();
+            let _ = failure.await;
+            drop(release);
+            panic!("teardown fixture requires a Start queued behind the failure notice");
+        }
+    };
+    // Once ready, B legitimately owns both leases. Observe A's release before
+    // allowing the already-registered successor to acquire that authority.
+    let (begin_wait, waiting) = tokio::sync::oneshot::channel();
+    let successor = zeroclaw_spawn::spawn!(async move {
+        waiting.await.unwrap();
+        deferred.wait().await
+    });
+    failure.abort();
+    assert!(failure.await.unwrap_err().is_cancelled());
+    drop(release);
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert!(driver.ordinary.command.try_lock().is_ok());
+    assert!(driver.ordinary.boundary.try_lock().is_ok());
+    begin_wait.send(()).unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(1), successor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(committed.response(), GoalResponse::Started(_)));
+    drop(committed);
+}
+
+#[tokio::test]
+async fn unlaunched_failure_rebind_published_then_start_is_direct() {
+    let (driver, ingress, _, supervisor) = unlaunched_worker_fixture();
+    let GoalControlAdmission::Direct(mut submission) = supervisor
+        .admit_control(
+            settings(),
+            ingress.clone(),
+            driver.clone(),
+            launch_command(false),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("idle Start must apply directly");
+    };
+    driver.script.fail_launch_bind.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.launch_after_response(settings(), &mut submission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.is::<zeroclaw_goal::GoalLaunchFailureReported>());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 1);
+    drop(submission);
+    let admission = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.admit_control(settings(), ingress, driver, launch_command(false)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let GoalControlAdmission::Direct(submission) = admission else {
+        panic!("a settled failure notice must not defer Start");
+    };
+    assert!(matches!(submission.response(), GoalResponse::Started(_)));
+    drop(submission);
+}
+
 async fn running_worker_on(
     coordinator: Option<&zeroclaw_goal::GoalExecutionRestartCoordinator>,
 ) -> (
