@@ -670,7 +670,9 @@ impl GoalDeferredReady {
     }
 
     /// Claim once and commit through the same driver lease. This performs no
-    /// predecessor drain, successor launch, lifecycle publication or rebind.
+    /// predecessor drain, successor launch or rebind. If audit persistence fails
+    /// after Start/Resume commits, terminalize the unlaunched epoch, release command
+    /// and turn ownership, attempt its notice, and mark GoalLaunchFailureReported.
     pub async fn commit(mut self, settings: GoalHostSettings) -> Result<GoalDeferredCommit> {
         let control = &mut self.control;
         let command = control
@@ -777,15 +779,37 @@ impl GoalDeferredReady {
                 // Running behind without an owner. Use the existing launch
                 // failure reconciliation; never admit model work on this path.
                 submission.launch_guard.failed();
+                let mut failure_reported = false;
                 if let Some(scope) = submission.launch_guard.scope() {
-                    control
+                    let scope = scope.clone();
+                    let notice = control
                         .supervisor
-                        .reconcile_launch_failure(scope, control.driver.as_ref(), &control.ingress)
+                        .fail_unlaunched_execution(&scope)
                         .await
                         .context("reconcile unlaunched Goal after control audit failure")?;
+                    failure_reported = notice.is_some();
+                    // Release settled command/checkpoint/turn ownership before reacquisition.
+                    drop(submission._lease.take());
+                    drop(self.boundary.take());
+                    drop(control.resource.take());
+                    if let Some(notice) = notice {
+                        control
+                            .supervisor
+                            .publish_unlaunched_failure_notice(
+                                notice,
+                                control.driver.as_ref(),
+                                &control.ingress,
+                            )
+                            .await;
+                    }
                 }
                 submission.launch_guard.settled();
-                return Err(error).context("persist Goal control transition audit");
+                let error = error.context("persist Goal control transition audit");
+                return Err(if failure_reported {
+                    error.context(GoalLaunchFailureReported)
+                } else {
+                    error
+                });
             }
         }
         Ok(GoalDeferredCommit {

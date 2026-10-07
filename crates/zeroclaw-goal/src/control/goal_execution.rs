@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{Mutex, OwnedRwLockReadGuard, RwLock, watch},
+    sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock, watch},
     task::JoinHandle,
 };
 use zeroclaw_api::{
@@ -143,6 +143,9 @@ pub struct GoalExecutionEngine {
 pub struct GoalExecutionSupervisor {
     engine: Arc<GoalExecutionEngine>,
     workers: Arc<Mutex<HashMap<String, Arc<Mutex<GoalWorker>>>>>,
+    /// Publication custody for unlaunched epochs, not durable lifecycle state.
+    unlaunched_failure_notices:
+        Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<GoalFailurePublication>>>>>,
     restart_gate: Option<Arc<GoalExecutionRestartGate>>,
     /// Process-local cancellation only; task rows remain lifecycle authority.
     pending_boundaries: Mutex<HashMap<String, Vec<GoalParentTurnCheckpoint>>>,
@@ -360,6 +363,28 @@ struct GoalFailurePublication {
     core_error: GoalCoreErrorPublication,
 }
 
+/// Owns one unlaunched notice until delivery settles or its task is torn down.
+/// Removing the slot before unlocking lets a queued Start leave its settle loop.
+#[must_use]
+struct GoalUnlaunchedFailureNotice {
+    scope: GoalExecutionScope,
+    publication: OwnedMutexGuard<GoalFailurePublication>,
+    latch: Arc<Mutex<GoalFailurePublication>>,
+    slots: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<GoalFailurePublication>>>>>,
+}
+
+impl Drop for GoalUnlaunchedFailureNotice {
+    fn drop(&mut self) {
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        if slots
+            .get(self.scope.task_id())
+            .is_some_and(|latch| Arc::ptr_eq(latch, &self.latch))
+        {
+            slots.remove(self.scope.task_id());
+        }
+    }
+}
+
 #[derive(Default)]
 enum GoalCoreErrorPublication {
     #[default]
@@ -438,6 +463,7 @@ impl GoalExecutionSupervisor {
         Self {
             engine,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            unlaunched_failure_notices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             restart_gate: None,
             pending_boundaries: Mutex::new(HashMap::new()),
             custody_gate: GoalSupervisorCustodyGate::new(),
@@ -451,6 +477,7 @@ impl GoalExecutionSupervisor {
         Self {
             engine,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            unlaunched_failure_notices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             restart_gate: Some(restart_gate),
             pending_boundaries: Mutex::new(HashMap::new()),
             custody_gate: GoalSupervisorCustodyGate::new(),
@@ -802,25 +829,67 @@ impl GoalExecutionSupervisor {
         driver: &dyn GoalSessionDriver,
         ingress: &GoalIngressContext,
     ) -> Result<bool> {
-        if !self.execution_is_current(scope).await? {
+        let Some(notice) = self.fail_unlaunched_execution(scope).await? else {
             return Ok(false);
+        };
+        self.publish_unlaunched_failure_notice(notice, driver, ingress)
+            .await;
+        Ok(true)
+    }
+
+    /// Commit terminal failure and return custody of the unlaunched notice.
+    /// Custody precedes the commit: a Start observing Failed must also see it.
+    /// The caller may or may not hold command serialization on this path.
+    async fn fail_unlaunched_execution(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<GoalUnlaunchedFailureNotice>> {
+        let latch = Arc::new(Mutex::new(GoalFailurePublication::default()));
+        let publication = latch.clone().lock_owned().await;
+        let previous = self
+            .unlaunched_failure_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(scope.task_id().to_owned(), latch.clone());
+        debug_assert!(
+            previous.is_none(),
+            "unlaunched notice already owns this task"
+        );
+        let notice = GoalUnlaunchedFailureNotice {
+            scope: scope.clone(),
+            publication,
+            latch,
+            slots: self.unlaunched_failure_notices.clone(),
+        };
+        if !self.execution_is_current(scope).await? {
+            return Ok(None);
         }
         self.engine.fail(scope, "executor_start_failed").await?;
-        let failure_publication = Mutex::new(GoalFailurePublication::default());
+        Ok(Some(notice))
+    }
+
+    /// Attempt delivery without ordinary-turn ownership: the publisher reacquires it.
+    /// Command ownership is permitted only in the unreachable launch-error class.
+    async fn publish_unlaunched_failure_notice(
+        &self,
+        mut notice: GoalUnlaunchedFailureNotice,
+        driver: &dyn GoalSessionDriver,
+        ingress: &GoalIngressContext,
+    ) {
         let notice_checkpoint = GoalParentTurnCheckpoint::new();
-        if let Err(_error) = publish_failure_notice_if_terminal(
+        if let Err(_error) = publish_failure_notice_body(
             self.engine.as_ref(),
-            scope,
+            &notice.scope,
             driver,
             ingress,
             &notice_checkpoint,
-            &failure_publication,
+            &mut notice.publication,
         )
         .await
         {
-            log_failure_notice_delivery_failure(scope);
+            log_failure_notice_delivery_failure(&notice.scope);
         }
-        Ok(true)
+        drop(notice);
     }
 
     /// Pause a newly admitted Goal without running its first model call when
@@ -1213,6 +1282,15 @@ impl GoalExecutionSupervisor {
         let Some(current) = current.filter(|task| task.status == TaskStatus::Failed) else {
             return false;
         };
+        if self
+            .unlaunched_failure_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&current.id)
+            .is_some_and(|latch| latch.try_lock().is_err())
+        {
+            return true;
+        }
         let worker = self
             .workers
             .lock()
@@ -1239,6 +1317,24 @@ impl GoalExecutionSupervisor {
     /// In particular, do not close the tail's admission checkpoint before completion.
     async fn settle_failed_predecessor(&self, session_id: &str) -> Result<()> {
         loop {
+            let current = self
+                .engine
+                .registry
+                .current_goal_for_session(session_id)
+                .await?;
+            let unlaunched = current
+                .filter(|task| task.status == TaskStatus::Failed)
+                .and_then(|task| {
+                    self.unlaunched_failure_notices
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&task.id)
+                        .cloned()
+                });
+            if let Some(latch) = unlaunched {
+                drop(latch.lock().await);
+                continue;
+            }
             let worker = self.workers.lock().await.get(session_id).cloned();
             let Some(worker) = worker else {
                 return Ok(());
