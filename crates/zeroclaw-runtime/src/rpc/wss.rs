@@ -4428,6 +4428,24 @@ mod accept_error_tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn goal_deferred_audit_failure_reports_notice_once_wss() {
+        exercise_goal_boundary_completion_over_wss(
+            "/goal resume",
+            crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::AuditFailure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn goal_deferred_audit_failure_competing_start_waits_for_notice_wss() {
+        exercise_goal_boundary_completion_over_wss(
+            "/goal resume",
+            crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::AuditFailureCompetingStart,
+        )
+        .await;
+    }
+
     async fn exercise_goal_boundary_completion_over_wss(
         command: &str,
         completion: crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion,
@@ -4474,8 +4492,23 @@ mod accept_error_tests {
             None
         };
         let original_generation = ctx.sessions.get_generation(SID).await.unwrap();
-        let (registry, control) =
-            prepare_queued_goal_control_fixture(&ctx, tmp.path(), SID, command).await;
+        let (registry, control, audit_gate) = if matches!(
+            completion,
+            GoalBoundaryCompletion::AuditFailureCompetingStart
+        ) {
+            let (registry, control, restart) =
+                crate::rpc::dispatch::connection_test_support::prepare_queued_goal_control_fixture_with_restart(
+                    &ctx, tmp.path(), SID, command,
+                ).await;
+            let gate = crate::rpc::dispatch::connection_test_support::gate_unlaunched_audit_failure_publication(
+                &ctx, tmp.path(), SID, &registry, restart.as_ref(),
+            ).await;
+            (registry, control, Some(gate))
+        } else {
+            let (registry, control) =
+                prepare_queued_goal_control_fixture(&ctx, tmp.path(), SID, command).await;
+            (registry, control, None)
+        };
         let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
         let before = registry
             .current_goal_for_session(&key)
@@ -4665,6 +4698,27 @@ mod accept_error_tests {
             ctx.goal_runtime
                 .fail_test_launch_bind(key.clone(), before.execution_epoch + 1);
         }
+        if matches!(
+            completion,
+            GoalBoundaryCompletion::AuditFailure
+                | GoalBoundaryCompletion::AuditFailureCompetingStart
+        ) {
+            let database = tmp.path().join("control_plane.db");
+            tokio::task::spawn_blocking(move || {
+                // Keep the fault on deferred audit settlement, not turn admission.
+                rusqlite::Connection::open(database)
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER fixture_refuse_goal_audit
+                     BEFORE UPDATE OF state ON goal_control_intents
+                     WHEN NEW.state = 'applied'
+                     BEGIN SELECT RAISE(ABORT, 'private fixture audit detail'); END;",
+                    )
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        }
         let replacing = matches!(completion, GoalBoundaryCompletion::Replace);
         let disposing = replacing || matches!(completion, GoalBoundaryCompletion::Dispose(_));
         if let GoalBoundaryCompletion::Dispose(method) = completion {
@@ -4692,6 +4746,51 @@ mod accept_error_tests {
             if let Some(turn) = &held_turn {
                 turn.release.notify_one();
             }
+        }
+        if let Some(gate) = &audit_gate {
+            crate::rpc::dispatch::connection_test_support::await_unlaunched_failure_publication(
+                gate,
+            )
+            .await;
+            let database = tmp.path().join("control_plane.db");
+            tokio::task::spawn_blocking(move || {
+                rusqlite::Connection::open(database)
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER fixture_refuse_goal_audit;")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            sink.send(Message::Text(rpc_request(Method::SessionGoal,
+                &serde_json::json!({"session_id": SID, "command": "/goal start competing fixture objective"}), 6,
+            ).into())).await.unwrap();
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("competing Start must be acknowledged before the failure notice")
+                .unwrap()
+                .unwrap();
+            let acknowledgement: serde_json::Value =
+                serde_json::from_str(acknowledgement.to_text().unwrap()).unwrap();
+            assert_eq!(acknowledgement["id"], 6);
+            assert!(acknowledgement["error"].is_null(), "{acknowledgement}");
+            let response: SessionGoalResult =
+                serde_json::from_value(acknowledgement["result"].clone()).unwrap();
+            assert_eq!(
+                response.response,
+                GoalResponse::Queued(zeroclaw_goal::control::GoalQueuedControl::Start)
+            );
+            crate::rpc::dispatch::connection_test_support::assert_goal_launch_failure_state(
+                &ctx,
+                registry.as_ref(),
+                &key,
+                &before,
+                SID,
+                original_generation,
+            )
+            .await;
+            crate::rpc::dispatch::connection_test_support::release_unlaunched_failure_publication(
+                gate,
+            );
         }
         let mut ordinary_text = String::new();
         let mut ordinary_response_seen = false;
@@ -4754,6 +4853,119 @@ mod accept_error_tests {
         assert_eq!(frame["method"], "session/goal_update");
         let update: crate::rpc::types::SessionGoalUpdate =
             serde_json::from_value(frame["params"].clone()).unwrap();
+        if audit_gate.is_some() {
+            crate::rpc::dispatch::connection_test_support::assert_goal_launch_failure_frame(
+                &frame, SID,
+            );
+            assert!(!frame.to_string().contains("private fixture audit detail"));
+            let message = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let started: serde_json::Value =
+                serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let started_update: crate::rpc::types::SessionGoalUpdate =
+                serde_json::from_value(started["params"].clone()).unwrap();
+            assert!(
+                matches!(started_update, crate::rpc::types::SessionGoalUpdate::Lifecycle {
+                session_id, response: GoalResponse::Started(_)
+            } if session_id == SID),
+                "failure notice must precede Started without command_failed: {started}"
+            );
+            let successor = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                successor.id, before.id,
+                "the queued Start must replace the notified predecessor"
+            );
+            sink.send(Message::Text(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({"session_id": SID, "command": "/goal cancel"}),
+                    7,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let message = stream.next().await.unwrap().unwrap();
+                    let next: serde_json::Value =
+                        serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    assert!(next["params"]["command_failed"].is_null(), "{next}");
+                    assert!(!next.to_string().contains("private fixture audit detail"));
+                    if next["id"] == 7 {
+                        assert!(next["error"].is_null(), "{next}");
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("competing Goal must accept immediate cancellation");
+            assert_eq!(
+                ctx.sessions.get_generation(SID).await,
+                Some(original_generation)
+            );
+            cancel.cancel();
+            drop(sink);
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
+        if matches!(completion, GoalBoundaryCompletion::AuditFailure) {
+            crate::rpc::dispatch::connection_test_support::assert_goal_launch_failure(
+                &ctx,
+                registry.as_ref(),
+                &key,
+                &before,
+                SID,
+                original_generation,
+                &frame,
+            )
+            .await;
+            assert!(!frame.to_string().contains("private fixture audit detail"));
+            sink.send(Message::Text(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({"session_id": SID, "command": "/goal status"}),
+                    5,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let next: serde_json::Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(next["id"], 5, "no duplicate command failure: {next}");
+            assert!(next["error"].is_null(), "{next}");
+            crate::rpc::dispatch::connection_test_support::assert_goal_control_dropped(
+                tmp.path(),
+                &key,
+            )
+            .await;
+            cancel.cancel();
+            drop(sink);
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
         if matches!(completion, GoalBoundaryCompletion::LaunchFailure) {
             assert!(matches!(update,
                 crate::rpc::types::SessionGoalUpdate::Lifecycle {
