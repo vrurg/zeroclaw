@@ -1271,12 +1271,14 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
         GoalTransitionResult::Applied
     );
 
+    // Only an immediate operator pause may fence this unsettled operation;
+    // plain pause belongs to the supervisor's settled-turn checkpoint.
     let pause = host
         .submit(
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Pause { immediate: false },
+            GoalCommand::Pause { immediate: true },
         )
         .await
         .unwrap();
