@@ -43,12 +43,26 @@ pub(super) struct GoalTestBindBarrier {
 
 /// Locks required only after a Matrix conversation enters the Goal control
 /// path. Ordinary channel traffic retains the historical persistence lock
-/// without paying for three unused async mutexes and a reset counter.
+/// without paying for unused async mutexes and coordination counters.
 struct MatrixGoalLocks {
     goal_command: Arc<tokio::sync::Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
     goal_supervisor: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
     pending_resets: Arc<AtomicUsize>,
+    pending_stops: Arc<AtomicUsize>,
+}
+
+const MAX_PENDING_MATRIX_GOAL_STOPS: usize = super::MAX_CONCURRENT_STOP_REPLIES;
+
+/// Owns one bounded command-lock waiter, not a durable Goal transition.
+pub(super) struct MatrixGoalStopGuard {
+    pending_stops: Arc<AtomicUsize>,
+}
+
+impl Drop for MatrixGoalStopGuard {
+    fn drop(&mut self) {
+        self.pending_stops.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Canonical process-local reset participation, not durable Goal state.
@@ -87,6 +101,7 @@ impl ConversationLocks {
             foreground: Arc::new(tokio::sync::Mutex::new(())),
             goal_supervisor: Arc::new(tokio::sync::Mutex::new(None)),
             pending_resets: Arc::new(AtomicUsize::new(0)),
+            pending_stops: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -265,6 +280,19 @@ pub(super) fn reserve_matrix_goal_reset(
     let pending_resets = Arc::clone(&locks_for_key(locks, key).matrix_goal().pending_resets);
     pending_resets.fetch_add(1, Ordering::SeqCst);
     MatrixGoalResetGuard { pending_resets }
+}
+
+pub(super) fn reserve_matrix_goal_stop(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> Option<MatrixGoalStopGuard> {
+    let pending_stops = Arc::clone(&locks_for_key(locks, key).matrix_goal().pending_stops);
+    pending_stops
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < MAX_PENDING_MATRIX_GOAL_STOPS).then_some(count + 1)
+        })
+        .ok()?;
+    Some(MatrixGoalStopGuard { pending_stops })
 }
 
 pub(super) fn matrix_goal_reset_pending(

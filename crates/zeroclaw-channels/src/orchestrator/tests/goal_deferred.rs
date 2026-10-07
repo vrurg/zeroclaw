@@ -1,5 +1,370 @@
 use super::*;
 
+#[tokio::test]
+async fn matrix_goal_stop_wrapper_preserves_non_matrix_no_op() {
+    let context = matrix_control_test_ctx();
+    let mut message = matrix_msg("@fixture:example.test");
+    message.channel = "test-channel".into();
+    assert!(
+        goal_execution::submit_matrix_goal_stop(context, message)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[derive(Default)]
+struct StopCancellationProbeProvider {
+    probe: GatedProbeModelProvider,
+    dropped: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for StopCancellationProbeProvider {
+    async fn chat_with_system(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        struct DropProbe<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _drop_probe = (!message.starts_with("Decide whether the assistant should send"))
+            .then(|| DropProbe(&self.dropped));
+        self.probe
+            .chat_with_system(system, message, model, temperature)
+            .await
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for StopCancellationProbeProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        self.probe.role()
+    }
+
+    fn alias(&self) -> &str {
+        "stop-cancellation-probe"
+    }
+}
+
+/// Ordinary cancellation precedes the Goal lock, even when the durable
+/// session owns a Running Goal without a resident parent worker.
+#[tokio::test]
+async fn matrix_goal_stop_cancels_ordinary_turn_before_goal_lock() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_cancels_ordinary_turn_before_goal_lock
+    ))
+    .await
+    {
+        return;
+    }
+    use zeroclaw_goal::{GoalTaskRecord, GoalTransitionResult};
+    use zeroclaw_runtime::control_plane::{ControlPlaneHandle, TaskRecord, TaskStatus};
+
+    let directory = tempfile::tempdir().unwrap();
+    let handle = ControlPlaneHandle::open(directory.path()).unwrap();
+    let registry = handle.goal_store().unwrap();
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(StopCancellationProbeProvider::default());
+    provider.probe.hold("m1");
+    let mut config = matrix_control_test_config();
+    config.data_dir = directory.path().to_owned();
+    config.goal.enabled = true;
+    config.goal.verifier.model_provider = "custom.fixture".into();
+    let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        config,
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    Arc::get_mut(&mut context).unwrap().session_store = Some(Arc::new(
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
+    ));
+    let mut message = matrix_msg("@fixture:example.test");
+    message.id = "m1".into();
+    let key = runtime_conversation_history_key(&context, &message);
+    foreground::install_goal_test_control_plane(&context.persist_locks, &key, handle);
+    let task: TaskRecord = serde_json::from_value(serde_json::json!({
+        "id": "fixture-running-stop", "kind": "goal", "status": "running",
+        "agent": context.agent_alias.as_str(), "session_id": key,
+        "principal_id": message.sender, "execution_epoch": 1,
+        "originator_route": format!("matrix:{}:{}", message.channel_alias.as_deref().unwrap_or_default(), message.reply_target),
+        "started_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .unwrap();
+    assert_eq!(
+        registry
+            .create_or_replace_session_goal(
+                task,
+                GoalTaskRecord {
+                    task_id: "fixture-running-stop".into(),
+                    objective: "bounded cancellation fixture".into(),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let command_lease = foreground::goal_command_lock(&context.persist_locks, &key)
+        .lock_owned()
+        .await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let router = AgentRouter::single(context);
+    let dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop(receiver, router, 4));
+    sender.send(message.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while provider.probe.entered_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    message.id = "fixture-stop".into();
+    message.content = "/stop".into();
+    sender.send(message).await.unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+        while !provider.dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    assert_eq!(
+        registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Running
+    );
+    drop(command_lease);
+    provider.probe.release("m1");
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(5), dispatch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cancelled,
+        "ordinary provider future survived the inline stop boundary"
+    );
+    assert_eq!(
+        registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Paused
+    );
+    assert!(channel.sent_messages.lock().await.iter().any(|reply| {
+        reply
+            .content
+            .contains(&channel_runtime_cli_string("goal-mode-paused"))
+    }));
+}
+
+/// A held Goal command lease must not stall another Matrix conversation's
+/// ordinary lane or its immediate cancellation acknowledgement.
+#[tokio::test]
+async fn matrix_goal_stop_lock_wait_preserves_other_conversation_progress() {
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(GatedProbeModelProvider::default());
+    provider.hold("m1");
+    let context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        matrix_control_test_config(),
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    let mut first = matrix_msg("@fixture:example.test");
+    first.reply_target = "!first:example.test".into();
+    first.content = "/stop".into();
+    let key = runtime_conversation_history_key(&context, &first);
+    let command_lease = foreground::goal_command_lock(&context.persist_locks, &key)
+        .lock_owned()
+        .await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let cancellation = CancellationToken::new();
+    let dispatch_cancel = cancellation.clone();
+    let router = AgentRouter::single(context);
+    let mut dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+        receiver,
+        router,
+        4,
+        dispatch_cancel,
+    ));
+    sender.send(first).await.unwrap();
+    let mut other = matrix_msg("@fixture:example.test");
+    other.id = "m1".into();
+    other.reply_target = "!second:example.test".into();
+    sender.send(other.clone()).await.unwrap();
+    let progressed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !provider.entered_ids().iter().any(|id| id == "m1") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let acknowledged = if progressed.is_ok() {
+        other.id = "fixture-second-stop".into();
+        other.content = "/stop".into();
+        sender.send(other.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !channel.sent_messages.lock().await.iter().any(|reply| {
+                reply.recipient == other.reply_target
+                    && reply.content == channel_runtime_cli_string("channel-runtime-stop-sent")
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    // Release the baseline's blocked dispatcher before asserting, so a red
+    // result cannot leave fixture work alive beyond its owning runtime.
+    drop(command_lease);
+    provider.release("m1");
+    cancellation.cancel();
+    drop(sender);
+    tokio::time::timeout(
+        CHANNEL_GENERATION_SHUTDOWN_GRACE + Duration::from_secs(2),
+        &mut dispatch,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        progressed.is_ok(),
+        "another Matrix lane stalled behind /stop's Goal lock"
+    );
+    assert!(
+        acknowledged,
+        "another conversation's /stop acknowledgement stalled"
+    );
+}
+
+/// Generation cancellation must retire a pending stop's lock waiter while
+/// its conversation's command lease is still held by a different owner.
+#[tokio::test]
+async fn matrix_goal_stop_lock_wait_observes_generation_shutdown() {
+    let context = matrix_control_test_ctx();
+    let mut message = matrix_msg("@fixture:example.test");
+    message.content = "/stop".into();
+    let key = runtime_conversation_history_key(&context, &message);
+    let command_lock = foreground::goal_command_lock(&context.persist_locks, &key);
+    let command_lease = command_lock.clone().lock_owned().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let cancellation = CancellationToken::new();
+    let dispatch_cancel = cancellation.clone();
+    let router = AgentRouter::single(context);
+    let mut dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+        receiver,
+        router,
+        4,
+        dispatch_cancel,
+    ));
+    sender.send(message).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut dispatch)
+            .await
+            .is_err()
+    );
+    cancellation.cancel();
+    let stopped = tokio::time::timeout(
+        CHANNEL_GENERATION_SHUTDOWN_GRACE + Duration::from_secs(1),
+        &mut dispatch,
+    )
+    .await;
+    let stopped_while_held = match stopped {
+        Ok(result) => {
+            result.unwrap();
+            true
+        }
+        Err(_) => false,
+    };
+    drop(command_lease);
+    drop(sender);
+    if !stopped_while_held {
+        tokio::time::timeout(Duration::from_secs(2), &mut dispatch)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        command_lock.try_lock_owned().is_ok(),
+        "a stop waiter survived dispatcher shutdown"
+    );
+    assert!(
+        stopped_while_held,
+        "generation shutdown waited for an unrelated Goal command lease"
+    );
+}
+
+/// Non-Matrix cancellation keeps its ordinary path, even when a Goal lock
+/// with the same canonical key is held; shutdown owns no Goal stop waiter.
+#[tokio::test]
+async fn matrix_goal_stop_non_matrix_control_avoids_goal_lock() {
+    let channel = Arc::new(SendMessageRecordingChannel::default());
+    let context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        Arc::new(GatedProbeModelProvider::default()),
+        zeroclaw_config::schema::Config::default(),
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    let message = zeroclaw_api::channel::ChannelMessage {
+        channel: "test-channel".into(),
+        reply_target: "fixture-peer".into(),
+        content: "/stop".into(),
+        ..Default::default()
+    };
+    let key = runtime_conversation_history_key(&context, &message);
+    let command_lease = foreground::goal_command_lock(&context.persist_locks, &key)
+        .lock_owned()
+        .await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let cancellation = CancellationToken::new();
+    let dispatch_cancel = cancellation.clone();
+    let router = AgentRouter::single(context);
+    let mut dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+        receiver,
+        router,
+        4,
+        dispatch_cancel,
+    ));
+    sender.send(message).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !channel.sent_messages.lock().await.iter().any(|reply| {
+            reply.content == channel_runtime_cli_string("channel-runtime-stop-no-task")
+        }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary non-Matrix stop must not acquire a Goal lock");
+    cancellation.cancel();
+    drop(sender);
+    tokio::time::timeout(Duration::from_millis(250), &mut dispatch)
+        .await
+        .expect("non-Matrix stop must leave no Goal waiter for shutdown")
+        .unwrap();
+    drop(command_lease);
+}
+
 /// Fail the predecessor through the ordinary model boundary, then hold a
 /// successor so the command's launch and cleanup can be observed separately.
 #[derive(Default)]
@@ -10,6 +375,264 @@ struct GoalFailedPredecessorProvider {
     first_entered: tokio::sync::Notify,
     first_release: tokio::sync::Notify,
     succeed_first: std::sync::atomic::AtomicBool,
+}
+
+#[tokio::test]
+async fn matrix_goal_stop_lock_wait_bounds_pending_goal_stops() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_lock_wait_bounds_pending_goal_stops
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_goal_stop_order_and_bound(true).await;
+}
+
+#[tokio::test]
+async fn matrix_goal_stop_lock_wait_precedes_later_goal_cancel() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_lock_wait_precedes_later_goal_cancel
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_goal_stop_order_and_bound(false).await;
+}
+
+/// Observe durable transition order independently of response scheduling.
+/// A held, billable parent settles only after the first stop has fenced it.
+async fn assert_matrix_goal_stop_order_and_bound(check_bound: bool) {
+    use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+    use zeroclaw_goal::GoalRuntime;
+    use zeroclaw_runtime::{
+        control_plane::{ControlPlaneHandle, TaskStatus},
+        cost::CostTracker,
+        goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let handle = ControlPlaneHandle::open(directory.path()).unwrap();
+    let registry = handle.goal_store().unwrap();
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(GoalFailedPredecessorProvider::default());
+    provider.hold_first.store(true, Ordering::SeqCst);
+    provider.succeed_first.store(true, Ordering::SeqCst);
+    let mut config = matrix_control_test_config();
+    config.data_dir = directory.path().to_owned();
+    config.goal.enabled = true;
+    config.goal.verifier.model_provider = "custom.fixture".into();
+    config.reliability.provider_retries = 0;
+    let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        config,
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    Arc::get_mut(&mut context).unwrap().session_store = Some(Arc::new(
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
+    ));
+    let mut message = matrix_msg("@fixture:example.test");
+    let key = runtime_conversation_history_key(&context, &message);
+    foreground::install_goal_test_control_plane(&context.persist_locks, &key, handle.clone());
+    let accounting = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            registry.clone(),
+            Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap()),
+            context.agent_alias.to_string(),
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor = handle
+        .goal_execution_restart()
+        .new_supervisor(Arc::new(
+            GoalRuntime::new(registry.clone()).execution_engine(accounting),
+        ))
+        .await;
+    *foreground::goal_supervisor_slot(&context.persist_locks, &key)
+        .lock()
+        .await = Some(supervisor);
+    let start = goal_execution::submit_matrix_goal(
+        context.clone(),
+        key.clone(),
+        message.clone(),
+        GoalCommand::Start {
+            budget: GoalBudgetSelection::Unlimited,
+            objective: "bounded cancellation fixture".into(),
+        },
+    )
+    .await
+    .unwrap();
+    goal_execution::deliver_matrix_goal_command(start, Some(channel.clone()), message.clone())
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), provider.first_entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Running
+    );
+    let audit = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    audit
+        .execute_batch(
+            "CREATE TABLE fixture_stop_transitions (status TEXT NOT NULL);
+         CREATE TRIGGER fixture_record_stop_transition AFTER UPDATE OF status ON tasks
+         WHEN NEW.kind = 'goal' AND OLD.status != NEW.status
+         BEGIN INSERT INTO fixture_stop_transitions(status) VALUES (NEW.status); END;",
+        )
+        .unwrap();
+    let command_lease = foreground::goal_command_lock(&context.persist_locks, &key)
+        .lock_owned()
+        .await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let router = AgentRouter::single(context);
+    let mut dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop(receiver, router, 4));
+    let stop_count = if check_bound {
+        MAX_CONCURRENT_STOP_REPLIES + 1
+    } else {
+        1
+    };
+    message.content = "/stop".into();
+    for index in 0..stop_count {
+        message.id = format!("fixture-stop-{index}");
+        sender.send(message.clone()).await.unwrap();
+    }
+    let overflow = if check_bound {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !channel.sent_messages.lock().await.iter().any(|reply| {
+                reply.content
+                    == format!(
+                        "{}\n{}",
+                        channel_runtime_cli_string("channel-runtime-stop-no-task"),
+                        channel_runtime_cli_string("goal-mode-command-failed")
+                    )
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        message.id = "fixture-cancel-after-stop".into();
+        message.content = "/goal cancel".into();
+        sender.send(message).await.unwrap();
+        true
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut dispatch)
+            .await
+            .is_err()
+    );
+    drop(command_lease);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while audit
+            .query_row(
+                "SELECT COUNT(*) FROM fixture_stop_transitions WHERE status = 'paused'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first stop must fence its running Goal before parent settlement");
+    provider.first_release.notify_one();
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(5), &mut dispatch)
+        .await
+        .expect("all accepted stop and cancellation tasks must drain")
+        .unwrap();
+    let statuses = audit
+        .prepare("SELECT status FROM fixture_stop_transitions ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        if check_bound {
+            vec!["paused"]
+        } else {
+            vec!["paused", "cancelled"]
+        }
+    );
+    let task = registry
+        .current_goal_for_session(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.status,
+        if check_bound {
+            TaskStatus::Paused
+        } else {
+            TaskStatus::Cancelled
+        }
+    );
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "a stop must admit no verifier or successor"
+    );
+    let replies = channel.sent_messages.lock().await;
+    let pause = replies
+        .iter()
+        .position(|reply| reply.content == channel_runtime_cli_string("goal-mode-pause-pending"))
+        .unwrap();
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|reply| reply.content == channel_runtime_cli_string("goal-mode-pause-pending"))
+            .count(),
+        1
+    );
+    if check_bound {
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply
+                    .content
+                    .contains(&channel_runtime_cli_string("goal-mode-command-failed")))
+                .count(),
+            1
+        );
+        assert!(
+            overflow,
+            "the ninth stop waited for the conversation's held Goal lock"
+        );
+    } else {
+        let cancel = replies
+            .iter()
+            .position(|reply| {
+                reply
+                    .content
+                    .starts_with(&channel_runtime_cli_string("goal-mode-cancelled"))
+                    || reply.content == channel_runtime_cli_string("goal-mode-cancel-pending")
+            })
+            .unwrap();
+        assert!(
+            pause < cancel,
+            "a later Goal cancel overtook the earlier stop"
+        );
+        assert!(!replies.iter().any(|reply| {
+            reply
+                .content
+                .contains(&channel_runtime_cli_string("goal-mode-command-failed"))
+        }));
+    }
 }
 
 impl zeroclaw_api::attribution::Attributable for GoalFailedPredecessorProvider {
