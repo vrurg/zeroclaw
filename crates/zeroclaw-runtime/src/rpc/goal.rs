@@ -1141,20 +1141,28 @@ impl RpcGoalRuntime {
     /// flight.  Its durable pause and accounting settlement therefore finish
     /// first; signalling the ordinary token beforehand would interrupt the
     /// operation the Goal controller is required to account for.
-    pub async fn pause_for_external_cancellation(&self, session_id: &str) -> Result<bool> {
+    /// Hand outstanding failure output to the connection after settlement;
+    /// the caller must deliver or explicitly withdraw it after signalling.
+    pub async fn pause_for_external_cancellation(
+        &self,
+        session_id: &str,
+    ) -> Result<(bool, Option<zeroclaw_goal::GoalFailureNoticeDelivery>)> {
         let Some(supervisor) = self.supervisor(session_id).await else {
-            return Ok(false);
+            return Ok((false, None));
         };
         let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
         let result = supervisor
             .pause_for_external_cancellation(&durable_session_id)
             .await?;
-        if matches!(result, crate::control_plane::GoalTransitionResult::Applied) {
+        if matches!(
+            result.transition,
+            crate::control_plane::GoalTransitionResult::Applied
+        ) {
             self.retire_supervisor_if_idle(session_id, &supervisor)
                 .await;
-            return Ok(true);
+            return Ok((true, result.failure_notice));
         }
-        Ok(false)
+        Ok((false, result.failure_notice))
     }
 
     /// Fence and dispose the current Goal before its RPC session disappears.

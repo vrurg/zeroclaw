@@ -1,12 +1,13 @@
 //! Failure output custody after classification releases lifecycle locks.
 
 use super::*;
+use std::future::Future;
 use tokio::sync::OwnedMutexGuard;
 
 /// Owns one exact worker's outstanding publication until delivery or withdrawal.
 /// The held latch prevents another drainer from publishing or retiring its owner.
 #[must_use = "deliver or explicitly withdraw the failure publication"]
-pub(super) struct GoalFailureNoticeDelivery {
+pub struct GoalFailureNoticeDelivery {
     engine: Arc<GoalExecutionEngine>,
     scope: GoalExecutionScope,
     driver: Arc<dyn GoalSessionDriver>,
@@ -47,26 +48,47 @@ impl GoalFailureNoticeDelivery {
         }
     }
 
-    pub(super) async fn deliver(mut self) {
-        if let Some(publication) = self.publication.as_mut()
-            && publish_failure_notice_body(
+    /// Attempt publication once, then release the latch and exact worker.
+    /// Dropping an unsettled obligation is only the abort/panic fallback.
+    pub async fn deliver(self) {
+        self.deliver_or_withdraw(std::future::pending()).await;
+    }
+
+    /// Attempt publication, or explicitly withdraw if cancellation wins.
+    /// Cancellation has priority; dropping this future is only the abort/panic
+    /// fallback, not the normal connection shutdown path.
+    pub async fn deliver_or_withdraw<F: Future<Output = ()>>(mut self, cancelled: F) {
+        let result = if let Some(publication) = self.publication.as_mut() {
+            let body = publish_failure_notice_body(
                 self.engine.as_ref(),
                 &self.scope,
                 self.driver.as_ref(),
                 &self.ingress,
                 &self.withdrawal,
                 publication,
-            )
-            .await
-            .is_err()
-        {
+            );
+            tokio::select! {
+                biased;
+                () = cancelled => None,
+                result = body => Some(result),
+            }
+        } else {
+            Some(Ok(()))
+        };
+        let Some(result) = result else {
+            self.withdraw().await;
+            return;
+        };
+        if result.is_err() {
             log_failure_notice_delivery_failure(&self.scope);
         }
         drop(self.publication.take());
         self.remove_worker().await;
     }
 
-    pub(super) async fn withdraw(mut self) {
+    /// Withdraw publication explicitly and retire its exact worker.
+    /// Dropping an unsettled obligation is only the abort/panic fallback.
+    pub async fn withdraw(mut self) {
         self.withdrawal.close();
         if let Some(publication) = self.publication.as_mut() {
             publication.notice_withdrawn = true;
@@ -199,6 +221,117 @@ mod tests {
             driver,
             ingress,
         }
+    }
+
+    async fn fixture_delivery(fixture: &FailedWorkerFixture) -> GoalFailureNoticeDelivery {
+        GoalFailureNoticeDelivery::new(
+            &fixture.supervisor,
+            fixture.scope.clone(),
+            Arc::clone(&fixture.worker),
+            Arc::clone(&fixture.driver),
+            fixture.ingress.clone(),
+            fixture.withdrawal.clone(),
+            Arc::clone(&fixture.publication).lock_owned().await,
+        )
+    }
+
+    async fn assert_explicitly_withdrawn(fixture: &FailedWorkerFixture) {
+        let publication = fixture.publication.try_lock().unwrap();
+        assert!(publication.notice_withdrawn);
+        assert!(!publication.notice_published);
+        drop(publication);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.withdrawal.wait_closed(),
+        )
+        .await
+        .unwrap();
+        assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+        assert!(
+            fixture
+                .supervisor
+                .drain_lifecycle_fence(&fixture.scope)
+                .await
+                .unwrap()
+                .failure_notice
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_or_withdraw_withdraws_explicitly_when_cancelled_first() {
+        let fixture = failed_worker_fixture().await;
+        fixture_delivery(&fixture)
+            .await
+            .deliver_or_withdraw(std::future::ready(()))
+            .await;
+        assert_explicitly_withdrawn(&fixture).await;
+    }
+
+    struct PendingDeliveryDriver {
+        key: GoalSessionKey,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalSessionDriver for PendingDeliveryDriver {
+        fn session_key(&self) -> &GoalSessionKey {
+            &self.key
+        }
+
+        async fn bind(&self, _: &GoalIngressContext) -> Result<GoalSessionLease> {
+            bail!("custody test must never acquire command authority")
+        }
+
+        async fn acquire_execution(
+            &self,
+            _: &GoalIngressContext,
+            _: &GoalExecutionScope,
+            _: &GoalParentTurnCheckpoint,
+        ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_or_withdraw_withdraws_explicitly_when_cancelled_during_acquisition() {
+        let mut fixture = failed_worker_fixture().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        fixture.driver = Arc::new(PendingDeliveryDriver {
+            key: fixture.ingress.session_key().clone(),
+            entered: Arc::clone(&entered),
+        });
+        let delivery = fixture_delivery(&fixture).await;
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let task = zeroclaw_spawn::spawn!(async move {
+            delivery
+                .deliver_or_withdraw(async { cancelled.await.unwrap() })
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        cancel.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_explicitly_withdrawn(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn deliver_or_withdraw_settles_like_deliver_when_not_cancelled() {
+        let fixture = failed_worker_fixture().await;
+        fixture_delivery(&fixture)
+            .await
+            .deliver_or_withdraw(std::future::pending())
+            .await;
+        let publication = fixture.publication.try_lock().unwrap();
+        assert!(!publication.notice_withdrawn);
+        assert!(!publication.notice_published);
+        drop(publication);
+        assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
     }
 
     #[tokio::test]
