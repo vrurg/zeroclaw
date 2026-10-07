@@ -951,6 +951,25 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
             .position(|row| row.content == channel_runtime_cli_string("goal-mode-pause-pending"))
             .unwrap();
         assert!(ack < original && original < ordinary && ordinary < notice && notice < late);
+        let parked = replies
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.content
+                    .contains("Goal failure lost its execution fence")
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parked.len(),
+            1,
+            "BR32(d): one fenced transition original; emitted contents: {:?}",
+            replies
+                .iter()
+                .map(|row| row.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(ordinary < parked[0] && parked[0] < notice);
     }
     assert_eq!(
         replies.iter().filter(|row| row.content == failure).count(),
