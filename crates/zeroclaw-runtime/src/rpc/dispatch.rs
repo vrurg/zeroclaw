@@ -14943,6 +14943,190 @@ pub(crate) mod connection_test_support {
         None
     }
 
+    /// A notification has no acknowledgement to deliver, but its predecessor
+    /// publication must release command authority while ordinary work owns FIFO.
+    pub(crate) async fn exercise_ack_failure_predecessor_transport(
+        ctx: &RpcContext,
+        session_id: &str,
+        registry: &dyn zeroclaw_goal::GoalTaskRegistry,
+        turns: (&HeldGoalParent, &HeldOrdinaryTurn, &HeldOrdinaryTurn),
+        mut send: impl std::ops::AsyncFnMut(serde_json::Value),
+        mut receive: impl std::ops::AsyncFnMut() -> serde_json::Value,
+    ) {
+        use crate::rpc::types::{SessionGoalResult, SessionGoalUpdate};
+        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+
+        let (parent, ordinary, successor) = turns;
+        let key = GoalSessionKey::zero_code(session_id).unwrap().durable_id();
+        let request = |command: &str, id| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/goal",
+                "params": {"session_id": session_id, "command": command}, "id": id,
+            })
+        };
+        send(request("/goal resume", 40)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 40 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Resumed(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        parent.assert_resume_input(None);
+        send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/prompt", "id": 41,
+            "params": {"session_id": session_id, "prompt": "ordinary work"},
+        }))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary prompt must queue behind the Goal parent");
+        send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/goal",
+            "params": {"session_id": session_id, "command": "/goal pause now"},
+        }))
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                != zeroclaw_api::task::TaskStatus::Paused
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notification must fence the held parent before release");
+        parent.turn.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ordinary.started.notified(),
+        )
+        .await
+        .expect("queued ordinary prompt must acquire the real FIFO");
+        send(request("/goal status", 43)).await;
+        let mut host_originals = 0;
+        let mut ordinary_ack = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                assert_ne!(frame["method"], "session/goal_update", "{frame}");
+                if frame["id"] == 41 {
+                    assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                    ordinary_ack = true;
+                }
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    assert!(
+                        frame["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("scripted failed predecessor"),
+                        "{frame}"
+                    );
+                    host_originals += 1;
+                }
+                if frame["id"] == 43 {
+                    let result: SessionGoalResult =
+                        serde_json::from_value(frame["result"].clone()).unwrap();
+                    assert!(matches!(result.response, GoalResponse::Terminal(_)));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Status must answer while notification failure delivery waits");
+        assert_eq!(host_originals, 1);
+        assert!(!ordinary.completed.load(Ordering::Acquire));
+        ordinary.release.notify_one();
+        let mut ordinary_complete = false;
+        let mut text = String::new();
+        let mut parked_originals = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = receive().await;
+                assert!(frame["error"].is_null(), "{frame}");
+                if frame["id"] == 41 {
+                    assert_ordinary_prompt_acknowledgement(&frame, session_id);
+                    ordinary_ack = true;
+                }
+                if frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"
+                {
+                    assert!(ordinary_complete, "{frame}");
+                    assert!(
+                        frame["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Goal failure lost its execution fence"),
+                        "{frame}"
+                    );
+                    parked_originals += 1;
+                } else if frame["method"] == "session/update" {
+                    ordinary_complete |=
+                        observe_ordinary_turn_update(&frame, session_id, &mut text);
+                }
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    assert!(ordinary_ack && ordinary_complete);
+                    assert!(
+                        matches!(
+                            update,
+                            SessionGoalUpdate::Failed {
+                                reason: zeroclaw_goal::control::GoalFailureReason::ExecutorFailed,
+                                ..
+                            }
+                        ),
+                        "no lifecycle response is owed for the notification: {update:?}"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("native failure publication must follow ordinary output");
+        assert_eq!(parked_originals, 1);
+        assert_eq!(text, "ordinary answer");
+        assert_eq!(successor.calls.load(Ordering::Acquire), 0);
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, zeroclaw_api::task::TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+    }
+
     pub(crate) async fn exercise_failed_predecessor_transport(
         ctx: &RpcContext,
         session_id: &str,
