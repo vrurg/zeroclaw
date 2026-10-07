@@ -1045,6 +1045,20 @@ enum MatrixFailureDeliveryCase {
     DrainerStart,
     TailReset,
     TailStart,
+    AckFailure,
+}
+
+#[tokio::test]
+async fn matrix_goal_ack_failure_delivery_releases_goal_command_lock() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_ack_failure_delivery_releases_goal_command_lock
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_failure_delivery_behind_ordinary_lane(MatrixFailureDeliveryCase::AckFailure)
+        .await;
 }
 
 #[derive(Default)]
@@ -1134,6 +1148,7 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         MatrixFailureDeliveryCase::DrainerStart | MatrixFailureDeliveryCase::TailStart
     );
     let reset_session = matches!(case, MatrixFailureDeliveryCase::TailReset);
+    let ack_failure = matches!(case, MatrixFailureDeliveryCase::AckFailure);
     let worker_tail = matches!(
         case,
         MatrixFailureDeliveryCase::TailReset | MatrixFailureDeliveryCase::TailStart
@@ -1253,12 +1268,22 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         )
         .await
         .unwrap();
-        let pause_channel = channel.clone();
-        let pause_message = message.clone();
-        Some(zeroclaw_spawn::spawn!(async move {
-            goal_execution::deliver_matrix_goal_command(pause, Some(pause_channel), pause_message)
+        if ack_failure {
+            Some(zeroclaw_spawn::spawn!(async move {
+                pause.response_delivery_failed().await.unwrap();
+            }))
+        } else {
+            let pause_channel = channel.clone();
+            let pause_message = message.clone();
+            Some(zeroclaw_spawn::spawn!(async move {
+                goal_execution::deliver_matrix_goal_command(
+                    pause,
+                    Some(pause_channel),
+                    pause_message,
+                )
                 .await;
-        }))
+            }))
+        }
     };
     let failure = channel_runtime_cli_string("goal-mode-failure-executor");
     let queued_reply = render_goal_response(&GoalResponse::Queued(GoalQueuedControl::Start));
@@ -1266,7 +1291,7 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     let mut delivery_waited_for_ordinary = false;
     let outcome = async {
         let pending = channel_runtime_cli_string("goal-mode-pause-pending");
-        if !worker_tail {
+        if !worker_tail && !ack_failure {
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !channel
                     .sent_messages
@@ -1299,6 +1324,29 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         })
         .await
         .unwrap();
+        if ack_failure {
+            // Native publication may wait for the ordinary lane, but must not
+            // keep the conversation's independent command authority hostage.
+            let command = foreground::goal_command_lock(&context.persist_locks, &key);
+            let guard = command
+                .try_lock_owned()
+                .expect("acknowledgement-failure delivery must release Goal command authority");
+            drop(guard);
+            let status = tokio::time::timeout(
+                Duration::from_secs(1),
+                goal_execution::submit_matrix_goal(
+                    context.clone(),
+                    key.clone(),
+                    message.clone(),
+                    GoalCommand::Status,
+                ),
+            )
+            .await
+            .expect("Status must answer while failure delivery waits")
+            .unwrap();
+            assert!(matches!(status.response(), GoalResponse::Terminal(_)));
+            drop(status);
+        }
         // Observe without polling the JoinHandle: an unfixed delivery may
         // already have returned, but cleanup must still join it exactly once.
         if let Some(delivery) = delivery.as_ref() {
@@ -1424,6 +1472,28 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
             .await
             .unwrap()
             .unwrap();
+    }
+    if ack_failure && result.is_ok() {
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            registry
+                .terminal_reason_for_session_goal(&failed.id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("executor_failed")
+        );
+        assert!(
+            foreground::goal_supervisor_slot(&context.persist_locks, &key)
+                .lock()
+                .await
+                .is_none()
+        );
     }
     if let Some(mut successor) = successor_delivery {
         tokio::time::timeout(Duration::from_secs(3), &mut successor)
@@ -1557,6 +1627,13 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
                 .count(),
             1
         );
+    } else if ack_failure {
+        assert!(delivery_waited_for_ordinary);
+        assert!(original < ordinary && ordinary < notice);
+        assert!(!replies.iter().any(|row| {
+            row.content
+                .starts_with(&channel_runtime_cli_string("goal-mode-terminal"))
+        }));
     } else {
         assert!(
             delivery_waited_for_ordinary,
