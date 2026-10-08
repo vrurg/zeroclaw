@@ -4368,6 +4368,125 @@ mod tests {
         );
     }
 
+    fn composition_sibling_schemas() -> (serde_json::Value, serde_json::Value) {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["direct", "keyed", "named"],
+                    "description": "Connection mode"
+                },
+                "target": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "target_alias": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "key_path": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "port": {
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 65535},
+                        {"type": "null"}
+                    ],
+                    "default": null
+                }
+            },
+            "required": ["mode"],
+            "allOf": [
+                {
+                    "if": {"properties": {"mode": {"const": "named"}}, "required": ["mode"]},
+                    "then": {"required": ["target_alias"]}
+                },
+                {
+                    "if": {"properties": {"mode": {"const": "keyed"}}, "required": ["mode"]},
+                    "then": {"required": ["key_path"]}
+                }
+            ],
+            "anyOf": [
+                {
+                    "properties": {"target_alias": {"type": "string", "minLength": 1}},
+                    "required": ["target_alias"]
+                },
+                {
+                    "properties": {"target": {"type": "string", "minLength": 1}},
+                    "required": ["target"]
+                }
+            ]
+        });
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["direct", "keyed", "named"],
+                    "description": "Connection mode"
+                },
+                "target": {"type": "string", "default": null},
+                "target_alias": {"type": "string", "default": null},
+                "key_path": {"type": "string", "default": null},
+                "port": {
+                    "type": "integer", "minimum": 1, "maximum": 65535, "default": null
+                }
+            },
+            "required": ["mode"],
+            "allOf": [
+                {
+                    "if": {"properties": {"mode": {"enum": ["named"]}}, "required": ["mode"]},
+                    "then": {"required": ["target_alias"]}
+                },
+                {
+                    "if": {"properties": {"mode": {"enum": ["keyed"]}}, "required": ["mode"]},
+                    "then": {"required": ["key_path"]}
+                }
+            ],
+            "anyOf": [
+                {
+                    "properties": {"target_alias": {"type": "string", "minLength": 1}},
+                    "required": ["target_alias"]
+                },
+                {
+                    "properties": {"target": {"type": "string", "minLength": 1}},
+                    "required": ["target"]
+                }
+            ]
+        });
+        (input, expected)
+    }
+
+    #[test]
+    fn convert_tool_specs_preserves_composition_sibling_schema_in_memo() {
+        let provider = make_model_provider("custom", "http://localhost:8000/v1", None);
+        let (schema, expected) = composition_sibling_schemas();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "select_target",
+            "Select a target",
+            schema,
+        )];
+
+        let first = provider.convert_tool_specs(Some(&tools)).unwrap();
+        let second = provider.convert_tool_specs(Some(&tools)).unwrap();
+
+        assert_eq!(*first[0].function.parameters, expected);
+        assert_eq!(*second[0].function.parameters, expected);
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &first[0].function.parameters,
+                &second[0].function.parameters
+            ),
+            "repeated conversion must reuse the corrected schema"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&first[0].function.parameters, &tools[0].parameters),
+            "nullable properties and const constraints must be cleaned"
+        );
+    }
+
     #[test]
     fn convert_tool_specs_shares_clean_schema_and_memoizes_dirty_schema() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);

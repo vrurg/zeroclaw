@@ -8075,6 +8075,160 @@ data: {\"type\":\"message_stop\"}\n\n";
         (addr, captured, handle)
     }
 
+    fn composition_sibling_schemas() -> (serde_json::Value, serde_json::Value) {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["direct", "keyed", "named"],
+                    "description": "Connection mode"
+                },
+                "target": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "target_alias": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "key_path": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": null
+                },
+                "port": {
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 65535},
+                        {"type": "null"}
+                    ],
+                    "default": null
+                }
+            },
+            "required": ["mode"],
+            "allOf": [
+                {
+                    "if": {"properties": {"mode": {"const": "named"}}, "required": ["mode"]},
+                    "then": {"required": ["target_alias"]}
+                },
+                {
+                    "if": {"properties": {"mode": {"const": "keyed"}}, "required": ["mode"]},
+                    "then": {"required": ["key_path"]}
+                }
+            ],
+            "anyOf": [
+                {
+                    "properties": {"target_alias": {"type": "string", "minLength": 1}},
+                    "required": ["target_alias"]
+                },
+                {
+                    "properties": {"target": {"type": "string", "minLength": 1}},
+                    "required": ["target"]
+                }
+            ]
+        });
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["direct", "keyed", "named"],
+                    "description": "Connection mode"
+                },
+                "target": {"type": "string", "default": null},
+                "target_alias": {"type": "string", "default": null},
+                "key_path": {"type": "string", "default": null},
+                "port": {
+                    "type": "integer", "minimum": 1, "maximum": 65535, "default": null
+                }
+            },
+            "required": ["mode"],
+            "allOf": [
+                {
+                    "if": {"properties": {"mode": {"enum": ["named"]}}, "required": ["mode"]},
+                    "then": {"required": ["target_alias"]}
+                },
+                {
+                    "if": {"properties": {"mode": {"enum": ["keyed"]}}, "required": ["mode"]},
+                    "then": {"required": ["key_path"]}
+                }
+            ],
+            "anyOf": [
+                {
+                    "properties": {"target_alias": {"type": "string", "minLength": 1}},
+                    "required": ["target_alias"]
+                },
+                {
+                    "properties": {"target": {"type": "string", "minLength": 1}},
+                    "required": ["target"]
+                }
+            ]
+        });
+        (input, expected)
+    }
+
+    #[tokio::test]
+    async fn chat_serializes_composition_sibling_schema() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = refusal_test_provider(addr);
+        let (schema, expected) = composition_sibling_schemas();
+        let tools = vec![ToolSpec::new("select_target", "Select a target", schema)];
+        let messages = vec![ChatMessage::user("Select a target")];
+
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (_, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no chat request captured");
+        assert_eq!(body["tools"][0]["name"], "select_target");
+        assert_eq!(body["tools"][0]["input_schema"], expected);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_serializes_composition_sibling_schema() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = refusal_test_provider(addr);
+        let (schema, expected) = composition_sibling_schemas();
+        let tools = vec![ToolSpec::new("select_target", "Select a target", schema)];
+        let messages = vec![ChatMessage::user("Select a target")];
+
+        let stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        // This JSON-only server proves the outgoing request body, not SSE success.
+        let _events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
+        server.abort();
+
+        let (_, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no streaming request captured");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["name"], "select_target");
+        assert_eq!(body["tools"][0]["input_schema"], expected);
+    }
+
     /// True when any `anthropic-beta` header line carries the server-side
     /// fallback opt-in beta.
     fn carries_server_fallback_beta(headers: &axum::http::HeaderMap) -> bool {

@@ -8,8 +8,8 @@
 //!
 //! 1. Removes unsupported keywords per model_provider strategy
 //! 2. Resolves local `$ref` entries from `$defs` and `definitions`
-//! 3. Flattens literal `anyOf` / `oneOf` unions into `enum`
-//! 4. Strips nullable variants from unions and `type` arrays
+//! 3. Flattens literal `anyOf` / `oneOf` unions when sibling constraints permit
+//! 4. Strips nullable variants from simplifiable unions and `type` arrays
 //! 5. Converts `const` to single-value `enum`
 //! 6. Detects circular references and stops recursion safely
 //!
@@ -89,6 +89,18 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
 /// Keywords that should be preserved during cleaning (metadata).
 const SCHEMA_META_KEYS: &[&str] = &["description", "title", "default"];
 
+/// Non-validating siblings may be dropped by the existing union adaptations.
+const SCHEMA_NON_VALIDATING_KEYS: &[&str] = &[
+    "$comment",
+    "$schema",
+    "$defs",
+    "definitions",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
 /// Schema cleaning strategies for different LLM model_providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CleaningStrategy {
@@ -155,7 +167,7 @@ impl SchemaCleanr {
     /// `clean(s) == s`. The triggers mirror every rewrite path in
     /// `clean_object`: strategy-specific keyword removal, plus the
     /// strategy-independent rewrites (`$ref` resolution, `const` → `enum`,
-    /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
+    /// `anyOf`/`oneOf` simplification, and
     /// null-stripping in `type` arrays).
     pub fn needs_cleaning(schema: &Value, strategy: CleaningStrategy) -> bool {
         match schema {
@@ -282,7 +294,6 @@ impl SchemaCleanr {
         // Build cleaned object
         let mut cleaned = Map::new();
         let unsupported: HashSet<&str> = strategy.unsupported_keywords().iter().copied().collect();
-        let has_union = obj.contains_key("anyOf") || obj.contains_key("oneOf");
 
         for (key, value) in obj {
             // Skip unsupported keywords
@@ -295,10 +306,6 @@ impl SchemaCleanr {
                 // Convert const to enum
                 "const" => {
                     cleaned.insert("enum".to_string(), json!([value]));
-                }
-                // Skip type if we have anyOf/oneOf (they define the type)
-                "type" if has_union => {
-                    // Skip
                 }
                 // Handle type arrays (remove null)
                 "type" if matches!(value, Value::Array(_)) => {
@@ -401,7 +408,7 @@ impl SchemaCleanr {
         decoded
     }
 
-    /// Try to simplify anyOf/oneOf to a simpler form.
+    /// Simplify anyOf/oneOf only when no retained sibling constraint is lost.
     fn try_simplify_union(
         obj: &Map<String, Value>,
         defs: &HashMap<String, Value>,
@@ -415,6 +422,18 @@ impl SchemaCleanr {
         } else {
             return None;
         };
+
+        let unsupported = strategy.unsupported_keywords();
+        if obj.keys().any(|key| {
+            let key = key.as_str();
+            key != union_key
+                && key != "type"
+                && !SCHEMA_META_KEYS.contains(&key)
+                && !SCHEMA_NON_VALIDATING_KEYS.contains(&key)
+                && !unsupported.contains(&key)
+        }) {
+            return None;
+        }
 
         let variants = obj.get(union_key)?.as_array()?;
 
@@ -430,17 +449,20 @@ impl SchemaCleanr {
             .filter(|v| !Self::is_null_schema(v))
             .collect();
 
-        // If only one variant remains after stripping nulls, return it
-        if non_null.len() == 1 {
-            return Some(Self::preserve_meta(obj, non_null[0].clone()));
+        let simplified = if non_null.len() == 1 {
+            non_null.into_iter().next()?
+        } else {
+            Self::try_flatten_literal_union(&non_null)?
+        };
+
+        // A sibling type is redundant only when the result preserves it exactly.
+        if let Some(sibling_type) = obj.get("type")
+            && simplified.get("type") != Some(sibling_type)
+        {
+            return None;
         }
 
-        // Try to flatten to enum if all variants are literals
-        if let Some(enum_value) = Self::try_flatten_literal_union(&non_null) {
-            return Some(Self::preserve_meta(obj, enum_value));
-        }
-
-        None
+        Some(Self::preserve_meta(obj, simplified))
     }
 
     /// Check if a schema represents null type.
@@ -901,7 +923,7 @@ mod tests {
             json!({ "$ref": "#/$defs/Age", "$defs": { "Age": { "type": "integer" } } }),
             // const → enum conversion.
             json!({ "const": "fixed" }),
-            // anyOf/oneOf simplification and sibling-type skipping.
+            // anyOf/oneOf simplification.
             json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
             json!({ "oneOf": [{ "type": "string" }, { "type": "number" }] }),
             // type-array null stripping.
@@ -1518,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_type_when_non_simplifiable_union_exists() {
+    fn test_composition_sibling_preserves_type_when_non_simplifiable_union_exists() {
         let schema = json!({
             "type": "object",
             "oneOf": [
@@ -1539,8 +1561,281 @@ mod tests {
 
         let cleaned = SchemaCleanr::clean_for_gemini(schema);
 
-        assert!(cleaned.get("type").is_none());
+        assert_eq!(cleaned["type"], "object");
         assert!(cleaned.get("oneOf").is_some());
+    }
+
+    fn composition_sibling_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["direct", "keyed", "named"], "description": "Connection mode"},
+                "target": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null},
+                "target_alias": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null},
+                "key_path": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null},
+                "port": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "null"}], "default": null}
+            },
+            "required": ["mode"],
+            "allOf": [
+                {"if": {"properties": {"mode": {"const": "named"}}, "required": ["mode"]}, "then": {"required": ["target_alias"]}},
+                {"if": {"properties": {"mode": {"const": "keyed"}}, "required": ["mode"]}, "then": {"required": ["key_path"]}}
+            ],
+            "anyOf": [
+                {"properties": {"target_alias": {"type": "string", "minLength": 1}}, "required": ["target_alias"]},
+                {"properties": {"target": {"type": "string", "minLength": 1}}, "required": ["target"]}
+            ]
+        })
+    }
+
+    fn expected_composition_sibling_schema(strategy: CleaningStrategy) -> Value {
+        let mut expected = composition_sibling_schema();
+        for property in ["target", "target_alias", "key_path"] {
+            expected["properties"][property] = json!({"type": "string", "default": null});
+        }
+        expected["properties"]["port"] = if strategy == CleaningStrategy::Gemini {
+            json!({"type": "integer", "default": null})
+        } else {
+            json!({"type": "integer", "minimum": 1, "maximum": 65535, "default": null})
+        };
+        for (index, mode) in ["named", "keyed"].into_iter().enumerate() {
+            expected["allOf"][index]["if"]["properties"]["mode"] = json!({"enum": [mode]});
+        }
+        if strategy == CleaningStrategy::Gemini {
+            expected["anyOf"][0]["properties"]["target_alias"] = json!({"type": "string"});
+            expected["anyOf"][1]["properties"]["target"] = json!({"type": "string"});
+        }
+        expected
+    }
+
+    #[test]
+    fn test_composition_sibling_any_of_property_branches() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "anyOf": [
+                {"properties": {"a": {"type": "string", "minLength": 1}}, "required": ["a"]},
+                {"properties": {"b": {"type": "string", "minLength": 1}}, "required": ["b"]}
+            ]
+        });
+        for strategy in [CleaningStrategy::Anthropic, CleaningStrategy::OpenAI] {
+            assert_eq!(SchemaCleanr::clean(schema.clone(), strategy), schema);
+        }
+    }
+
+    #[test]
+    fn test_composition_sibling_one_of_property_branches() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "oneOf": [
+                {"properties": {"a": {"type": "string", "minLength": 1}}, "required": ["a"]},
+                {"properties": {"b": {"type": "string", "minLength": 1}}, "required": ["b"]}
+            ]
+        });
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_root_constraints_across_strategies() {
+        for strategy in [
+            CleaningStrategy::Anthropic,
+            CleaningStrategy::OpenAI,
+            CleaningStrategy::Gemini,
+            CleaningStrategy::Conservative,
+        ] {
+            assert_eq!(
+                SchemaCleanr::clean(composition_sibling_schema(), strategy),
+                expected_composition_sibling_schema(strategy),
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_composition_sibling_nested_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"contact": {"type": "string", "oneOf": [{"format": "email"}, {"format": "uri"}]}}
+        });
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_min_length_prevents_lossy_simplification() {
+        let schema = json!({"minLength": 1, "anyOf": [{"type": "string"}, {"type": "null"}], "description": "d"});
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_both_unions_are_preserved() {
+        let schema = json!({
+            "anyOf": [{"const": "a", "type": "string"}, {"const": "b", "type": "string"}],
+            "oneOf": [{"const": "a", "type": "string"}, {"const": "c", "type": "string"}]
+        });
+        assert_eq!(
+            SchemaCleanr::clean_for_anthropic(schema),
+            json!({
+                "anyOf": [{"enum": ["a"], "type": "string"}, {"enum": ["b"], "type": "string"}],
+                "oneOf": [{"enum": ["a"], "type": "string"}, {"enum": ["c"], "type": "string"}]
+            })
+        );
+    }
+
+    #[test]
+    fn test_composition_sibling_all_of_prevents_lossy_simplification() {
+        let schema = json!({
+            "allOf": [{"required": ["id"]}],
+            "anyOf": [{"type": "object", "properties": {"id": {"type": "string"}}}, {"type": "null"}]
+        });
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_properties_and_untyped_branch_are_preserved() {
+        let schema = json!({
+            "type": "object", "properties": {"a": {"type": "string"}},
+            "anyOf": [{"required": ["a"]}, {"type": "null"}]
+        });
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_max_length_prevents_lossy_simplification() {
+        let schema = json!({"anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 5});
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_type_with_resolved_branches() {
+        let schema = json!({
+            "type": "object", "oneOf": [{"$ref": "#/$defs/A"}, {"$ref": "#/$defs/B"}],
+            "$defs": {
+                "A": {"type": "object", "properties": {"a": {"type": "string"}}},
+                "B": {"type": "object", "properties": {"b": {"type": "integer"}}}
+            }
+        });
+        assert_eq!(
+            SchemaCleanr::clean_for_anthropic(schema),
+            json!({
+                "type": "object", "oneOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}},
+                    {"type": "object", "properties": {"b": {"type": "integer"}}}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_composition_sibling_safe_simplification_controls() {
+        let cases = [
+            (
+                json!({"anyOf": [{"type": "string"}, {"type": "null"}], "description": "d", "title": "t", "default": null}),
+                json!({"type": "string", "description": "d", "title": "t", "default": null}),
+            ),
+            (
+                json!({"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "T", "examples": ["x"]}),
+                json!({"type": "string", "default": null, "title": "T"}),
+            ),
+            (
+                json!({"type": "string", "anyOf": [{"const": "a", "type": "string"}, {"const": "b", "type": "string"}], "description": "d"}),
+                json!({"type": "string", "enum": ["a", "b"], "description": "d"}),
+            ),
+            (
+                json!({"type": "object", "anyOf": [{"type": "object", "properties": {"a": {"type": "string"}}}, {"type": "null"}]}),
+                json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+            ),
+            (
+                json!({"anyOf": [{"$ref": "#/$defs/Item"}, {"type": "null"}], "$defs": {"Item": {"type": "object", "properties": {"id": {"type": "string"}}}}}),
+                json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+            ),
+        ];
+        for strategy in [
+            CleaningStrategy::Anthropic,
+            CleaningStrategy::OpenAI,
+            CleaningStrategy::Gemini,
+            CleaningStrategy::Conservative,
+        ] {
+            for (input, expected) in &cases {
+                assert_eq!(
+                    SchemaCleanr::clean(input.clone(), strategy),
+                    *expected,
+                    "{strategy:?}: {input}"
+                );
+            }
+        }
+        assert_eq!(
+            SchemaCleanr::clean_for_gemini(json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 5
+            })),
+            json!({"type": "string"})
+        );
+    }
+
+    #[test]
+    fn test_composition_sibling_untyped_union_stays_untyped() {
+        let schema = json!({
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "anyOf": [{"required": ["a"]}, {"required": ["b"]}]
+        });
+        assert_eq!(SchemaCleanr::clean_for_anthropic(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_composition_sibling_non_redundant_type_prevents_simplification() {
+        let schemas = [
+            json!({"type": "integer", "anyOf": [{"type": "string"}, {"type": "null"}]}),
+            json!({"type": "object", "anyOf": [{"required": ["a"]}, {"type": "null"}]}),
+        ];
+        for strategy in [
+            CleaningStrategy::Anthropic,
+            CleaningStrategy::OpenAI,
+            CleaningStrategy::Gemini,
+            CleaningStrategy::Conservative,
+        ] {
+            for schema in &schemas {
+                assert_eq!(SchemaCleanr::clean(schema.clone(), strategy), *schema);
+            }
+        }
+    }
+
+    #[test]
+    fn test_composition_sibling_cache_reuses_corrected_schema() {
+        let schema = Arc::new(composition_sibling_schema());
+        let cache = SchemaCleanCache::default();
+        let first = cache.clean_shared(&schema, CleaningStrategy::Anthropic);
+        let second = cache.clean_shared(&schema, CleaningStrategy::Anthropic);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &schema));
+        assert_eq!(
+            *first,
+            expected_composition_sibling_schema(CleaningStrategy::Anthropic)
+        );
+        assert_eq!(
+            *first,
+            SchemaCleanr::clean((*schema).clone(), CleaningStrategy::Anthropic)
+        );
+    }
+
+    #[test]
+    fn test_composition_sibling_cache_isolates_strategies() {
+        let schema = Arc::new(composition_sibling_schema());
+        let cache = SchemaCleanCache::default();
+        let anthropic = cache.clean_shared(&schema, CleaningStrategy::Anthropic);
+        let gemini = cache.clean_shared(&schema, CleaningStrategy::Gemini);
+        assert!(!Arc::ptr_eq(&anthropic, &gemini));
+        assert!(Arc::ptr_eq(
+            &gemini,
+            &cache.clean_shared(&schema, CleaningStrategy::Gemini)
+        ));
+        assert_eq!(
+            *anthropic,
+            expected_composition_sibling_schema(CleaningStrategy::Anthropic)
+        );
+        assert_eq!(
+            *gemini,
+            expected_composition_sibling_schema(CleaningStrategy::Gemini)
+        );
+        assert_eq!(*schema, composition_sibling_schema());
     }
 
     #[test]
