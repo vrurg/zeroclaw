@@ -2990,6 +2990,632 @@ async fn matrix_goal_budget_is_queued_and_enforced_after_parent_settlement() {
     .await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn matrix_goal_and_rpc_pending_controls_are_revoked_by_one_live_disable() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_and_rpc_pending_controls_are_revoked_by_one_live_disable
+    ))
+    .await
+    {
+        return;
+    }
+
+    use futures_util::FutureExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use zeroclaw_goal::GoalResponse;
+    use zeroclaw_runtime::{
+        control_plane::TaskStatus,
+        rpc::types::{SessionGoalResult, SessionGoalUpdate},
+    };
+
+    const RPC_SESSION: &str = "vt74-rpc";
+    const RPC_OWNER: &str = "vt74-owner";
+
+    async fn install_rpc_session(
+        context: &Arc<zeroclaw_runtime::rpc::context::RpcContext>,
+        workspace: &std::path::Path,
+        provider: Arc<GoalIngressBoundaryProvider>,
+    ) {
+        let lease = context
+            .agent_lifecycle
+            .reserve_admission("test-agent")
+            .unwrap()
+            .publish()
+            .unwrap();
+        let agent = zeroclaw_runtime::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]))
+            .memory(Arc::new(NoopMemory))
+            .observer(Arc::new(NoopObserver))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(workspace.to_path_buf())
+            .agent_alias("test-agent".into())
+            .build()
+            .unwrap();
+        context
+            .sessions
+            .insert(
+                RPC_SESSION.into(),
+                zeroclaw_runtime::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    workspace.to_str().unwrap(),
+                    zeroclaw_runtime::rpc::types::ChatMode::Chat,
+                )
+                .with_owner(Some(RPC_OWNER.into()))
+                .with_lifecycle_lease(lease),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn write_rpc(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .unwrap();
+        request.push(b'\n');
+        writer.write_all(&request).await.unwrap();
+    }
+
+    async fn read_rpc_result(
+        reader: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        id: u64,
+        notifications: &mut Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .expect("local IPC response must arrive")
+                .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if frame["id"] == id {
+                assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+                return frame["result"].clone();
+            }
+            notifications.push(frame);
+        }
+    }
+
+    fn intent_rows(
+        database: &std::path::Path,
+        rpc_key: &str,
+        matrix_key: &str,
+    ) -> Vec<(String, String, String, String, i64)> {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, kind, state, task_id, expected_epoch
+                 FROM goal_control_intents
+                 WHERE session_id IN (?1, ?2)
+                 ORDER BY session_id, kind, intent_id",
+            )
+            .unwrap();
+        statement
+            .query_map(rusqlite::params![rpc_key, matrix_key], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = matrix_control_test_config();
+    config.data_dir = directory.path().to_path_buf();
+    config.config_path = directory.path().join("config.toml");
+    config.goal.enabled = true;
+    config.goal.verifier.model_provider = "custom.fixture".into();
+    let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+    agent.workspace.path = Some(directory.path().to_path_buf());
+    config.agents.insert("test-agent".into(), agent.clone());
+    config.save().await.unwrap();
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+    let socket_path = zeroclaw_runtime::rpc::local::socket_path(&config);
+    let provider = Arc::new(GoalIngressBoundaryProvider::default());
+
+    let (context_tx, context_rx) = tokio::sync::oneshot::channel();
+    let context_tx = Arc::new(parking_lot::Mutex::new(Some(context_tx)));
+    let context_tx_for_socket = Arc::clone(&context_tx);
+    let provider_for_socket = Arc::clone(&provider);
+    let workspace_for_socket = directory.path().to_path_buf();
+    let mut registry = zeroclaw_runtime::daemon::DaemonRegistry::new();
+    registry.register_socket(Box::new(move |context, cancel, client_count, readiness| {
+        let context_tx = Arc::clone(&context_tx_for_socket);
+        let provider = Arc::clone(&provider_for_socket);
+        let workspace = workspace_for_socket.clone();
+        Box::pin(async move {
+            install_rpc_session(&context, &workspace, provider).await;
+            if let Some(sender) = context_tx.lock().take() {
+                let _ = sender.send(Arc::clone(&context));
+            }
+            zeroclaw_runtime::rpc::local::run_local_listener(
+                context,
+                cancel,
+                client_count,
+                readiness,
+            )
+            .await
+        })
+    }));
+    let daemon_authority = authority.clone();
+    let daemon = zeroclaw_spawn::spawn!(async move {
+        zeroclaw_runtime::daemon::run_with_authority(
+            daemon_authority,
+            "127.0.0.1".into(),
+            0,
+            registry,
+            false,
+            false,
+        )
+        .await
+    });
+    let rpc_context = tokio::time::timeout(Duration::from_secs(5), context_rx)
+        .await
+        .expect("daemon must construct the shared RPC context")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon local IPC socket must become available");
+
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let mut matrix_context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        config.clone(),
+        agent,
+        "test-provider",
+        None,
+    );
+    let session_backend = Arc::new(
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
+    );
+    {
+        let context = Arc::get_mut(&mut matrix_context).unwrap();
+        context.live_config = authority.live_handle();
+        context.session_store = Some(session_backend);
+    }
+
+    let mut matrix_message = matrix_msg("@fixture:example.test");
+    matrix_message.id = "vt74-matrix-setup".into();
+    let matrix_key = runtime_conversation_history_key(&matrix_context, &matrix_message);
+    let matrix_start = goal_execution::submit_matrix_goal(
+        matrix_context.clone(),
+        matrix_key.clone(),
+        matrix_message.clone(),
+        zeroclaw_commands::goal::GoalCommand::Start {
+            budget: zeroclaw_commands::goal::GoalBudgetSelection::Unlimited,
+            objective: "finish the Matrix cutover fixture".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(matrix_start.response(), GoalResponse::Started(_)));
+    matrix_start.response_delivery_failed().await.unwrap();
+
+    let goal_registry = zeroclaw_runtime::control_plane::control_plane()
+        .unwrap()
+        .goal_store()
+        .unwrap();
+    let matrix_before = goal_registry
+        .current_goal_for_session(&matrix_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(matrix_before.status, TaskStatus::Paused);
+    let matrix_goal_before = goal_registry
+        .get_goal_task(&matrix_before.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (matrix_sender, matrix_receiver) = tokio::sync::mpsc::channel(8);
+    let matrix_router = AgentRouter::single(matrix_context.clone());
+    let mut matrix_dispatch =
+        zeroclaw_spawn::spawn!(run_message_dispatch_loop(matrix_receiver, matrix_router, 4));
+    matrix_message.id = "vt74-matrix-ordinary".into();
+    matrix_message.content = "ordinary Matrix work".into();
+    matrix_sender.send(matrix_message.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.requests.lock().unwrap().len() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary Matrix turn must hold the foreground boundary");
+
+    let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut rpc_notifications = Vec::new();
+    write_rpc(
+        &mut writer,
+        1,
+        "initialize",
+        serde_json::json!({"protocol_version": 1, "tui_id": RPC_OWNER}),
+    )
+    .await;
+    read_rpc_result(&mut reader, 1, &mut rpc_notifications).await;
+    write_rpc(
+        &mut writer,
+        2,
+        "session/new",
+        serde_json::json!({
+            "agent_alias": "test-agent",
+            "cwd": directory.path(),
+            "session_id": RPC_SESSION,
+            "chat_mode": "chat",
+            "keep_siblings": true,
+        }),
+    )
+    .await;
+    let opened = read_rpc_result(&mut reader, 2, &mut rpc_notifications).await;
+    assert_eq!(opened["session_id"], RPC_SESSION);
+
+    write_rpc(
+        &mut writer,
+        3,
+        "session/goal",
+        serde_json::json!({
+            "session_id": RPC_SESSION,
+            "command": "/goal start --unlimited finish the RPC cutover fixture",
+        }),
+    )
+    .await;
+    let started: SessionGoalResult =
+        serde_json::from_value(read_rpc_result(&mut reader, 3, &mut rpc_notifications).await)
+            .unwrap();
+    assert!(matches!(started.response, GoalResponse::Started(_)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.requests.lock().unwrap().len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("RPC Goal parent must hold its admitted provider operation");
+
+    let rpc_key = zeroclaw_goal::GoalSessionKey::zero_code(RPC_SESSION)
+        .unwrap()
+        .durable_id();
+    let rpc_before = goal_registry
+        .current_goal_for_session(&rpc_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rpc_before.status, TaskStatus::Running);
+    let rpc_goal_before = goal_registry
+        .get_goal_task(&rpc_before.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (id, command, expected) in [
+        (4, "/goal pause", zeroclaw_goal::GoalQueuedControl::Pause),
+        (
+            5,
+            "/goal budget set --tokens 17",
+            zeroclaw_goal::GoalQueuedControl::Budget,
+        ),
+    ] {
+        write_rpc(
+            &mut writer,
+            id,
+            "session/goal",
+            serde_json::json!({"session_id": RPC_SESSION, "command": command}),
+        )
+        .await;
+        let response: SessionGoalResult =
+            serde_json::from_value(read_rpc_result(&mut reader, id, &mut rpc_notifications).await)
+                .unwrap();
+        assert_eq!(response.response, GoalResponse::Queued(expected));
+    }
+
+    matrix_message.id = "vt74-matrix-budget".into();
+    matrix_message.content = "/goal budget set --tokens 19".into();
+    matrix_sender.send(matrix_message).await.unwrap();
+    let matrix_queued = channel_runtime_cli_string("goal-mode-queued-budget");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !channel
+            .sent_messages
+            .lock()
+            .await
+            .iter()
+            .any(|reply| reply.content == matrix_queued)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Matrix budget must acknowledge while its ordinary turn remains held");
+
+    let database = directory.path().join("control_plane.db");
+    let before_intents = intent_rows(&database, &rpc_key, &matrix_key);
+    eprintln!("VT74(i) intent rows before cutover: {before_intents:?}");
+    assert_eq!(before_intents.len(), 3);
+    assert!(before_intents.iter().all(|row| row.2 == "pending"));
+    assert!(before_intents.iter().any(|row| {
+        row.0 == rpc_key
+            && row.1 == "pause"
+            && row.3 == rpc_before.id
+            && row.4 == rpc_before.execution_epoch
+    }));
+    assert!(before_intents.iter().any(|row| {
+        row.0 == rpc_key
+            && row.1 == "set_budget"
+            && row.3 == rpc_before.id
+            && row.4 == rpc_before.execution_epoch
+    }));
+    assert!(before_intents.iter().any(|row| {
+        row.0 == matrix_key
+            && row.1 == "set_budget"
+            && row.3 == matrix_before.id
+            && row.4 == matrix_before.execution_epoch
+    }));
+
+    let pre_release = std::panic::AssertUnwindSafe(async {
+        write_rpc(
+            &mut writer,
+            6,
+            "config/set",
+            serde_json::json!({"prop": "goal.enabled", "value": false}),
+        )
+        .await;
+        let committed = read_rpc_result(&mut reader, 6, &mut rpc_notifications).await;
+        assert_eq!(committed["set"], true);
+        assert!(!authority.snapshot_config().goal.enabled);
+        for (key, before) in [(&rpc_key, &rpc_before), (&matrix_key, &matrix_before)] {
+            let cancelled = goal_registry
+                .current_goal_for_session(key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cancelled.status, TaskStatus::Cancelled);
+            assert_eq!(cancelled.execution_epoch, before.execution_epoch + 1);
+            assert_eq!(
+                goal_registry
+                    .terminal_reason_for_session_goal(&cancelled.id, key)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("policy_revoked")
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    provider.ordinary_release.notify_waiters();
+    provider.goal_release.notify_waiters();
+    provider.resumed_release.notify_waiters();
+
+    let mut result = pre_release;
+    if result.is_ok() {
+        result = std::panic::AssertUnwindSafe(async {
+            let after_intents = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let rows = intent_rows(&database, &rpc_key, &matrix_key);
+                    if rows
+                        .iter()
+                        .all(|row| !matches!(row.2.as_str(), "pending" | "claimed"))
+                    {
+                        break rows;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all three controls must settle after the held operations release");
+            eprintln!("VT74(i) intent rows after cutover: {after_intents:?}");
+            assert_eq!(after_intents.len(), 3);
+            assert!(
+                after_intents
+                    .iter()
+                    .all(|row| matches!(row.2.as_str(), "superseded" | "abandoned"))
+            );
+            for before in &before_intents {
+                let after = after_intents
+                    .iter()
+                    .find(|after| after.0 == before.0 && after.1 == before.1)
+                    .unwrap();
+                assert_eq!((&after.3, after.4), (&before.3, before.4));
+            }
+
+            for (key, before, goal_before) in [
+                (&rpc_key, &rpc_before, &rpc_goal_before),
+                (&matrix_key, &matrix_before, &matrix_goal_before),
+            ] {
+                let cancelled = goal_registry
+                    .current_goal_for_session(key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(cancelled.status, TaskStatus::Cancelled);
+                assert_eq!(cancelled.execution_epoch, before.execution_epoch + 1);
+                let goal_after = goal_registry
+                    .get_goal_task(&cancelled.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    goal_after.effective_token_limit,
+                    goal_before.effective_token_limit
+                );
+                assert_eq!(goal_after.pause_reason, goal_before.pause_reason);
+            }
+            assert_eq!(provider.requests.lock().unwrap().len(), 2);
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while rpc_context
+                    .sessions
+                    .session_queue
+                    .queue_depth(RPC_SESSION)
+                    .await
+                    != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both RPC controls must release their queue reservations");
+            write_rpc(
+                &mut writer,
+                7,
+                "session/goal",
+                serde_json::json!({"session_id": RPC_SESSION, "command": "/goal status"}),
+            )
+            .await;
+            let status: SessionGoalResult = serde_json::from_value(
+                read_rpc_result(&mut reader, 7, &mut rpc_notifications).await,
+            )
+            .unwrap();
+            assert_eq!(status.response, GoalResponse::Disabled);
+            let classify_rpc_notifications = |notifications: &[serde_json::Value]| {
+                let mut ordinary_candidates = 0_usize;
+                let mut lifecycle = Vec::new();
+                for frame in notifications {
+                    if frame["method"] != "session/goal_update" {
+                        continue;
+                    }
+                    let update: SessionGoalUpdate = serde_json::from_value(frame["params"].clone())
+                        .unwrap_or_else(|error| panic!("malformed Goal update {frame}: {error}"));
+                    match update {
+                        SessionGoalUpdate::VerifiedCandidate {
+                            session_id,
+                            candidate,
+                        } if session_id == RPC_SESSION
+                            && candidate == "Goal boundary candidate" =>
+                        {
+                            ordinary_candidates += 1;
+                        }
+                        SessionGoalUpdate::Lifecycle {
+                            session_id,
+                            response,
+                        } if session_id == RPC_SESSION => lifecycle.push(response),
+                        _ => panic!("unexpected RPC Goal update after live disable: {frame}"),
+                    }
+                }
+                (ordinary_candidates, lifecycle)
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while {
+                    let (ordinary_candidates, lifecycle) =
+                        classify_rpc_notifications(&rpc_notifications);
+                    lifecycle.len() < 2 || ordinary_candidates < 1
+                } {
+                    let mut line = String::new();
+                    let bytes = reader.read_line(&mut line).await.unwrap();
+                    assert_ne!(bytes, 0, "local IPC closed before both final controls");
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame["id"].is_null(),
+                        "unexpected RPC response while draining final controls: {frame}"
+                    );
+                    rpc_notifications.push(frame);
+                }
+            })
+            .await
+            .expect("both RPC controls and the admitted Goal output must arrive");
+            let (ordinary_candidates, lifecycle) = classify_rpc_notifications(&rpc_notifications);
+            assert_eq!(
+                ordinary_candidates, 1,
+                "the admitted RPC Goal operation's ordinary output must be delivered exactly once"
+            );
+            assert_eq!(lifecycle.len(), 2);
+            assert!(lifecycle.iter().all(|response| matches!(
+                response,
+                GoalResponse::Disabled | GoalResponse::Terminal(_)
+            )));
+
+            let matrix_final = [
+                channel_runtime_cli_string("goal-mode-disabled"),
+                channel_runtime_cli_string("goal-mode-terminal"),
+            ];
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let replies = channel.sent_messages.lock().await;
+                    if replies
+                        .iter()
+                        .any(|reply| matrix_final.contains(&reply.content))
+                    {
+                        break;
+                    }
+                    drop(replies);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Matrix control must receive its final terminal response");
+            let replies = channel.sent_messages.lock().await;
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|reply| reply.content == matrix_queued)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|reply| matrix_final.contains(&reply.content))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                replies.len(),
+                3,
+                "no Goal execution notice may be published"
+            );
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| reply.content == "ordinary boundary candidate")
+            );
+        })
+        .catch_unwind()
+        .await;
+    }
+
+    drop(matrix_sender);
+    let matrix_drained = tokio::time::timeout(Duration::from_secs(5), &mut matrix_dispatch).await;
+    if matrix_drained.is_err() {
+        matrix_dispatch.abort();
+    }
+    drop(writer);
+    daemon.abort();
+    let _ = daemon.await;
+    if let Err(panic) = result {
+        if matrix_drained.is_err() {
+            let _ = matrix_dispatch.await;
+        }
+        std::panic::resume_unwind(panic);
+    }
+    matrix_drained
+        .expect("Matrix dispatcher must drain after fixture release")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn matrix_goal_immediate_pause_now_fences_before_parent_settlement() {
     if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
@@ -3149,6 +3775,14 @@ async fn matrix_goal_ingress_delegated_to_fresh_process(test_name: &str) -> bool
         .expect("isolated Matrix ingress test must start");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if test_name == "matrix_goal_and_rpc_pending_controls_are_revoked_by_one_live_disable" {
+        for line in stderr
+            .lines()
+            .filter(|line| line.starts_with("VT74(i) intent rows "))
+        {
+            eprintln!("{line}");
+        }
+    }
     assert!(
         output.status.success(),
         "isolated Matrix ingress test failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -5010,6 +5644,10 @@ async fn assert_matrix_goal_deferred_ingress(
         zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
     );
     Arc::get_mut(&mut context).unwrap().session_store = Some(backend.clone());
+    // Own the canonical live settings that `matrix_goal_settings` reads, so
+    // the settings-failure case can publish its invalid revision there.
+    let live = zeroclaw_config::live::LiveConfig::new(context.live_config.snapshot());
+    Arc::get_mut(&mut context).unwrap().live_config = live.handle();
     let mut message = matrix_msg("@fixture:example.test");
     message.content = "ordinary boundary request".into();
     let key = runtime_conversation_history_key(&context, &message);
@@ -5313,15 +5951,9 @@ async fn assert_matrix_goal_deferred_ingress(
             // Corrupt only the fixture's live settings after valid admission.
             // The production delivery path must resolve them again at the
             // checkpoint, abandon its ready intent, and publish one failure.
-            let snapshot = runtime_defaults_snapshot(&context);
-            let mut config = (*snapshot.config).clone();
+            let mut config = live.snapshot();
             config.goal.default_cost_limit_usd = f64::NAN;
-            *context.runtime_defaults_override.lock().unwrap() =
-                Some(Arc::new(ChannelRuntimeOverride {
-                    config: Arc::new(config),
-                    defaults: snapshot.defaults,
-                    generation: snapshot.generation + 1,
-                }));
+            live.publish(live.next_revision().unwrap(), config).unwrap();
             return;
         }
         if matches!(

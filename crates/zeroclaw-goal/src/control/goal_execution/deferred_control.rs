@@ -219,7 +219,11 @@ impl GoalExecutionSupervisor {
         // read guard only through registration, never through the queued wait;
         // commit obtains a fresh guard after the live boundary is reached.
         let intake_admission = match &self.restart_gate {
-            Some(gate) => gate.admit(&command).await?,
+            Some(gate) => {
+                let admission = gate.admit(&command).await?;
+                gate.validate_policy_generation(&settings, &command)?;
+                admission
+            }
             None => None,
         };
         let submission = self
@@ -680,7 +684,10 @@ impl GoalDeferredReady {
             .take()
             .context("Goal deferred command missing")?;
         let admission = match &control.supervisor.restart_gate {
-            Some(gate) => match gate.admit(&command).await {
+            Some(gate) => match gate.admit(&command).await.and_then(|admission| {
+                gate.validate_policy_generation(&settings, &command)?;
+                Ok(admission)
+            }) {
                 Ok(admission) => admission,
                 Err(error) => {
                     control

@@ -15,6 +15,7 @@ use zeroclaw_config::{
     goal::{GoalConfig, GoalVerifierConfig},
     providers::ModelProviderRef,
 };
+use zeroclaw_goal::task::GoalPolicyTarget;
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
     GoalExecutionScope, GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext,
@@ -33,7 +34,10 @@ use zeroclaw_runtime::goal_accounting::{
 
 #[path = "support/goal_transition_fault.rs"]
 mod goal_transition_fault;
-use goal_transition_fault::{FinishFaultPauseGate, FinishFaultRegistry, OriginalTransitionFailure};
+use goal_transition_fault::{
+    FinishFaultPauseGate, FinishFaultRegistry, OriginalCurrentGoalReadFailure,
+    OriginalTransitionFailure,
+};
 
 struct RecordingDriver {
     binding: GoalSessionBinding,
@@ -4299,6 +4303,274 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
         "resumed Goal terminal record: {completed:?}"
     );
     assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn live_policy_generation_rejects_stale_start_and_resume_before_store_admission() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let coordinator = GoalExecutionRestartCoordinator::new();
+    let supervisor = coordinator
+        .new_supervisor(Arc::new(runtime.execution_engine(factory)))
+        .await;
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let observed = coordinator.policy_generation();
+    coordinator.begin_policy_cutover().await;
+    coordinator.reopen_for_generation().await;
+    let stale = host_settings(true).with_policy_generation(observed);
+    let start = GoalCommand::Start {
+        budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+        objective: "finish the bounded repair".into(),
+    };
+    for command in [start.clone(), GoalCommand::Resume { response: None }] {
+        let error = supervisor
+            .submit(stale.clone(), ingress.clone(), driver.clone(), command)
+            .await
+            .expect_err("stale policy must be rejected before durable admission");
+        assert_eq!(
+            error.to_string(),
+            "Goal policy changed while this command was being admitted; retry the command"
+        );
+        assert!(
+            store
+                .current_goal_for_session(&ingress.session_key().durable_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    for command in [
+        GoalCommand::Pause { immediate: false },
+        GoalCommand::Cancel,
+        GoalCommand::Status,
+        GoalCommand::Help,
+        GoalCommand::Budget,
+    ] {
+        supervisor
+            .submit(stale.clone(), ingress.clone(), driver.clone(), command)
+            .await
+            .unwrap();
+    }
+
+    for settings in [
+        host_settings(true).with_policy_generation(coordinator.policy_generation()),
+        host_settings(true),
+    ] {
+        let admitted = supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                start.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admitted.response(), GoalResponse::Started(_)));
+        // No provider work is needed to prove command admission. Cancel the
+        // newly created epoch before launching, retaining ordinary cleanup.
+        let cancelled = supervisor
+            .submit(
+                settings,
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Cancel,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(cancelled.response(), GoalResponse::Cancelled(_)));
+        drop(admitted);
+    }
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn revoked_target_drain_preserves_other_workers_and_continues_after_read_failure() {
+    timeout(Duration::from_secs(5), async {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let registry = Arc::new(FinishFaultRegistry::new(
+            store.clone(),
+            "unused-finish-fault",
+        ));
+        let runtime = GoalRuntime::new(registry.clone() as Arc<dyn GoalTaskRegistry>);
+        let directory = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let factory = Arc::new(
+            RuntimeGoalOperationAccountingFactory::new(
+                registry.clone() as Arc<dyn GoalTaskRegistry>,
+                tracker,
+                "main",
+                Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+            )
+            .unwrap(),
+        );
+        let engine = Arc::new(runtime.execution_engine(factory));
+        let coordinator = Arc::new(GoalExecutionRestartCoordinator::new());
+        let settings = host_settings(true);
+        let mut workers = Vec::new();
+        for session in ["drain-first", "drain-second", "drain-unaffected"] {
+            let ingress = GoalIngressContext::trusted(
+                GoalSessionKey::zero_code(session).unwrap(),
+                "main",
+                "zerocode:local",
+                GoalIngressPrincipal::ZeroCode {
+                    tui_id: "test-connection".into(),
+                },
+            )
+            .unwrap();
+            let parent_started = Arc::new(Notify::new());
+            let release_parent = Arc::new(Notify::new());
+            let verifier_calls = Arc::new(AtomicUsize::new(0));
+            let driver = Arc::new(PausingExecutionDriver {
+                binding: GoalSessionBinding::new(ingress.session_key().clone()),
+                parent_started: parent_started.clone(),
+                release_parent: release_parent.clone(),
+                verifier_calls: verifier_calls.clone(),
+            });
+            let supervisor = coordinator.new_supervisor(engine.clone()).await;
+            let mut started = supervisor
+                .submit(
+                    settings.clone(),
+                    ingress.clone(),
+                    driver,
+                    GoalCommand::Start {
+                        budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                        objective: "finish the bounded repair".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(started.response(), GoalResponse::Started(_)));
+            supervisor
+                .launch_after_response(settings.clone(), &mut started)
+                .await
+                .unwrap();
+            parent_started.notified().await;
+            let current = store
+                .current_goal_for_session(&ingress.session_key().durable_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let target = GoalPolicyTarget {
+                task_id: current.id,
+                session_id: ingress.session_key().durable_id(),
+                execution_epoch: current.execution_epoch,
+            };
+            let scope = GoalExecutionScope::new(
+                target.task_id.clone(),
+                target.session_id.clone(),
+                target.execution_epoch,
+            )
+            .unwrap();
+            workers.push((supervisor, target, scope, release_parent, verifier_calls));
+        }
+        let targets = vec![workers[0].1.clone(), workers[1].1.clone()];
+        assert_eq!(
+            store.cancel_policy_targets(&targets).await.unwrap(),
+            GoalTransitionResult::Applied
+        );
+        registry.fail_next_current_read(&targets[0].session_id);
+
+        // A session match alone cannot drain a different epoch.
+        let mut stale_target = workers[2].1.clone();
+        stale_target.execution_epoch += 1;
+        let mut drain_targets = targets.clone();
+        drain_targets.push(stale_target);
+        let stopping = coordinator.clone();
+        let mut draining = ::zeroclaw_spawn::spawn!(async move {
+            stopping.stop_revoked_in_place(&drain_targets).await
+        });
+        assert!(
+            timeout(Duration::from_millis(20), &mut draining)
+                .await
+                .is_err(),
+            "a first-target error must not skip the still-admitted second target"
+        );
+        assert_eq!(registry.read_failures(), 1);
+        assert!(workers[1].0.owns_scope(&workers[1].2).await);
+        workers[1].3.notify_one();
+        let error = draining.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<OriginalCurrentGoalReadFailure>()
+                .is_some()
+        );
+        assert!(!workers[1].0.owns_scope(&workers[1].2).await);
+        assert!(workers[0].0.owns_scope(&workers[0].2).await);
+        assert!(workers[2].0.owns_scope(&workers[2].2).await);
+        let unaffected = store
+            .current_goal_for_session(&workers[2].1.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unaffected.status, TaskStatus::Running);
+        assert_eq!(unaffected.execution_epoch, workers[2].1.execution_epoch);
+
+        workers[0].3.notify_one();
+        coordinator.stop_revoked_in_place(&targets).await.unwrap();
+        assert!(!workers[0].0.owns_scope(&workers[0].2).await);
+        for target in &targets {
+            let task = store
+                .current_goal_for_session(&target.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.status, TaskStatus::Cancelled);
+            assert_eq!(task.execution_epoch, target.execution_epoch + 1);
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[workers[2].1.clone()])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        workers[2].3.notify_one();
+        coordinator
+            .stop_revoked_in_place(&[workers[2].1.clone()])
+            .await
+            .unwrap();
+        assert!(!workers[2].0.owns_scope(&workers[2].2).await);
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.4.load(Ordering::SeqCst) == 0)
+        );
+        assert_eq!(registry.read_failures(), 1);
+        assert_eq!(registry.failures(), 0);
+    })
+    .await
+    .expect("all target drains must settle without blocking unrelated workers");
 }
 
 #[tokio::test]

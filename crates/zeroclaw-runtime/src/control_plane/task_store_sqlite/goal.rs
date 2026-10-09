@@ -2104,7 +2104,14 @@ mod tests {
             zeroclaw_goal::control::revoke_goals_under_policy(&store, &policy)
                 .await
                 .unwrap(),
-            vec![zeroclaw_goal::control::GoalPolicyRevocation::GoalModeDisabled]
+            vec![(
+                GoalPolicyTarget {
+                    task_id: "policy-classifier-goal".into(),
+                    session_id: "rpc_policy_classifier".into(),
+                    execution_epoch: 1,
+                },
+                zeroclaw_goal::control::GoalPolicyRevocation::GoalModeDisabled,
+            )]
         );
 
         let cancelled = store.get("policy-classifier-goal").await.unwrap().unwrap();

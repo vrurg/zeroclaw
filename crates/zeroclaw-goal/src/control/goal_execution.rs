@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -26,7 +26,7 @@ use crate::{
     checkpoint::{GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint},
     task::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-        GoalTaskRegistry, GoalTransitionResult,
+        GoalPolicyTarget, GoalTaskRegistry, GoalTransitionResult,
     },
 };
 
@@ -304,10 +304,62 @@ impl GoalExecutionRestartCoordinator {
     pub async fn reopen_for_generation(&self) {
         self.gate.reopen().await;
     }
+
+    /// Return the current process-local Goal-policy generation.
+    pub fn policy_generation(&self) -> u64 {
+        self.gate.policy_generation()
+    }
+
+    /// Drain only the exact pre-cancel epochs revoked by a live policy change.
+    ///
+    /// Every target and every registered live owner is attempted. The first
+    /// failure is returned only after the remaining exact scopes have drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first invalid target or exact-scope drain failure after all
+    /// remaining targets and registered owners have been attempted.
+    pub async fn stop_revoked_in_place(&self, targets: &[GoalPolicyTarget]) -> Result<()> {
+        let supervisors = {
+            let mut registered = self.supervisors.lock().await;
+            let supervisors = registered
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            registered.retain(|candidate| candidate.strong_count() > 0);
+            supervisors
+        };
+        let mut failure = None;
+        for target in targets {
+            let scope = match GoalExecutionScope::new(
+                target.task_id.clone(),
+                target.session_id.clone(),
+                target.execution_epoch,
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            for supervisor in &supervisors {
+                if supervisor.owns_scope(&scope).await
+                    && let Err(error) = supervisor.drain_lifecycle_fence(&scope).await
+                {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 struct GoalExecutionRestartGate {
     closed: AtomicBool,
+    policy_generation: AtomicU64,
     barrier: Arc<RwLock<()>>,
 }
 
@@ -315,6 +367,7 @@ impl GoalExecutionRestartGate {
     fn new() -> Self {
         Self {
             closed: AtomicBool::new(false),
+            policy_generation: AtomicU64::new(0),
             barrier: Arc::new(RwLock::new(())),
         }
     }
@@ -327,14 +380,39 @@ impl GoalExecutionRestartGate {
             return Ok(None);
         }
         if self.closed.load(Ordering::Acquire) {
-            bail!("Goal execution is quiescing for daemon restart");
+            bail!(
+                "Goal execution admission is closed for a configuration cutover or daemon restart"
+            );
         }
         let guard = Arc::clone(&self.barrier).read_owned().await;
         if self.closed.load(Ordering::Acquire) {
             drop(guard);
-            bail!("Goal execution is quiescing for daemon restart");
+            bail!(
+                "Goal execution admission is closed for a configuration cutover or daemon restart"
+            );
         }
         Ok(Some(GoalExecutionAdmission { _guard: guard }))
+    }
+
+    fn validate_policy_generation(
+        &self,
+        settings: &GoalHostSettings,
+        command: &GoalCommand,
+    ) -> Result<()> {
+        if matches!(
+            command,
+            GoalCommand::Start { .. } | GoalCommand::Resume { .. }
+        ) && settings
+            .policy_generation
+            .is_some_and(|observed| observed != self.policy_generation())
+        {
+            bail!("Goal policy changed while this command was being admitted; retry the command");
+        }
+        Ok(())
+    }
+
+    fn policy_generation(&self) -> u64 {
+        self.policy_generation.load(Ordering::Acquire)
     }
 
     async fn close_admission(&self) {
@@ -346,6 +424,7 @@ impl GoalExecutionRestartGate {
 
     async fn reopen(&self) {
         let _barrier = self.barrier.write().await;
+        self.policy_generation.fetch_add(1, Ordering::AcqRel);
         self.closed.store(false, Ordering::Release);
     }
 }
@@ -672,7 +751,11 @@ impl GoalExecutionSupervisor {
     ) -> Result<GoalExecutionSubmission> {
         let mut custody = Some(custody);
         let admission = match &self.restart_gate {
-            Some(gate) => gate.admit(&command).await?,
+            Some(gate) => {
+                let admission = gate.admit(&command).await?;
+                gate.validate_policy_generation(&settings, &command)?;
+                admission
+            }
             None => None,
         };
         let previous = self.scope_for_session(&ingress).await?;
@@ -2884,6 +2967,40 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_policy_generation_changes_only_after_reopening_admission() {
+        let coordinator = GoalExecutionRestartCoordinator::new();
+        assert_eq!(coordinator.policy_generation(), 0);
+        coordinator.begin_policy_cutover().await;
+        assert_eq!(coordinator.policy_generation(), 0);
+
+        let start = GoalCommand::Start {
+            budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+            objective: "finish the bounded repair".into(),
+        };
+        let error = coordinator.gate.admit(&start).await.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Goal execution admission is closed for a configuration cutover or daemon restart"
+        );
+        for command in [
+            GoalCommand::Pause { immediate: false },
+            GoalCommand::Cancel,
+            GoalCommand::Status,
+            GoalCommand::Help,
+        ] {
+            assert!(coordinator.gate.admit(&command).await.unwrap().is_none());
+        }
+
+        coordinator.reopen_for_generation().await;
+        assert_eq!(coordinator.policy_generation(), 1);
+        // Release the admitted command before a later cutover takes the writer.
+        drop(coordinator.gate.admit(&start).await.unwrap());
+        coordinator.begin_policy_cutover().await;
+        coordinator.reopen_for_generation().await;
+        assert_eq!(coordinator.policy_generation(), 2);
+    }
 
     #[tokio::test]
     async fn ready_control_removes_pending_registration_before_commit() {

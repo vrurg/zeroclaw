@@ -22,13 +22,26 @@ impl std::fmt::Display for OriginalTransitionFailure {
 
 impl std::error::Error for OriginalTransitionFailure {}
 
-/// Delegates all lifecycle state to the real store; only one named finish call
-/// fails once. The injected failure never mutates or fabricates a durable row.
+#[derive(Debug)]
+pub(super) struct OriginalCurrentGoalReadFailure;
+
+impl std::fmt::Display for OriginalCurrentGoalReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("distinctive original Goal current-row read failure")
+    }
+}
+
+impl std::error::Error for OriginalCurrentGoalReadFailure {}
+
+/// Delegates lifecycle state to the real store, with one-shot finish and
+/// explicitly armed read failures. Neither failure fabricates a durable row.
 pub(super) struct FinishFaultRegistry {
     store: Arc<SqliteTaskStore>,
     remaining_reason: Mutex<Option<&'static str>>,
     failures: AtomicUsize,
     pause_gate: Option<Arc<FinishFaultPauseGate>>,
+    failing_read_session: Mutex<Option<String>>,
+    read_failures: AtomicUsize,
 }
 
 /// Hold the failed worker transition until an explicit pause fence is durable.
@@ -45,6 +58,8 @@ impl FinishFaultRegistry {
             remaining_reason: Mutex::new(Some(reason)),
             failures: AtomicUsize::new(0),
             pause_gate: None,
+            failing_read_session: Mutex::new(None),
+            read_failures: AtomicUsize::new(0),
         }
     }
 
@@ -55,6 +70,14 @@ impl FinishFaultRegistry {
 
     pub(super) fn failures(&self) -> usize {
         self.failures.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn fail_next_current_read(&self, session_id: &str) {
+        *self.failing_read_session.lock().unwrap() = Some(session_id.to_owned());
+    }
+
+    pub(super) fn read_failures(&self) -> usize {
+        self.read_failures.load(Ordering::SeqCst)
     }
 }
 
@@ -131,6 +154,19 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>> {
+        let inject = {
+            let mut failing_session = self.failing_read_session.lock().unwrap();
+            if failing_session.as_deref() == Some(session_id) {
+                failing_session.take();
+                true
+            } else {
+                false
+            }
+        };
+        if inject {
+            self.read_failures.fetch_add(1, Ordering::SeqCst);
+            return Err(OriginalCurrentGoalReadFailure.into());
+        }
         self.store.current_goal_for_session(session_id).await
     }
 

@@ -42,7 +42,7 @@ pub struct GoalVerifierConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "goal"]
 pub struct GoalConfig {
-    /// Allow Goal Mode admission. Disabled by default.
+    /// Allow Goal Mode admission. Disabled by default. Disabling Goal Mode through a live configuration write cancels nonterminal Goals before the change is saved; re-enabling never revives them.
     #[serde(default)]
     pub enabled: bool,
     /// Default Goal token limit; zero means unlimited. Required, with `default_cost_limit_usd`, whenever the `[goal]` section is present.
@@ -119,7 +119,7 @@ mod tests {
         for (path, expected) in [
             (
                 "goal.enabled",
-                "Allow Goal Mode admission. Disabled by default.",
+                "Allow Goal Mode admission. Disabled by default. Disabling Goal Mode through a live configuration write cancels nonterminal Goals before the change is saved; re-enabling never revives them.",
             ),
             (
                 "goal.default_token_limit",
@@ -172,7 +172,7 @@ mod tests {
             (
                 "goal",
                 "enabled",
-                "Allow Goal Mode admission. Disabled by default.",
+                "Allow Goal Mode admission. Disabled by default. Disabling Goal Mode through a live configuration write cancels nonterminal Goals before the change is saved; re-enabling never revives them.",
             ),
             (
                 "goal",

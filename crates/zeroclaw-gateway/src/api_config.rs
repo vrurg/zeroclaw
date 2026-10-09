@@ -479,7 +479,7 @@ async fn persist_and_swap_retaining(
     let controls = state.reload_tx.clone();
     let task =
         zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-            let prepared = persist_and_swap_prepared(
+            let (prepared, cutover) = persist_and_swap_prepared(
                 &guard,
                 Arc::clone(&pending_reload),
                 controls,
@@ -487,6 +487,7 @@ async fn persist_and_swap_retaining(
                 authorization,
             )
             .await?;
+            drop(cutover.finish().await);
             finish_prepared_channel_generation(prepared, pending_reload).await;
             if let Err(e) =
                 zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
@@ -600,8 +601,9 @@ mod test_pre_save_pause_gate {
 /// Save-and-swap half of the config persistence sequence, split from the
 /// channel-generation drain so the retained destructive transaction can commit
 /// the alias generation synchronously after the live swap and before the
-/// drain. Returns the prepared (not yet begun) channel-generation drain when
-/// the mutation changed the channel-generation projection.
+/// drain. Returns the unfinished Goal-policy cutover and the prepared (not yet
+/// begun) channel-generation drain when that projection changed. The caller
+/// finishes the cutover after any alias commit and before the channel drain.
 ///
 /// On a pre-commit save error the disk state is rolled back and the live
 /// snapshot is left untouched. The caller must hold the config write lock.
@@ -613,10 +615,13 @@ async fn persist_and_swap_prepared(
     mut new_config: zeroclaw_config::schema::Config,
     authorization: ConfigWriteAuthorization,
 ) -> Result<
-    Option<(
-        zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
-        zeroclaw_runtime::daemon::GatewayReloadControls,
-    )>,
+    (
+        Option<(
+            zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
+            zeroclaw_runtime::daemon::GatewayReloadControls,
+        )>,
+        zeroclaw_runtime::daemon::LiveGoalPolicyCutover,
+    ),
     Response,
 > {
     authorization
@@ -662,29 +667,49 @@ async fn persist_and_swap_prepared(
     let snapshot = read_config_snapshot(&config_path)
         .await
         .map_err(error_response)?;
+    let cutover = zeroclaw_runtime::daemon::begin_live_goal_policy_cutover(commit, &new_config)
+        .await
+        .map_err(|error| {
+            error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("Goal policy could not be applied; nothing was saved: {error:#}"),
+            ))
+        })?;
 
     #[cfg(test)]
     test_pre_save_pause_gate::pause(&config_path).await;
 
     if let Err(e) = new_config.save_dirty().await {
+        let cancelled_goal_count = cutover.cancelled_goal_count();
         if let Some(prev) = snapshot {
             let _ = tokio::fs::write(&config_path, prev).await;
         }
         // When the path was absent, the atomic writer either leaves it absent
         // on failure or reports a visible rename as success. Do not remove a
         // path here: an external writer may have created it after admission.
-        return Err(error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save failed: {e}"),
-        )));
+        drop(cutover.finish().await);
+        return Err(error_response(match cancelled_goal_count {
+            Some(count) => goal_policy_save_failure(count, e),
+            None => ConfigApiError::new(ConfigApiCode::ReloadFailed, format!("save failed: {e}")),
+        }));
     }
 
     authorization.publish_persisted(&new_config);
-    commit
-        .publish(revision, new_config)
-        .map_err(|e| error_response(config_commit_publish_error(e)))?;
+    if let Err(e) = commit.publish(revision, new_config) {
+        drop(cutover.finish().await);
+        return Err(error_response(config_commit_publish_error(e)));
+    }
     pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
-    Ok(prepared_channel_generation)
+    Ok((prepared_channel_generation, cutover))
+}
+
+fn goal_policy_save_failure(count: usize, error: impl std::fmt::Display) -> ConfigApiError {
+    ConfigApiError::new(
+        ConfigApiCode::InternalError,
+        format!(
+            "Config save failed after {count} Goal(s) were cancelled by the new Goal policy; those Goals stay cancelled: {error}"
+        ),
+    )
 }
 
 /// Drain the prepared channel generation and schedule the daemon reload.
@@ -1605,8 +1630,8 @@ async fn delete_agent_cascade(
         zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
             // Save the prepared config and install the matching live snapshot;
             // a true pre-commit save error rolls back disk state and ends this
-            // task with the reservation uncommitted and generations unchanged.
-            let prepared = persist_and_swap_prepared(
+            // task with the reservation uncommitted and alias generation unchanged.
+            let (prepared, cutover) = persist_and_swap_prepared(
                 &guard,
                 pending_reload.clone(),
                 reload_controls,
@@ -1617,6 +1642,7 @@ async fn delete_agent_cascade(
             // Committed: advance the alias generation exactly once.
             // Synchronous — no await between the live swap and this commit.
             lifecycle_lease.commit_destructive_mutation();
+            drop(cutover.finish().await);
             // Retire and await the channel generation while still holding the
             // config write guard, then schedule the daemon reload.
             finish_prepared_channel_generation(prepared, pending_reload).await;
@@ -2364,24 +2390,28 @@ async fn rename_agent_cascade(
         // Save the prepared config and install the matching live
         // snapshot; a true pre-commit save error rolls back disk state
         // and ends this task with both reservations uncommitted and
-        // generations unchanged. A resume run (config already committed
+        // alias generations unchanged. A resume run (config already committed
         // `from -> to` by a prior crashed attempt) skips the persist.
-        let prepared = if !skip_persist {
-            persist_and_swap_prepared(
+        let (prepared, cutover) = if !skip_persist {
+            let (prepared, cutover) = persist_and_swap_prepared(
                 &guard,
                 pending_reload.clone(),
                 reload_controls,
                 working.clone(),
                 authorization.expect("persisting rename was authorized"),
             )
-            .await?
+            .await?;
+            (prepared, Some(cutover))
         } else {
-            None
+            (None, None)
         };
         // Committed: advance both alias generations exactly once.
         // Synchronous — no await between the live swap and this commit.
         for lease in &mut lifecycle_leases {
             lease.commit_destructive_mutation();
+        }
+        if let Some(cutover) = cutover {
+            drop(cutover.finish().await);
         }
         // Retire and await the channel generation while still holding the
         // config write guard, then schedule the daemon reload.
@@ -3079,6 +3109,18 @@ pub async fn handle_migrate(
             let pending_reload = Arc::clone(&state.pending_reload);
             let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
                 Box::pin(async move {
+                    let cutover = zeroclaw_runtime::daemon::begin_live_goal_policy_cutover(
+                        &commit, &prepared,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!(
+                                "Goal policy could not be applied; nothing was saved: {error:#}"
+                            ),
+                        )
+                    })?;
                     // 1. Write migrated content to temp + fsync.
                     match tokio::fs::OpenOptions::new()
                         .create_new(true)
@@ -3089,47 +3131,67 @@ pub async fn handle_migrate(
                         Ok(mut temp) => {
                             use tokio::io::AsyncWriteExt;
                             if let Err(e) = temp.write_all(new_content.as_bytes()).await {
+                                let cancelled_goal_count = cutover.cancelled_goal_count();
                                 let _ = tokio::fs::remove_file(&temp_path).await;
-                                return Err(ConfigApiError::new(
-                                    ConfigApiCode::InternalError,
-                                    format!("failed to write migrated config to temp: {e}"),
-                                ));
+                                drop(cutover.finish().await);
+                                let message =
+                                    format!("failed to write migrated config to temp: {e}");
+                                return Err(match cancelled_goal_count {
+                                    Some(count) => goal_policy_save_failure(count, message),
+                                    None => {
+                                        ConfigApiError::new(ConfigApiCode::InternalError, message)
+                                    }
+                                });
                             }
                             if let Err(e) = temp.sync_all().await {
+                                let cancelled_goal_count = cutover.cancelled_goal_count();
                                 let _ = tokio::fs::remove_file(&temp_path).await;
-                                return Err(ConfigApiError::new(
-                                    ConfigApiCode::InternalError,
-                                    format!("failed to fsync migrated config temp: {e}"),
-                                ));
+                                drop(cutover.finish().await);
+                                let message = format!("failed to fsync migrated config temp: {e}");
+                                return Err(match cancelled_goal_count {
+                                    Some(count) => goal_policy_save_failure(count, message),
+                                    None => {
+                                        ConfigApiError::new(ConfigApiCode::InternalError, message)
+                                    }
+                                });
                             }
                         }
                         Err(e) => {
-                            return Err(ConfigApiError::new(
-                                ConfigApiCode::InternalError,
-                                format!("failed to create temp config file: {e}"),
-                            ));
+                            let cancelled_goal_count = cutover.cancelled_goal_count();
+                            drop(cutover.finish().await);
+                            let message = format!("failed to create temp config file: {e}");
+                            return Err(match cancelled_goal_count {
+                                Some(count) => goal_policy_save_failure(count, message),
+                                None => ConfigApiError::new(ConfigApiCode::InternalError, message),
+                            });
                         }
                     }
 
                     // 2. Backup BEFORE replacing the original.
                     if let Err(e) = tokio::fs::copy(&replace_config_path, &backup_path).await {
+                        let cancelled_goal_count = cutover.cancelled_goal_count();
                         let _ = tokio::fs::remove_file(&temp_path).await;
-                        return Err(ConfigApiError::new(
-                            ConfigApiCode::InternalError,
-                            format!("failed to write backup: {e}"),
-                        ));
+                        drop(cutover.finish().await);
+                        let message = format!("failed to write backup: {e}");
+                        return Err(match cancelled_goal_count {
+                            Some(count) => goal_policy_save_failure(count, message),
+                            None => ConfigApiError::new(ConfigApiCode::InternalError, message),
+                        });
                     }
 
                     // 3. Atomic rename. On failure, restore from backup.
                     if let Err(e) = tokio::fs::rename(&temp_path, &replace_config_path).await {
+                        let cancelled_goal_count = cutover.cancelled_goal_count();
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         if backup_path.exists() {
                             let _ = tokio::fs::copy(&backup_path, &replace_config_path).await;
                         }
-                        return Err(ConfigApiError::new(
-                            ConfigApiCode::InternalError,
-                            format!("failed to atomically replace config: {e}"),
-                        ));
+                        drop(cutover.finish().await);
+                        let message = format!("failed to atomically replace config: {e}");
+                        return Err(match cancelled_goal_count {
+                            Some(count) => goal_policy_save_failure(count, message),
+                            None => ConfigApiError::new(ConfigApiCode::InternalError, message),
+                        });
                     }
 
                     // 4. Fsync the parent directory so the rename is durable.
@@ -3147,10 +3209,12 @@ pub async fn handle_migrate(
                     // above, so later full saves retain that target's load provenance.
                     prepared.loaded_from = Some(replace_config_path.clone());
                     authorization.publish_persisted(&prepared);
-                    commit
-                        .publish(revision, prepared)
-                        .map_err(config_commit_publish_error)?;
+                    if let Err(e) = commit.publish(revision, prepared) {
+                        drop(cutover.finish().await);
+                        return Err(config_commit_publish_error(e));
+                    }
                     pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+                    drop(cutover.finish().await);
                     Ok(())
                 }),
             );
@@ -3465,6 +3529,1206 @@ mod tests {
             sop_audit: None,
             sop_driver_handles: None,
         }
+    }
+
+    #[cfg(unix)]
+    async fn live_goal_policy_gateway_child(test_name: &'static str) -> bool {
+        const CHILD_ENV: &str = "ZEROCLAW_GOAL_POLICY_GATEWAY_CASE_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return true;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(executable)
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, test_name)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Goal policy gateway test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[cfg(unix)]
+    struct GatewayPolicyProvider {
+        continue_with_tool: bool,
+        tool_runs: Arc<std::sync::atomic::AtomicUsize>,
+        calls: std::sync::atomic::AtomicUsize,
+        settled: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[cfg(unix)]
+    impl GatewayPolicyProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                continue_with_tool: false,
+                tool_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                settled: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn with_tool_continuation() -> Arc<Self> {
+            Arc::new(Self {
+                continue_with_tool: true,
+                tool_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                settled: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        async fn wait_entered(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.entered.acquire())
+                .await
+                .expect("real parent operation must reach the structured provider boundary")
+                .unwrap()
+                .forget();
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for GatewayPolicyProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "gateway-policy-fixture"
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ModelProvider for GatewayPolicyProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("the gateway cutover fixture requires the structured call boundary")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(call == 0, "revocation must not admit a successor operation");
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.settled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.continue_with_tool {
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                        id: "gateway-policy-continuation".into(),
+                        name: "gateway_policy_continuation".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                        input_tokens: Some(4),
+                        output_tokens: Some(2),
+                        ..Default::default()
+                    }),
+                    reasoning_content: None,
+                });
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("turn finished".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(4),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    struct GatewayPolicyContinuationTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    zeroclaw_api::tool_attribution!(
+        GatewayPolicyContinuationTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zeroclaw_api::tool::Tool for GatewayPolicyContinuationTool {
+        fn name(&self) -> &str {
+            "gateway_policy_continuation"
+        }
+
+        fn description(&self) -> &str {
+            "gateway_policy_continuation"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroclaw_api::tool::ToolResult::ok("continued"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum GatewayPolicyFixtureShape {
+        RpcSessions,
+        AgentDelete,
+    }
+
+    #[cfg(unix)]
+    struct GatewayPolicyFixture {
+        _directory: tempfile::TempDir,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+        state: AppState,
+        context: Arc<zeroclaw_runtime::rpc::context::RpcContext>,
+        daemon: tokio::task::JoinHandle<
+            anyhow::Result<(
+                zeroclaw_runtime::daemon::DaemonExit,
+                Option<zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard>,
+            )>,
+        >,
+        goal_provider: Arc<GatewayPolicyProvider>,
+        cancel_provider: Arc<GatewayPolicyProvider>,
+        ordinary_provider: Arc<GatewayPolicyProvider>,
+        reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+        notifications: Vec<serde_json::Value>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for GatewayPolicyFixture {
+        fn drop(&mut self) {
+            self.goal_provider.release.add_permits(1);
+            self.cancel_provider.release.add_permits(1);
+            self.ordinary_provider.release.add_permits(1);
+            self.daemon.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    impl GatewayPolicyFixture {
+        async fn new() -> Self {
+            Self::build(GatewayPolicyFixtureShape::RpcSessions).await
+        }
+
+        async fn for_agent_delete() -> Self {
+            Self::build(GatewayPolicyFixtureShape::AgentDelete).await
+        }
+
+        async fn build(shape: GatewayPolicyFixtureShape) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = temp_config(&directory);
+            config.goal.enabled = true;
+            config.goal.verifier.model_provider = "openai.fixture".into();
+            config.heartbeat.enabled = false;
+            config.scheduler.enabled = false;
+            let model = config.providers.models.ensure("openai", "fixture").unwrap();
+            model.model = Some("test-model".into());
+            model.uri = Some("http://127.0.0.1:1".into());
+            let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.fixture".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            };
+            agent.workspace.path = Some(directory.path().join("workspace"));
+            agent.channels.push("matrix.primary".into());
+            config.agents.insert("victim".into(), agent);
+            config.channels.matrix.insert(
+                "primary".into(),
+                zeroclaw_config::schema::MatrixConfig {
+                    enabled: true,
+                    homeserver: "http://127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+            );
+            std::fs::create_dir_all(config.agent_workspace_dir("victim")).unwrap();
+            if matches!(shape, GatewayPolicyFixtureShape::AgentDelete) {
+                let mut co_owner = config.agents["victim"].clone();
+                co_owner.workspace.path = Some(directory.path().join("co-owner-workspace"));
+                config.agents.insert("matrix-co-owner".into(), co_owner);
+                std::fs::create_dir_all(config.agent_workspace_dir("matrix-co-owner")).unwrap();
+            }
+            config.risk_profiles.entry("default".into()).or_default();
+            config.runtime_profiles.entry("default".into()).or_default();
+            config.save().await.unwrap();
+            let authority =
+                zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+            let state = test_state_from_authority(&authority);
+            let socket_path = zeroclaw_runtime::rpc::local::socket_path(&config);
+            let goal_provider = GatewayPolicyProvider::with_tool_continuation();
+            let cancel_provider = GatewayPolicyProvider::with_tool_continuation();
+            let ordinary_provider = GatewayPolicyProvider::new();
+            let (context_tx, context_rx) = tokio::sync::oneshot::channel();
+            let context_tx = Arc::new(parking_lot::Mutex::new(Some(context_tx)));
+            let goal = Arc::clone(&goal_provider);
+            let cancel_goal = Arc::clone(&cancel_provider);
+            let ordinary = Arc::clone(&ordinary_provider);
+            let workspace = config.agent_workspace_dir("victim");
+            let mut registry = zeroclaw_runtime::daemon::DaemonRegistry::new();
+            registry.register_socket(Box::new(move |context, cancel, count, readiness| {
+                let sender = Arc::clone(&context_tx);
+                let goal = Arc::clone(&goal);
+                let cancel_goal = Arc::clone(&cancel_goal);
+                let ordinary = Arc::clone(&ordinary);
+                let workspace = workspace.clone();
+                Box::pin(async move {
+                    if matches!(shape, GatewayPolicyFixtureShape::RpcSessions) {
+                        for (session_id, provider) in [("gateway-goal", goal), ("gateway-cancel", cancel_goal), ("gateway-ordinary", ordinary)] {
+                            let lease = context.agent_lifecycle.reserve_admission("victim").unwrap()
+                                .publish().unwrap();
+                            let tools = if session_id == "gateway-ordinary" {
+                                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])
+                            } else {
+                                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                                    Box::new(GatewayPolicyContinuationTool {
+                                        runs: Arc::clone(&provider.tool_runs),
+                                    }),
+                                ])
+                            };
+                            let agent = zeroclaw_runtime::agent::agent::Agent::builder()
+                                .model_provider(Box::new(provider))
+                                .model_name("test-model".into())
+                                .tools(tools)
+                                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("gateway-policy")))
+                                .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver))
+                                .tool_dispatcher(Box::new(zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher))
+                                .workspace_dir(workspace.clone())
+                                .agent_alias("victim".into())
+                                .build().unwrap();
+                            context.sessions.insert(session_id.into(),
+                                zeroclaw_runtime::rpc::session::RpcSession::new(agent, "victim",
+                                    workspace.to_str().unwrap(), zeroclaw_runtime::rpc::types::ChatMode::Chat)
+                                    .with_owner(Some("gateway-policy-owner".into()))
+                                    .with_lifecycle_lease(lease)).await.unwrap();
+                        }
+                    }
+                    if let Some(sender) = sender.lock().take() {
+                        let _ = sender.send(Arc::clone(&context));
+                    }
+                    zeroclaw_runtime::rpc::local::run_local_listener(context, cancel, count, readiness).await
+                })
+            }));
+            let daemon_authority = authority.clone();
+            let daemon = zeroclaw_spawn::spawn!(async move {
+                zeroclaw_runtime::daemon::run_with_authority(
+                    daemon_authority,
+                    "127.0.0.1".into(),
+                    0,
+                    registry,
+                    false,
+                    false,
+                )
+                .await
+            });
+            let context = tokio::time::timeout(Duration::from_secs(5), context_rx)
+                .await
+                .expect("daemon must construct its shared control plane")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !socket_path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("daemon local IPC must bind");
+            let stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut fixture = Self {
+                _directory: directory,
+                authority,
+                state,
+                context,
+                daemon,
+                goal_provider,
+                cancel_provider,
+                ordinary_provider,
+                reader: tokio::io::BufReader::new(reader),
+                writer,
+                notifications: Vec::new(),
+            };
+            fixture
+                .send(
+                    1,
+                    "initialize",
+                    serde_json::json!({"protocol_version": 1,
+                "tui_id": "gateway-policy-owner"}),
+                )
+                .await;
+            fixture.result(1).await;
+            if matches!(shape, GatewayPolicyFixtureShape::RpcSessions) {
+                // Reuse the already installed scripted sessions through the ordinary owner check.
+                for (id, session) in [
+                    (2, "gateway-goal"),
+                    (3, "gateway-ordinary"),
+                    (4, "gateway-cancel"),
+                ] {
+                    fixture
+                        .send(
+                            id,
+                            "session/new",
+                            serde_json::json!({"agent_alias": "victim",
+                        "cwd": fixture.authority.snapshot_config().agent_workspace_dir("victim"),
+                        "session_id": session, "chat_mode": "chat", "keep_siblings": true}),
+                        )
+                        .await;
+                    assert_eq!(fixture.result(id).await["session_id"], session);
+                }
+            }
+            fixture
+        }
+
+        async fn send(&mut self, id: u64, method: &str, params: serde_json::Value) {
+            use tokio::io::AsyncWriteExt;
+            let mut request = serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0",
+                "id": id, "method": method, "params": params}))
+            .unwrap();
+            request.push(b'\n');
+            self.writer.write_all(&request).await.unwrap();
+        }
+
+        async fn result(&mut self, id: u64) -> serde_json::Value {
+            use tokio::io::AsyncBufReadExt;
+            loop {
+                let mut line = String::new();
+                let count =
+                    tokio::time::timeout(Duration::from_secs(5), self.reader.read_line(&mut line))
+                        .await
+                        .expect("local IPC response must arrive")
+                        .unwrap();
+                assert_ne!(count, 0, "local IPC closed before the response");
+                let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if frame["id"] == id {
+                    assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+                    return frame["result"].clone();
+                }
+                assert!(
+                    frame["id"].is_null(),
+                    "unexpected response while waiting for {id}: {frame}"
+                );
+                self.notifications.push(frame);
+            }
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            value: &str,
+        ) -> Result<RetainedConfigWrite, Box<Response>> {
+            let commit = self.state.begin_config_commit().await.unwrap();
+            let mut prospective = commit.current_config();
+            prospective.set_prop_persistent(path, value).unwrap();
+            let authorization =
+                authorize_config_write(&None, ConfigWriteSet::default(), &commit).unwrap();
+            persist_and_swap(&self.state, authorization, prospective, commit)
+                .await
+                .map_err(Box::new)
+        }
+
+        fn parent_failure_text(&self, session_id: &str) -> &str {
+            let terminal = self
+                .notifications
+                .iter()
+                .filter(|frame| {
+                    frame["method"] == "session/update"
+                        && frame["params"]["session_id"] == session_id
+                        && frame["params"]["type"] == "turn_complete"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                terminal.len(),
+                1,
+                "exactly one parent terminal event: {terminal:?}"
+            );
+            assert_eq!(terminal[0]["params"]["outcome"], "failed");
+            terminal[0]["params"]["content"].as_str().unwrap()
+        }
+
+        async fn wait_cancelled_response(&mut self, session_id: &str) {
+            use tokio::io::AsyncBufReadExt;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(self.reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame["id"].is_null(),
+                        "unexpected response during cancel drain: {frame}"
+                    );
+                    let cancelled = frame["method"] == "session/goal_update"
+                        && frame["params"]["lifecycle"]["session_id"] == session_id
+                        && frame["params"]["lifecycle"]["response"]["kind"] == "cancelled";
+                    self.notifications.push(frame);
+                    if cancelled {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("immediate cancel must publish its final command response after settlement");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn seed_gateway_matrix_goal(
+        id: &str,
+        paused: bool,
+    ) -> zeroclaw_runtime::control_plane::TaskRecord {
+        use zeroclaw_runtime::control_plane::{
+            GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTransitionResult, TaskKind,
+            TaskRecord, TaskStatus,
+        };
+        let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+        let registry = plane.goal_store().unwrap();
+        let session_id = format!("matrix_{}", id.replace('-', "_"));
+        let task = TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Goal,
+            agent: "victim".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: plane.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix:primary:room".into()),
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(session_id.clone()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        assert_eq!(
+            registry
+                .create_or_replace_session_goal(
+                    task,
+                    GoalTaskRecord {
+                        task_id: id.into(),
+                        objective: "finish the gateway policy fixture".into(),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        if paused {
+            assert_eq!(
+                registry
+                    .pause_session_goal(
+                        id,
+                        &session_id,
+                        1,
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: None,
+                            blockers: Vec::new(),
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+        plane.store.get(id).await.unwrap().unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn assert_gateway_goal_cancelled(before: &zeroclaw_runtime::control_plane::TaskRecord) {
+        let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+        let after = plane.store.get(&before.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            zeroclaw_runtime::control_plane::TaskStatus::Cancelled
+        );
+        assert_eq!(after.execution_epoch, before.execution_epoch + 1);
+        assert_eq!(
+            plane
+                .goal_store()
+                .unwrap()
+                .terminal_reason_for_session_goal(&before.id, before.session_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("policy_revoked")
+        );
+        assert!(after.finished_at.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_disable_fences_before_save_and_preserves_ordinary_prompt() {
+        if !live_goal_policy_gateway_child("api_config::tests::live_goal_policy_gateway_disable_fences_before_save_and_preserves_ordinary_prompt").await { return; }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut fixture = GatewayPolicyFixture::new().await;
+            // Establish the ordinary immediate-cancel error at the same real parent boundary.
+            fixture
+                .send(
+                    8,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-cancel",
+                "command": "/goal start --unlimited finish the bounded repair"}),
+                )
+                .await;
+            assert_eq!(fixture.result(8).await["response"]["kind"], "started");
+            fixture.cancel_provider.wait_entered().await;
+            let cancel_supervisor = fixture
+                .context
+                .goal_runtime
+                .supervisor("gateway-cancel")
+                .await
+                .unwrap();
+            fixture
+                .send(
+                    9,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-cancel",
+                "command": "/goal cancel"}),
+                )
+                .await;
+            assert_eq!(
+                fixture.result(9).await["response"]["kind"],
+                "transition_pending"
+            );
+            assert!(
+                !fixture
+                    .cancel_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            fixture.cancel_provider.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !cancel_supervisor.try_retire().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("immediate cancel must drain its held parent operation");
+            fixture.wait_cancelled_response("gateway-cancel").await;
+            let immediate_cancel_error = fixture.parent_failure_text("gateway-cancel").to_owned();
+            assert!(!immediate_cancel_error.is_empty());
+            assert_eq!(
+                fixture
+                    .cancel_provider
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                fixture
+                    .cancel_provider
+                    .tool_runs
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the held operation must execute its tool step before the next admission is fenced"
+            );
+            assert!(
+                fixture
+                    .cancel_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            fixture
+                .send(
+                    4,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-goal",
+                "command": "/goal start --unlimited finish the bounded repair"}),
+                )
+                .await;
+            assert_eq!(fixture.result(4).await["response"]["kind"], "started");
+            fixture.goal_provider.wait_entered().await;
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let running = plane
+                .goal_store()
+                .unwrap()
+                .current_goal_for_session("rpc_gateway-goal")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                running.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Running
+            );
+            let paused = seed_gateway_matrix_goal("gateway-paused", true).await;
+            let supervisor = fixture
+                .context
+                .goal_runtime
+                .supervisor("gateway-goal")
+                .await
+                .unwrap();
+            fixture
+                .send(
+                    5,
+                    "session/prompt",
+                    serde_json::json!({"session_id": "gateway-ordinary",
+                "prompt": "finish the ordinary turn"}),
+                )
+                .await;
+            fixture.ordinary_provider.wait_entered().await;
+            fixture
+                .send(
+                    6,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-goal",
+                "command": "/goal status"}),
+                )
+                .await;
+            fixture.result(6).await;
+            fixture.notifications.clear();
+            let disk_before =
+                std::fs::read(fixture.authority.snapshot_config().config_path).unwrap();
+            let revision = fixture.authority.published_revision();
+            let gate =
+                test_pre_save_pause_gate::arm(fixture.authority.snapshot_config().config_path);
+            let state = fixture.state.clone();
+            let write = zeroclaw_spawn::spawn!(async move {
+                let commit = state.begin_config_commit().await.unwrap();
+                let mut prospective = commit.current_config();
+                prospective
+                    .set_prop_persistent("goal.enabled", "false")
+                    .unwrap();
+                let authorization =
+                    authorize_config_write(&None, ConfigWriteSet::default(), &commit).unwrap();
+                persist_and_swap(&state, authorization, prospective, commit).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+                .await
+                .expect("gateway write must reach the existing pre-save boundary");
+            for before in [&running, &paused] {
+                assert_gateway_goal_cancelled(before).await;
+            }
+            assert_eq!(
+                std::fs::read(fixture.authority.snapshot_config().config_path).unwrap(),
+                disk_before
+            );
+            assert!(fixture.authority.snapshot_config().goal.enabled);
+            assert_eq!(fixture.authority.published_revision(), revision);
+            gate.release();
+            drop(
+                write
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|_| panic!("gateway disable must succeed")),
+            );
+            assert!(!fixture.authority.snapshot_config().goal.enabled);
+            let saved =
+                std::fs::read_to_string(fixture.authority.snapshot_config().config_path).unwrap();
+            let saved: toml::Value = toml::from_str(&saved).unwrap();
+            let saved_goal = saved
+                .get("goal")
+                .expect("the saved config must keep the fixture's non-default [goal] table");
+            assert_eq!(
+                saved_goal
+                    .get("verifier")
+                    .and_then(|verifier| verifier.get("model_provider"))
+                    .and_then(toml::Value::as_str),
+                Some("openai.fixture"),
+                "the disable save must preserve the unrelated Goal verifier selection"
+            );
+            let saved_enabled = saved_goal
+                .get("enabled")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .expect("saved Goal enabled value must be boolean")
+                })
+                .unwrap_or_else(|| zeroclaw_config::schema::Config::default().goal.enabled);
+            assert!(
+                !saved_enabled,
+                "the saved config must leave Goal Mode disabled"
+            );
+            assert!(
+                !supervisor.try_retire().await,
+                "the admitted parent must remain owned until settlement"
+            );
+            assert!(
+                !supervisor
+                    .worker_completed_for_session("rpc_gateway-goal")
+                    .await
+            );
+            assert!(
+                !fixture
+                    .ordinary_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the unrelated ordinary prompt must remain in flight"
+            );
+            fixture.goal_provider.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !supervisor.try_retire().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("revoked worker must leave the supervisor without another operation");
+            assert_eq!(
+                fixture
+                    .goal_provider
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                fixture
+                    .goal_provider
+                    .tool_runs
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the held operation must execute its tool step before the next admission is fenced"
+            );
+            assert!(
+                fixture
+                    .goal_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the admitted model call must settle before its owner leaves the supervisor"
+            );
+            assert!(
+                !fixture
+                    .ordinary_provider
+                    .settled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            fixture.ordinary_provider.release.add_permits(1);
+            let ordinary = fixture.result(5).await;
+            assert_eq!(
+                ordinary,
+                serde_json::json!({}),
+                "the ordinary RPC prompt must acknowledge success"
+            );
+            let ordinary_terminal = fixture
+                .notifications
+                .iter()
+                .filter(|frame| {
+                    frame["method"] == "session/update"
+                        && frame["params"]["session_id"] == "gateway-ordinary"
+                        && frame["params"]["type"] == "turn_complete"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ordinary_terminal.len(), 1);
+            assert_eq!(ordinary_terminal[0]["params"]["outcome"], "completed");
+            assert_eq!(ordinary_terminal[0]["params"]["content"], "turn finished");
+            fixture
+                .send(
+                    7,
+                    "session/goal",
+                    serde_json::json!({"session_id": "gateway-goal",
+                "command": "/goal status"}),
+                )
+                .await;
+            assert_eq!(fixture.result(7).await["response"]["kind"], "disabled");
+            assert_eq!(
+                fixture.parent_failure_text("gateway-goal"),
+                immediate_cancel_error,
+                "live policy fencing must render its own parent error exactly like immediate cancel"
+            );
+            assert!(
+                fixture
+                    .notifications
+                    .iter()
+                    .all(|frame| frame["method"] != "session/goal_update"),
+                "revoked Goals must emit no lifecycle or failure notice: {:?}",
+                fixture.notifications
+            );
+        })
+        .await
+        .expect("gateway cutover must not wait for an admitted parent operation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_cancellation_failure_rolls_back_and_reopens_admission() {
+        if !live_goal_policy_gateway_child("api_config::tests::live_goal_policy_gateway_cancellation_failure_rolls_back_and_reopens_admission").await { return; }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut fixture = GatewayPolicyFixture::new().await;
+            let first = seed_gateway_matrix_goal("gateway-fault-a", false).await;
+            let second = seed_gateway_matrix_goal("gateway-fault-b", true).await;
+            let config = fixture.authority.snapshot_config();
+            let disk_before = std::fs::read(&config.config_path).unwrap();
+            let live_before = serde_json::to_value(&config).unwrap();
+            let revision = fixture.authority.published_revision();
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let registry = plane.goal_store().unwrap();
+            let extensions = [registry.get_goal_task(&first.id).await.unwrap(), registry.get_goal_task(&second.id).await.unwrap()];
+            let connection = rusqlite::Connection::open(config.data_dir.join("control_plane.db")).unwrap();
+            connection.execute_batch("CREATE TRIGGER reject_gateway_policy_revocation BEFORE UPDATE OF status ON tasks
+                WHEN OLD.id = 'gateway-fault-b' AND NEW.status = 'cancelled'
+                BEGIN SELECT RAISE(ABORT, 'gateway policy cancellation fixture failure'); END;").unwrap();
+            let error = fixture.write("goal.enabled", "false").await.err().expect("cancellation failpoint must refuse the write");
+            let (status, body) = response_json(*error).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["code"], serde_json::to_value(ConfigApiCode::InternalError).unwrap());
+            let message = body["message"].as_str().unwrap();
+            assert!(message.starts_with("Goal policy could not be applied; nothing was saved:"), "{body}");
+            assert!(message.contains("gateway policy cancellation fixture failure"), "{body}");
+            assert_eq!(std::fs::read(&config.config_path).unwrap(), disk_before);
+            assert_eq!(serde_json::to_value(fixture.authority.snapshot_config()).unwrap(), live_before);
+            assert_eq!(fixture.authority.published_revision(), revision);
+            assert!(!fixture.state.pending_reload.load(std::sync::atomic::Ordering::Relaxed));
+            for (before, extension) in [first, second].into_iter().zip(extensions) {
+                assert_eq!(serde_json::to_value(plane.store.get(&before.id).await.unwrap().unwrap()).unwrap(), serde_json::to_value(&before).unwrap());
+                assert_eq!(serde_json::to_value(registry.get_goal_task(&before.id).await.unwrap()).unwrap(), serde_json::to_value(extension).unwrap());
+            }
+            fixture.send(4, "session/goal", serde_json::json!({"session_id": "gateway-goal",
+                "command": "/goal start --unlimited start an unrelated Goal"})).await;
+            assert_eq!(fixture.result(4).await["response"]["kind"], "started", "cancellation failure must reopen actual Goal admission");
+            fixture.goal_provider.wait_entered().await;
+        }).await.expect("failed cancellation must not leave admission closed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_inert_write_never_accesses_store_or_changes_generation() {
+        if !live_goal_policy_gateway_child("api_config::tests::live_goal_policy_gateway_inert_write_never_accesses_store_or_changes_generation").await { return; }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let fixture = GatewayPolicyFixture::new().await;
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let registry = plane.goal_store().unwrap();
+            let connection = rusqlite::Connection::open(
+                fixture
+                    .authority
+                    .snapshot_config()
+                    .data_dir
+                    .join("control_plane.db"),
+            )
+            .unwrap();
+            connection
+                .execute_batch("ALTER TABLE tasks RENAME TO unavailable_tasks;")
+                .unwrap();
+            assert!(
+                registry.list_nonterminal_session_goals().await.is_err(),
+                "fixture must detect policy store access"
+            );
+            let coordinator = plane.goal_execution_restart();
+            let generation = coordinator.policy_generation();
+            drop(
+                fixture
+                    .write("goal.default_token_limit", "123456")
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("inert write must not read unavailable Goal storage")
+                    }),
+            );
+            assert_eq!(coordinator.policy_generation(), generation);
+            assert_eq!(
+                fixture.authority.snapshot_config().goal.default_token_limit,
+                123456
+            );
+            assert!(registry.list_nonterminal_session_goals().await.is_err());
+        })
+        .await
+        .expect("inert gateway write must not wait for Goal storage");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_agent_delete_preserves_goal_history_and_removes_ordinary_rows()
+     {
+        if !live_goal_policy_gateway_child("api_config::tests::live_goal_policy_gateway_agent_delete_preserves_goal_history_and_removes_ordinary_rows").await { return; }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let fixture = GatewayPolicyFixture::for_agent_delete().await;
+            // This seeded Matrix row proves deletion history, not an admitted parent operation.
+            let running = seed_gateway_matrix_goal("gateway-delete-goal", false).await;
+            let config = fixture.authority.snapshot_config();
+            let connection = rusqlite::Connection::open(config.data_dir.join("control_plane.db")).unwrap();
+            connection.execute_batch("INSERT INTO tasks (id, kind, agent, status, started_at, finished_at)
+                VALUES ('gateway-delete-one', 'delegate', 'victim', 'completed', '2026-09-01T00:00:00Z', '2026-09-01T00:00:01Z'),
+                       ('gateway-delete-two', 'delegate', 'victim', 'completed', '2026-09-01T00:00:00Z', '2026-09-01T00:00:01Z'),
+                       ('gateway-delete-other', 'delegate', 'other', 'completed', '2026-09-01T00:00:00Z', '2026-09-01T00:00:01Z');").unwrap();
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let registry = plane.goal_store().unwrap();
+            let other_before = serde_json::to_value(plane.store.get("gateway-delete-other").await.unwrap()).unwrap();
+            let disk_before = std::fs::read(&config.config_path).unwrap();
+            let revision = fixture.authority.published_revision();
+            assert_eq!(fixture.state.agent_lifecycle.live_session_count("victim"), 0);
+            assert!(fixture.state.agent_lifecycle.delete_blocker("victim").is_none());
+            let gate = test_pre_save_pause_gate::arm(config.config_path.clone());
+            let state = fixture.state.clone();
+            let mut deletion = zeroclaw_spawn::spawn!(handle_delete_map_key(State(state), None,
+                Query(MapKeyQuery { path: "agents".into(), key: "victim".into() })));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    () = gate.wait_paused() => {}
+                    result = &mut deletion => {
+                        let (status, body) = response_json(result.unwrap()).await;
+                        panic!("actual gateway agent delete completed before the pre-save boundary: {status} {body}");
+                    }
+                }
+            }).await
+                .expect("actual gateway agent delete must reach the pre-save boundary");
+            assert_gateway_goal_cancelled(&running).await;
+            let cancelled_before = serde_json::to_value(plane.store.get(&running.id).await.unwrap()).unwrap();
+            let extension_before = serde_json::to_value(registry.get_goal_task(&running.id).await.unwrap()).unwrap();
+            assert_eq!(std::fs::read(&config.config_path).unwrap(), disk_before);
+            assert!(fixture.authority.snapshot_config().agents.contains_key("victim"));
+            assert_eq!(fixture.authority.published_revision(), revision);
+            gate.release();
+            let (status, body) = response_json(deletion.await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["warnings"].as_array().is_none_or(|warnings| warnings.iter()
+                .all(|warning| !warning.as_str().unwrap().contains("control-plane"))), "{body}");
+            assert!(!fixture.authority.snapshot_config().agents.contains_key("victim"));
+            assert_gateway_goal_cancelled(&running).await;
+            assert_eq!(serde_json::to_value(plane.store.get(&running.id).await.unwrap()).unwrap(), cancelled_before);
+            assert_eq!(serde_json::to_value(registry.get_goal_task(&running.id).await.unwrap()).unwrap(), extension_before);
+            assert!(plane.store.get("gateway-delete-one").await.unwrap().is_none());
+            assert!(plane.store.get("gateway-delete-two").await.unwrap().is_none());
+            assert_eq!(serde_json::to_value(plane.store.get("gateway-delete-other").await.unwrap()).unwrap(), other_before);
+            let retained: i64 = connection.query_row("SELECT COUNT(*) FROM tasks WHERE agent = 'victim'", [], |row| row.get(0)).unwrap();
+            assert_eq!(retained, 1, "cascade must remove exactly the two ordinary rows and retain Goal history");
+            let archives = std::fs::read_dir(config.data_dir.join("agents/_deleted")).unwrap()
+                .map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+            assert_eq!(archives.len(), 1);
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(archives[0].join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["control_plane_tasks"], 2,
+                "the actual cascade report must count ordinary rows only");
+            assert!(manifest["warnings"].as_array().unwrap().iter().all(|warning|
+                !warning.as_str().unwrap().contains("control-plane")), "{manifest}");
+        }).await.expect("gateway agent delete must revoke before config publication and retain history");
+    }
+
+    #[cfg(unix)]
+    struct GatewayPolicyDirectoryModeGuard {
+        path: std::path::PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl GatewayPolicyDirectoryModeGuard {
+        fn read_only(path: std::path::PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let guard = Self {
+                original: std::fs::metadata(&path).unwrap().permissions(),
+                path,
+            };
+            std::fs::set_permissions(&guard.path, std::fs::Permissions::from_mode(0o555))
+                .expect("make the fixture config directory read-only");
+            guard
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GatewayPolicyDirectoryModeGuard {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.path, self.original.clone())
+                .expect("restore the fixture config directory permissions");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_save_failure_reports_cancelled_goals() {
+        if !live_goal_policy_gateway_child(
+            "api_config::tests::live_goal_policy_gateway_save_failure_reports_cancelled_goals",
+        )
+        .await
+        {
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut fixture = GatewayPolicyFixture::new().await;
+            let before = seed_gateway_matrix_goal("gateway-save-failure", false).await;
+            let config = fixture.authority.snapshot_config();
+            let disk_before = std::fs::read(&config.config_path).unwrap();
+            let live_before = serde_json::to_value(&config).unwrap();
+            let revision = fixture.authority.published_revision();
+            let pending_before = fixture
+                .state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert!(!pending_before);
+            let config_parent = config.config_path.parent().unwrap().to_path_buf();
+            let at_pause = before.clone();
+            let gate = test_pre_save_pause_gate::arm(config.config_path.clone());
+            let (write_result, mode_guard) = tokio::join!(
+                fixture.write("goal.enabled", "false"),
+                async move {
+                    tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+                        .await
+                        .expect("gateway save must reach the pre-save boundary");
+                    assert_gateway_goal_cancelled(&at_pause).await;
+                    let mode_guard = GatewayPolicyDirectoryModeGuard::read_only(config_parent);
+                    gate.release();
+                    mode_guard
+                }
+            );
+            let status = write_result
+                .as_ref()
+                .map_or_else(|response| response.status(), |_| StatusCode::OK);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "environment stop: directory mode 0o555 must make save_dirty fail"
+            );
+            let (_, body) = response_json(*write_result.err().unwrap()).await;
+            assert_eq!(
+                body["code"],
+                serde_json::to_value(ConfigApiCode::InternalError).unwrap()
+            );
+            assert!(
+                body["message"].as_str().unwrap().starts_with(
+                    "Config save failed after 1 Goal(s) were cancelled by the new Goal policy; those Goals stay cancelled:"
+                ),
+                "{body}"
+            );
+            drop(mode_guard);
+            assert_eq!(std::fs::read(&config.config_path).unwrap(), disk_before);
+            assert_eq!(
+                serde_json::to_value(fixture.authority.snapshot_config()).unwrap(),
+                live_before
+            );
+            assert_eq!(fixture.authority.published_revision(), revision);
+            assert_eq!(
+                fixture
+                    .state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                pending_before
+            );
+            assert_gateway_goal_cancelled(&before).await;
+            fixture
+                .send(
+                    4,
+                    "session/goal",
+                    serde_json::json!({
+                        "session_id": "gateway-goal",
+                        "command": "/goal start --unlimited start after the failed policy save"
+                    }),
+                )
+                .await;
+            assert_eq!(
+                fixture.result(4).await["response"]["kind"],
+                "started",
+                "save failure must reopen actual Goal admission"
+            );
+            fixture.goal_provider.wait_entered().await;
+        })
+        .await
+        .expect("failed gateway save must retain cancellation and reopen admission");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_goal_policy_gateway_inert_save_failure_keeps_existing_error() {
+        if !live_goal_policy_gateway_child(
+            "api_config::tests::live_goal_policy_gateway_inert_save_failure_keeps_existing_error",
+        )
+        .await
+        {
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let fixture = GatewayPolicyFixture::new().await;
+            let before = seed_gateway_matrix_goal("gateway-inert-save-failure", false).await;
+            let config = fixture.authority.snapshot_config();
+            let disk_before = std::fs::read(&config.config_path).unwrap();
+            let live_before = serde_json::to_value(&config).unwrap();
+            let revision = fixture.authority.published_revision();
+            let pending_before = fixture
+                .state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert!(!pending_before);
+            let plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let coordinator = plane.goal_execution_restart();
+            let generation = coordinator.policy_generation();
+            let config_parent = config.config_path.parent().unwrap().to_path_buf();
+            let gate = test_pre_save_pause_gate::arm(config.config_path.clone());
+            let (write_result, mode_guard) = tokio::join!(
+                fixture.write("goal.default_token_limit", "123456"),
+                async move {
+                    tokio::time::timeout(Duration::from_secs(5), gate.wait_paused())
+                        .await
+                        .expect("inert gateway save must reach the pre-save boundary");
+                    let mode_guard = GatewayPolicyDirectoryModeGuard::read_only(config_parent);
+                    gate.release();
+                    mode_guard
+                }
+            );
+            let status = write_result
+                .as_ref()
+                .map_or_else(|response| response.status(), |_| StatusCode::OK);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "environment stop: directory mode 0o555 must make save_dirty fail"
+            );
+            let (_, body) = response_json(*write_result.err().unwrap()).await;
+            assert_eq!(
+                body["code"],
+                serde_json::to_value(ConfigApiCode::ReloadFailed).unwrap()
+            );
+            let message = body["message"].as_str().unwrap();
+            assert!(message.starts_with("save failed: "), "{body}");
+            assert!(!message.contains("Goal(s) were cancelled"), "{body}");
+            drop(mode_guard);
+            assert_eq!(
+                serde_json::to_value(plane.store.get(&before.id).await.unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(coordinator.policy_generation(), generation);
+            assert_eq!(std::fs::read(&config.config_path).unwrap(), disk_before);
+            assert_eq!(
+                serde_json::to_value(fixture.authority.snapshot_config()).unwrap(),
+                live_before
+            );
+            assert_eq!(fixture.authority.published_revision(), revision);
+            assert_eq!(
+                fixture
+                    .state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                pending_before
+            );
+        })
+        .await
+        .expect("inert gateway save failure must preserve policy and existing error");
     }
 
     fn install_channel_generation_controls(

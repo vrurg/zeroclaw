@@ -1093,11 +1093,11 @@ impl RpcGoalRuntime {
         control_plane().cloned()
     }
 
-    fn current_settings(&self, context: &RpcContext) -> Result<GoalHostSettings> {
-        let config = context.config.read();
-        let control_plane = self
-            .current_control_plane()
-            .context("Goal control plane is unavailable")?;
+    fn settings_from_config(
+        config: &zeroclaw_config::schema::Config,
+        owner_boot_id: String,
+        policy_generation: u64,
+    ) -> Result<GoalHostSettings> {
         let limits = config.goal.effective_limits().map_err(|error| {
             anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
         })?;
@@ -1108,8 +1108,18 @@ impl RpcGoalRuntime {
                 cost_limit_usd: limits.cost_limit_usd,
             },
             std::process::id(),
-            control_plane.boot_id,
+            owner_boot_id,
         )
+        .map(|settings| settings.with_policy_generation(policy_generation))
+    }
+
+    fn current_settings(&self, context: &RpcContext) -> Result<GoalHostSettings> {
+        let control_plane = self
+            .current_control_plane()
+            .context("Goal control plane is unavailable")?;
+        let policy_generation = control_plane.goal_execution_restart().policy_generation();
+        let config = context.config.read();
+        Self::settings_from_config(&config, control_plane.boot_id, policy_generation)
     }
 
     /// Whether this session's Goal can be safely disposed without waiting for
@@ -1198,6 +1208,11 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<RpcGoalCommandSubmission> {
+        let control_plane = self
+            .current_control_plane()
+            .context("Goal control plane is unavailable")?;
+        let restart_coordinator = control_plane.goal_execution_restart();
+        let policy_generation = restart_coordinator.policy_generation();
         let config = context.config.read().clone();
         if !config.goal.enabled {
             return Ok(RpcGoalCommandSubmission {
@@ -1205,12 +1220,9 @@ impl RpcGoalRuntime {
                 post_response: None,
             });
         }
-        let control_plane = self
-            .current_control_plane()
-            .context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
-        let restart_coordinator = control_plane.goal_execution_restart();
-        let settings = self.current_settings(&context)?;
+        let settings =
+            Self::settings_from_config(&config, control_plane.boot_id, policy_generation)?;
         let session_id = driver.raw_session_id().to_owned();
         let outbound = Arc::clone(&driver.outbound);
         let ingress = GoalIngressContext::trusted(

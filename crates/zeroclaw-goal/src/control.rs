@@ -1196,6 +1196,7 @@ pub struct GoalHostSettings {
     default_limits: GoalBudgetLimits,
     owner_pid: u32,
     owner_boot_id: String,
+    policy_generation: Option<u64>,
 }
 
 impl GoalHostSettings {
@@ -1255,7 +1256,15 @@ impl GoalHostSettings {
             },
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
+            policy_generation: None,
         })
+    }
+
+    /// Record the live Goal-policy generation observed before these settings
+    /// were resolved.
+    pub fn with_policy_generation(mut self, generation: u64) -> Self {
+        self.policy_generation = Some(generation);
+        self
     }
 }
 

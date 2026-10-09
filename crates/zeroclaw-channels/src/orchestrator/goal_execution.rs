@@ -461,13 +461,13 @@ fn matrix_goal_settings(
 ) -> Result<GoalHostSettings> {
     let control_plane = matrix_goal_control_plane(context, history_key)
         .context("Goal control plane is unavailable")?;
-    let defaults = runtime_defaults_snapshot(context);
-    let limits =
-        defaults.config.goal.effective_limits().map_err(|error| {
-            anyhow::Error::msg(format!("invalid Goal default limits: {error:?}"))
-        })?;
+    let policy_generation = control_plane.goal_execution_restart().policy_generation();
+    let goal = context.live_config.read().goal.clone();
+    let limits = goal
+        .effective_limits()
+        .map_err(|error| anyhow::Error::msg(format!("invalid Goal default limits: {error:?}")))?;
     GoalHostSettings::from_validated_limits(
-        defaults.config.goal.enabled,
+        goal.enabled,
         GoalBudgetLimits {
             token_limit: limits.token_limit,
             cost_limit_usd: limits.cost_limit_usd,
@@ -475,6 +475,7 @@ fn matrix_goal_settings(
         std::process::id(),
         control_plane.boot_id.clone(),
     )
+    .map(|settings| settings.with_policy_generation(policy_generation))
 }
 
 /// Route Matrix `/stop` through the ordinary immediate Goal-pause command

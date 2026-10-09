@@ -116,23 +116,25 @@ pub fn classify_goal_policy(
 pub async fn revoke_goals_under_policy(
     registry: &dyn GoalTaskRegistry,
     successor: &GoalPolicySnapshot,
-) -> Result<Vec<GoalPolicyRevocation>> {
+) -> Result<Vec<(GoalPolicyTarget, GoalPolicyRevocation)>> {
     let observed = registry.list_nonterminal_session_goals().await?;
-    let mut targets = Vec::new();
-    let mut reasons = Vec::new();
+    let mut revoked = Vec::new();
     for task in &observed {
         if let GoalPolicyDecision::Revoke { target, reason } =
             classify_goal_policy(successor, task)?
         {
-            targets.push(target);
-            reasons.push(reason);
+            revoked.push((target, reason));
         }
     }
-    if targets.is_empty() {
+    if revoked.is_empty() {
         return Ok(Vec::new());
     }
+    let targets = revoked
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<Vec<_>>();
     match registry.cancel_policy_targets(&targets).await? {
-        GoalTransitionResult::Applied => Ok(reasons),
+        GoalTransitionResult::Applied => Ok(revoked),
         GoalTransitionResult::Stale => anyhow::bail!("Goal policy targets changed during cutover"),
         GoalTransitionResult::Missing => {
             anyhow::bail!("Goal policy target disappeared during cutover")

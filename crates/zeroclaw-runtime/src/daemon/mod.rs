@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
+use zeroclaw_goal::GoalDiagnosticTextGuard;
 
 use self::registry::ChannelRegistryClearer;
+use crate::goal_accounting::RuntimeGoalDiagnosticTextGuard;
 
 /// A daemon-run-owned channel generation. RPC config mutations prepare an
 /// opaque drain for this exact generation; committing the mutation retires the
@@ -435,6 +437,154 @@ pub(crate) fn goal_policy_snapshot(config: &Config) -> zeroclaw_goal::control::G
             .map(|(alias, channel)| (alias.clone(), channel.enabled))
             .collect(),
     }
+}
+
+/// An unfinished live Goal-policy cutover.
+///
+/// A non-inert value keeps fresh Goal admission closed until [`Self::finish`]
+/// reopens it. Dropping the value schedules the same reopen and exact worker
+/// drain so cancellation cannot strand admission closed.
+pub struct LiveGoalPolicyCutover {
+    coordinator: Option<std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>>,
+    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
+}
+
+impl LiveGoalPolicyCutover {
+    fn inert() -> Self {
+        Self {
+            coordinator: None,
+            targets: Vec::new(),
+        }
+    }
+
+    /// Return how many Goals this cutover's policy revocation cancelled.
+    ///
+    /// `None` means the cutover is inert: the Goal policy projection did not
+    /// change, or no control plane exists, so admission was never closed and
+    /// the Goal store was not touched. `Some(n)` means the cutover is
+    /// non-inert, and `n` is the exact number of Goals its atomic revocation
+    /// cancelled, including zero. Callers read this before [`Self::finish`],
+    /// which consumes the cutover.
+    #[must_use]
+    pub fn cancelled_goal_count(&self) -> Option<usize> {
+        self.coordinator.as_ref().map(|_| self.targets.len())
+    }
+
+    /// Reopen admission and schedule the exact revoked workers for draining.
+    pub async fn finish(mut self) -> Option<JoinHandle<()>> {
+        let coordinator = self.coordinator.as_ref()?;
+        coordinator.reopen_for_generation().await;
+
+        // Keep Drop armed until the awaited reopen has completed. Cancelling
+        // this future before then must still schedule the fallback reopen.
+        let coordinator = self
+            .coordinator
+            .take()
+            .expect("non-inert Goal policy cutover lost its coordinator");
+        let targets = std::mem::take(&mut self.targets);
+        if targets.is_empty() {
+            return None;
+        }
+        Some(spawn_revoked_goal_stop(coordinator, targets))
+    }
+}
+
+impl Drop for LiveGoalPolicyCutover {
+    fn drop(&mut self) {
+        let Some(coordinator) = self.coordinator.take() else {
+            return;
+        };
+        let targets = std::mem::take(&mut self.targets);
+        let _fallback = zeroclaw_spawn::spawn!(async move {
+            coordinator.reopen_for_generation().await;
+            if !targets.is_empty() {
+                stop_revoked_goals_and_log(coordinator, targets).await;
+            }
+        });
+    }
+}
+
+fn spawn_revoked_goal_stop(
+    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
+) -> JoinHandle<()> {
+    zeroclaw_spawn::spawn!(async move {
+        stop_revoked_goals_and_log(coordinator, targets).await;
+    })
+}
+
+async fn stop_revoked_goals_and_log(
+    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
+) {
+    if let Err(error) = coordinator.stop_revoked_in_place(&targets).await {
+        let error = RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}"));
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": error})),
+            "Revoked Goal worker drain failed after a live policy cutover"
+        );
+    }
+}
+
+/// Close Goal admission and apply the prospective live policy before config
+/// persistence begins.
+///
+/// # Errors
+///
+/// Returns an error when the live control plane has no Goal registry or when
+/// prospective-policy classification or atomic revocation fails.
+pub async fn begin_live_goal_policy_cutover(
+    commit: &crate::live_config_authority::ConfigCommit,
+    prospective: &Config,
+) -> Result<LiveGoalPolicyCutover> {
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Ok(LiveGoalPolicyCutover::inert());
+    };
+    let coordinator = control_plane.goal_execution_restart();
+    let registry = control_plane.goal_store()?;
+    let live = commit.live_handle();
+    begin_live_goal_policy_cutover_with(coordinator, registry, &live, prospective).await
+}
+
+pub(crate) async fn begin_live_goal_policy_cutover_with(
+    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
+    registry: std::sync::Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+    live: &zeroclaw_config::live::LiveConfigHandle,
+    prospective: &Config,
+) -> Result<LiveGoalPolicyCutover> {
+    let current_policy = {
+        let current = live.read();
+        goal_policy_snapshot(&current)
+    };
+    let prospective_policy = goal_policy_snapshot(prospective);
+    if current_policy == prospective_policy {
+        return Ok(LiveGoalPolicyCutover::inert());
+    }
+
+    coordinator.begin_policy_cutover().await;
+    let revoked = match zeroclaw_goal::control::revoke_goals_under_policy(
+        registry.as_ref(),
+        &prospective_policy,
+    )
+    .await
+    {
+        Ok(revoked) => revoked,
+        Err(error) => {
+            coordinator.reopen_for_generation().await;
+            return Err(error);
+        }
+    };
+    let targets = revoked
+        .into_iter()
+        .map(|(target, _reason)| target)
+        .collect();
+    Ok(LiveGoalPolicyCutover {
+        coordinator: Some(coordinator),
+        targets,
+    })
 }
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
@@ -3203,6 +3353,10 @@ fn has_supervised_channels(config: &Config) -> bool {
 // The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
 #[cfg(test)]
+#[path = "../../tests/support/goal_policy_cutover.rs"]
+mod goal_policy_cutover_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -3238,6 +3392,50 @@ mod tests {
                 .iter()
                 .any(|channel| channel == "matrix.main")
         );
+    }
+
+    #[tokio::test]
+    async fn live_goal_policy_cutover_reports_cancelled_goal_count() {
+        let directory = TempDir::new().unwrap();
+        let registry: std::sync::Arc<dyn zeroclaw_goal::GoalTaskRegistry> = std::sync::Arc::new(
+            crate::control_plane::SqliteTaskStore::new(directory.path()).unwrap(),
+        );
+        let coordinator =
+            std::sync::Arc::new(zeroclaw_goal::GoalExecutionRestartCoordinator::new());
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+
+        let generation = coordinator.policy_generation();
+        let mut prospective = config.clone();
+        prospective.goal.default_token_limit = 123_456;
+        let cutover = begin_live_goal_policy_cutover_with(
+            std::sync::Arc::clone(&coordinator),
+            std::sync::Arc::clone(&registry),
+            &live.handle(),
+            &prospective,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cutover.cancelled_goal_count(), None);
+        assert!(cutover.finish().await.is_none());
+        assert_eq!(coordinator.policy_generation(), generation);
+
+        let generation = coordinator.policy_generation();
+        let mut prospective = config;
+        prospective.goal.enabled = false;
+        let cutover = begin_live_goal_policy_cutover_with(
+            std::sync::Arc::clone(&coordinator),
+            registry,
+            &live.handle(),
+            &prospective,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cutover.cancelled_goal_count(), Some(0));
+        assert_eq!(cutover.cancelled_goal_count(), Some(0));
+        assert!(cutover.finish().await.is_none());
+        assert!(coordinator.policy_generation() > generation);
     }
 
     #[tokio::test]

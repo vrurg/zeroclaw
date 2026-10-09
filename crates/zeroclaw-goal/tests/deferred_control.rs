@@ -901,6 +901,105 @@ async fn restart_gate_closes_queued_start_and_refuses_new_registration() {
 }
 
 #[tokio::test]
+async fn policy_generation_fences_actual_admit_control_before_side_effects() {
+    const RETRY: &str =
+        "Goal policy changed while this command was being admitted; retry the command";
+
+    for resume in [false, true] {
+        let (driver, ingress) = serialized_fixture();
+        let registry = Arc::new(Registry::default());
+        if resume {
+            registry.seed(&ingress.session_key().durable_id(), TaskStatus::Paused);
+        }
+        let coordinator = zeroclaw_goal::GoalExecutionRestartCoordinator::new();
+        let runtime = GoalRuntime::new(registry.clone());
+        let supervisor = coordinator
+            .new_supervisor(Arc::new(
+                runtime.execution_engine(Arc::new(NoModelAccounting)),
+            ))
+            .await;
+        let observed_generation = coordinator.policy_generation();
+        let before = {
+            let state = registry.0.lock().unwrap();
+            serde_json::to_value((&state.task, &state.goal)).unwrap()
+        };
+
+        coordinator.begin_policy_cutover().await;
+        coordinator.reopen_for_generation().await;
+        let error = supervisor
+            .admit_control(
+                settings().with_policy_generation(observed_generation),
+                ingress,
+                driver.clone(),
+                launch_command(resume),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), RETRY);
+        let state = registry.0.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value((&state.task, &state.goal)).unwrap(),
+            before
+        );
+        assert!(state.intents.is_empty());
+        assert!(state.transitions.is_empty());
+        assert_eq!(state.session_lookups, 0);
+        assert_eq!(
+            driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    for resume in [false, true] {
+        for attach_generation in [true, false] {
+            let (driver, ingress) = serialized_fixture();
+            let registry = Arc::new(Registry::default());
+            if resume {
+                registry.seed(&ingress.session_key().durable_id(), TaskStatus::Paused);
+            }
+            let coordinator = zeroclaw_goal::GoalExecutionRestartCoordinator::new();
+            let runtime = GoalRuntime::new(registry.clone());
+            let supervisor = coordinator
+                .new_supervisor(Arc::new(
+                    runtime.execution_engine(Arc::new(NoModelAccounting)),
+                ))
+                .await;
+            let current_generation = coordinator.policy_generation();
+            let settings = if attach_generation {
+                settings().with_policy_generation(current_generation)
+            } else {
+                settings()
+            };
+
+            let GoalControlAdmission::Direct(mut submission) = supervisor
+                .admit_control(settings, ingress, driver, launch_command(resume))
+                .await
+                .unwrap()
+            else {
+                panic!("an idle Start or Resume must apply directly");
+            };
+            if resume {
+                assert!(matches!(submission.response(), GoalResponse::Resumed(_)));
+            } else {
+                assert!(matches!(submission.response(), GoalResponse::Started(_)));
+            }
+            {
+                let state = registry.0.lock().unwrap();
+                assert!(state.intents.is_empty());
+                assert_eq!(state.transitions, [if resume { "resume" } else { "start" }]);
+            }
+            supervisor
+                .pause_before_launch(
+                    &mut submission,
+                    zeroclaw_goal::GoalPauseReason::OperatorPaused,
+                )
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_audit_settlement_does_not_strand_a_new_epoch_without_a_worker() {
     let (driver, ingress) = serialized_fixture();
     let registry = Arc::new(Registry::default());
