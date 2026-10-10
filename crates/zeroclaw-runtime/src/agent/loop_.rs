@@ -616,7 +616,7 @@ where
     TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
 }
 
-/// Run a future with the session key set in task-local storage.
+/// Run a future with the session key in task-local storage and log attribution.
 /// The scope wraps the entire agent turn, so all tools invoked during
 /// the turn (including nested calls) see the same session key.
 /// SessionsCurrentTool reads this to identify the active session.
@@ -624,7 +624,13 @@ pub async fn scope_session_key<F>(session_key: Option<String>, future: F) -> F::
 where
     F: std::future::Future,
 {
-    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+    match session_key {
+        Some(key) => {
+            let future = ::zeroclaw_log::scope!(session_key: key.as_str() => future);
+            TOOL_LOOP_SESSION_KEY.scope(Some(key), future).await
+        }
+        None => TOOL_LOOP_SESSION_KEY.scope(None, future).await,
+    }
 }
 
 pub(crate) fn compute_excluded_mcp_tools(
@@ -3336,7 +3342,7 @@ pub(crate) async fn process_message_shared_with_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3358,7 +3364,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission_and_principal(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3383,7 +3389,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
 /// source for tools that resolve security policy at execution time.
 pub async fn process_message_with_live_config(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3403,7 +3409,7 @@ pub async fn process_message_with_live_config(
 
 pub async fn process_message_with_live_config_and_admission(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3425,7 +3431,7 @@ pub async fn process_message_with_live_config_and_admission(
 
 async fn process_message_inner(
     mut config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -6742,7 +6748,10 @@ mod tests {
 
     struct ImageRecoveryContinuationProvider {
         image_counts: Mutex<Vec<usize>>,
-        resubmission: Option<(tokio::sync::mpsc::Sender<String>, String)>,
+        resubmission: Option<(
+            tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+            String,
+        )>,
     }
 
     impl ::zeroclaw_api::attribution::Attributable for ImageRecoveryContinuationProvider {
@@ -6805,7 +6814,7 @@ mod tests {
             }
             let text = if call == 1 {
                 if let Some((tx, message)) = &self.resubmission {
-                    tx.send(message.clone()).await.unwrap();
+                    tx.send(message.clone().into()).await.unwrap();
                 }
                 r#"<tool_call>
 {"name":"probe","arguments":{"value":"ok"}}
@@ -19776,10 +19785,10 @@ Let me check the result."#;
             None,
         )
         .await;
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let live_result = super::process_message_with_live_config(
             config,
-            live_config,
+            live_config.handle(),
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -19930,16 +19939,16 @@ Let me check the result."#;
         std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
             .expect("agent workspace directory");
 
-        let live_config = Arc::new(RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let result = super::process_message_with_live_config(
             config.clone(),
-            live_config,
+            live_config.handle(),
             "live-file-download-agent",
             "download the private document",
             Some("session"),
@@ -20351,6 +20360,177 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_session_scopes_correlate_provider_traces_in_logs() {
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct InterleaveRequests(tokio::sync::Barrier);
+
+        #[async_trait]
+        impl HookHandler for InterleaveRequests {
+            fn name(&self) -> &str {
+                "interleave-requests"
+            }
+
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.wait().await;
+                HookResult::Continue(())
+            }
+        }
+
+        async fn run_session(session_key: &str, turn_id: &str, hooks: &HookRunner) {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#,
+                "done",
+            ]);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    CountingTool::new("count_tool", Arc::clone(&invocations)),
+                )]);
+            let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+            let result = scope_session_key(
+                Some(session_key.to_string()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    served_route_sink: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            dispatch_model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &NoopObserver,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 10,
+                        hooks: Some(hooks),
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                        security: None,
+                    },
+                    history: &mut history,
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
+                    channel_name: "cli",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: Some("test-agent"),
+                    turn_id,
+                }),
+            )
+            .await
+            .expect("tool loop should succeed");
+            assert_eq!(result, "done");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        }
+
+        fn assert_correlations(records: &[serde_json::Value], traces: &[String; 2]) {
+            for (trace, session) in traces.iter().zip(["conversation-a", "conversation-b"]) {
+                for message in ["llm_request", "llm_response"] {
+                    let events: Vec<_> = records
+                        .iter()
+                        .filter(|record| {
+                            record["trace_id"].as_str() == Some(trace.as_str())
+                                && record["message"].as_str() == Some(message)
+                        })
+                        .collect();
+                    assert_eq!(events.len(), 2, "both iterations must emit {message}");
+                    for event in events {
+                        assert_eq!(event["zeroclaw"]["session_key"].as_str(), Some(session));
+                    }
+                }
+            }
+        }
+
+        // The capture pipeline and writer are process-global. Keep other log
+        // tests from changing their configuration while these turns interleave.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let tmp = tempfile::tempdir().expect("create log workspace");
+        let cfg = zeroclaw_log::LogConfig {
+            log_persistence: "full".into(),
+            ..Default::default()
+        };
+        zeroclaw_log::init_from_config(&cfg, tmp.path());
+        let _reset_writer = scopeguard::guard((), |_| {
+            zeroclaw_log::init_from_config(
+                &zeroclaw_log::LogConfig {
+                    log_persistence: "none".into(),
+                    ..Default::default()
+                },
+                tmp.path(),
+            );
+        });
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(InterleaveRequests(tokio::sync::Barrier::new(2))));
+        let traces = [
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ];
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                run_session("conversation-a", &traces[0], &hooks),
+                run_session("conversation-b", &traces[1], &hooks),
+            );
+        })
+        .await
+        .expect("interleaved turns should complete");
+
+        let mut broadcast_records = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            broadcast_records.push(record);
+        }
+        assert_correlations(&broadcast_records, &traces);
+
+        zeroclaw_log::flush_for_test().expect("flush runtime trace");
+        let persisted = std::fs::read_to_string(
+            zeroclaw_log::runtime_trace_path().expect("runtime trace path"),
+        )
+        .expect("read runtime trace");
+        let persisted_records: Vec<serde_json::Value> = persisted
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .collect();
+        assert_correlations(&persisted_records, &traces);
     }
 
     #[tokio::test]
