@@ -22171,7 +22171,9 @@ mod tests {
             drop(lock);
             successor
         };
-        let (result, successor) = tokio::join!(operation, replace);
+        // Poll the replacement first: without its real Pending signal this
+        // control must reject early rather than depending on scheduler timing.
+        let (successor, result) = tokio::join!(biased; replace, operation);
         let err = result.expect_err("a replaced session cannot be configured by the old owner");
         assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
         assert!(err.message.contains("Session changed while queued"));
@@ -37828,6 +37830,10 @@ mod tests {
             .ensure("openai", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
+        // The mock always fails, and one request is enough to check the
+        // dispatched model. Retries would only add backoff to the prompt.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
@@ -37970,6 +37976,10 @@ mod tests {
         edited.uri = Some(server.uri());
         edited.model = Some("old-model".into());
         edited.context_window = Some(200_000);
+        // The mock always fails, and one request is enough to check the
+        // dispatched model. Retries would only add backoff to the prompt.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
 
         let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
         let dispatcher = Arc::new(make_config_set_test_dispatcher_with_commit_pause(
@@ -43331,6 +43341,10 @@ mod tests {
             .ensure("openai", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
+        // The mock always fails, and one request per prompt is enough to
+        // check the restored transcript. Retries would only add backoff.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         let data_dir = config.data_dir.clone();
         let (dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -43442,6 +43456,10 @@ mod tests {
             .ensure("openai", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
+        // The mock always fails, and this test only needs that failure.
+        // Retries would only add backoff to the prompt.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         let data_dir = config.data_dir.clone();
 
         // Manual wiring (not the persistence constructor) so the outbound
@@ -44363,6 +44381,10 @@ mod tests {
                 .ensure("openai", "test-provider")
                 .unwrap()
                 .uri = Some(server.uri());
+            // The mock always fails, and one request is enough to check the
+            // dispatched model. Retries would only add backoff to the prompt.
+            config.reliability.provider_retries = 0;
+            config.reliability.provider_backoff_ms = 1;
             let data_dir = config.data_dir.clone();
             let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
             let (dispatcher, sessions, acp_store) =
@@ -44621,6 +44643,10 @@ mod tests {
             .ensure("openai", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
+        // The mock always fails, and one request is enough to check the
+        // dispatched model. Retries would only add backoff to the prompt.
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         let data_dir = config.data_dir.clone();
         let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
         let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_commit_pause(
