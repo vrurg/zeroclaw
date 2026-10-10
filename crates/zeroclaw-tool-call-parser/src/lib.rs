@@ -711,27 +711,31 @@ pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
 }
 
 fn malformed_json_string_fields(text: &str) -> Vec<(String, String)> {
-    static JSON_STRING_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")"#)
-            .expect("JSON_STRING_FIELD_RE regex must compile")
-    });
-
-    JSON_STRING_FIELD_RE
+    // Match keys independently of values. In broken JSON an unterminated
+    // earlier value can appear to close at a later key's opening quote;
+    // consuming that quote as part of a field pair would hide the later name.
+    malformed_json_field_key_regex()
         .captures_iter(text)
         .filter_map(|cap| {
             let key = serde_json::from_str::<String>(cap.get(1)?.as_str()).ok()?;
-            let value = serde_json::from_str::<String>(cap.get(2)?.as_str()).ok()?;
+            let value = serde_json::Deserializer::from_str(&text[cap.get(0)?.end()..])
+                .into_iter::<String>()
+                .next()?
+                .ok()?;
             Some((key, value))
         })
         .collect()
 }
 
-fn malformed_json_field_names(text: &str) -> HashSet<String> {
+fn malformed_json_field_key_regex() -> &'static Regex {
     static JSON_FIELD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"("(?:\\.|[^"\\])*")\s*:"#).expect("JSON_FIELD_KEY_RE regex must compile")
     });
+    &JSON_FIELD_KEY_RE
+}
 
-    JSON_FIELD_KEY_RE
+fn malformed_json_field_names(text: &str) -> HashSet<String> {
+    malformed_json_field_key_regex()
         .captures_iter(text)
         .filter_map(|cap| serde_json::from_str::<String>(cap.get(1)?.as_str()).ok())
         .collect()
@@ -3565,6 +3569,41 @@ mod tests {
         ));
         assert!(!looks_like_malformed_json_tool_invocation(
             r#"{"retries": 3, "timeout_ms":"#,
+            &known,
+        ));
+    }
+
+    #[test]
+    fn arguments_first_export_detection_recovers_names_after_broken_values() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"arguments":{"content":"secret},"name":"session_prompt_set"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"content":"C:\workspace\"},"name":"session_prompt_set"}]}"#,
+            r#"{"tool_calls":[{"parameters":{"content":"secret},"na\u006de":"session_prompt_\u0073et"}]}"#,
+            r#"{"tool_calls":[{"arguments":"secret},"name":"session_prompt_set"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(envelope).is_err());
+            assert!(
+                looks_like_malformed_json_tool_invocation(envelope, &known),
+                "a broken earlier value must not consume a later sensitive name"
+            );
+            assert!(looks_like_malformed_json_tool_invocation(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+            assert!(!looks_like_malformed_json_tool_invocation(
+                &envelope
+                    .replace("session_prompt_set", "shell")
+                    .replace("session_prompt_\\u0073et", "shell"),
+                &known,
+            ));
+        }
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"content":"secret},"name":"session_prompt_set"}"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"arguments":{},"name":"session_prompt_set"}"#,
             &known,
         ));
     }

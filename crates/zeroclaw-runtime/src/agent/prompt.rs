@@ -2566,6 +2566,53 @@ mod tests {
     }
 
     #[test]
+    fn arguments_first_export_redacts_broken_values_without_changing_provider_history() {
+        let marker = "session-prompt-private-marker";
+        for value in [marker.to_string(), format!("C:\\workspace\\{marker}\\")] {
+            let malformed = format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{value}}},"name":"session_prompt_set"}}]}}"#
+            );
+            let (_, calls) = parse_tool_calls(&malformed);
+            assert!(
+                calls.is_empty(),
+                "this malformed invocation is never executed"
+            );
+            assert!(session_prompt_tool_call_envelope_mentioned(&malformed));
+            assert_eq!(
+                redact_session_prompt_text_protocol_for_export(&malformed),
+                SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER,
+                "the parse-issue log export must omit the proposed attachment"
+            );
+            let history = vec![
+                ChatMessage::assistant(&malformed),
+                ChatMessage::user("cancel that and summarize the log"),
+            ];
+            let exported = redact_session_prompt_history_for_export(&history, true);
+            assert_eq!(
+                exported[0].content,
+                SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
+            );
+            assert_eq!(exported[1].content, history[1].content);
+            assert_eq!(history[0].content, malformed);
+            assert!(history[0].content.contains(marker));
+            let disabled_export = redact_session_prompt_history_for_export(&history, false);
+            assert_eq!(disabled_export.len(), history.len());
+            for (actual, expected) in disabled_export.iter().zip(&history) {
+                assert_eq!(actual.role, expected.role);
+                assert_eq!(
+                    actual.content, expected.content,
+                    "unmarked history inference remains off when the feature is disabled"
+                );
+            }
+            let ordinary = malformed.replace("session_prompt_set", "shell");
+            assert_eq!(
+                redact_session_prompt_text_protocol_for_export(&ordinary),
+                ordinary
+            );
+        }
+    }
+
+    #[test]
     fn export_copy_preserves_malformed_ordinary_tool_diagnostics_and_user_input() {
         let malformed = r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"pwd"}}]"#;
         let messages = vec![

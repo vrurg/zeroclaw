@@ -679,6 +679,101 @@ mod argument_preservation_tests {
     }
 
     #[tokio::test]
+    async fn arguments_first_export_omits_attachment_from_emitted_parse_issue() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            session_prompt_approval_required: true,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "arguments-first-export-log",
+            serving_provider_name: None,
+            serving_model: None,
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: vec![ToolSpec::new(
+                "session_prompt_set",
+                "attach session context",
+                json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["session_prompt_set".to_owned()]),
+            use_native_tools: false,
+        };
+
+        // Protect the real log broadcast hook from parallel writer tests.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        let marker = "session-prompt-private-marker";
+        for value in [marker.to_string(), format!("C:\\workspace\\{marker}\\")] {
+            let malformed = format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{value}}},"name":"session_prompt_set"}}]}}"#
+            );
+            let interpreted = interpret_chat_response(
+                &ctx,
+                "test.provider",
+                "test-model",
+                ChatResponse {
+                    text: Some(malformed.clone()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                &[],
+                &specs,
+                false,
+                0,
+                false,
+            )
+            .await;
+            assert!(interpreted.parse_issue_detected);
+            assert!(interpreted.tool_calls.is_empty());
+            assert_eq!(interpreted.assistant_history_content, malformed);
+
+            let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = log_rx
+                        .recv()
+                        .await
+                        .expect("log broadcast remains installed");
+                    if event["message"] == "tool_call_parse_issue"
+                        && event["trace_id"] == ctx.turn_id
+                    {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("the production parser must emit its parse-issue event");
+            assert_eq!(
+                logged["attributes"]["response"],
+                redact_session_prompt_text_protocol_for_export(&malformed).as_ref()
+            );
+            assert!(!logged.to_string().contains(marker));
+        }
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[tokio::test]
     async fn json_document_reaches_file_write_unchanged() {
         let workspace = tempfile::tempdir().unwrap();
         let tool = FileWriteTool::new(Arc::new(SecurityPolicy {
