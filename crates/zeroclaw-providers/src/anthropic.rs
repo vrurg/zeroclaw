@@ -4853,8 +4853,22 @@ data: {\"type\":\"message_stop\"}\n\n";
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         let auth_service = AuthService::new(state_dir.path(), false);
 
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile before creating stream");
+
         let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(auth_service)
+            .auth_profile(auth_service.clone())
             .build();
         let messages = vec![ChatMessage::user("hello")];
         let stream = provider.stream_chat(
@@ -4867,6 +4881,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             None,
             StreamOptions::new(true),
         );
+        auth_service
+            .remove_profile("anthropic", "subscription")
+            .await
+            .expect("remove profile after stream creation");
         let events = stream.collect::<Vec<_>>().await;
         assert!(matches!(
             events.as_slice(),

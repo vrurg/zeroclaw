@@ -49990,6 +49990,22 @@ model_provider = \"ollama.default\"
     }
 
     #[test]
+    async fn anthropic_oauth_mode_uses_the_documented_toml_spelling() {
+        let oauth: AnthropicModelProviderConfig = toml::from_str("auth_mode = \"oauth\"\n")
+            .expect("documented oauth spelling should deserialize");
+        assert_eq!(oauth.auth_mode, Some(AnthropicAuthMode::OAuth));
+        assert!(
+            toml::to_string(&oauth)
+                .expect("OAuth config should serialize")
+                .contains("auth_mode = \"oauth\""),
+        );
+        assert!(
+            toml::from_str::<AnthropicModelProviderConfig>("auth_mode = \"o_auth\"\n").is_err(),
+            "the obsolete o_auth spelling must not be accepted"
+        );
+    }
+
+    #[test]
     async fn anthropic_oauth_rejects_inline_key_and_nonofficial_endpoint() {
         let mut inline_key = Config::default();
         inline_key.providers.models.anthropic.insert(

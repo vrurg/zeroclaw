@@ -497,12 +497,22 @@ pub(crate) fn fallback_auth_ready_for_alias(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> bool {
+    let source_family = crate::canonicalize_v2_model_provider_name(family);
     let provider_kind = opts
         .provider_kind
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(family);
+        .map(crate::canonicalize_v2_model_provider_name)
+        .unwrap_or(source_family);
+
+    // A typed slot selecting the native Anthropic implementation remains on
+    // its legacy static-key path. It is not the canonical Anthropic alias that
+    // owns an OAuth profile with this spelling, so fallback admission must not
+    // borrow that profile either.
+    if provider_kind == "anthropic" && source_family != "anthropic" {
+        return has_api_key(key);
+    }
 
     // openai missing-entry fallback: keep construction symmetric with
     // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
