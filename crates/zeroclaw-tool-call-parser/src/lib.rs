@@ -823,12 +823,30 @@ pub fn malformed_tagged_invocation_mentions_known_tool(
     TOOL_CALL_OPEN_TAGS.iter().any(|tag| {
         let prefix = tag.trim_end_matches('>');
         lower.match_indices(prefix).any(|(start, _)| {
+            // MiniMax encodes identity in the opening tag, not a JSON body.
+            // Recover only that identity; a missing close must not admit a call.
+            if let Some(name) = minimax_invocation_identity(&content[start..]) {
+                return known_tool_names.contains(&name.to_ascii_lowercase());
+            }
             let rest = &content[start + prefix.len()..];
             let body = rest
                 .trim_start()
                 .strip_prefix('>')
                 .unwrap_or(rest)
                 .trim_start();
+            if let Some(name) = minimax_invocation_identity(body) {
+                return known_tool_names.contains(&name.to_ascii_lowercase());
+            }
+            if body.starts_with('<') {
+                // XML's outer element owns the tool identity even when its
+                // closing element is damaged. Do not search argument elements.
+                return XML_OPEN_TAG_RE.captures(body).is_some_and(|capture| {
+                    capture.get(0).is_some_and(|matched| matched.start() == 0)
+                        && capture.get(1).is_some_and(|name| {
+                            known_tool_names.contains(&name.as_str().to_ascii_lowercase())
+                        })
+                });
+            }
             if body.starts_with('[') {
                 return looks_like_malformed_json_tool_invocation(body, known_tool_names);
             }
@@ -1093,6 +1111,21 @@ static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</invoke>"#)
         .expect("MINIMAX_INVOKE_RE regex must compile")
 });
+
+// Export-only identity recovery mirrors the MiniMax opening-tag grammar.
+// No closing tag or arguments are required: this never accepts a tool call.
+static MINIMAX_INVOKE_IDENTITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)^<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
+        .expect("MINIMAX_INVOKE_IDENTITY_RE regex must compile")
+});
+
+fn minimax_invocation_identity(content: &str) -> Option<&str> {
+    let capture = MINIMAX_INVOKE_IDENTITY_RE.captures(content)?;
+    capture
+        .get(1)
+        .or_else(|| capture.get(2))
+        .map(|name| map_tool_name_alias(name.as_str().trim()))
+}
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(

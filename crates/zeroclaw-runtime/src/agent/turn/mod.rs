@@ -2583,7 +2583,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     "retry": malformed_tool_protocol_retries,
                     "max_retries": MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
                     "response_excerpt": truncate_with_ellipsis(
-                        &scrub_credentials(&response_text),
+                        &scrub_credentials(
+                            &crate::agent::prompt::redact_session_prompt_text_protocol_for_export(
+                                &response_text,
+                            ),
+                        ),
                         600
                     ),
                     })),

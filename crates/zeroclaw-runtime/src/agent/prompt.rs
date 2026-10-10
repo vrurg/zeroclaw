@@ -2857,6 +2857,42 @@ mod tests {
     }
 
     #[test]
+    fn damaged_xml_and_minimax_export_omits_sensitive_content() {
+        let marker = "non-json-private-canary";
+        for response in [
+            format!(
+                "<tool_call><session_prompt_set><id>task</id><content>{marker}</content></tool_call>"
+            ),
+            format!(
+                "<minimax:tool_call><invoke name=\"session_prompt_set\"><parameter name=\"content\">{marker}</parameter></minimax:tool_call>"
+            ),
+            format!(
+                "<tool_call><invoke name='session_prompt_set'><parameter name='content'>{marker}</parameter></tool_call>"
+            ),
+            format!(
+                "<tool_call><invoke name=\" functions.session_prompt_set \" ><parameter name=\"content\">{marker}</parameter></tool_call>"
+            ),
+        ] {
+            assert!(
+                !redact_session_prompt_text_protocol_for_export(&response).contains(marker),
+                "{response}"
+            );
+            let ordinary = response.replace("session_prompt_set", "shell");
+            assert_eq!(
+                redact_session_prompt_text_protocol_for_export(&ordinary),
+                ordinary
+            );
+        }
+        let ordinary = format!(
+            "<tool_call><shell><command>echo session_prompt_set {marker}</command></tool_call>"
+        );
+        assert_eq!(
+            redact_session_prompt_text_protocol_for_export(&ordinary),
+            ordinary
+        );
+    }
+
+    #[test]
     fn text_protocol_export_redactor_covers_malformed_prompt_envelopes() {
         let marker = "session-prompt-private-marker";
         let malformed =

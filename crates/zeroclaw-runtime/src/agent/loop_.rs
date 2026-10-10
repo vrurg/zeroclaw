@@ -10646,11 +10646,19 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_tool_call_loop_retries_malformed_tool_protocol_without_leaking_json() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let marker = "turn-debug-private-canary";
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+            r#"<invoke>{"name":"session_prompt_set","arguments":{"content":"turn-debug-private-canary"}</invoke>"#,
             "Recovered answer.",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -10664,7 +10672,8 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(ToolLoop {
+        let result = zeroclaw_log::scope!(trace_id: turn_id.as_str(), => async {
+            run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10719,6 +10728,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+        }).await
         })
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -10736,6 +10746,20 @@ mod tests {
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
             "history should include internal parser feedback for the model"
         );
+        let mut feedback_events = 0;
+        while let Ok(event) = log_rx.try_recv() {
+            if event["trace_id"] == turn_id {
+                assert!(!event.to_string().contains(marker), "{event}");
+                if event["message"] == "tool_call_parse_feedback_details" {
+                    feedback_events += 1;
+                }
+            }
+        }
+        assert_eq!(
+            feedback_events, 2,
+            "DEBUG branch must be observed, not filtered out"
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]

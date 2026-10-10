@@ -734,6 +734,9 @@ mod argument_preservation_tests {
             r#"<invoke>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</invoke>"#
         ));
         cases.push(format!(r#"Saving that. {{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}"#));
+        cases.push(format!(
+            "<tool_call><session_prompt_set><id>task</id><content>{marker}</content></tool_call>"
+        ));
         for malformed in cases {
             let mut guard =
                 super::super::stream_guard::StreamTextGuard::new(Some(&specs.tool_specs));
@@ -763,7 +766,11 @@ mod argument_preservation_tests {
                 false,
             )
             .await;
-            assert!(interpreted.parse_issue_detected);
+            assert!(
+                interpreted.parse_issue_detected,
+                "{malformed}: {:?}",
+                interpreted.tool_calls
+            );
             assert!(interpreted.tool_calls.is_empty());
             assert_eq!(interpreted.assistant_history_content, malformed);
 
