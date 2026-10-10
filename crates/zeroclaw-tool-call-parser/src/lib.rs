@@ -782,7 +782,9 @@ pub fn looks_like_malformed_json_tool_invocation(
         .any(|key| field_names.contains(*key));
     let has_known_sensitive_name =
         string_fields.iter().any(|(key, value)| {
-            key == "name" && known_sensitive_tool_names.contains(&value.trim().to_ascii_lowercase())
+            key == "name"
+                && known_sensitive_tool_names
+                    .contains(&map_tool_name_alias(value.trim()).to_ascii_lowercase())
         }) || has_unterminated_sensitive_name_prefix(&lower, known_sensitive_tool_names);
     // This helper is used for sensitive-export redaction. A malformed generic
     // tool envelope must retain its diagnostic and provider history; only a
@@ -811,7 +813,12 @@ pub fn malformed_tagged_invocation_mentions_known_tool(
             while let Some(key) = map.next_key::<String>()? {
                 if key == "name" {
                     let name = map.next_value::<String>()?;
-                    *self.recovered = Some(self.known.contains(&name.to_ascii_lowercase()));
+                    // Rejected envelopes retain the execution parser's name
+                    // identity, without becoming accepted or executable calls.
+                    *self.recovered = Some(
+                        self.known
+                            .contains(&map_tool_name_alias(name.trim()).to_ascii_lowercase()),
+                    );
                     return Ok(());
                 }
                 map.next_value::<serde::de::IgnoredAny>()?;

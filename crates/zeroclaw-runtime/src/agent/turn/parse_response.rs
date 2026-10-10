@@ -733,6 +733,14 @@ mod argument_preservation_tests {
         cases.push(format!(
             r#"<invoke>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</invoke>"#
         ));
+        for name in [
+            "default_api.session_prompt_set",
+            " tools.session_prompt_set ",
+        ] {
+            cases.push(format!(
+                r#"<invoke>{{"name":"{name}","arguments":{{"content":"{marker}"}}</invoke>"#
+            ));
+        }
         cases.push(format!(r#"Saving that. {{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}"#));
         cases.push(format!(
             "<tool_call><session_prompt_set><id>task</id><content>{marker}</content></tool_call>"

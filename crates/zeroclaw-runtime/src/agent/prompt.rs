@@ -2394,6 +2394,44 @@ mod tests {
     }
 
     #[test]
+    fn damaged_json_aliases_share_the_sensitive_export_boundary() {
+        let marker = "damaged-alias-private-canary";
+        for name in [
+            "default_api.session_prompt_set",
+            "tools.session_prompt_set",
+            " session_prompt_set ",
+            " tools.session_prompt_set ",
+        ] {
+            for text in [
+                format!(
+                    r#"<invoke>{{"name":"{name}","arguments":{{"content":"{marker}"}}</invoke>"#
+                ),
+                format!(
+                    r#"{{"tool_calls":[{{"name":"{name}","arguments":{{"content":"{marker}"}}}}]"#
+                ),
+            ] {
+                assert!(session_prompt_tool_call_envelope_mentioned(&text), "{text}");
+                assert!(!redact_session_prompt_text_protocol_for_export(&text).contains(marker));
+                let messages = vec![ChatMessage::assistant(&text)];
+                assert!(
+                    !redact_session_prompt_tool_exchanges_for_export(&messages)[0]
+                        .content
+                        .contains(marker)
+                );
+                assert_eq!(messages[0].content, text, "provider history stays raw");
+            }
+        }
+        for name in ["default_api.shell", " tools.shell "] {
+            for text in [
+                format!(r#"<invoke>{{"name":"{name}","arguments":{{"cmd":"pwd"}}</invoke>"#),
+                format!(r#"{{"tool_calls":[{{"name":"{name}","arguments":{{"cmd":"pwd"}}}}]"#),
+            ] {
+                assert_eq!(redact_session_prompt_text_protocol_for_export(&text), text);
+            }
+        }
+    }
+
+    #[test]
     fn export_copy_redacts_alias_mapped_session_prompt_tool_calls() {
         let marker = "session-prompt-private-marker";
         let messages = vec![

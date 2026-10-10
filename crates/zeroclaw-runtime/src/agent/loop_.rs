@@ -10658,7 +10658,7 @@ mod tests {
         let marker = "turn-debug-private-canary";
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
-            r#"<invoke>{"name":"session_prompt_set","arguments":{"content":"turn-debug-private-canary"}</invoke>"#,
+            r#"<invoke>{"name":" tools.session_prompt_set ","arguments":{"content":"turn-debug-private-canary"}</invoke>"#,
             "Recovered answer.",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
