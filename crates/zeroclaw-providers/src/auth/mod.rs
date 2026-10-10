@@ -196,7 +196,7 @@ impl AuthService {
     /// profile ID. Alias-bound callers use it when the provider-local name
     /// must remain literal rather than being treated as a user-supplied
     /// fully-qualified profile override.
-    pub async fn get_profile_by_name(
+    pub(crate) async fn get_profile_by_name(
         &self,
         model_provider: &str,
         profile_name: &str,
