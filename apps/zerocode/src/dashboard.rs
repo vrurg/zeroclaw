@@ -2381,11 +2381,15 @@ impl Dashboard {
                         level: DashboardMessageLevel::Info,
                     });
                     self.session_kill_message_id = Some(session_id.clone());
-                    if self.detail_open
+                    // A refresh may remove the killed row before its reply is
+                    // consumed. Close that empty detail, but not another tab's
+                    // pane or a different session selected during the request.
+                    if self.tab == Tab::Sessions
+                        && self.detail_open
                         && self
                             .selected_session_index()
                             .and_then(|idx| self.sessions.get(idx))
-                            .is_some_and(|session| session.session_id == result.session_id)
+                            .is_none_or(|session| session.session_id == result.session_id)
                     {
                         self.detail_open = false;
                         self.detail_scroll = 0;
@@ -3601,6 +3605,60 @@ mod tests {
                 .text
                 .contains("session-1")
         );
+    }
+
+    #[tokio::test]
+    async fn session_kill_success_reconciles_refreshed_and_reselected_detail() {
+        for (tab, remaining_id, should_stay_open) in [
+            (Tab::Sessions, None, false),
+            (Tab::Sessions, Some("session-2"), true),
+            (Tab::Agents, Some("session-1"), true),
+        ] {
+            let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+            let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+                crate::jsonrpc::RpcOutbound::new(writer_tx),
+            )));
+            let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+            dashboard.tab = tab;
+            dashboard.detail_open = true;
+            dashboard.session_messages_id = Some("session-1".to_string());
+            // The refresh can remove the killed row, or the operator can select
+            // another session/tab before the captured Kill outcome is consumed.
+            if let Some(session_id) = remaining_id {
+                dashboard.sessions.push(SessionEntry {
+                    session_id: session_id.to_string(),
+                    session_key: "key-2".to_string(),
+                    created_at: String::new(),
+                    last_activity: String::new(),
+                    message_count: 1,
+                    agent_alias: None,
+                    channel_id: None,
+                    name: None,
+                });
+            }
+            dashboard.session_state.select(Some(0));
+            dashboard.session_kill_inflight_id = Some("session-1".to_string());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            dashboard.session_kill_rx = Some(rx);
+            tx.send(SessionKillUpdate {
+                session_id: "session-1".to_string(),
+                result: Ok(crate::client::SessionKillResult {
+                    session_id: "session-1".to_string(),
+                    killed: true,
+                }),
+            })
+            .unwrap();
+
+            dashboard.drain_session_kill_updates();
+
+            assert_eq!(
+                dashboard.detail_open, should_stay_open,
+                "remaining session: {remaining_id:?}"
+            );
+            if !should_stay_open {
+                assert!(dashboard.session_messages_id.is_none());
+            }
+        }
     }
 
     #[tokio::test]
