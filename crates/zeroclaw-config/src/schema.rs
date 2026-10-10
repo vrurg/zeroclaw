@@ -23982,6 +23982,16 @@ impl Config {
                     "{path}: auth_mode = \"oauth\" must not be combined with api_key"
                 );
             }
+            // This typed slot is already Anthropic. A `kind` override would
+            // select a different implementation after permissive loading and
+            // bypass this alias's stored-profile OAuth contract.
+            if provider.base.kind.is_some() {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path}: auth_mode = \"oauth\" must not be combined with kind"
+                );
+            }
             if !AnthropicModelProviderConfig::has_official_oauth_endpoint(
                 provider.base.uri.as_deref(),
             ) {
@@ -50019,6 +50029,26 @@ model_provider = \"ollama.default\"
                 .expect_err("OAuth must use the official endpoint")
                 .to_string()
                 .contains("official https://api.anthropic.com")
+        );
+
+        let mut kind_override = Config::default();
+        kind_override.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        assert!(
+            kind_override
+                .validate()
+                .expect_err("OAuth must not dispatch through a kind override")
+                .to_string()
+                .contains("must not be combined with kind")
         );
 
         for uri in [

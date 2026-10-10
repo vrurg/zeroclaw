@@ -702,10 +702,10 @@ impl AnthropicBuilder {
         self
     }
 
-    /// Override the API endpoint. Trailing slashes are stripped so
-    /// callers need not care whether config supplied them.
+    /// Override the API endpoint. Surrounding whitespace and a trailing slash
+    /// are stripped so callers match the typed config endpoint normalization.
     pub fn base_url(mut self, base_url: &str) -> Self {
-        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self.base_url = Some(base_url.trim().trim_end_matches('/').to_string());
         self
     }
 
@@ -812,7 +812,21 @@ impl AnthropicModelProvider {
         let Some(auth_service) = &self.auth_service else {
             return Err(Self::missing_credentials_error());
         };
+        self.ensure_profile_auth_official_endpoint()?;
         Self::resolve_profile_credential(auth_service, &self.alias).await
+    }
+
+    /// Keep stored setup tokens on Anthropic's exact public root at every
+    /// construction path, including callers of the public builder that bypass
+    /// the typed config factory. Static API-key aliases deliberately remain
+    /// free to use custom endpoints.
+    fn ensure_profile_auth_official_endpoint(&self) -> anyhow::Result<()> {
+        if self.base_url == BASE_URL {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Anthropic OAuth aliases require the official https://api.anthropic.com endpoint"
+        )
     }
 
     async fn resolve_profile_credential(
@@ -3666,6 +3680,10 @@ impl AnthropicModelProvider {
             })
             .boxed();
         };
+        if let Err(error) = self.ensure_profile_auth_official_endpoint() {
+            return stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
+                .boxed();
+        }
         let profile_name = self.alias.clone();
         stream::once(async move {
             let credential = Self::resolve_profile_credential(&auth_service, &profile_name).await;
@@ -4764,140 +4782,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn oauth_alias_resolves_stored_profile_for_messages_request() {
-        use axum::{Json, Router, http::HeaderMap, routing::post};
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
-
-        let state_dir = tempfile::tempdir().expect("temporary state directory");
-        AuthService::new(state_dir.path(), false)
-            .store_model_provider_token(
-                "anthropic",
-                "subscription",
-                "profile-token",
-                std::collections::HashMap::from([(
-                    "auth_kind".to_string(),
-                    "authorization".to_string(),
-                )]),
-                true,
-            )
-            .await
-            .expect("store profile");
-        AuthService::new(state_dir.path(), false)
-            .store_model_provider_token(
-                "anthropic",
-                "other",
-                "other-profile-token",
-                std::collections::HashMap::from([(
-                    "auth_kind".to_string(),
-                    "authorization".to_string(),
-                )]),
-                true,
-            )
-            .await
-            .expect("make nonmatching profile active");
-        let captured = Arc::new(Mutex::new(None));
-        let captured_request = captured.clone();
-        let app = Router::new().route(
-            "/v1/messages",
-            post(
-                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
-                    let captured_request = captured_request.clone();
-                    async move {
-                        *captured_request.lock().expect("capture lock") = Some((headers, body));
-                        Json(serde_json::json!({
-                            "content": [{"type": "text", "text": "ok"}],
-                            "usage": {"input_tokens": 1, "output_tokens": 1}
-                        }))
-                    }
-                },
-            ),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock server");
-        let address = listener.local_addr().expect("mock address");
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.expect("serve mock");
-        });
-        let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(AuthService::new(state_dir.path(), false))
-            .base_url(&format!("http://{address}"))
-            .build();
-        assert_eq!(
-            provider
-                .chat_with_system(None, "hello", "claude-opus-4-6", None)
-                .await
-                .expect("profile-backed request should succeed"),
-            "ok"
-        );
-        server.abort();
-        let (headers, body) = captured
-            .lock()
-            .expect("capture lock")
-            .take()
-            .expect("request captured");
-        assert_eq!(
-            headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer profile-token")
-        );
-        assert!(headers.get("x-api-key").is_none());
-        assert!(body["system"].to_string().contains("Claude Code"));
-    }
-
-    #[tokio::test]
-    async fn oauth_profile_stream_resolves_at_poll_time_without_static_credentials() {
-        use axum::{Json, Router, http::HeaderMap, routing::post};
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
-
+    async fn oauth_profile_messages_reject_nonofficial_endpoint_before_network_io() {
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         let auth_service = AuthService::new(state_dir.path(), false);
-
-        let captured = Arc::new(Mutex::new(None));
-        let captured_request = captured.clone();
-        let app = Router::new().route(
-            "/v1/messages",
-            post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
-                let captured_request = captured_request.clone();
-                async move {
-                    *captured_request.lock().expect("capture lock") = Some((headers, body));
-                    (
-                        [("content-type", "text/event-stream")],
-                        concat!(
-                            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"streamed\"}}\n\n",
-                            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
-                            "data: {\"type\":\"message_stop\"}\n\n"
-                        ),
-                    )
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock server");
-        let address = listener.local_addr().expect("mock address");
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.expect("serve mock");
-        });
-
-        let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(auth_service.clone())
-            .base_url(&format!("http://{address}"))
-            .build();
-        let messages = vec![ChatMessage::user("hello")];
-        let stream = provider.stream_chat(
-            ProviderChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            },
-            "claude-opus-4-6",
-            None,
-            StreamOptions::new(true),
-        );
         auth_service
             .store_model_provider_token(
                 "anthropic",
@@ -4910,32 +4797,160 @@ data: {\"type\":\"message_stop\"}\n\n";
                 true,
             )
             .await
-            .expect("store profile after stream creation");
-        let events = stream.collect::<Vec<_>>().await;
+            .expect("store profile");
+        let (address, requests, server) = spawn_counting_messages_server().await;
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .base_url(&format!("http://{address}"))
+            .build();
+        let error = provider
+            .chat_with_system(None, "hello", "claude-opus-4-6", None)
+            .await
+            .expect_err("profile-backed credentials must reject a custom endpoint");
         server.abort();
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "streamed"
-        )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, Ok(StreamEvent::Final)))
-        );
-        let (headers, body) = captured
-            .lock()
-            .expect("capture lock")
-            .take()
-            .expect("OAuth stream request captured");
         assert_eq!(
-            headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer profile-token")
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the protected profile token must not reach a custom endpoint"
         );
-        assert!(headers.get("x-api-key").is_none());
-        assert!(body["system"].to_string().contains("Claude Code"));
+        assert!(
+            error
+                .to_string()
+                .contains("official https://api.anthropic.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_accepts_whitespace_around_the_official_endpoint() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let credential = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .base_url(" https://api.anthropic.com ")
+            .build()
+            .resolve_credential()
+            .await
+            .expect("the builder must normalize schema-accepted whitespace");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_stream_resolves_missing_profile_at_poll_time() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-opus-4-6",
+            None,
+            StreamOptions::new(true),
+        );
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(message))] if message.contains("credentials not set")
+        ));
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_stream_rejects_nonofficial_endpoint_before_network_io() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile");
+        let (address, requests, server) = spawn_counting_messages_server().await;
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .base_url(&format!("http://{address}"))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-opus-4-6",
+                None,
+                StreamOptions::new(true),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(message))] if message.contains("official https://api.anthropic.com")
+        ));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the protected profile token must not reach a custom endpoint"
+        );
+    }
+
+    async fn spawn_counting_messages_server() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        (address, requests, server)
     }
 
     #[test]

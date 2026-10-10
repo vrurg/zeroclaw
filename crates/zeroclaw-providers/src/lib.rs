@@ -1563,11 +1563,11 @@ fn apply_factory_leaf_metadata(
     ))
 }
 
-/// Reject raw inline keys on persisted Anthropic OAuth aliases before the
-/// common credential resolver trims empty values away. Config loading records
+/// Reject configuration that would let a persisted Anthropic OAuth alias
+/// bypass its typed stored-profile implementation. Config loading records
 /// validation failures but continues, so every alias-aware construction path
-/// must preserve the schema's presence-based admission rule.
-fn reject_anthropic_oauth_inline_api_key(
+/// must preserve the schema's presence-based admission rules.
+fn reject_anthropic_oauth_config_conflicts(
     config: &zeroclaw_config::schema::Config,
     family: &str,
     alias: &str,
@@ -1579,11 +1579,17 @@ fn reject_anthropic_oauth_inline_api_key(
     let Some(entry) = config.providers.models.anthropic.get(alias) else {
         return Ok(());
     };
-    if entry.auth_mode == Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth)
-        && entry.base.api_key.is_some()
-    {
+    if entry.auth_mode != Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth) {
+        return Ok(());
+    }
+    if entry.base.api_key.is_some() {
         anyhow::bail!(
             "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+        );
+    }
+    if entry.base.kind.is_some() {
+        anyhow::bail!(
+            "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with kind"
         );
     }
     Ok(())
@@ -1624,7 +1630,7 @@ fn create_model_provider_inner(
         .unwrap_or(name);
 
     if let Some(config) = config {
-        reject_anthropic_oauth_inline_api_key(config, name, alias)?;
+        reject_anthropic_oauth_config_conflicts(config, name, alias)?;
     }
 
     // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
@@ -4251,6 +4257,35 @@ mod tests {
                 "unexpected error for {api_key:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn alias_construction_rejects_anthropic_oauth_kind_overrides() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let error = match create_model_provider_from_ref(&config, "anthropic.subscription") {
+            Ok(_) => panic!("invalid loaded OAuth configuration must not dispatch through kind"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("must not be combined with kind"),
+            "unexpected construction error: {error}"
+        );
     }
 
     #[test]
