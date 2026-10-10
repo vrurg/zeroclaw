@@ -12,7 +12,7 @@ use zeroclaw_config::schema::IdentityConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::{
     looks_like_malformed_json_tool_invocation, parse_tool_calls,
-    parsed_tool_protocol_mentions_known_tool, tool_protocol_envelope_mentions_known_tool,
+    parsed_tool_protocol_mentions_known_tool, tool_invocation_envelope_mentions_known_tool,
 };
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
@@ -277,16 +277,22 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
     // wrapper spellings, or a newly supported parser format can leak opaque
     // attachment content before approval.
     session_prompt_accepted_tool_call_envelope(content)
-        || tool_protocol_envelope_mentions_known_tool(content, session_prompt_tool_names())
+        || tool_invocation_envelope_mentions_known_tool(content, session_prompt_tool_names())
         || escaped_json_tool_protocol(content).is_some_and(|decoded| {
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
-                || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
+                || tool_invocation_envelope_mentions_known_tool(
+                    &decoded,
+                    session_prompt_tool_names(),
+                )
         })
         || malformed_xml_session_prompt_call(content)
         || looks_like_malformed_json_tool_invocation(content, session_prompt_tool_names())
         || transport_escaped_json_candidate(content).is_some_and(|decoded| {
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
-                || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
+                || tool_invocation_envelope_mentions_known_tool(
+                    &decoded,
+                    session_prompt_tool_names(),
+                )
                 || malformed_xml_session_prompt_call(&decoded)
                 || looks_like_malformed_json_tool_invocation(&decoded, session_prompt_tool_names())
         })
@@ -365,7 +371,7 @@ fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
     let accepted = |candidate: &str| {
         accepted_by_runtime(candidate)
             || parsed_tool_protocol_mentions_known_tool(candidate, session_prompt_tool_names())
-            || tool_protocol_envelope_mentions_known_tool(candidate, session_prompt_tool_names())
+            || tool_invocation_envelope_mentions_known_tool(candidate, session_prompt_tool_names())
     };
 
     accepted(content)

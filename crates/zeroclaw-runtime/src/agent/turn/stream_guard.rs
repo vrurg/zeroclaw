@@ -1239,6 +1239,16 @@ mod stream_text_guard_tests {
         );
     }
 
+    #[test]
+    fn mixed_envelope_with_argumentless_known_call_is_suppressed() {
+        let envelope = r#"{"tool_calls":[{"name":"unknown","arguments":{}},{"name":"shell"}]}"#;
+        for chunks in [vec![envelope], vec![&envelope[..35], &envelope[35..]]] {
+            let mut guard = guard_with_tool();
+            assert_eq!(push_all(&mut guard, &chunks), "");
+            assert!(guard.suppressed_protocol);
+        }
+    }
+
     /// The one-chunk variant of the preamble leak: the prefix and the
     /// envelope arrive in a single delta, so the prefix is buffered ahead
     /// of the candidate and must be released by the suppression itself (the

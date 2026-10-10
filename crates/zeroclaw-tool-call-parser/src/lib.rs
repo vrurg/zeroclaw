@@ -301,6 +301,7 @@ fn classify_tool_protocol_json_value(
 fn json_value_mentions_known_tool(
     value: &serde_json::Value,
     known_tool_names: &HashSet<String>,
+    require_invocation_shape: bool,
 ) -> bool {
     if known_tool_names.is_empty() {
         return false;
@@ -308,9 +309,9 @@ fn json_value_mentions_known_tool(
 
     let Some(object) = value.as_object() else {
         return value.as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+            items.iter().any(|item| {
+                json_value_mentions_known_tool(item, known_tool_names, require_invocation_shape)
+            })
         });
     };
 
@@ -323,7 +324,9 @@ fn json_value_mentions_known_tool(
     };
 
     if name_matches(object.get("name"))
-        && (has_arguments_signal(value) || has_responses_function_call_shape(value))
+        && (!require_invocation_shape
+            || has_arguments_signal(value)
+            || has_responses_function_call_shape(value))
     {
         return true;
     }
@@ -333,13 +336,13 @@ fn json_value_mentions_known_tool(
         .and_then(serde_json::Value::as_object)
     {
         let function = serde_json::Value::Object(function.clone());
-        if json_value_mentions_known_tool(&function, known_tool_names) {
+        if json_value_mentions_known_tool(&function, known_tool_names, require_invocation_shape) {
             return true;
         }
     }
 
     if let Some(function_call) = object.get("function_call")
-        && json_value_mentions_known_tool(function_call, known_tool_names)
+        && json_value_mentions_known_tool(function_call, known_tool_names, require_invocation_shape)
     {
         return true;
     }
@@ -349,9 +352,9 @@ fn json_value_mentions_known_tool(
             .get(*key)
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+                items.iter().any(|item| {
+                    json_value_mentions_known_tool(item, known_tool_names, require_invocation_shape)
+                })
             })
     })
 }
@@ -359,6 +362,26 @@ fn json_value_mentions_known_tool(
 pub fn tool_protocol_envelope_mentions_known_tool(
     text: &str,
     known_tool_names: &HashSet<String>,
+) -> bool {
+    known_tool_envelope_matches(text, known_tool_names, false)
+}
+
+/// Recognize invocation-shaped envelopes for export-only redaction.
+///
+/// Unlike the shared protocol guard, this preserves business JSON with only a
+/// known `name`. Do not use this stricter predicate for streaming suppression:
+/// the parser accepts argument-less calls inside mixed protocol arrays.
+pub fn tool_invocation_envelope_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    known_tool_envelope_matches(text, known_tool_names, true)
+}
+
+fn known_tool_envelope_matches(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+    require_invocation_shape: bool,
 ) -> bool {
     if known_tool_names.is_empty() {
         return false;
@@ -370,7 +393,7 @@ pub fn tool_protocol_envelope_mentions_known_tool(
     }
 
     if let Some(body) = json_fence_body(trimmed) {
-        return tool_protocol_envelope_mentions_known_tool(body, known_tool_names);
+        return known_tool_envelope_matches(body, known_tool_names, require_invocation_shape);
     }
 
     if starts_with_tool_protocol_tag_or_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed)
@@ -384,15 +407,16 @@ pub fn tool_protocol_envelope_mentions_known_tool(
         }
     }
 
-    serde_json::from_str::<serde_json::Value>(trimmed)
-        .is_ok_and(|value| json_value_mentions_known_tool(&value, known_tool_names))
+    serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| {
+        json_value_mentions_known_tool(&value, known_tool_names, require_invocation_shape)
+    })
 }
 
 /// Return whether the runtime would accept any call to one of `known_tool_names`.
 ///
 /// This deliberately follows [`parse_tool_calls`] for legacy text formats
 /// rather than maintaining a second list of provider spellings. Complete JSON
-/// stays with [`tool_protocol_envelope_mentions_known_tool`], whose structural
+/// stays with [`tool_invocation_envelope_mentions_known_tool`], whose structural
 /// discriminator distinguishes an invocation from business JSON that happens
 /// to carry a `name` field. Callers at export-only boundaries use both helpers
 /// to preserve accepted-call identity without changing parsing or model-visible
@@ -3530,18 +3554,43 @@ mod tests {
     }
 
     #[test]
+    fn shared_detector_preserves_argumentless_calls_in_mixed_envelopes() {
+        let known = HashSet::from(["shell".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"name":"unknown","arguments":{}},{"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"name":"unknown","parameters":{}},{"function":{"name":"shell"}}]}"#,
+        ] {
+            assert!(classify_tool_protocol_envelope(envelope).is_some());
+            assert!(
+                parse_tool_calls(envelope)
+                    .1
+                    .iter()
+                    .any(|call| call.name == "shell")
+            );
+            assert!(tool_protocol_envelope_mentions_known_tool(envelope, &known));
+            assert!(!tool_invocation_envelope_mentions_known_tool(
+                envelope, &known
+            ));
+            assert!(tool_protocol_envelope_mentions_known_tool(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+        }
+    }
+
+    #[test]
     fn known_tool_detection_requires_complete_invocation_shape() {
         let known = HashSet::from(["session_prompt_set".to_owned()]);
 
-        assert!(!tool_protocol_envelope_mentions_known_tool(
+        assert!(!tool_invocation_envelope_mentions_known_tool(
             r#"{"name":"session_prompt_set","description":"Document this identifier"}"#,
             &known,
         ));
-        assert!(tool_protocol_envelope_mentions_known_tool(
+        assert!(tool_invocation_envelope_mentions_known_tool(
             r#"{"name":"session_prompt_set","arguments":{"content":"opaque"}}"#,
             &known,
         ));
-        assert!(tool_protocol_envelope_mentions_known_tool(
+        assert!(tool_invocation_envelope_mentions_known_tool(
             r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
             &HashSet::from(["session_prompt_list".to_owned()]),
         ));
