@@ -843,6 +843,26 @@ fn has_unterminated_sensitive_name_prefix(
     false
 }
 
+fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+
+    // Shared suppression retains upstream's direct name-field search: an
+    // earlier unterminated argument string must not consume a later name.
+    // Decoded field-pair matching is confined to export redaction behind its
+    // own admission boundary, not used to redefine streaming detection.
+    static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
+    });
+
+    JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
+        cap.get(1)
+            .map(|name| name.as_str().trim().to_ascii_lowercase())
+            .is_some_and(|name| known_tool_names.contains(&name))
+    })
+}
+
 fn has_malformed_tool_protocol_text_signal_for_known_tools(
     text: &str,
     known_tool_names: &HashSet<String>,
@@ -866,11 +886,7 @@ fn has_malformed_tool_protocol_text_signal_for_known_tools(
 
     has_protocol_container
         && has_arguments
-        && malformed_json_string_fields(text)
-            .iter()
-            .any(|(key, value)| {
-                key == "name" && known_tool_names.contains(&value.trim().to_ascii_lowercase())
-            })
+        && malformed_text_mentions_known_tool(text, known_tool_names)
 }
 
 fn json_fence_body(trimmed: &str) -> Option<&str> {
@@ -3551,6 +3567,37 @@ mod tests {
             r#"{"retries": 3, "timeout_ms":"#,
             &known,
         ));
+    }
+
+    #[test]
+    fn shared_malformed_detector_preserves_arguments_first_idless_calls() {
+        let known = HashSet::from(["shell".to_owned(), "file_read".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"path":"C:\temp\"},"name":"file_read"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(envelope).is_err());
+            assert!(!looks_like_malformed_tool_protocol_envelope(envelope));
+            assert!(looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                envelope, &known,
+            ));
+            assert!(looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+        }
+        assert!(
+            !looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                r#"{"tool_calls":[{"name":"sh\u0065ll","arguments":"{"#,
+                &known,
+            )
+        );
+        assert!(
+            !looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"unknown"}]}"#,
+                &known,
+            )
+        );
     }
 
     #[test]

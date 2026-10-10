@@ -451,6 +451,54 @@ mod tests {
     use zeroclaw_providers::ToolCall;
 
     #[test]
+    fn shared_protocol_detection_withholds_idless_and_mixed_envelopes() {
+        use super::super::{protocol_detect, stream_guard::StreamTextGuard};
+        let known = std::collections::HashSet::from(["shell".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"name":"unknown","arguments":{}},{"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#,
+        ] {
+            for chunks in [vec![envelope], vec![&envelope[..35], &envelope[35..]]] {
+                let mut guard = StreamTextGuard::new(Some(&[crate::tools::ToolSpec::new(
+                    "shell",
+                    "run a command",
+                    serde_json::json!({"type": "object"}),
+                )]));
+                let mut forwarded = String::new();
+                for chunk in chunks {
+                    if let Some(text) = guard.push(chunk) {
+                        forwarded.push_str(&text);
+                    }
+                }
+                if let Some(tail) = guard.finish() {
+                    forwarded.push_str(&tail);
+                }
+                assert_eq!(forwarded, "");
+                assert!(guard.suppressed_protocol);
+            }
+        }
+        let malformed = r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#;
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(malformed);
+        assert!(calls.is_empty());
+        assert!(
+            protocol_detect::detect_tool_call_parse_issue_for_known_tools(
+                malformed, &calls, &known
+            )
+            .is_some()
+        );
+        let ordinary = r#"{"retries":3,"timeout_ms":1000}"#;
+        let mut guard = StreamTextGuard::new(Some(&[crate::tools::ToolSpec::new(
+            "shell",
+            "run a command",
+            serde_json::json!({"type": "object"}),
+        )]));
+        let mut forwarded = guard.push(ordinary).unwrap_or_default();
+        forwarded.push_str(&guard.finish().unwrap_or_default());
+        assert_eq!(forwarded, ordinary);
+        assert!(!guard.suppressed_protocol);
+    }
+
+    #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {
         let history = build_native_assistant_history(
             "",
