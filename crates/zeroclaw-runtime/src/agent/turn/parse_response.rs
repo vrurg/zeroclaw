@@ -745,7 +745,15 @@ mod argument_preservation_tests {
         cases.push(format!(
             "<tool_call><session_prompt_set><id>task</id><content>{marker}</content></tool_call>"
         ));
-        for malformed in cases {
+        let truncated_cases =
+            ["default_api.session_prompt_set", " tools.session_prompt_se"].map(|name| {
+                format!(r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"{name}"#)
+            });
+        for (malformed, expect_parse_issue) in cases
+            .into_iter()
+            .map(|text| (text, true))
+            .chain(truncated_cases.into_iter().map(|text| (text, false)))
+        {
             let mut guard =
                 super::super::stream_guard::StreamTextGuard::new(Some(&specs.tool_specs));
             let mut forwarded = guard.push(&malformed).unwrap_or_default();
@@ -774,34 +782,71 @@ mod argument_preservation_tests {
                 false,
             )
             .await;
-            assert!(
-                interpreted.parse_issue_detected,
+            assert_eq!(
+                interpreted.parse_issue_detected, expect_parse_issue,
                 "{malformed}: {:?}",
                 interpreted.tool_calls
             );
             assert!(interpreted.tool_calls.is_empty());
             assert_eq!(interpreted.assistant_history_content, malformed);
 
-            let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            // Truncated names are export-sensitive without changing upstream
+            // parse-issue classification; only existing rejected shapes emit WARN.
+            if expect_parse_issue {
+                let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let event = log_rx
+                            .recv()
+                            .await
+                            .expect("log broadcast remains installed");
+                        if event["message"] == "tool_call_parse_issue"
+                            && event["trace_id"] == ctx.turn_id
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .expect("the production parser must emit its parse-issue event");
+                assert_eq!(
+                    logged["attributes"]["response"],
+                    redact_session_prompt_text_protocol_for_export(&malformed).as_ref()
+                );
+                assert!(!logged.to_string().contains(marker));
+            }
+
+            record_accepted_chat_response(
+                &ctx,
+                "test.provider",
+                "test-model",
+                &malformed,
+                &[],
+                0,
+                None,
+                &[],
+                std::time::Instant::now(),
+                0,
+                None,
+            )
+            .await;
+            let response_logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     let event = log_rx
                         .recv()
                         .await
                         .expect("log broadcast remains installed");
-                    if event["message"] == "tool_call_parse_issue"
-                        && event["trace_id"] == ctx.turn_id
-                    {
+                    if event["message"] == "llm_response" && event["trace_id"] == ctx.turn_id {
                         break event;
                     }
                 }
             })
             .await
-            .expect("the production parser must emit its parse-issue event");
+            .expect("the production response recorder must emit its INFO event");
             assert_eq!(
-                logged["attributes"]["response"],
+                response_logged["attributes"]["raw_response"],
                 redact_session_prompt_text_protocol_for_export(&malformed).as_ref()
             );
-            assert!(!logged.to_string().contains(marker));
+            assert!(!response_logged.to_string().contains(marker));
         }
         zeroclaw_log::clear_broadcast_hook();
     }

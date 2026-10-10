@@ -19207,6 +19207,12 @@ Let me check the result."#;
 
         let malformed_outputs = [
             format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"default_api.session_prompt_set"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":" tools.session_prompt_se"#
+            ),
+            format!(
                 r#"{{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{MARKER}"}}}}]"#
             ),
             format!(

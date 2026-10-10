@@ -2394,6 +2394,39 @@ mod tests {
     }
 
     #[test]
+    fn truncated_json_aliases_share_the_sensitive_export_boundary() {
+        let marker = "truncated-alias-private-canary";
+        for name in [
+            "default_api.session_prompt_set",
+            "tools.session_prompt_se",
+            " session_prompt_se",
+            " tools.session_prompt_se",
+            "\tdefault_api.session_prompt_se",
+            "DEFAULT_API.SESSION_PROMPT_LI",
+            " tools.session_prompt_del",
+        ] {
+            let text =
+                format!(r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"{name}"#);
+            assert!(
+                session_prompt_tool_call_envelope_mentioned(&text),
+                "{name:?}"
+            );
+            assert!(!redact_session_prompt_text_protocol_for_export(&text).contains(marker));
+            let messages = vec![ChatMessage::assistant(&text)];
+            assert!(
+                !redact_session_prompt_tool_exchanges_for_export(&messages)[0]
+                    .content
+                    .contains(marker)
+            );
+            assert_eq!(messages[0].content, text, "provider history stays raw");
+        }
+        for name in ["default_api.shell", " tools.she", "\tshell"] {
+            let text = format!(r#"{{"tool_calls":[{{"arguments":{{"cmd":"pwd"}},"name":"{name}"#);
+            assert_eq!(redact_session_prompt_text_protocol_for_export(&text), text);
+        }
+    }
+
+    #[test]
     fn damaged_json_aliases_share_the_sensitive_export_boundary() {
         let marker = "damaged-alias-private-canary";
         for name in [

@@ -893,6 +893,9 @@ fn has_unterminated_sensitive_name_prefix(
             search_start = name_key_start + "\"name\"".len();
             continue;
         };
+        // Export-only recovery must normalize incomplete identities too;
+        // execution's complete-name parser trims whitespace and resolves aliases.
+        let after_open_quote = after_open_quote.trim_start();
 
         let mut prefix_end = 0;
         let mut escaped = false;
@@ -919,7 +922,7 @@ fn has_unterminated_sensitive_name_prefix(
         }
 
         if !terminated {
-            let prefix = &after_open_quote[..prefix_end];
+            let prefix = map_tool_name_alias(&after_open_quote[..prefix_end]);
             if !prefix.is_empty()
                 && known_sensitive_tool_names
                     .iter()
