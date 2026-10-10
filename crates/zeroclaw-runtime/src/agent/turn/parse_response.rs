@@ -724,10 +724,28 @@ mod argument_preservation_tests {
         while log_rx.try_recv().is_ok() {}
 
         let marker = "session-prompt-private-marker";
-        for value in [marker.to_string(), format!("C:\\workspace\\{marker}\\")] {
-            let malformed = format!(
+        let mut cases: Vec<String> = [marker.to_string(), format!("C:\\workspace\\{marker}\\")]
+            .into_iter()
+            .map(|value| format!(
                 r#"{{"tool_calls":[{{"arguments":{{"content":"{value}}},"name":"session_prompt_set"}}]}}"#
-            );
+            ))
+            .collect();
+        cases.push(format!(
+            r#"<invoke>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</invoke>"#
+        ));
+        cases.push(format!(r#"Saving that. {{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}"#));
+        for malformed in cases {
+            let mut guard =
+                super::super::stream_guard::StreamTextGuard::new(Some(&specs.tool_specs));
+            let mut forwarded = guard.push(&malformed).unwrap_or_default();
+            forwarded.push_str(&guard.finish().unwrap_or_default());
+            // The arguments-first broken-string cases exercise log masking
+            // independently; the preamble case also proves upstream stream
+            // suppression and downstream export agree on the same raw text.
+            if malformed.starts_with("Saving that.") {
+                assert!(guard.suppressed_protocol);
+                assert!(!forwarded.contains(marker));
+            }
             let interpreted = interpret_chat_response(
                 &ctx,
                 "test.provider",
@@ -740,7 +758,7 @@ mod argument_preservation_tests {
                 },
                 &[],
                 &specs,
-                false,
+                guard.suppressed_protocol,
                 0,
                 false,
             )

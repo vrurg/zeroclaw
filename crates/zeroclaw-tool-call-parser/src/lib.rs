@@ -790,6 +790,68 @@ pub fn looks_like_malformed_json_tool_invocation(
     has_arguments && has_known_sensitive_name
 }
 
+/// Recover a sensitive identity from a rejected tagged call for export only.
+/// Uses the execution parser's tag vocabulary without accepting or executing
+/// the damaged call. An ordinary outer tool name takes precedence over names
+/// mentioned inside its arguments.
+pub fn malformed_tagged_invocation_mentions_known_tool(
+    content: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    struct CallName<'a> {
+        recovered: &'a mut Option<bool>,
+        known: &'a HashSet<String>,
+    }
+    impl<'de> serde::de::Visitor<'de> for CallName<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a tool-call object with a top-level name")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "name" {
+                    let name = map.next_value::<String>()?;
+                    *self.recovered = Some(self.known.contains(&name.to_ascii_lowercase()));
+                    return Ok(());
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let lower = content.to_ascii_lowercase();
+    TOOL_CALL_OPEN_TAGS.iter().any(|tag| {
+        let prefix = tag.trim_end_matches('>');
+        lower.match_indices(prefix).any(|(start, _)| {
+            let rest = &content[start + prefix.len()..];
+            let body = rest
+                .trim_start()
+                .strip_prefix('>')
+                .unwrap_or(rest)
+                .trim_start();
+            if body.starts_with('[') {
+                return looks_like_malformed_json_tool_invocation(body, known_tool_names);
+            }
+            if !body.starts_with('{') {
+                return false;
+            }
+            let mut recovered = None;
+            let mut decoder = serde_json::Deserializer::from_str(body);
+            // Keep a recovered identity even if checking the remaining map fails.
+            let _ = serde::Deserializer::deserialize_map(
+                &mut decoder,
+                CallName {
+                    recovered: &mut recovered,
+                    known: known_tool_names,
+                },
+            );
+            recovered.unwrap_or_else(|| {
+                looks_like_malformed_json_tool_invocation(body, known_tool_names)
+            })
+        })
+    })
+}
+
 fn has_unterminated_sensitive_name_prefix(
     lower_text: &str,
     known_sensitive_tool_names: &HashSet<String>,

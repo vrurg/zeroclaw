@@ -287,6 +287,7 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
         })
         || malformed_xml_session_prompt_call(content)
         || looks_like_malformed_json_tool_invocation(content, session_prompt_tool_names())
+        || malformed_embedded_session_prompt_call(content)
         || transport_escaped_json_candidate(content).is_some_and(|decoded| {
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
                 || tool_invocation_envelope_mentions_known_tool(
@@ -295,6 +296,7 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
                 )
                 || malformed_xml_session_prompt_call(&decoded)
                 || looks_like_malformed_json_tool_invocation(&decoded, session_prompt_tool_names())
+                || malformed_embedded_session_prompt_call(&decoded)
         })
 }
 
@@ -309,56 +311,29 @@ fn session_prompt_tool_names() -> &'static HashSet<String> {
 }
 
 fn malformed_xml_session_prompt_call(content: &str) -> bool {
-    struct CallName<'a>(&'a mut Option<bool>);
+    zeroclaw_tool_call_parser::malformed_tagged_invocation_mentions_known_tool(
+        content,
+        session_prompt_tool_names(),
+    )
+}
 
-    impl<'de> serde::de::Visitor<'de> for CallName<'_> {
-        type Value = ();
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a tool-call object with a top-level name")
+fn malformed_embedded_session_prompt_call(content: &str) -> bool {
+    // Streaming can withhold an invocation after ordinary prose. Inspect the
+    // same candidate starts for export without changing execution or history.
+    let mut remaining = content;
+    while let Some(start) =
+        crate::agent::turn::protocol_detect::find_embedded_protocol_candidate_start(remaining)
+    {
+        let candidate = &remaining[start..];
+        if looks_like_malformed_json_tool_invocation(candidate, session_prompt_tool_names()) {
+            return true;
         }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-            while let Some(key) = map.next_key::<String>()? {
-                if key == "name" {
-                    let name = map.next_value::<String>()?;
-                    *self.0 =
-                        Some(session_prompt_tool_names().contains(&name.to_ascii_lowercase()));
-                    return Ok(());
-                }
-                map.next_value::<serde::de::IgnoredAny>()?;
-            }
-            Ok(())
-        }
+        let Some(character) = candidate.chars().next() else {
+            break;
+        };
+        remaining = &candidate[character.len_utf8()..];
     }
-
-    // Inspect original rejected/truncated tags: the execution parser consumes
-    // some rejected envelopes from its visible-text projection. Recover only
-    // the outer name, not an unrelated name mentioned in ordinary arguments.
-    let lower = content.to_ascii_lowercase();
-    ["<tool_call", "<toolcall", "<tool-call"].iter().any(|tag| {
-        lower.match_indices(tag).any(|(start, _)| {
-            let rest = &content[start + tag.len()..];
-            let body = rest
-                .trim_start()
-                .strip_prefix('>')
-                .unwrap_or(rest)
-                .trim_start();
-            if !body.starts_with('{') {
-                return false;
-            }
-            let mut decoder = serde_json::Deserializer::from_str(body);
-            let mut recovered = None;
-            // serde_json checks the remaining map after the visitor exits.
-            // That can fail for this intentionally incomplete envelope;
-            // keep the already recovered identity solely for export, never
-            // as proof that the call is valid or executable.
-            let _ = serde::Deserializer::deserialize_map(&mut decoder, CallName(&mut recovered));
-            recovered.unwrap_or_else(|| {
-                looks_like_malformed_json_tool_invocation(body, session_prompt_tool_names())
-            })
-        })
-    })
+    false
 }
 
 fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
@@ -2813,6 +2788,71 @@ mod tests {
         assert_eq!(
             crate::agent::loop_::scrub_for_export(&with_attachment),
             format!("{host}{SESSION_PROMPTS_EXPORT_MARKER}")
+        );
+    }
+
+    #[test]
+    fn malformed_wrapper_and_preamble_export_omits_sensitive_content() {
+        let marker = "wrapper-private-canary";
+        for tag in [
+            "tool_call",
+            "tool_calls",
+            "toolcall",
+            "tool-call",
+            "tools",
+            "invoke",
+            "minimax:tool_call",
+            "minimax:toolcall",
+        ] {
+            let response = format!(
+                r#"<{tag}>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</{tag}>"#
+            );
+            assert!(
+                !redact_session_prompt_text_protocol_for_export(&response).contains(marker),
+                "{tag}"
+            );
+            let history = vec![ChatMessage::assistant(&response)];
+            let exported = redact_session_prompt_history_for_export(&history, true);
+            assert_eq!(
+                exported[0].content,
+                SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
+            );
+            assert_eq!(history[0].content, response);
+            let array = format!(
+                r#"<{tag}>[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</{tag}>"#
+            );
+            assert!(
+                !redact_session_prompt_text_protocol_for_export(&array).contains(marker),
+                "array in {tag}"
+            );
+            let ordinary_array = array.replace("session_prompt_set", "shell");
+            assert_eq!(
+                redact_session_prompt_text_protocol_for_export(&ordinary_array),
+                ordinary_array
+            );
+            let ordinary = format!(
+                r#"<{tag}>{{"name":"shell","arguments":{{"content":"session_prompt_set {marker}"}}</{tag}>"#
+            );
+            assert_eq!(
+                redact_session_prompt_text_protocol_for_export(&ordinary),
+                ordinary
+            );
+        }
+        let response = format!(
+            r#"Saving that. {{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}"#
+        );
+        assert!(!redact_session_prompt_text_protocol_for_export(&response).contains(marker));
+        let history = vec![ChatMessage::assistant(&response)];
+        let exported = redact_session_prompt_history_for_export(&history, true);
+        assert_eq!(
+            exported[0].content,
+            SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
+        );
+        assert_eq!(history[0].content, response);
+        let ordinary = response.replace("session_prompt_set", "shell");
+        assert_eq!(
+            redact_session_prompt_text_protocol_for_export(&ordinary),
+            ordinary
         );
     }
 
