@@ -45,9 +45,10 @@ pub struct SettledAttemptSummary {
     pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub accepted: bool,
-    /// Display-only estimate of the summary request's input tokens, set by
-    /// the caller when the provider omitted `input_tokens`. Rejected attempts
-    /// leave this `None`; accounting reads only `input_tokens`.
+    /// Display-only estimate of the finalized, sanitized request's input tokens
+    /// when the provider omitted `input_tokens`, floored at any known cached
+    /// subset. Rejected attempts leave this `None`; accounting reads only
+    /// provider-reported usage.
     pub estimated_input_tokens: Option<u64>,
 }
 
@@ -240,28 +241,36 @@ impl ResolvedModelAccess<'_> {
                     )
                     .map(|(_, cost_usd)| cost_usd)
                 });
+                // This seam owns the request after hooks, trimming and final
+                // media sanitization. Estimate that request, not mutable caller
+                // history, and never turn the estimate into billable usage.
+                let input_tokens = response.usage.as_ref().and_then(|usage| usage.input_tokens);
+                let cached_input_tokens = response
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.cached_input_tokens);
+                let estimated_input_tokens = input_tokens
+                    .is_none()
+                    .then(|| {
+                        (crate::agent::history::estimate_history_tokens(&sanitized) as u64)
+                            .max(cached_input_tokens.unwrap_or(0))
+                    })
+                    .filter(|&estimate| estimate > 0);
                 // The accepted leaf is always projected (even usage-less, so
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.
                 accounting_owner.settled_out.push(SettledAttemptSummary {
                     provider_ref: served_provider,
                     model: served_model,
-                    input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
-                    cached_input_tokens: response
-                        .usage
-                        .as_ref()
-                        .and_then(|usage| usage.cached_input_tokens),
+                    input_tokens,
+                    cached_input_tokens,
                     output_tokens: response
                         .usage
                         .as_ref()
                         .and_then(|usage| usage.output_tokens),
                     cost_usd: accepted_cost_usd,
                     accepted: true,
-                    // The caller (max_iter) fills this from the summary
-                    // request's message history when the provider omitted
-                    // `input_tokens`, so the context meter keeps its numerator
-                    // after the final-summary event.
-                    estimated_input_tokens: None,
+                    estimated_input_tokens,
                 });
                 Ok(response)
             }
@@ -780,9 +789,11 @@ mod run_model_query_tests {
         assert!(!summaries[0].accepted);
         assert_eq!(summaries[0].input_tokens, Some(80));
         assert_eq!(summaries[0].output_tokens, Some(5));
+        assert_eq!(summaries[0].estimated_input_tokens, None);
         assert!(summaries[1].accepted);
         assert_eq!(summaries[1].input_tokens, Some(80));
         assert_eq!(summaries[1].output_tokens, Some(7));
+        assert_eq!(summaries[1].estimated_input_tokens, None);
     }
 
     #[tokio::test]
