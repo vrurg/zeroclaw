@@ -12789,6 +12789,7 @@ fn build_channel_by_id(
                 .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_allow_bot_messages(sl.allow_bot_messages)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("slack.{alias}")),
@@ -14410,6 +14411,7 @@ fn collect_configured_channels_with_authority(
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
                     .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_allow_bot_messages(sl.allow_bot_messages)
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -16788,8 +16790,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names =
+        let mut effective_tool_names =
             effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
+        let hidden_builtin_names = tools_registry.hidden_builtin_names();
+        effective_tool_names.retain(|name| !hidden_builtin_names.contains(*name));
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
@@ -16809,6 +16813,18 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             startup_excluded_tools,
             ch_activated_handle.as_ref(),
         )?;
+        if let Some(state) = &ch_activated_handle {
+            let section = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deferred_builtin_prompt_section();
+            if !section.is_empty() {
+                if !deferred_section.is_empty() {
+                    deferred_section.push_str("\n\n");
+                }
+                deferred_section.push_str(&section);
+            }
+        }
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
             agent.resolved.strict_tool_parsing,

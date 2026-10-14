@@ -2919,11 +2919,7 @@ impl RpcDispatcher {
             return;
         };
         for (name, channel) in factory(self.ctx.config.clone(), agent_alias.to_string()) {
-            agent
-                .channel_handles()
-                .reaction
-                .write()
-                .insert(name, channel);
+            agent.channel_handles().register_channel(name, channel);
         }
     }
 
@@ -3240,6 +3236,14 @@ impl RpcDispatcher {
             if result.is_ok() {
                 let accepted = Arc::new(commit.current_config());
                 publish_accepted_config_policy(&ctx.auth, &accepted);
+                // The daemon's cost tracker keeps its own copy of `[cost]`,
+                // taken when the daemon started. Hand it the accepted
+                // section so a raised or lowered limit binds the next budget
+                // check (including the next provider call of a turn already
+                // running) without a restart.
+                if let Some(tracker) = ctx.cost_tracker.as_ref() {
+                    tracker.update_config(accepted.cost.clone());
+                }
                 Self::apply_prepared_live_sessions_refresh(
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
@@ -9621,6 +9625,42 @@ impl RpcDispatcher {
                 continue;
             };
 
+            // Pre-filter on scope BEFORE taking the per-session lock. A
+            // running turn holds `model_provider_update` for its whole
+            // duration (see `handle_session_prompt`), so locking first would
+            // park this transaction — and the sequential dispatcher loop of
+            // the connection that issued the `config/set` — behind every
+            // busy session on the daemon, including ones this edit cannot
+            // touch (editing agent B's provider while agent A is mid-turn).
+            // The pre-read is authoritative for selection: overrides only
+            // change through `session/configure`, which takes
+            // `config_write_lock` first, and the caller holds that lock for
+            // the whole transaction. Agent alias is fixed for a generation.
+            // The state is re-read under the lock below anyway so the
+            // rebuild uses exactly what the ordering boundary guarantees.
+            {
+                let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                    continue;
+                };
+                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                    continue;
+                };
+                let in_scope = scope
+                    .resolve_provider_ref(config, &agent_alias, &overrides)
+                    .map_err(|error| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!(
+                                "Config update cannot refresh live session `{session_id}`: {error}"
+                            ),
+                        )
+                    })?
+                    .is_some();
+                if !in_scope {
+                    continue;
+                }
+            }
+
             // Acquire the per-session ordering boundary. This serialises
             // with session/configure so the state we read afterwards
             // reflects any configure that committed before this point.
@@ -13545,13 +13585,34 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             model_context_window,
             cost_usd: _,
             accepted: true,
+            estimated_input_tokens,
             ..
-        } => SessionUpdateEvent::ContextUsage {
-            session_id: session_id.to_string(),
-            input_tokens: *input_tokens,
-            max_context_tokens: *context_token_budget,
-            model_context_window: *model_context_window,
-        },
+        } => {
+            // Display numerator: prefer the provider-reported count, and fall
+            // back to the runtime estimate only when the provider omitted it.
+            // The estimate is labelled so a client never renders it as a
+            // measured value; accounting and persistence consumers keep
+            // reading the provider-only `input_tokens` off the event itself.
+            let (displayed_input_tokens, input_tokens_source) =
+                match (*input_tokens, *estimated_input_tokens) {
+                    (Some(measured), _) => (
+                        Some(measured),
+                        Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                    ),
+                    (None, Some(estimated)) => (
+                        Some(estimated),
+                        Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    ),
+                    (None, None) => (None, None),
+                };
+            SessionUpdateEvent::ContextUsage {
+                session_id: session_id.to_string(),
+                input_tokens: displayed_input_tokens,
+                input_tokens_source,
+                max_context_tokens: *context_token_budget,
+                model_context_window: *model_context_window,
+            }
+        }
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
@@ -13848,6 +13909,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn create_room(
+            &self,
+            _options: &zeroclaw_api::channel::RoomCreationOptions,
+        ) -> anyhow::Result<String> {
+            Ok("test-session-room".to_string())
+        }
     }
 
     fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
@@ -13860,6 +13928,25 @@ mod tests {
             );
             channels
         })
+    }
+
+    fn assert_local_session_channels(agent: &crate::agent::agent::Agent) {
+        let handles = agent.channel_handles();
+        for (tool, handle) in [
+            ("reaction/git_forge", Some(&handles.reaction)),
+            ("ask_user/send_via", handles.ask_user.as_ref()),
+            ("channel_room", handles.channel_room.as_ref()),
+            ("poll", handles.poll.as_ref()),
+            ("escalate", handles.escalate.as_ref()),
+        ] {
+            let channels = handle.expect("configured tool handle should exist").read();
+            assert_eq!(channels.len(), 2, "{tool} should resolve both channels");
+            assert!(
+                channels.contains_key("git.main"),
+                "{tool} lost live channel"
+            );
+            assert!(channels.contains_key("rpc"), "{tool} lost RPC back-channel");
+        }
     }
 
     #[tokio::test]
@@ -13885,10 +13972,24 @@ mod tests {
             .expect("session should be live");
         {
             let agent = before.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert_eq!(reaction.len(), 2);
-            assert!(reaction.contains_key("git.main"));
-            assert!(reaction.contains_key("rpc"));
+            assert_local_session_channels(&agent);
+            let result = agent
+                .execute_tool_for_test(
+                    "channel_room",
+                    serde_json::json!({
+                        "action": "create_room",
+                        "channel": "git.main",
+                        "name": "test-room",
+                    }),
+                )
+                .await
+                .expect("fixture exposes channel_room")
+                .expect("channel_room should execute");
+            assert!(
+                result.success,
+                "channel_room must reach live channel: {result:?}"
+            );
+            assert!(result.output.contains("test-session-room"));
         }
 
         dispatcher
@@ -13903,16 +14004,8 @@ mod tests {
             std::sync::Arc::ptr_eq(&before, &after),
             "same-mode resume must rebind the existing session rather than rebuilding it"
         );
-        assert!(
-            after
-                .lock()
-                .await
-                .channel_handles()
-                .reaction
-                .read()
-                .contains_key("git.main"),
-            "same-mode resume must preserve local channel handles"
-        );
+        let agent = after.lock().await;
+        assert_local_session_channels(&agent);
     }
 
     #[tokio::test]
@@ -14185,10 +14278,7 @@ mod tests {
             .expect("rehydration should not fail")
             .expect("restorable ACP session must rehydrate");
         let agent = recovered.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert_eq!(reaction.len(), 2);
-        assert!(reaction.contains_key("git.main"));
-        assert!(reaction.contains_key("rpc"));
+        assert_local_session_channels(&agent);
     }
 
     /// The personality filename allowlist constrains the name, not its target.
@@ -17544,9 +17634,13 @@ mod tests {
         assert_eq!(result["size_bytes"], json!(payload.len()), "{committed}");
         assert_eq!(result["deduplicated"], json!(false), "{committed}");
         let stored = std::path::PathBuf::from(result["workspace_path"].as_str().unwrap());
+        // Compare resolved paths: the reply carries the canonical path without
+        // the Windows verbatim prefix, while the fixture's temp root can be
+        // spelled through a symlink or an 8.3 short name.
         assert!(
-            stored.starts_with(std::fs::canonicalize(&agent_workspace).unwrap())
-                || stored.starts_with(&agent_workspace),
+            std::fs::canonicalize(&stored)
+                .unwrap()
+                .starts_with(std::fs::canonicalize(&agent_workspace).unwrap()),
             "the upload lands in the agent workspace: {committed}"
         );
         assert_eq!(std::fs::read(&stored).unwrap(), payload);
@@ -27256,6 +27350,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -27346,6 +27441,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         if let TurnEvent::Usage {
             context_token_budget,
@@ -27502,6 +27598,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         if let TurnEvent::Usage {
@@ -27592,6 +27689,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-b".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let model_ctx_window = if let TurnEvent::Usage {
             provider_ref,
@@ -27644,6 +27742,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         // budget = trim budget (fills toward), window = full model capacity.
         let json = notification_for_turn_event("s1", &event).unwrap();
@@ -27661,6 +27760,120 @@ mod tests {
         assert_eq!(v["params"]["model_context_window"], 200_000);
     }
 
+    /// Boundary: when the provider omits usage, the meter must still receive
+    /// a numerator, and it must be labelled `estimate` so a client never
+    /// renders a derived value as provider-reported.
+    #[test]
+    fn estimated_usage_reaches_context_usage_labelled_as_an_estimate() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".to_string(),
+            model: "local-model".to_string(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 4_200,
+            "estimate must supply the display numerator"
+        );
+        assert_eq!(
+            v["params"]["input_tokens_source"], "estimate",
+            "estimated numerators must be labelled, not passed off as measured"
+        );
+        assert_eq!(v["params"]["max_context_tokens"], 180_000);
+    }
+
+    /// Boundary: a provider-reported count is labelled `provider` and the
+    /// estimate never competes with it.
+    #[test]
+    fn provider_reported_usage_reaches_context_usage_labelled_as_provider() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
+            estimated_input_tokens: None,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["input_tokens"], 100);
+        assert_eq!(v["params"]["input_tokens_source"], "provider");
+    }
+
+    /// Boundary: cached-only provider usage keeps the measured total unknown,
+    /// and the display numerator it forwards must not fall below the proven
+    /// cached subset. This exercises the real cached-plus-estimate pairing the
+    /// producer emits, not an estimate-free event.
+    #[test]
+    fn cached_only_usage_forwards_a_numerator_at_or_above_its_cached_subset() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: Some(80_000),
+            output_tokens: Some(7),
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "anthropic.default".to_string(),
+            model: "model-c".to_string(),
+            accepted: true,
+            // What `record_accepted_chat_response` actually produces for this
+            // response: the history estimate floored at the cached subset.
+            estimated_input_tokens: Some(80_000),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 80_000,
+            "display numerator must respect the known cached minimum"
+        );
+        assert_eq!(
+            v["params"]["input_tokens_source"], "estimate",
+            "a floored value is still an estimate, not a measured total"
+        );
+    }
+
+    /// Boundary: with no measured total and no estimate at all, the numerator
+    /// stays absent rather than being back-filled.
+    #[test]
+    fn unknown_total_without_an_estimate_stays_absent() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: Some(7),
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "anthropic.default".to_string(),
+            model: "model-c".to_string(),
+            accepted: true,
+            estimated_input_tokens: None,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert!(
+            v["params"].get("input_tokens").is_none(),
+            "an unknown measured total must stay absent, not be back-filled"
+        );
+        assert!(
+            v["params"].get("input_tokens_source").is_none(),
+            "absent numerator must carry no provenance label"
+        );
+    }
+
     #[test]
     fn rejected_usage_event_does_not_advance_context_snapshot() {
         let event = TurnEvent::Usage {
@@ -27673,6 +27886,7 @@ mod tests {
             provider_ref: "openai.fallback".to_string(),
             model: "model-b".to_string(),
             accepted: false,
+            estimated_input_tokens: None,
         };
 
         assert!(
@@ -27826,6 +28040,7 @@ mod tests {
             provider_ref: "custom.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27853,6 +28068,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27876,6 +28092,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27900,6 +28117,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -37526,6 +37744,65 @@ mod tests {
         drop(blocked_guard);
     }
 
+    /// Editing agent B's `model_provider` must not queue behind agent A's
+    /// running turn. `handle_session_prompt` holds the session's
+    /// `model_provider_update` guard for the whole turn; if the refresh
+    /// transaction locked every session before checking scope, a config
+    /// edit for an idle agent would stall until an unrelated busy agent
+    /// finished — and the issuing TUI's `config/list` would time out and
+    /// exit (observed 2026-10-07 on the experiment daemon).
+    #[tokio::test]
+    async fn config_set_for_other_agent_does_not_wait_on_busy_session() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        config.agents.insert(
+            "other-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        // Only `test-agent` has a live session; it is "mid-turn".
+        let busy_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&busy_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "agents.other-agent.model_provider",
+                "value": "openai.other-provider"
+            })),
+        )
+        .await
+        .expect("editing another agent's provider must not wait on this session's turn")
+        .expect("config/set must succeed");
+
+        // The busy session was out of scope: its provider is untouched.
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "old-model"
+        );
+        drop(busy_guard);
+    }
+
     #[tokio::test]
     async fn model_provider_update_preserves_newer_session_override() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -38332,6 +38609,152 @@ mod tests {
         let (mut dispatcher, rx, _sessions) = make_dispatcher_with_capture(config);
         dispatcher.set_authenticated_for_test();
         (dispatcher, rx)
+    }
+
+    /// A limit raised through `config/set` must bind the daemon's cost
+    /// tracker at its next budget check. The tracker keeps its own copy of
+    /// `[cost]`; before the accepted section was handed to it, RPC turns kept
+    /// enforcing the startup limit until the daemon restarted.
+    #[tokio::test]
+    async fn config_set_cost_limit_applies_to_live_cost_tracker() {
+        use zeroclaw_config::cost::types::{BudgetCheck, TokenUsage};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cost = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 1.0,
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            cost: cost.clone(),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let tracker =
+            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        // $3.00 recorded today against a $1.00 daily limit.
+        tracker
+            .record_usage(TokenUsage::new(
+                "test-model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        assert!(
+            matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ),
+            "precondition: the seeded spend trips the startup limit"
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, Arc::clone(&tracker));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set",
+            json!({"prop": "cost.daily_limit_usd", "value": 10.0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "config/set: {response}");
+
+        assert_eq!(tracker.config().daily_limit_usd, 10.0);
+        assert!(
+            matches!(tracker.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the raised limit must apply without a restart"
+        );
+    }
+
+    /// The inverse control: a limit lowered through `config/set` below the
+    /// spend already recorded today must make the next budget check refuse,
+    /// and the recorded usage must survive the swap untouched. Together with
+    /// the raised-limit case this pins both directions of the live refresh.
+    #[tokio::test]
+    async fn config_set_lowered_cost_limit_refuses_next_check_and_keeps_usage() {
+        use zeroclaw_config::cost::types::{BudgetCheck, TokenUsage, UsagePeriod};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cost = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 10.0,
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            cost: cost.clone(),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let tracker =
+            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        // $3.00 recorded today against a $10.00 daily limit.
+        tracker
+            .record_usage(TokenUsage::new(
+                "test-model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        let today = chrono::Utc::now().date_naive();
+        assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
+        assert!(
+            matches!(tracker.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "precondition: the seeded spend is within the startup limit"
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, Arc::clone(&tracker));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set",
+            json!({"prop": "cost.daily_limit_usd", "value": 1.0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "config/set: {response}");
+
+        assert_eq!(tracker.config().daily_limit_usd, 1.0);
+        match tracker.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period: UsagePeriod::Day,
+                ..
+            } => {
+                assert_eq!(current_usd, 3.0, "recorded spend is what the check sees");
+                assert_eq!(
+                    limit_usd, 1.0,
+                    "the lowered limit is what the check enforces"
+                );
+            }
+            other => panic!("the lowered limit must refuse the next check, got {other:?}"),
+        }
+        // The swap replaced only the limits; today's recorded usage is intact.
+        assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
     }
 
     /// Send one request through `process_line` (the wire dispatch path, not
@@ -44499,7 +44922,14 @@ mod tests {
                     zeroclaw_api::grants::Verb::Execute,
                 ],
             );
-        let workspace = config.agent_workspace_dir("test-agent");
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it; the raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), which a scoped
+        // steer refuses.
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, _handles) = scripted_turn_provider();
         install_state_test_session_owned_at(
