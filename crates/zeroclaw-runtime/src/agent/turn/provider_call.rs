@@ -250,6 +250,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
@@ -261,6 +262,7 @@ pub(crate) async fn call_provider(
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
     iteration: usize,
+    guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
@@ -293,6 +295,7 @@ pub(crate) async fn call_provider(
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
+                        guard_tools,
                     )
                     .await
                     {
@@ -1293,6 +1296,7 @@ mod streaming_fallback_tests {
                 None,
                 false,
                 0,
+                None,
             );
             let cancel = async {
                 provider.recovery_started.notified().await;
@@ -1338,6 +1342,7 @@ mod streaming_fallback_tests {
                 None,
                 false,
                 0,
+                None,
             ),
         )
         .await
@@ -1874,6 +1879,7 @@ mod streaming_fallback_tests {
                         None,
                         true,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -1973,6 +1979,7 @@ mod streaming_fallback_tests {
             None,
             true,
             0,
+            None,
         )
         .await
         .expect("stream fallback remains a provider-call outcome");
@@ -2029,6 +2036,7 @@ mod streaming_fallback_tests {
             None,
             true,
             0,
+            None,
         )
         .await
         .expect("stream interruption remains a provider-call outcome")
@@ -2166,6 +2174,7 @@ mod streaming_fallback_tests {
                 None,
                 true,
                 0,
+                None,
             )
             .await
             .expect("stream failure is returned as a provider-call outcome");
@@ -2289,6 +2298,7 @@ mod streaming_fallback_tests {
             None,
             false,
             0,
+            None,
         )
         .await
         .expect("provider call returns its outcome");
@@ -2372,6 +2382,7 @@ mod streaming_fallback_tests {
                 None,
                 true,
                 0,
+                None,
             )
             .await
             .expect("pre-output refusal is recovered by the next candidate");
@@ -2477,6 +2488,7 @@ mod streaming_fallback_tests {
             None,
             true,
             0,
+            None,
         )
         .await
         .expect("dispatch returns the provider outcome")
@@ -2549,6 +2561,7 @@ mod streaming_fallback_tests {
             None,
             false,
             0,
+            None,
         )
         .await
         .expect("cancellation remains a provider-call outcome");
@@ -2622,6 +2635,7 @@ mod streaming_fallback_tests {
             None,
             false,
             0,
+            None,
         )
         .await
         .expect("timeout remains a provider-call outcome");
@@ -2823,6 +2837,7 @@ mod streaming_fallback_tests {
             None,
             true,
             0,
+            None,
         );
         let cancel = async {
             provider.recovery_started.notified().await;
@@ -2874,6 +2889,7 @@ mod streaming_fallback_tests {
             None,
             true,
             0,
+            None,
         )
         .await
         .expect("provider call completes");
@@ -2920,6 +2936,7 @@ mod streaming_fallback_tests {
                 None,
                 true,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3033,6 +3050,7 @@ mod streaming_fallback_tests {
                 None,
                 streaming,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3083,6 +3101,7 @@ mod streaming_fallback_tests {
                 None,
                 true,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3241,6 +3260,7 @@ mod streaming_fallback_tests {
                         None,
                         true,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3348,6 +3368,7 @@ mod streaming_fallback_tests {
                         None,
                         true,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3608,6 +3629,7 @@ mod streaming_fallback_tests {
                         None,
                         true,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3686,6 +3708,7 @@ mod streaming_fallback_tests {
                         None,
                         true,
                         0,
+                        None,
                     ),
                 ),
             )
