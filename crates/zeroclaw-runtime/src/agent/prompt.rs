@@ -135,6 +135,16 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     redact_session_prompt_history_for_export(messages, true)
 }
 
+/// Whether provider-bound messages carry opaque session-prompt content that
+/// the export projection masks. The export classifier is the single owner;
+/// this never mutates or replaces provider working state.
+pub(crate) fn provider_messages_carry_session_prompt_content(messages: &[ChatMessage]) -> bool {
+    redact_session_prompt_tool_exchanges_for_export(messages)
+        .iter()
+        .zip(messages)
+        .any(|(exported, raw)| exported.content != raw.content)
+}
+
 /// Project retained history at a non-provider boundary using current feature
 /// exposure only for invocation inference. Host-marked sensitive exchanges
 /// remain private after disablement; provider history is never mutated.
@@ -2234,6 +2244,53 @@ mod tests {
         // A shell-less runtime keeps the POSIX wording it rendered before.
         let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
         assert!(none.contains("trash"), "{none}");
+    }
+
+    // Hook admission must use the export classifier, including executed-result
+    // provenance, without treating restored safe placeholders as private input.
+    #[test]
+    fn provider_message_privacy_matches_session_prompt_export_projection() {
+        assert!(provider_messages_carry_session_prompt_content(&[
+            ChatMessage::system(
+                "host policy\n\n## Session Prompts\n- id: \"task\"; content: \"PRIVATE_CANARY\"\n"
+            ),
+        ]));
+        assert!(provider_messages_carry_session_prompt_content(&[
+            ChatMessage::assistant(
+                r#"<tool_call>{"name":"session_prompt_set","arguments":{"id":"task","content":"PRIVATE_CANARY"}}</tool_call>"#
+            ),
+        ]));
+        for native in [false, true] {
+            let mut history = Vec::new();
+            crate::agent::turn::history_append::append_tool_round_to_history(
+                &mut history,
+                "rewritten ordinary call".into(),
+                &[],
+                &[crate::agent::turn::results_collect::ToolRoundResult {
+                    tool_call_id: native.then(|| "call-1".into()),
+                    output: "PRIVATE_CANARY".into(),
+                    attachments: Vec::new(),
+                    sensitive_session_prompt: true,
+                }],
+                "PRIVATE_CANARY",
+                native,
+            );
+            assert!(provider_messages_carry_session_prompt_content(&history));
+            assert!(history.iter().any(|m| m.content.contains("PRIVATE_CANARY")));
+            assert!(!provider_messages_carry_session_prompt_content(
+                &redact_session_prompt_tool_exchanges_for_export(&history),
+            ));
+        }
+        for text in [
+            "ordinary request",
+            "[Session-prompt tool exchange omitted from export]",
+            "[Tool results]\n[Session-prompt tool exchange omitted from export]",
+        ] {
+            assert!(!provider_messages_carry_session_prompt_content(&[
+                ChatMessage::system("ordinary system"),
+                ChatMessage::user(text),
+            ]));
+        }
     }
 
     #[test]

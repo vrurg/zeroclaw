@@ -7433,6 +7433,44 @@ mod tests {
 
     type CapturedLlmInputs = Arc<Mutex<Vec<(Vec<ChatMessage>, String)>>>;
 
+    struct SessionPromptBeforeLlmProbe {
+        calls: Arc<AtomicUsize>,
+        seen_inputs: CapturedLlmInputs,
+        cancel: bool,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for SessionPromptBeforeLlmProbe {
+        fn name(&self) -> &str {
+            "session-prompt-before-llm-probe"
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.cancel {
+                return crate::hooks::HookResult::Cancel("blocked by request policy".into());
+            }
+            messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == "user")
+                .expect("current user request")
+                .content = "hook-only provider request".into();
+            *model = "hook-selected-model".into();
+            crate::hooks::HookResult::Continue(())
+        }
+
+        async fn on_llm_input(&self, messages: &[ChatMessage], model: &str) {
+            self.seen_inputs
+                .lock()
+                .push((messages.to_vec(), model.to_string()));
+        }
+    }
+
     struct MutatingBeforeLlmHook {
         seen_inputs: CapturedLlmInputs,
     }
@@ -9380,6 +9418,106 @@ mod tests {
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
             );
+        }
+
+        // Sensitive requests bypass modifying hooks without changing provider bytes;
+        // ordinary requests retain mutation, model selection, and cancellation.
+        #[tokio::test]
+        async fn session_prompt_turn_skips_modifying_llm_hooks_and_preserves_provider_request() {
+            for native in [false, true] {
+                for streamed in [false, true] {
+                    for cancel in [false, true] {
+                        for attached in [false, true] {
+                            let requests = Arc::new(Mutex::new(Vec::new()));
+                            let mut agent = test_agent_with_provider(
+                                Box::new(HookProtocolCaptureProvider {
+                                    supports_native: native,
+                                    requests: requests.clone(),
+                                }),
+                                Vec::new(),
+                            );
+                            let calls = Arc::new(AtomicUsize::new(0));
+                            let inputs = Arc::new(Mutex::new(Vec::new()));
+                            let mut hooks = crate::hooks::HookRunner::new();
+                            hooks.register(Box::new(SessionPromptBeforeLlmProbe {
+                                calls: calls.clone(),
+                                seen_inputs: inputs.clone(),
+                                cancel,
+                            }));
+                            agent.hook_runner = Some(Arc::new(hooks));
+                            let base_model = agent.model_name.clone();
+                            if attached {
+                                agent.set_session_prompt_attachments(
+                                    "## Session Prompts\n- id: \"task\"; content: \"HOOK_CANARY\"\n"
+                                        .into(),
+                                );
+                            }
+                            let result = if streamed {
+                                let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                                agent
+                                    .turn_streamed("original user request", tx, None)
+                                    .await
+                                    .map(|(answer, _)| answer)
+                            } else {
+                                agent.turn("original user request").await
+                            };
+                            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!attached));
+                            if cancel && !attached {
+                                assert!(
+                                    result
+                                        .unwrap_err()
+                                        .to_string()
+                                        .contains("cancelled by hook")
+                                );
+                                assert!(requests.lock().is_empty());
+                                continue;
+                            }
+                            result.expect("sensitive requests must not be cancelled by hooks");
+                            let captured = requests.lock();
+                            assert_eq!(captured.len(), 1);
+                            let (model, _, messages) = &captured[0];
+                            assert_eq!(
+                                model,
+                                if attached {
+                                    &base_model
+                                } else {
+                                    "hook-selected-model"
+                                }
+                            );
+                            let user = messages
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == "user")
+                                .unwrap();
+                            assert!(user.content.contains(if attached {
+                                "original user request"
+                            } else {
+                                "hook-only provider request"
+                            }));
+                            let system = messages
+                                .iter()
+                                .find(|message| message.role == "system")
+                                .unwrap();
+                            assert_eq!(system.content.contains("HOOK_CANARY"), attached);
+                            let exported = inputs.lock();
+                            assert_eq!(exported.len(), captured.len());
+                            assert!(
+                                !exported[0]
+                                    .0
+                                    .iter()
+                                    .any(|message| message.content.contains("HOOK_CANARY"))
+                            );
+                            if attached {
+                                assert!(exported[0].0.iter().any(|message| {
+                                    message.content.contains(
+                                        "[Persistent session prompts omitted from export]",
+                                    )
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         #[test]

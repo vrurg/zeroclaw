@@ -100,6 +100,12 @@ An enabled configuration with another session backend is rejected. Prompt
 attachments are not available to cron jobs, delegates, subagents, one-shot
 requests, or auxiliary calls.
 
+Independent transcripts started during a turn, including delegated agents,
+subagents, inline runs, and SOP steps assigned to another agent, use their own system
+prompt, without inheriting the parent's attached prompts. A same-agent inline
+SOP step continues the primary turn's shared transcript without prompt-tool
+access.
+
 ## Agent tools
 
 The current chat session receives three tools when the feature is enabled:
@@ -231,6 +237,17 @@ the opaque arguments or results. This redaction is the restart boundary: after
 loading a retained transcript, the model does not recover the hidden tool
 exchange from history, but the attached prompt collection itself remains
 available through the session metadata and the next injected system prompt.
+
+Modifying `before_llm_call` hooks are not called for requests carrying attached
+prompt text or session-prompt tool exchanges, including programmatically
+registered handlers. Such requests dispatch as prepared: hook transformations,
+model changes, and cancellation do not run. The void `on_llm_input` callback
+still receives its masked export view; provider working history is not masked.
+The same conservative export classifier governs this exclusion, so literal
+attachment headings or invocation-like assistant text can also skip modifying
+hooks. Ordinary requests and restored redaction placeholders retain normal
+hook behavior. Alternative prompt-hook policies require a separate
+architectural decision.
 
 Masking does not remove content-derived fingerprints. Generic approval and
 audit arguments can include the attachment's full `content_sha256`; LLM request

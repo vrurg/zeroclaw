@@ -123,6 +123,10 @@ rewrite does not grant access to an unsupported or stale session context.
 Alternative hook policies require a separate architectural decision rather than
 an implicit exception to this feature's contract.
 
+Likewise, `before_llm_call` is skipped for requests carrying attached prompt
+text or prompt-tool exchanges, including graceful summaries. The prepared
+request reaches the provider unchanged; `on_llm_input` keeps its masked view.
+
 Approval has different front doors:
 
 - CLI managers prompt the operator and support `yes`, `no`, and `always`.

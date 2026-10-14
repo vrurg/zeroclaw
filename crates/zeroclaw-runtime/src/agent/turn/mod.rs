@@ -631,16 +631,70 @@ impl ToolProtocolPrompts {
 }
 
 tokio::task_local! {
-    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+    /// `None` withholds an enclosing attachment-bearing turn's variants from
+    /// a nested future that owns an independent transcript.
+    static TOOL_PROTOCOL_PROMPTS: Option<Arc<ToolProtocolPrompts>>;
 }
 
-/// Scope complete prompt variants around an Agent turn. This remains transient
-/// request state: durable history keeps the caller-owned canonical prompt.
+fn with_scoped_tool_protocol_prompts<R>(f: impl FnOnce(&ToolProtocolPrompts) -> R) -> Option<R> {
+    TOOL_PROTOCOL_PROMPTS
+        .try_with(|prompts| prompts.as_deref().map(f))
+        .ok()
+        .flatten()
+}
+
+fn attachment_protocol_scope_active() -> bool {
+    with_scoped_tool_protocol_prompts(|prompts| prompts.required_pair.is_some()).unwrap_or(false)
+}
+
+/// Scope complete prompt variants around an Agent turn's own transcript. This
+/// remains transient request state: durable history keeps the canonical prompt.
 pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
     prompts: Arc<ToolProtocolPrompts>,
     future: F,
 ) -> F::Output {
-    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+    TOOL_PROTOCOL_PROMPTS.scope(Some(prompts), future).await
+}
+
+/// Independent transcripts must not consume their enclosing turn's attachment
+/// variants. Non-attachment scopes retain their existing behavior.
+pub(crate) async fn without_attachment_protocol_prompts<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    if attachment_protocol_scope_active() {
+        TOOL_PROTOCOL_PROMPTS.scope(None, future).await
+    } else {
+        future.await
+    }
+}
+
+// As with the v1 tool-hook exclusion in call_prep, private prompt content must
+// not enter modifying hooks. A projected/masked mutation policy would need a
+// separate architectural decision; provider working state is never replaced.
+fn modifying_llm_hooks_for_request<'a>(
+    hooks: Option<&'a crate::hooks::HookRunner>,
+    messages: &[ChatMessage],
+    turn_id: &str,
+) -> Option<&'a crate::hooks::HookRunner> {
+    let hooks = hooks.filter(|hooks| !hooks.is_empty())?;
+    if attachment_protocol_scope_active()
+        || crate::agent::prompt::provider_messages_carry_session_prompt_content(messages)
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(serde_json::json!({
+                    "hook_phase": "before_llm_call",
+                    "reason": "session_prompt_content",
+                    "trace_id": turn_id,
+                })),
+            "Skipping modifying LLM hooks for private session-prompt content"
+        );
+        None
+    } else {
+        Some(hooks)
+    }
 }
 
 fn refresh_scoped_tool_protocol_prompt(
@@ -648,7 +702,7 @@ fn refresh_scoped_tool_protocol_prompt(
     request_messages: &mut [ChatMessage],
     use_native_tools: bool,
 ) {
-    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+    let _ = with_scoped_tool_protocol_prompts(|prompts| {
         // History keeps the swapped prompt without re-capping it; only the
         // provider-bound copy is capped. A capped native request is rebuilt
         // from the complete native prompt, never from a capped text history.
@@ -782,9 +836,9 @@ fn apply_builtin_prompt_scope(
                         .strip_prefix(canonical)
                         .map(str::to_owned)
                         .or_else(|| {
-                            let refresh_cap = TOOL_PROTOCOL_PROMPTS
-                                .try_with(|prompts| prompts.max_chars)
-                                .unwrap_or(max_system_prompt_chars);
+                            let refresh_cap =
+                                with_scoped_tool_protocol_prompts(|prompts| prompts.max_chars)
+                                    .unwrap_or(max_system_prompt_chars);
                             let capped = crate::agent::system_prompt::finalize_system_prompt(
                                 canonical.to_owned(),
                                 refresh_cap,
@@ -1665,11 +1719,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let max_system_prompt_chars = config
         .zip(agent_alias)
         .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
-        .or_else(|| {
-            TOOL_PROTOCOL_PROMPTS
-                .try_with(|prompts| prompts.max_chars)
-                .ok()
-        })
+        .or_else(|| with_scoped_tool_protocol_prompts(|prompts| prompts.max_chars))
         .unwrap_or(0);
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
@@ -1926,6 +1976,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
                         None => (None, None),
                     };
+                    // Summary preparation uses hooks only for before_llm_call.
+                    let summary_hooks =
+                        modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
                     let summary_result = finish_after_max_iterations(
                         injected_memory_preamble,
                         model_provider,
@@ -1946,7 +1999,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         config,
                         multimodal_config,
                         security,
-                        hooks,
+                        summary_hooks,
                         summary_image_cache,
                         summary_provider_image_state,
                         |provider, selected_model| {
@@ -2060,7 +2113,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
 
-        if let Some(hooks) = base_ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+        if let Some(hooks) =
+            modifying_llm_hooks_for_request(base_ctx.hooks, &provider_request_messages, turn_id)
+        {
             let mut candidate_model = active_model.to_string();
             match hooks
                 .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
@@ -2140,7 +2195,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
         // reconciliation.
-        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let uses_scoped_tool_protocol = with_scoped_tool_protocol_prompts(|_| ()).is_some();
         let protocol_model = if uses_scoped_tool_protocol {
             provider_dispatch_model
         } else {
@@ -3450,6 +3505,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
         None => (None, None),
     };
+    // Summary preparation uses hooks only for before_llm_call.
+    let summary_hooks = modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
     let summary_result = finish_after_max_iterations(
         injected_memory_preamble,
         model_provider,
@@ -3470,7 +3527,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         config,
         multimodal_config,
         security,
-        hooks,
+        summary_hooks,
         summary_image_cache,
         summary_provider_image_state,
         |provider, selected_model| {
@@ -4269,7 +4326,10 @@ async fn drive_live_sop_actions(
                         // the step-context message pushed above and receives
                         // the step's final output below; intermediate child
                         // tool-chatter stays out of it. Same-agent steps keep
-                        // sharing the turn history unchanged.
+                        // sharing the turn history unchanged. An independent
+                        // child also runs outside the parent's attachment-
+                        // bearing protocol scope so refresh cannot replace
+                        // its own system prompt with the parent's variants.
                         let mut child_history: Vec<ChatMessage> = Vec::new();
                         let mut child_setup_error: Option<anyhow::Error> = None;
                         if let Some(o) = owned {
@@ -4449,9 +4509,13 @@ async fn drive_live_sop_actions(
                                     })),
                                 )
                             );
-                            let step_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                                .scope(false, nested_step)
-                                .await;
+                            let nested_step = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step);
+                            let step_result = if owned.is_some() {
+                                without_attachment_protocol_prompts(Box::pin(nested_step)).await
+                            } else {
+                                nested_step.await
+                            };
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()
@@ -4671,6 +4735,57 @@ mod surface3_tests {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
         ))
+    }
+
+    // Withholding is conditional and poll-scoped: ordinary caps remain active,
+    // independent attachment children keep their prompt, and the parent restores.
+    #[tokio::test]
+    async fn independent_transcript_scope_preserves_ordinary_caps_and_restores_parent() {
+        let native = "parent native prompt repeated for a finite budget".to_string();
+        let ordinary = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native.clone(),
+            native,
+            24,
+        ));
+        scope_tool_protocol_prompts(ordinary, async {
+            let mut expected_history = vec![ChatMessage::system("child system")];
+            let mut expected_request = expected_history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut expected_history, &mut expected_request, true);
+            let mut history = vec![ChatMessage::system("child system")];
+            let mut request = history.clone();
+            without_attachment_protocol_prompts(async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            })
+            .await;
+            assert_eq!(history[0].content, expected_history[0].content);
+            assert_eq!(request[0].content, expected_request[0].content);
+            assert!(request[0].content.chars().count() <= 24);
+        })
+        .await;
+        let parent =
+            "parent policy\n\n## Session Prompts\n- id: \"task\"; content: \"SCOPE_CANARY\"\n";
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            async {
+                let mut history = vec![ChatMessage::system("child system")];
+                let mut request = history.clone();
+                without_attachment_protocol_prompts(async {
+                    assert!(!attachment_protocol_scope_active());
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+                })
+                .await;
+                assert_eq!(history[0].content, "child system");
+                assert_eq!(request[0].content, "child system");
+                assert!(attachment_protocol_scope_active());
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+                assert_eq!(history[0].content, parent);
+                assert_eq!(request[0].content, parent);
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -7810,6 +7925,161 @@ mod sop_step_reassembly_tests {
         .await
     }
 
+    struct PromptPrivacyHook(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for PromptPrivacyHook {
+        fn name(&self) -> &str {
+            "prompt-privacy-probe"
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            messages.push(ChatMessage::user("hook-rewrite"));
+            crate::hooks::HookResult::Continue(())
+        }
+    }
+
+    // A marked explicit-list exchange remains private even without an attachment
+    // section in the current system prompt; provider working history stays raw.
+    #[tokio::test]
+    async fn prompt_tool_exchange_history_skips_modifying_llm_hook() {
+        let mut history = vec![ChatMessage::system("ordinary system")];
+        history_append::append_tool_round_to_history(
+            &mut history,
+            "listing complete".into(),
+            &[],
+            &[results_collect::ToolRoundResult {
+                tool_call_id: None,
+                output: "LIST_CANARY".into(),
+                attachments: Vec::new(),
+                sensitive_session_prompt: true,
+            }],
+            "LIST_CANARY",
+            false,
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        run_budgeted_test_loop_with_hooks(
+            &provider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(10),
+            CancellationToken::new(),
+            10,
+            None,
+            Some(&hooks),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            requests.lock().unwrap()[0]
+                .0
+                .iter()
+                .any(|m| m.content.contains("LIST_CANARY"))
+        );
+    }
+
+    // Summary dispatch is a separate modifying-hook boundary, not protected by
+    // redacting the later void callback in the ordinary provider path.
+    #[tokio::test]
+    async fn max_iteration_summary_skips_llm_hook_for_attachment_history() {
+        let mut history = vec![
+            ChatMessage::system(
+                "host policy\n\n## Session Prompts\n- id: \"task\"; content: \"SUMMARY_CANARY\"\n",
+            ),
+            ChatMessage::user("finish"),
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let result = run_budgeted_test_loop_with_hooks(
+            &provider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(1),
+            CancellationToken::new(),
+            10,
+            None,
+            Some(&hooks),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("execution-tree iteration budget"));
+        assert!(
+            requests.lock().unwrap()[0].1.is_empty(),
+            "summary offers no tools"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            requests.lock().unwrap()[0]
+                .0
+                .iter()
+                .any(|m| m.content.contains("SUMMARY_CANARY"))
+        );
+    }
+
+    // Restored privacy placeholders contain no private bytes and must not
+    // disable ordinary request transformations.
+    #[tokio::test]
+    async fn restored_prompt_redaction_carriers_keep_modifying_llm_hooks() {
+        for carrier in [
+            "[Session-prompt tool exchange omitted from export]",
+            "[Tool results]\n[Session-prompt tool exchange omitted from export]",
+        ] {
+            let mut history = vec![
+                ChatMessage::system("ordinary system"),
+                ChatMessage::user(carrier),
+            ];
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CaptureProvider {
+                requests: requests.clone(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+            let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+            run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                ExecutionTreeBudget::root(10),
+                CancellationToken::new(),
+                10,
+                None,
+                Some(&hooks),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                requests.lock().unwrap()[0]
+                    .0
+                    .iter()
+                    .any(|m| m.content == "hook-rewrite")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
         struct SummaryProbe(Arc<AtomicUsize>, &'static str, bool);
@@ -8523,6 +8793,82 @@ mod sop_step_reassembly_tests {
         assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
     }
 
+    // A distinct step agent must retain its own system prompt even while the
+    // parent turn has an attachment-bearing protocol pair in task-local scope.
+    #[tokio::test]
+    async fn cross_agent_step_never_inherits_attachment_protocol_prompts() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".into(),
+            seeded_owned(
+                requests.clone(),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                Some(0.42),
+            ),
+        );
+        let parent =
+            "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"SOP_CANARY\"\n";
+        let mut history = vec![
+            ChatMessage::system(parent),
+            ChatMessage::user(PARENT_MARKER),
+        ];
+        let mut new_out = Vec::new();
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            drive_step(
+                engine.clone(),
+                action,
+                &TextProvider,
+                &tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                Some(&mut new_out),
+                Some("outer"),
+                Some(SopStepReassembly {
+                    config: &config,
+                    live_config: None,
+                }),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await;
+        let captured = requests.lock().unwrap();
+        assert!(!captured.is_empty());
+        for (messages, _, _) in captured.iter() {
+            assert!(messages.iter().all(|m| !m.content.contains("SOP_CANARY")
+                && !m.content.contains("PARENT_SYSTEM_MARKER")));
+            assert_eq!(messages.first().map(|m| m.role.as_str()), Some("system"));
+            assert_eq!(messages.last().map(|m| m.role.as_str()), Some("user"));
+        }
+        assert_eq!(history[0].content, parent);
+        assert_eq!(
+            history
+                .last()
+                .map(|m| (m.role.as_str(), m.content.as_str())),
+            Some(("assistant", "child-done"))
+        );
+        assert_eq!(
+            new_out.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+    }
+
     /// The child registry and the child's own `tool_filter_groups` govern the
     /// tool specs the nested loop offers the child provider — through the
     /// loop's final filters, not just at assembly.
@@ -8743,6 +9089,68 @@ mod sop_step_reassembly_tests {
         assert_eq!(
             step1_result(&engine, &run_id).effective_agent.as_deref(),
             Some("outer")
+        );
+    }
+
+    // A same-agent SOP step is still the current primary transcript, rather
+    // than a new recipient; its existing replay and prompt-tool exclusion stay.
+    #[tokio::test]
+    async fn same_agent_step_keeps_attachment_turn_transcript() {
+        let (engine, run_id, action) = start_single_cross_agent_step("outer");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let parent = "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"SAME_AGENT_CANARY\"\n";
+        let mut history = vec![ChatMessage::system(parent)];
+        let mut new_out = Vec::new();
+        let mut cache = std::collections::HashMap::new();
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            drive_step(
+                engine.clone(),
+                action,
+                &provider,
+                &tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                Some(&mut new_out),
+                Some("outer"),
+                None,
+                None,
+                &mut cache,
+            ),
+        )
+        .await;
+        let captured = requests.lock().unwrap();
+        assert!(!captured.is_empty());
+        for (messages, offered_tools, _) in captured.iter() {
+            assert_eq!(messages[0].content, parent);
+            assert!(
+                offered_tools
+                    .iter()
+                    .all(|name| !name.starts_with("session_prompt_"))
+            );
+        }
+        assert!(cache.is_empty());
+        assert_eq!(history[0].content, parent);
+        assert_eq!(
+            history.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            new_out.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
         );
     }
 

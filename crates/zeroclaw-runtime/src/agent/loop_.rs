@@ -3273,16 +3273,19 @@ pub async fn run(
     // This CLI/cron/subturn entry does not own a durable primary Chat turn.
     // Inline callers (notably cron_run) can inherit the parent task's session
     // locals, so deny attachment access here rather than relying on spawning.
+    // Their independent transcript must also withhold the parent turn's
+    // attachment-bearing protocol variants, preserving its own system prompt.
     // Forwarding access would also require deliberately propagating exact child
     // approval and privacy guarantees; that is outside the bounded proposal.
-    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-        .scope(
+    crate::agent::turn::without_attachment_protocol_prompts(Box::pin(
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
             false,
             __zc_body
                 .instrument(__zc_scope_span)
                 .instrument(__zc_attribution_span),
-        )
-        .await
+        ),
+    ))
+    .await
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
@@ -23215,6 +23218,91 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    // Inline run() is shared by unsupported child surfaces. Their serialized
+    // provider request must use their own prompt, not the primary turn's pair.
+    #[tokio::test]
+    async fn inline_run_never_inherits_attachment_protocol_prompts() {
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Json(serde_json::json!({"choices": [{"message": {"content": "done"}}]}))
+                }
+            }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("child-scope-test".into()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "child-scope-test".into(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".into(), Default::default());
+        let parent =
+            "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"RUN_CANARY\"\n";
+        let result = crate::agent::turn::scope_tool_protocol_prompts(
+            Arc::new(
+                crate::agent::turn::ToolProtocolPrompts::with_required_prompts(
+                    parent.into(),
+                    parent.into(),
+                ),
+            ),
+            Box::pin(super::run(
+                config,
+                "child-scope-test",
+                Some("run job".into()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                false,
+                Some(tmp.path().join("child-state.json")),
+                None,
+                TurnOrigin::Cron,
+                super::AgentRunOverrides::default(),
+            )),
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap(), "done");
+        let captured = requests.lock().unwrap();
+        assert!(!captured.is_empty());
+        for request in captured.iter() {
+            let serialized = request.to_string();
+            assert!(!serialized.contains("RUN_CANARY"));
+            assert!(!serialized.contains("PARENT_SYSTEM_MARKER"));
+        }
     }
 
     #[tokio::test]

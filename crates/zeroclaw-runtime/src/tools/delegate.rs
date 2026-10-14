@@ -5314,9 +5314,11 @@ impl DelegateTool {
         // future off the test/runtime thread stack before adding this scope.
         // Keep the session-prompt task-local scope behind a future boundary
         // before composing the execution-tree budget and optional thinking
-        // scopes.
-        let delegated_turn =
-            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(false, Box::pin(execution));
+        // scopes. The delegate owns an independent transcript, so the parent
+        // turn's attachment-bearing protocol variants must not replace it.
+        let delegated_turn = crate::agent::turn::without_attachment_protocol_prompts(
+            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(false, Box::pin(execution)),
+        );
         let execution =
             ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(delegated_turn));
         let result = match thinking_params {
@@ -9289,6 +9291,47 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("tool count matched: 1"));
+    }
+
+    // Foreground delegates run inline but own their transcript: the parent's
+    // attachment-bearing transport variants must not replace the child's prompt.
+    #[tokio::test]
+    async fn agentic_delegate_never_inherits_attachment_protocol_prompts() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"DELEGATE_CANARY\"\n";
+        let result = crate::agent::turn::scope_tool_protocol_prompts(
+            Arc::new(
+                crate::agent::turn::ToolProtocolPrompts::with_required_prompts(
+                    parent.into(),
+                    parent.into(),
+                ),
+            ),
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("delegate complete"));
+        let prompt = provider
+            .request()
+            .system_prompt
+            .expect("child system prompt");
+        assert!(!prompt.contains("DELEGATE_CANARY"));
+        assert!(!prompt.contains("PARENT_SYSTEM_MARKER"));
+        assert!(!prompt.is_empty());
     }
 
     /// The bounded agentic child turn gates image markers with the PARENT's
