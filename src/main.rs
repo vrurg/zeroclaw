@@ -715,6 +715,8 @@ enum QuickstartChecklistAction {
     Memory,
     Channels,
     PeerGroups,
+    #[cfg(feature = "plugins-wasm")]
+    Plugins,
     Agent,
     Create,
     Quit,
@@ -966,6 +968,8 @@ mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
+#[cfg(all(feature = "agent-runtime", feature = "plugins-wasm"))]
+mod quickstart_plugins;
 #[cfg(feature = "agent-runtime")]
 mod relay_cli;
 #[cfg(feature = "agent-runtime")]
@@ -1844,6 +1848,10 @@ async fn run_quickstart_cli(
         // user has actually opened the selector and left it. Until
         // then the row stays `[ ]` rather than a pre-checked default.
         peer_groups_visited: bool,
+        // Optional like Channels: tool plugins picked in the Plugins row.
+        // Nothing is downloaded or written until Create.
+        #[cfg(feature = "plugins-wasm")]
+        plugins: crate::quickstart_plugins::PluginsRow,
         agent: Option<AgentChoice>,
     }
     enum ProviderChoice {
@@ -2097,15 +2105,24 @@ async fn run_quickstart_cli(
                     &peer_groups_summary,
                 ),
             ),
-            (
-                QuickstartChecklistAction::Agent,
-                quickstart_row(
-                    "cli-quickstart-row-agent-identity",
-                    glyph(form.agent_done()),
-                    &agent_summary,
-                ),
-            ),
         ];
+        #[cfg(feature = "plugins-wasm")]
+        choices.push((
+            QuickstartChecklistAction::Plugins,
+            quickstart_row(
+                "cli-quickstart-row-plugins",
+                glyph(form.plugins.visited()),
+                &form.plugins.summary(),
+            ),
+        ));
+        choices.push((
+            QuickstartChecklistAction::Agent,
+            quickstart_row(
+                "cli-quickstart-row-agent-identity",
+                glyph(form.agent_done()),
+                &agent_summary,
+            ),
+        ));
         let create_enabled = form.all_done();
         choices.push((
             QuickstartChecklistAction::Create,
@@ -2690,6 +2707,16 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
+            #[cfg(feature = "plugins-wasm")]
+            QuickstartChecklistAction::Plugins => {
+                // Picking only: nothing is downloaded or written until Create.
+                // Ctrl+C keeps the checklist's exit semantics.
+                let exit =
+                    Box::pin(crate::quickstart_plugins::open_row(&cfg, &mut form.plugins)).await?;
+                if exit == crate::quickstart_plugins::RowExit::Interrupted {
+                    std::process::exit(130);
+                }
+            }
             QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
@@ -2981,6 +3008,28 @@ async fn run_quickstart_cli(
         },
     };
 
+    // Plugins picked in the Plugins row are installed, configured and offered
+    // for activation now, before the agent step. The phase dry-runs the agent
+    // step first, so a submission it would refuse stops here before any config
+    // is changed or any plugin installed. Each plugin then goes through the
+    // canonical publish-and-seed transaction, so an interruption never leaves
+    // a package half published.
+    #[cfg(feature = "plugins-wasm")]
+    let plugin_phase = match Box::pin(crate::quickstart_plugins::run_create_phase(
+        &mut cfg,
+        &form.plugins,
+        &submission,
+    ))
+    .await
+    {
+        Ok(phase) => phase,
+        Err(halt) => match halt.report() {
+            // Ctrl+C keeps the checklist's exit semantics.
+            None => std::process::exit(130),
+            Some(error) => return Err(error),
+        },
+    };
+
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
         Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
@@ -2995,6 +3044,8 @@ async fn run_quickstart_cli(
             if let Some(auth) = inline_auth {
                 Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
             }
+            #[cfg(feature = "plugins-wasm")]
+            Box::pin(plugin_phase.print_readiness(&cfg)).await;
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
@@ -3039,6 +3090,8 @@ async fn run_quickstart_cli(
             if let Some(auth) = inline_auth {
                 Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
             }
+            #[cfg(feature = "plugins-wasm")]
+            Box::pin(plugin_phase.print_readiness(&cfg)).await;
             eprintln!();
             anyhow::bail!(
                 "{}",
@@ -3049,7 +3102,37 @@ async fn run_quickstart_cli(
             )
         }
         Err(errs) => {
-            eprintln!();
+            // The plugin step ran first. Once it changed anything, the usual
+            // report that nothing on disk was changed would be false.
+            #[cfg(feature = "plugins-wasm")]
+            let headline = plugin_phase.apply_failed_headline(&cfg);
+            #[cfg(not(feature = "plugins-wasm"))]
+            let headline = None;
+            Err(report_agent_not_created(&errs, headline))
+        }
+    }
+}
+
+/// Print why the agent step refused a Quickstart submission and return the
+/// error Quickstart ends with.
+///
+/// The report opens with the agent step's usual lines, which say nothing on
+/// disk was changed. `headline` replaces them for a run whose plugin step
+/// already installed, configured or activated plugins, where they would be
+/// false.
+#[cfg(feature = "agent-runtime")]
+fn report_agent_not_created(
+    errs: &[zeroclaw_runtime::quickstart::QuickstartError],
+    headline: Option<Vec<String>>,
+) -> anyhow::Error {
+    eprintln!();
+    match headline {
+        Some(lines) => {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
+        None => {
             eprintln!(
                 "{}",
                 t(
@@ -3064,20 +3147,17 @@ async fn run_quickstart_cli(
                     "Your existing config is untouched. Fix the following and run quickstart again:",
                 )
             );
-            eprintln!();
-            for e in &errs {
-                eprintln!("  • {}: {}", quickstart_step_label(e.step), e.message);
-            }
-            eprintln!();
-            anyhow::bail!(
-                "{}",
-                qta(
-                    "cli-quickstart-could-not-finish",
-                    &[("count", &errs.len().to_string())],
-                )
-            )
         }
     }
+    eprintln!();
+    for e in errs {
+        eprintln!("  • {}: {}", quickstart_step_label(e.step), e.message);
+    }
+    eprintln!();
+    anyhow::Error::msg(qta(
+        "cli-quickstart-could-not-finish",
+        &[("count", &errs.len().to_string())],
+    ))
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -3810,8 +3890,10 @@ fn tool_binding_entries(
         .collect()
 }
 
-/// Print the destinations a freshly seeded instance row was granted, one line
-/// each, plus the exact command that edits the grant later.
+/// The destinations a freshly seeded instance row was granted, one line each,
+/// plus the exact command that edits the grant later. Install prints them for
+/// the row it creates ([`created_plugin_config_entry_lines`]), and the channel
+/// binding ceremony for the row it creates as well.
 ///
 /// The grant ceremony: installation is an explicit operator act, and the
 /// printed, persisted allowlist is its record. `package` is what the operator
@@ -3819,20 +3901,6 @@ fn tool_binding_entries(
 /// lives on, and it reaches the operator inside the printed command rather than
 /// as a bare token they would have to transcribe. A manifest that declares
 /// nothing prints nothing.
-#[cfg(feature = "plugins-wasm")]
-fn print_egress_grant_ceremony(
-    config_dir: &std::path::Path,
-    package: &str,
-    instance_key: &str,
-    granted: &[String],
-) {
-    for line in egress_grant_ceremony_lines(config_dir, package, instance_key, granted) {
-        println!("{line}");
-    }
-}
-
-/// The lines [`print_egress_grant_ceremony`] prints, which the channel
-/// binding ceremony prints for the row it creates as well.
 #[cfg(feature = "plugins-wasm")]
 fn egress_grant_ceremony_lines(
     config_dir: &std::path::Path,
@@ -3869,6 +3937,38 @@ fn egress_grant_ceremony_lines(
         "Edit this grant later with the printed command.",
     ));
     lines
+}
+
+/// The withheld half of the grant ceremony: a default tool binding's row
+/// created with an empty grant although its manifest declares destinations
+/// the row can use. One line says so and carries the command that grants the
+/// declaration later, the same command the channel binding ceremony prints
+/// for a row it creates under `--egress none`. `withheld` is that declaration
+/// in canonical form; a row that withheld nothing prints nothing.
+#[cfg(feature = "plugins-wasm")]
+fn withheld_egress_grant_lines(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    withheld: &[String],
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::egress_set_command;
+    if withheld.is_empty() {
+        return Vec::new();
+    }
+    vec![ta(
+        "cli-plugin-egress-withheld",
+        &[
+            ("name", package),
+            ("count", &withheld.len().to_string()),
+            (
+                "command",
+                &egress_set_command(config_dir, instance_key, withheld),
+            ),
+        ],
+        "Network access for '{$name}' was withheld: its config entry grants no destinations. \
+         Grant the {$count} declared destination(s) later with: {$command}",
+    )]
 }
 
 /// Print the declaration-versus-grant difference for an instance row that
@@ -5486,15 +5586,40 @@ struct StagedPluginConfigEntries {
     existing: Vec<String>,
     /// The canonical declaration each created row was granted.
     granted: Vec<String>,
+    /// The canonical declaration each created row was not granted, because
+    /// the decision withheld it. Empty under
+    /// [`crate::plugins::channel_instance::EgressDecision::SeedDeclared`].
+    withheld: Vec<String>,
+}
+
+/// Whether the `[plugins]` section `config` holds stands in for one that could
+/// not be read: the loader found that section malformed, or could not read the
+/// config file at all, and reset it to defaults for this run. Its rows, plugins
+/// directory and signature policy are then the defaults rather than what the
+/// file says, so [`stage_plugin_config_entries`] seeds no row until the file
+/// is repaired, and Quickstart's Plugins step installs nothing.
+#[cfg(feature = "plugins-wasm")]
+fn plugins_section_degraded(config: &crate::config::schema::Config) -> bool {
+    config
+        .degraded_security
+        .iter()
+        .any(|section| section == crate::config::migration::WHOLE_CONFIG_SENTINEL)
+        || config
+            .degraded_sections
+            .iter()
+            .any(|section| section == "plugins")
 }
 
 /// Stage `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
-/// default instance keys, carrying the manifest's declared egress destinations
-/// into each row this call creates. `config set
+/// default instance keys. `tool_egress` decides what each row this call
+/// creates starts out granting: the manifest's declared egress destinations
+/// (`SeedDeclared`, what `plugin install` always seeds), or nothing
+/// (`Withhold`, which Quickstart offers). `config set
 /// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
 /// resolution, which only matches entries already present in live config.
 /// Idempotent: existing entries and operator values remain untouched — an
-/// existing row's `egress_hosts` is reported against, never rewritten.
+/// existing row's `egress_hosts` is reported against, never rewritten,
+/// whatever the decision.
 /// A pre-typed-config row keyed by the package name is unsupported beta state:
 /// refuse before creating a canonical row and print the same ordered update
 /// guidance as `plugin list` — including its rule that a deployment-wide
@@ -5511,16 +5636,13 @@ fn stage_plugin_config_entries(
     package: &str,
     entries: &[(zeroclaw::plugins::PluginCapability, String)],
     declared_egress: &[String],
+    tool_egress: crate::plugins::channel_instance::EgressDecision,
 ) -> Result<StagedPluginConfigEntries> {
     if entries.is_empty() {
         return Ok(StagedPluginConfigEntries::default());
     }
 
-    let whole_config_degraded = config
-        .degraded_security
-        .iter()
-        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
-    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+    if plugins_section_degraded(config) {
         for (_, instance_key) in entries {
             eprintln!(
                 "{}",
@@ -5539,20 +5661,8 @@ fn stage_plugin_config_entries(
 
     let mut created = Vec::new();
     let mut existing = Vec::new();
-    let legacy_candidates = [package.to_string()];
     for (_, instance_key) in entries {
-        let row_names: Vec<String> = config
-            .plugins
-            .entries
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect();
-        let state = crate::plugins::egress_ceremony::resolve_grant_state(
-            instance_key,
-            &legacy_candidates,
-            &row_names,
-            |row| config.plugins.entry_egress(row),
-        );
+        let state = tool_row_grant_state(config, package, instance_key);
         if matches!(
             state,
             crate::plugins::egress_ceremony::EgressGrantState::Stranded { .. }
@@ -5586,13 +5696,18 @@ fn stage_plugin_config_entries(
         }
     }
 
-    // Seed the declaration into the rows just created, before the save, so the
-    // grant lands through the same dirty-path persistence the entry itself
+    // Seed the decided grant into the rows just created, before the save, so
+    // the grant lands through the same dirty-path persistence the entry itself
     // uses — one row per instance carrying both `config` and `egress_hosts`.
     // `egress_hosts` is a plaintext sibling of the `#[secret]` `config` map, so
     // `encrypt_secrets` leaves it readable in the file the operator audits
     // (asserted by `seeded_egress_is_written_plaintext_beside_encrypted_config`).
-    let granted = crate::plugins::egress_ceremony::canonical_hosts(declared_egress);
+    // A withheld declaration leaves the created rows with an empty grant.
+    let declared = crate::plugins::egress_ceremony::canonical_hosts(declared_egress);
+    let (granted, withheld) = match tool_egress {
+        crate::plugins::channel_instance::EgressDecision::SeedDeclared => (declared, Vec::new()),
+        crate::plugins::channel_instance::EgressDecision::Withhold => (Vec::new(), declared),
+    };
     if !granted.is_empty() {
         for instance_key in &created {
             config
@@ -5610,12 +5725,42 @@ fn stage_plugin_config_entries(
         created,
         existing,
         granted,
+        withheld,
     })
+}
+
+/// Where the grant of `package`'s default tool binding row `instance_key`
+/// lives, read the way [`stage_plugin_config_entries`] reads it before it
+/// creates that row. The state is
+/// [`crate::plugins::egress_ceremony::EgressGrantState::Stranded`] when the row
+/// is absent and a pre-typed-config row keyed by the package name stands in
+/// its place, which staging refuses to create a second row beside. Quickstart
+/// reads the same state to report such a row by the rename it needs.
+#[cfg(feature = "plugins-wasm")]
+fn tool_row_grant_state(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+) -> crate::plugins::egress_ceremony::EgressGrantState {
+    let row_names: Vec<String> = config
+        .plugins
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    crate::plugins::egress_ceremony::resolve_grant_state(
+        instance_key,
+        &[package.to_string()],
+        &row_names,
+        |row| config.plugins.entry_egress(row),
+    )
 }
 
 /// Print what [`stage_plugin_config_entries`] staged, once the save has
 /// succeeded, in the order install has always printed it: each created row
-/// with the grant it was given, then the rows that already existed.
+/// with the grant it was given, or the declaration it withheld
+/// ([`created_plugin_config_entry_lines`]), then the rows that already
+/// existed.
 #[cfg(feature = "plugins-wasm")]
 fn report_seeded_plugin_config_entries(
     config: &crate::config::schema::Config,
@@ -5623,22 +5768,8 @@ fn report_seeded_plugin_config_entries(
     staged: &StagedPluginConfigEntries,
     declared_egress: &[String],
 ) {
-    for instance_key in &staged.created {
-        println!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seeded",
-                &[("name", instance_key)],
-                "Seeded config entry. Set plugin config values with \
-                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
-            )
-        );
-        print_egress_grant_ceremony(
-            egress_command_config_dir(config),
-            package,
-            instance_key,
-            &staged.granted,
-        );
+    for line in created_plugin_config_entry_lines(config, package, staged) {
+        println!("{line}");
     }
 
     // Rows that already existed — an upgrade, a reinstall, or an
@@ -5654,6 +5785,42 @@ fn report_seeded_plugin_config_entries(
     for instance_key in &staged.existing {
         report_existing_egress_grant(config, package, instance_key, declared_egress);
     }
+}
+
+/// The lines [`report_seeded_plugin_config_entries`] prints for the rows
+/// `staged` created, in install's order: each row's seeded line, then the
+/// grant ceremony for the declaration it was granted
+/// ([`egress_grant_ceremony_lines`]) or the line for the declaration it
+/// withheld ([`withheld_egress_grant_lines`]).
+#[cfg(feature = "plugins-wasm")]
+fn created_plugin_config_entry_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    staged: &StagedPluginConfigEntries,
+) -> Vec<String> {
+    let config_dir = egress_command_config_dir(config);
+    let mut lines = Vec::new();
+    for instance_key in &staged.created {
+        lines.push(ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", instance_key)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<instance-key>.config.<key>`.",
+        ));
+        lines.extend(egress_grant_ceremony_lines(
+            config_dir,
+            package,
+            instance_key,
+            &staged.granted,
+        ));
+        lines.extend(withheld_egress_grant_lines(
+            config_dir,
+            package,
+            instance_key,
+            &staged.withheld,
+        ));
+    }
+    lines
 }
 
 /// Publish a plugin and seed its config entries as one transaction.
@@ -5693,12 +5860,19 @@ fn report_seeded_plugin_config_entries(
 /// naming the commands that bind an instance. A package without the channel
 /// capability returns none, so a tool install prints exactly what it always
 /// has.
+///
+/// `tool_egress` is what the default tool binding's row starts out granting
+/// when this install creates it; see [`stage_plugin_config_entries`]. `plugin
+/// install` passes `SeedDeclared`, as it always seeded. It never touches a
+/// row that exists, and never a channel row, whose grant the channel request
+/// decides.
 #[cfg(feature = "plugins-wasm")]
 async fn publish_and_seed_plugin(
     host: &mut zeroclaw::plugins::host::PluginHost,
     config: &mut crate::config::schema::Config,
     admitted: zeroclaw::plugins::host::AdmittedSource,
     channel: Option<ChannelBindingRequest>,
+    tool_egress: crate::plugins::channel_instance::EgressDecision,
     announce_installed: impl FnOnce(&str),
 ) -> Result<Vec<String>> {
     use crate::plugins::channel_instance::{
@@ -5723,8 +5897,13 @@ async fn publish_and_seed_plugin(
             .find(|row| !row.is_channel())
             .map(|row| declared_hosts_for_row(manifest, row))
             .unwrap_or_default();
-        let staged =
-            stage_plugin_config_entries(config, &name, &tool_binding_entries(rows), &declared)?;
+        let staged = stage_plugin_config_entries(
+            config,
+            &name,
+            &tool_binding_entries(rows),
+            &declared,
+            tool_egress,
+        )?;
         let binding = match &channel {
             Some(request) => {
                 let plan = plan_channel_binding(config, manifest, &request.alias, request.egress)
@@ -5793,11 +5972,41 @@ async fn publish_and_seed_plugin(
             "the plugin package '{name}' was rolled back after its configuration \
              could not be seeded; re-run the install once the cause above is resolved"
         ))),
-        Err(rollback_err) => Err(seed_err.context(format!(
+        Err(rollback_err) => Err(seed_err.context(PublishRollbackFailed {
+            package: name,
+            rollback_error: rollback_err.to_string(),
+        })),
+    }
+}
+
+/// The error layer [`publish_and_seed_plugin`] adds when undoing its publish
+/// failed too: the package stays installed and has to be removed by hand.
+///
+/// A type rather than only text, so a caller that reports what a run changed
+/// can tell this failure from one that left nothing behind. The host drops
+/// the package from its loaded set before it deletes the directory, so after
+/// this failure the host no longer lists a package that is still on disk.
+/// The text is what `plugin install` prints.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+struct PublishRollbackFailed {
+    package: String,
+    rollback_error: String,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl std::fmt::Display for PublishRollbackFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            package: name,
+            rollback_error,
+        } = self;
+        write!(
+            f,
             "the plugin package '{name}' could not be seeded and rolling it back \
-             ALSO failed ({rollback_err}); the package is still installed — remove \
+             ALSO failed ({rollback_error}); the package is still installed — remove \
              it with `zeroclaw plugin remove {name}` before retrying"
-        ))),
+        )
     }
 }
 
@@ -5848,11 +6057,14 @@ async fn install_admitted_source(
         })?;
     }
     verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
+    // The tool row is seeded with the declaration, as `plugin install` always
+    // seeded it.
     Box::pin(publish_and_seed_plugin(
         host,
         config,
         admitted,
         channel,
+        crate::plugins::channel_instance::EgressDecision::SeedDeclared,
         announce_installed,
     ))
     .await
@@ -9117,6 +9329,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // The next engine restores them as active, so it has to own their
             // terminal write too; see `SopDriverTeardown::unsettled_runs`.
             let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
+            let mut carried_sop_settlements = None;
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -9182,11 +9395,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         Some(authority.execution_capability()),
                     );
                     let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
-                    if !unsettled.is_empty() {
+                    let pending = carried_sop_settlements.take();
+                    if !unsettled.is_empty() || pending.is_some() {
                         let mut guard = match engine.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
+                        if let Some(queue) = pending {
+                            guard.adopt_orphaned_run_settlement_queue(queue);
+                        }
                         guard.adopt_orphaned_run_settlements(unsettled.into_iter().map(|run_id| {
                             (
                                 run_id,
@@ -9218,10 +9435,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // triggers against the shared engine for this daemon iteration.
                 // The generation-owned driver supervisor: exists whenever the
                 // SOP engine does, whether or not the maintenance tick runs.
-                let sop_driver_supervisor = if sop_engine.is_some() {
-                    Some(SopDriverSupervisor::new(std::mem::take(
-                        &mut carried_sop_drivers,
-                    )))
+                let sop_driver_supervisor = if let Some(engine) = sop_engine.as_ref() {
+                    Some(SopDriverSupervisor::new(
+                        std::mem::take(&mut carried_sop_drivers),
+                        engine,
+                    ))
                 } else {
                     let carried = std::mem::take(&mut carried_sop_drivers);
                     if !carried.is_empty() {
@@ -9906,6 +10124,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let teardown = supervisor.shutdown().await;
                     carried_sop_drivers = teardown.still_running;
                     carried_unsettled_sop_runs = teardown.unsettled_runs;
+                    carried_sop_settlements = teardown.pending_settlements;
                 }
                 let (exit, transferred_ownership) = exit?;
                 match exit {
@@ -10732,7 +10951,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
                 let sop_driver_supervisor = sop_engine
                     .as_ref()
-                    .map(|_| SopDriverSupervisor::new(Vec::new()));
+                    .map(|engine| SopDriverSupervisor::new(Vec::new(), engine));
                 let sop_maintenance = spawn_sop_maintenance(
                     &config,
                     sop_engine.as_ref(),
@@ -12030,16 +12249,17 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Box::pin(config.save_dirty()).await?;
 
-                // Report the withheld tool when this patch is what enabled the
-                // section. The helper returns early while it stays disabled, so
-                // the guard is only about the already-enabled case: the startup
-                // call has recorded that one for this process, and recording it
-                // again here would restore the second copy this command used to
-                // write. The trace sink was installed before the command
-                // dispatched, so the record has somewhere to go.
+                // Report only a new enable transition: startup already recorded
+                // an enabled section. Drain this post-save notice before the
+                // short-lived CLI exits, while preserving the committed config
+                // if the persistence writer reports a failure.
                 #[cfg(feature = "agent-runtime")]
-                if !verifiable_intent_was_enabled {
+                if !verifiable_intent_was_enabled && config.verifiable_intent.enabled {
                     warn_verifiable_intent_withheld(&config);
+                    zeroclaw_log::flush().context(t(
+                        "cli-config-patch-notice-flush-failed",
+                        "Config patch was saved, but its notice could not be flushed",
+                    ))?;
                 }
 
                 if json {
@@ -14536,6 +14756,8 @@ struct SopDriverTeardown {
     /// restores them; it adopts these so its maintenance owns the settlement
     /// instead of renewing a claim nothing will release.
     unsettled_runs: Vec<String>,
+    /// Same queue the old engine writes, including failures after handoff.
+    pending_settlements: Option<zeroclaw_runtime::sop::engine::OrphanedRunSettlementQueue>,
 }
 
 /// One daemon generation's headless-driver supervisor. Every driver the
@@ -14548,6 +14770,8 @@ struct SopDriverTeardown {
 #[cfg(feature = "agent-runtime")]
 struct SopDriverSupervisor {
     drivers: SopDriverSet,
+    /// Retained independently of driver handles, which admission may prune.
+    pending_settlements: Option<zeroclaw_runtime::sop::engine::OrphanedRunSettlementQueue>,
     /// Drivers a previous generation aborted that had not stopped by the time
     /// its teardown returned.
     ///
@@ -14576,7 +14800,10 @@ impl SopMaintenance {
 
 #[cfg(feature = "agent-runtime")]
 impl SopDriverSupervisor {
-    fn new(carried: Vec<tokio::task::JoinHandle<()>>) -> Self {
+    fn new(
+        carried: Vec<tokio::task::JoinHandle<()>>,
+        engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    ) -> Self {
         if !carried.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -14586,8 +14813,13 @@ impl SopDriverSupervisor {
                  stopped; this generation tracks them until they do"
             );
         }
+        let pending_settlements = match engine.lock() {
+            Ok(engine) => engine.orphaned_run_settlement_queue(),
+            Err(poisoned) => poisoned.into_inner().orphaned_run_settlement_queue(),
+        };
         Self {
             drivers: SopDriverSet::default(),
+            pending_settlements: Some(pending_settlements),
             carried,
         }
     }
@@ -14645,6 +14877,7 @@ impl SopDriverSupervisor {
             return SopDriverTeardown {
                 still_running,
                 unsettled_runs: Vec::new(),
+                pending_settlements: self.pending_settlements,
             };
         }
         // A cursor, not an iterator: when the drain deadline fires mid-loop the
@@ -14665,6 +14898,7 @@ impl SopDriverSupervisor {
             return SopDriverTeardown {
                 still_running,
                 unsettled_runs: Vec::new(),
+                pending_settlements: self.pending_settlements,
             };
         }
         // `abort` only *requests* cancellation: the task stops at its next
@@ -14769,6 +15003,7 @@ impl SopDriverSupervisor {
         SopDriverTeardown {
             still_running,
             unsettled_runs,
+            pending_settlements: self.pending_settlements,
         }
     }
 }
@@ -15842,15 +16077,20 @@ mod tests {
     #[test]
     fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
         let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
-        let rows = [
+        let mut rows = vec![
             ("[ ] Model provider — not yet chosen", "[ ] Model"),
             ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
             ("[ ] Memory — not yet chosen", "[ ] Memory"),
             ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
             ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+        ];
+        #[cfg(feature = "plugins-wasm")]
+        rows.push(("[ ] Plugins — not yet visited", "[ ] Plugins"));
+        rows.extend([
             ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
             ("── Create agent", "── Create"),
-        ];
+        ]);
+        assert_eq!(rows.len(), QUICKSTART_CHECKLIST_ROWS);
 
         for (row, identifiable_prefix) in rows {
             let fitted = fit_quickstart_selector_row(row, budget);
@@ -15869,14 +16109,16 @@ mod tests {
     /// the real, longer, column-padded row has already collapsed.
     #[cfg(feature = "agent-runtime")]
     fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
-        const ROW_KEYS: [&str; 6] = [
+        let mut row_keys = vec![
             "cli-quickstart-row-model-provider",
             "cli-quickstart-row-risk-profile",
             "cli-quickstart-row-memory",
             "cli-quickstart-row-channels",
             "cli-quickstart-row-peer-groups",
-            "cli-quickstart-row-agent-identity",
         ];
+        #[cfg(feature = "plugins-wasm")]
+        row_keys.push("cli-quickstart-row-plugins");
+        row_keys.push("cli-quickstart-row-agent-identity");
 
         let value_for = |key: &str| -> String {
             cli_ftl
@@ -15886,7 +16128,7 @@ mod tests {
                 .to_string()
         };
 
-        let mut rows: Vec<String> = ROW_KEYS
+        let mut rows: Vec<String> = row_keys
             .iter()
             .map(|key| {
                 value_for(key)
@@ -15897,6 +16139,11 @@ mod tests {
         rows.push(value_for("cli-quickstart-create-agent"));
         rows
     }
+
+    /// Checklist rows: five selectors before Plugins, the Plugins row in
+    /// builds with plugin support, Agent identity, and Create.
+    #[cfg(feature = "agent-runtime")]
+    const QUICKSTART_CHECKLIST_ROWS: usize = if cfg!(feature = "plugins-wasm") { 8 } else { 7 };
 
     #[cfg(feature = "agent-runtime")]
     #[test]
@@ -15933,7 +16180,11 @@ mod tests {
 
         for (locale, cli_ftl) in locales {
             let rows = quickstart_checklist_rows_for_locale(cli_ftl);
-            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+            assert_eq!(
+                rows.len(),
+                QUICKSTART_CHECKLIST_ROWS,
+                "{locale}: expected {QUICKSTART_CHECKLIST_ROWS} checklist rows"
+            );
 
             for width in 0..=120usize {
                 let Some(budget) = quickstart_selector_row_budget(width) else {
@@ -16012,10 +16263,20 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_height_prevents_paging_suffixes() {
-        let item_count = 7;
+        let item_count = QUICKSTART_CHECKLIST_ROWS;
         let min_height = quickstart_selector_min_height(item_count);
 
-        assert_eq!(min_height, 9);
+        // The prompt line and the terminal's final line come on top of the
+        // rows: 9 rows of terminal for the 7-row checklist, 10 once the
+        // Plugins row is compiled in.
+        assert_eq!(
+            min_height,
+            if cfg!(feature = "plugins-wasm") {
+                10
+            } else {
+                9
+            }
+        );
         assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
         assert!(quickstart_selector_fits_height(min_height, item_count));
         assert!(quickstart_selector_fits_height(min_height + 1, item_count));
@@ -16185,15 +16446,20 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
-        let actions = [
+        let mut actions = vec![
             QuickstartChecklistAction::Provider,
             QuickstartChecklistAction::Risk,
             QuickstartChecklistAction::Memory,
             QuickstartChecklistAction::Channels,
             QuickstartChecklistAction::PeerGroups,
+        ];
+        #[cfg(feature = "plugins-wasm")]
+        actions.push(QuickstartChecklistAction::Plugins);
+        actions.extend([
             QuickstartChecklistAction::Agent,
             QuickstartChecklistAction::Create,
-        ];
+        ]);
+        assert_eq!(actions.len(), QUICKSTART_CHECKLIST_ROWS);
         let choices: Vec<(QuickstartChecklistAction, String)> = actions
             .iter()
             .copied()
@@ -18756,6 +19022,7 @@ mod tests {
 
         let teardown = SopDriverSupervisor {
             drivers,
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown_with_deadlines(
@@ -18843,6 +19110,7 @@ mod tests {
         ));
         let teardown = SopDriverSupervisor {
             drivers,
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown_with_deadlines(
@@ -18891,6 +19159,417 @@ mod tests {
             0,
             "the next generation released the claim instead of renewing it"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_finished_drivers_settlement_retry_survives_reload_with_its_original_kind() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::{OrphanedRunSettlement, SopRunStatus};
+
+        for (kind, event_kind, restore_succeeds) in [
+            (
+                OrphanedRunSettlement::ExecutionRejected,
+                "run_execution_rejected",
+            ),
+            (
+                OrphanedRunSettlement::DrainedBeforeAdmission,
+                "run_generation_drained",
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(kind, event_kind)| {
+            [true, false].map(|restore_succeeds| (kind, event_kind, restore_succeeds))
+        }) {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = tmp.path().join("sop-runs.db");
+            let name = "finished-driver-retry";
+            let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+                zeroclaw_runtime::sop::SqliteRunStore::open(&db).unwrap(),
+            ));
+            let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+            let supervisor = SopDriverSupervisor::new(Vec::new(), &engine);
+            let driver_engine = engine.clone();
+            let driver_run = run_id.clone();
+            assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+                &supervisor.drivers,
+                &run_id,
+                &engine,
+                || {
+                    ::zeroclaw_spawn::spawn!(async move {
+                        driver_engine
+                            .lock()
+                            .unwrap()
+                            .settle_orphaned_run(&driver_run, kind)
+                            .unwrap_err();
+                    })
+                },
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !store.fired() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // This current-thread task has no await inside its settlement;
+            // it finished before this test resumes. New admission prunes it.
+            assert!(zeroclaw_runtime::sop::admit_sop_driver(
+                &supervisor.drivers,
+                || ::zeroclaw_spawn::spawn!(async {}),
+            ));
+            assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
+            let teardown = supervisor.shutdown().await;
+            assert!(teardown.still_running.is_empty());
+            assert!(teardown.unsettled_runs.is_empty());
+            assert_eq!(store.claim_counts(name).unwrap().0, 1);
+
+            let reopened =
+                std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).unwrap());
+            let mut next = zeroclaw_runtime::sop::SopEngine::new(
+                zeroclaw_config::schema::SopConfig::default(),
+            )
+            .with_store(reopened.clone());
+            next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            let stored_json: String = connection
+                .query_row(
+                    "SELECT json FROM sop_runs WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if !restore_succeeds {
+                connection
+                    .execute(
+                        "UPDATE sop_runs SET json='invalid' WHERE run_id=?1",
+                        [&run_id],
+                    )
+                    .unwrap();
+            }
+            next.restore_runs();
+            next.adopt_orphaned_run_settlement_queue(teardown.pending_settlements.unwrap());
+            // Aborted-driver fallback must not relabel an existing rejection.
+            next.adopt_orphaned_run_settlements([(
+                run_id.clone(),
+                OrphanedRunSettlement::DriverAborted,
+            )]);
+            if !restore_succeeds {
+                assert!(next.active_runs().is_empty());
+                assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+                assert!(next.has_pending_orphan_settlement(&run_id));
+                assert_eq!(reopened.claim_counts(name).unwrap().0, 1);
+                assert!(!reopened.list_events(&run_id).unwrap().iter().any(|event| {
+                    event.kind == event_kind || event.kind == "run_driver_aborted"
+                }));
+                connection
+                    .execute(
+                        "UPDATE sop_runs SET json=?1 WHERE run_id=?2",
+                        [&stored_json, &run_id],
+                    )
+                    .unwrap();
+                // Do not restore again: maintenance must resolve the cache miss.
+            }
+            assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 1);
+            assert!(!next.has_pending_orphan_settlement(&run_id));
+            assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+            assert_eq!(
+                next.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(
+                reopened.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(reopened.claim_counts(name).unwrap().0, 0);
+            let events = reopened.list_events(&run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == event_kind)
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.kind == "run_driver_aborted")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn overlapping_generations_settle_an_orphan_once_and_reconcile_stale_views() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+        use zeroclaw_runtime::sop::metrics::SopMetricsCollector;
+        use zeroclaw_runtime::sop::store::{
+            ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy,
+            SopEventRecord, StoreError,
+        };
+        use zeroclaw_runtime::sop::{
+            OrphanedRunSettlement, SopEngine, SopRunStatus, SopRunStore, SqliteRunStore,
+        };
+
+        // Pause one authoritative read after it took its snapshot. The other
+        // engine must not enter its read until this settlement has finished.
+        type ReadProbe = (mpsc::Sender<()>, Option<mpsc::Receiver<()>>);
+
+        struct ReadProbeStore {
+            inner: SqliteRunStore,
+            probe: Mutex<Option<ReadProbe>>,
+        }
+
+        impl SopRunStore for ReadProbeStore {
+            fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
+                self.inner.save_run(run)
+            }
+            fn save_run_with_event(
+                &self,
+                run: &PersistedRun,
+                event: &SopEventRecord,
+            ) -> Result<u64, StoreError> {
+                self.inner.save_run_with_event(run, event)
+            }
+            fn finish_run(&self, id: &str, run: &PersistedRun) -> Result<(), StoreError> {
+                self.inner.finish_run(id, run)
+            }
+            fn finish_run_with_event(
+                &self,
+                id: &str,
+                run: &PersistedRun,
+                event: &SopEventRecord,
+            ) -> Result<u64, StoreError> {
+                self.inner.finish_run_with_event(id, run, event)
+            }
+            fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+                self.inner.load_active_runs()
+            }
+            fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+                self.inner.load_terminal_runs(limit)
+            }
+            fn load_run(&self, id: &str) -> Result<Option<PersistedRun>, StoreError> {
+                let run = self.inner.load_run(id)?;
+                let probe = self.probe.lock().unwrap().take();
+                if let Some((started, release)) = probe {
+                    started.send(()).unwrap();
+                    if let Some(release) = release {
+                        release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                }
+                Ok(run)
+            }
+            fn last_terminal_completed_at(&self, name: &str) -> Result<Option<String>, StoreError> {
+                self.inner.last_terminal_completed_at(name)
+            }
+            fn try_claim_run(
+                &self,
+                id: &str,
+                name: &str,
+                per_sop: usize,
+                global: usize,
+            ) -> Result<Option<ClaimToken>, StoreError> {
+                self.inner.try_claim_run(id, name, per_sop, global)
+            }
+            fn renew_claim_for_restore(
+                &self,
+                id: &str,
+                name: &str,
+            ) -> Result<ClaimToken, StoreError> {
+                self.inner.renew_claim_for_restore(id, name)
+            }
+            fn claim_counts(&self, name: &str) -> Result<(usize, usize), StoreError> {
+                self.inner.claim_counts(name)
+            }
+            fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+                self.inner.heartbeat_claim(token)
+            }
+            fn release_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+                self.inner.release_claim(token)
+            }
+            fn expired_claims(&self, now: &str) -> Result<Vec<ClaimToken>, StoreError> {
+                self.inner.expired_claims(now)
+            }
+            fn append_event(&self, event: &SopEventRecord) -> Result<u64, StoreError> {
+                self.inner.append_event(event)
+            }
+            fn list_events(&self, id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+                self.inner.list_events(id)
+            }
+            fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+                self.inner.save_proposal(proposal)
+            }
+            fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+                self.inner.load_proposal(id)
+            }
+            fn list_proposals(
+                &self,
+                status: Option<ProposalStatus>,
+            ) -> Result<Vec<ProposalRecord>, StoreError> {
+                self.inner.list_proposals(status)
+            }
+            fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+                self.inner.prune(policy)
+            }
+            fn health_check(&self) -> bool {
+                self.inner.health_check()
+            }
+            fn backend(&self) -> &'static str {
+                self.inner.backend()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("sop-runs.db");
+        let name = "overlapping-settlement";
+        let old_store = Arc::new(ReadProbeStore {
+            inner: SqliteRunStore::open(&db).unwrap(),
+            probe: Mutex::new(None),
+        });
+        let (old, run_id) = engine_with_one_running_run(name, old_store.clone());
+        let queue = old.lock().unwrap().orphaned_run_settlement_queue();
+        let next_store = Arc::new(ReadProbeStore {
+            inner: SqliteRunStore::open(&db).unwrap(),
+            probe: Mutex::new(None),
+        });
+        let metrics = Arc::new(SopMetricsCollector::new());
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(8);
+        let mut next = SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_store(next_store.clone())
+            .with_metrics(metrics.clone())
+            .with_run_notifier(notifier);
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        next.adopt_orphaned_run_settlement_queue(queue.clone());
+        assert!(next.active_runs().contains_key(&run_id));
+
+        // An unreadable durable row must retain the retry even with both caches
+        // populated; it must not fall back to writing either cached snapshot.
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT json FROM sop_runs WHERE run_id=?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sop_runs SET json='invalid' WHERE run_id=?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert!(
+            old.lock()
+                .unwrap()
+                .settle_orphaned_run(&run_id, OrphanedRunSettlement::ExecutionRejected)
+                .is_err()
+        );
+        assert!(next.has_pending_orphan_settlement(&run_id));
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 1);
+        connection
+            .execute(
+                "UPDATE sop_runs SET json=?1 WHERE run_id=?2",
+                [&json, &run_id],
+            )
+            .unwrap();
+
+        let (old_read, old_read_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        *old_store.probe.lock().unwrap() = Some((old_read, Some(release_rx)));
+        let (next_read, next_read_rx) = mpsc::channel();
+        *next_store.probe.lock().unwrap() = Some((next_read, None));
+        let old_run_id = run_id.clone();
+        let old_engine = old.clone();
+        let old_attempt = std::thread::spawn(move || {
+            old_engine
+                .lock()
+                .unwrap()
+                .settle_orphaned_run(&old_run_id, OrphanedRunSettlement::ExecutionRejected)
+        });
+        old_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let serialized = queue.settlement_in_progress_for_test();
+        let (attempt_started, attempt_started_rx) = mpsc::channel();
+        let next_run_id = run_id.clone();
+        let next_attempt = std::thread::spawn(move || {
+            attempt_started.send(()).unwrap();
+            let result =
+                next.settle_orphaned_run(&next_run_id, OrphanedRunSettlement::DriverAborted);
+            (next, result)
+        });
+        attempt_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        // Release and join before asserting, including on a broken lock, so the
+        // regression never leaves a paused worker behind on failure.
+        release.send(()).unwrap();
+        let old_result = old_attempt.join().unwrap().unwrap();
+        let (mut next, next_result) = next_attempt.join().unwrap();
+        assert!(
+            serialized,
+            "the handed-off gate must cover the old engine's authoritative read"
+        );
+        assert_eq!(old_result, Some(SopRunStatus::Running));
+        assert_eq!(next_result.unwrap(), None);
+        next_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        for engine in [&*old.lock().unwrap(), &next] {
+            assert!(!engine.active_runs().contains_key(&run_id));
+            assert!(!engine.has_pending_orphan_settlement(&run_id));
+            assert_eq!(
+                engine.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(engine.finished_runs(Some(name)).len(), 1);
+        }
+        let durable = next_store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(durable.run.status, SopRunStatus::Cancelled);
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 0);
+        let events = next_store.list_events(&run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_execution_rejected")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted")
+        );
+        assert_eq!(metrics.snapshot()["global"]["runs_cancelled"], 0);
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Another retry and maintenance pass only reconcile views; they must not
+        // rewrite the winner's terminal revision or refill its released claim.
+        next.adopt_orphaned_run_settlements([(
+            run_id.clone(),
+            OrphanedRunSettlement::DriverAborted,
+        )]);
+        assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+        assert_eq!(next.finished_runs(Some(name)).len(), 1);
+        assert_eq!(
+            next_store.load_run(&run_id).unwrap().unwrap().revision,
+            durable.revision
+        );
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 0);
+        assert_eq!(next_store.list_events(&run_id).unwrap().len(), events.len());
+        assert_eq!(metrics.snapshot()["global"]["runs_cancelled"], 0);
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let reused = next_store
+            .try_claim_run("replacement-run", name, 1, 1)
+            .unwrap()
+            .expect("settlement made the concurrency slot reusable");
+        next_store.release_claim(&reused).unwrap();
     }
 
     /// `calls_tool`: the model asks for one tool before answering, so a test can
@@ -19548,6 +20227,7 @@ mod tests {
         // production ones; the logic under test is identical.
         let carried = SopDriverSupervisor {
             drivers,
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown_with_deadlines(
@@ -19657,6 +20337,7 @@ mod tests {
         }));
         let carried = SopDriverSupervisor {
             drivers,
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown_with_deadlines(
@@ -19693,6 +20374,7 @@ mod tests {
         let started = std::time::Instant::now();
         let carried = SopDriverSupervisor {
             drivers,
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown_with_deadlines(
@@ -19716,6 +20398,7 @@ mod tests {
         let adopted_at = std::time::Instant::now();
         let still_carried = SopDriverSupervisor {
             drivers: SopDriverSet::default(),
+            pending_settlements: None,
             carried: carried.still_running,
         }
         .shutdown_with_deadlines(
@@ -19757,6 +20440,7 @@ mod tests {
         let drivers = SopDriverSet::default();
         let carried = SopDriverSupervisor {
             drivers: std::sync::Arc::clone(&drivers),
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown()
@@ -19842,6 +20526,7 @@ mod tests {
 
         let carried = SopDriverSupervisor {
             drivers: std::sync::Arc::clone(&drivers),
+            pending_settlements: None,
             carried: Vec::new(),
         }
         .shutdown()
@@ -20000,51 +20685,15 @@ mod tests {
         );
     }
 
-    /// Runtime load verification for an *already installed* plugin.
-    ///
-    /// The install gate cannot cover a plugin installed before it existed,
-    /// installed through `--no-verify`, or one whose host was upgraded
-    /// underneath it. These are the two surfaces that can: `plugin info`
-    /// always, `plugin list --verify` on demand.
-    ///
-    /// The assertions run against the rendered lines rather than captured
-    /// stdout because those functions *are* the output. That is also what lets
-    /// the plain listing be checked for the absence of the flag's effect.
+    /// The in-tree tool component, for every test in this binary that needs a
+    /// real one: the plugin load-check tests below and the Quickstart plugin
+    /// step's tests. Both run with the Cranelift backend, the one that
+    /// compiles this raw component.
     #[cfg(feature = "plugins-wasm-cranelift")]
-    mod plugin_load_check {
-        use super::*;
-        use std::path::{Path, PathBuf};
+    pub(crate) mod tool_component_fixture {
+        use std::path::PathBuf;
         use std::process::Command;
         use std::sync::OnceLock;
-        use zeroclaw::plugins::host::PluginHost;
-
-        /// The wasmtime-independent part of a compile failure's cause chain.
-        /// Asserting on this rather than on translated prose keeps the test
-        /// honest under any locale the process happens to detect.
-        const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
-
-        fn verifier_limits() -> zeroclaw::plugins::component::PluginLimits {
-            zeroclaw_runtime::plugin_runtime::plugin_limits(
-                &crate::config::schema::Config::default(),
-            )
-        }
-
-        /// The fixture package's manifest, mirroring the one the plugins
-        /// crate's end-to-end test installs.
-        const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
-version = "0.0.0"
-wasm_path = "tool-fixture.wasm"
-capabilities = ["tool"]
-permissions = ["config_read"]
-
-[config_schema]
-"$schema" = "https://json-schema.org/draft/2020-12/schema"
-type = "object"
-additionalProperties = false
-
-[config_schema.properties.label]
-type = "string"
-"#;
 
         /// This test binary sits at `<target>/<profile>/deps/<name>`, so its
         /// own path is what locates the target directory when
@@ -20057,10 +20706,10 @@ type = "string"
                 .to_path_buf()
         }
 
-        /// Build the in-tree tool component once per test binary. There is no
-        /// skip path: a fixture that cannot be built is a test failure, not a
-        /// silently green run.
-        fn tool_fixture() -> PathBuf {
+        /// The component, built once per test process. There is no skip path:
+        /// a fixture that cannot be built is a test failure, not a silently
+        /// green run.
+        pub(crate) fn wasm() -> PathBuf {
             static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
             FIXTURE
                 .get_or_init(|| {
@@ -20096,6 +20745,51 @@ type = "string"
                 })
                 .clone()
         }
+    }
+
+    /// Runtime load verification for an *already installed* plugin.
+    ///
+    /// The install gate cannot cover a plugin installed before it existed,
+    /// installed through `--no-verify`, or one whose host was upgraded
+    /// underneath it. These are the two surfaces that can: `plugin info`
+    /// always, `plugin list --verify` on demand.
+    ///
+    /// The assertions run against the rendered lines rather than captured
+    /// stdout because those functions *are* the output. That is also what lets
+    /// the plain listing be checked for the absence of the flag's effect.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    mod plugin_load_check {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use zeroclaw::plugins::host::PluginHost;
+
+        /// The wasmtime-independent part of a compile failure's cause chain.
+        /// Asserting on this rather than on translated prose keeps the test
+        /// honest under any locale the process happens to detect.
+        const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
+
+        fn verifier_limits() -> zeroclaw::plugins::component::PluginLimits {
+            zeroclaw_runtime::plugin_runtime::plugin_limits(
+                &crate::config::schema::Config::default(),
+            )
+        }
+
+        /// The fixture package's manifest, mirroring the one the plugins
+        /// crate's end-to-end test installs.
+        const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.label]
+type = "string"
+"#;
 
         /// Seed a throwaway config directory and install the fixture into it
         /// through the real `PluginHost::install`, so the package under test is
@@ -20103,7 +20797,11 @@ type = "string"
         fn install_fixture(workspace: &Path) -> PluginHost {
             let source = workspace.join("source/tool-fixture");
             std::fs::create_dir_all(&source).unwrap();
-            std::fs::copy(tool_fixture(), source.join("tool-fixture.wasm")).unwrap();
+            std::fs::copy(
+                super::tool_component_fixture::wasm(),
+                source.join("tool-fixture.wasm"),
+            )
+            .unwrap();
             std::fs::write(source.join("manifest.toml"), FIXTURE_MANIFEST).unwrap();
 
             let mut host = PluginHost::new(workspace).expect("throwaway plugin host");
@@ -20549,6 +21247,8 @@ type = "string"
     /// Install's seeding of a package's tool rows without a package to
     /// publish: stage the rows, save once, then report, as
     /// `publish_and_seed_plugin` does around any channel binding it adds.
+    /// The rows are seeded with the declaration, as `plugin install` seeds
+    /// them.
     #[cfg(feature = "plugins-wasm")]
     async fn seed_plugin_config_entries(
         config: &mut crate::config::schema::Config,
@@ -20556,7 +21256,13 @@ type = "string"
         entries: &[(zeroclaw::plugins::PluginCapability, String)],
         declared_egress: &[String],
     ) -> Result<()> {
-        let staged = stage_plugin_config_entries(config, package, entries, declared_egress)?;
+        let staged = stage_plugin_config_entries(
+            config,
+            package,
+            entries,
+            declared_egress,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
+        )?;
         if !staged.created.is_empty() {
             Box::pin(config.save_dirty()).await?;
         }
@@ -23673,6 +24379,7 @@ maxLength = 1
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
@@ -23834,6 +24541,7 @@ maxLength = 1
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
@@ -23858,6 +24566,7 @@ maxLength = 1
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
@@ -23866,6 +24575,174 @@ maxLength = 1
             grant_of(&config, &key),
             Some(Vec::new()),
             "adding http_client must not turn the earlier declaration into reach"
+        );
+    }
+
+    /// The tool row's decision, withheld: install creates the row with an
+    /// empty grant and reports the declaration it withheld with the command
+    /// that grants it later, the command the channel binding ceremony prints
+    /// under `--egress none`. Seeding the declaration, what `plugin install`
+    /// passes, adds no line to what install has always printed. Both are read
+    /// from the lines install's report prints for the rows it created.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_withheld_tool_row_is_created_empty_and_names_its_grant_command() {
+        use crate::plugins::channel_instance::{EgressDecision, declared_hosts_for_row};
+        use crate::plugins::egress_ceremony::{canonical_hosts, egress_set_command};
+
+        let manifest = tool_manifest("weather-tool", &["b.example.com", "a.example.com"], true);
+        let key = expected_instance_key(&manifest);
+        let seeded_line = ta("cli-plugin-config-entry-seeded", &[("name", &key)], "");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let rows = crate::plugins::channel_instance::instance_rows(&config, &manifest)
+            .expect("rows must derive");
+        let declared = declared_hosts_for_row(&manifest, &rows[0]);
+        let canonical = canonical_hosts(&declared);
+        let entries = install_entries(&config, &manifest);
+        let staged = stage_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &declared,
+            EgressDecision::Withhold,
+        )
+        .expect("staging must succeed");
+        assert_eq!(staged.created, vec![key.clone()]);
+        assert!(staged.granted.is_empty(), "nothing is granted");
+        assert_eq!(staged.withheld, canonical);
+        Box::pin(config.save_dirty()).await.expect("save");
+        let row = entry_on_disk(&config.config_path, &key);
+        assert!(
+            row.get("egress_hosts")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "the created row grants nothing: {row:?}"
+        );
+        assert_eq!(config.plugins.entry_egress(&key).0, Vec::<String>::new());
+
+        let command = egress_set_command(egress_command_config_dir(&config), &key, &canonical);
+        let withheld_line = ta(
+            "cli-plugin-egress-withheld",
+            &[
+                ("name", "weather-tool"),
+                ("count", &canonical.len().to_string()),
+                ("command", &command),
+            ],
+            "",
+        );
+        assert!(
+            withheld_line.contains(&command),
+            "the withheld line carries the grant command: {withheld_line}"
+        );
+        assert_eq!(
+            created_plugin_config_entry_lines(&config, "weather-tool", &staged),
+            vec![seeded_line.clone(), withheld_line],
+            "the report names the created row, then the declaration it withheld with the \
+             command that grants it, and no grant ceremony"
+        );
+
+        // Seeding the declaration grants it and withholds nothing, so install
+        // prints the grant ceremony alone, as it always has.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let entries = install_entries(&config, &manifest);
+        let staged = stage_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &declared,
+            EgressDecision::SeedDeclared,
+        )
+        .expect("staging must succeed");
+        assert_eq!(staged.granted, canonical);
+        assert!(staged.withheld.is_empty());
+        let ceremony = egress_grant_ceremony_lines(
+            egress_command_config_dir(&config),
+            "weather-tool",
+            &key,
+            &canonical,
+        );
+        assert!(!ceremony.is_empty(), "the declaration is granted on record");
+        assert_eq!(
+            created_plugin_config_entry_lines(&config, "weather-tool", &staged),
+            [vec![seeded_line], ceremony].concat(),
+            "the report is the seeded line and the grant ceremony, as install has always \
+             printed them"
+        );
+    }
+
+    /// Whatever the tool row's decision, a row that already exists is reported
+    /// against and never written: withholding does not empty an operator's
+    /// grant, and seeding does not extend it.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn no_tool_row_decision_touches_an_existing_row() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let key = expected_instance_key(&manifest);
+        for decision in [EgressDecision::Withhold, EgressDecision::SeedDeclared] {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let mut config = config_in_dir(tmp.path());
+            config
+                .plugins
+                .entries
+                .push(crate::config::schema::PluginEntryConfig {
+                    name: key.clone(),
+                    egress_hosts: vec!["unrelated.example.org".to_string()],
+                    ..Default::default()
+                });
+            let before = config.plugins.entries.clone();
+
+            let entries = install_entries(&config, &manifest);
+            let staged = stage_plugin_config_entries(
+                &mut config,
+                "weather-tool",
+                &entries,
+                &manifest.egress.hosts,
+                decision,
+            )
+            .expect("staging must succeed");
+
+            assert!(staged.created.is_empty(), "{decision:?}");
+            assert_eq!(staged.existing, vec![key.clone()], "{decision:?}");
+            assert_eq!(
+                format!("{:?}", config.plugins.entries),
+                format!("{before:?}"),
+                "{decision:?}: the existing row is left as it was"
+            );
+            assert!(
+                config.dirty_paths.is_empty(),
+                "{decision:?}: nothing is staged for the save: {:?}",
+                config.dirty_paths
+            );
+        }
+    }
+
+    /// A publish whose rollback failed too reads exactly as `plugin install`
+    /// always printed it, and a caller can still recognize it by type.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_failed_rollback_keeps_its_text_and_is_recognizable_by_type() {
+        let error = anyhow::Error::msg("seeding failed").context(PublishRollbackFailed {
+            package: "weather-tool".to_string(),
+            rollback_error: "permission denied".to_string(),
+        });
+        assert_eq!(
+            format!("{error:#}"),
+            "the plugin package 'weather-tool' could not be seeded and rolling it back ALSO \
+             failed (permission denied); the package is still installed — remove it with \
+             `zeroclaw plugin remove weather-tool` before retrying: seeding failed"
+        );
+        assert!(error.downcast_ref::<PublishRollbackFailed>().is_some());
+
+        let rolled_back = anyhow::Error::msg("seeding failed").context("rolled back");
+        assert!(
+            rolled_back
+                .downcast_ref::<PublishRollbackFailed>()
+                .is_none()
         );
     }
 
@@ -23920,6 +24797,7 @@ maxLength = 1
             &mut config1,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_name| {},
         ))
         .await
@@ -23953,6 +24831,7 @@ maxLength = 1
             &mut config2,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_name| {},
         ))
         .await
@@ -24034,6 +24913,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_name| announced.set(true),
         ))
         .await
@@ -24192,6 +25072,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_name| announced.set(true),
         ))
         .await
@@ -24238,6 +25119,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_name| announced.set(true),
         ))
         .await
@@ -24400,6 +25282,7 @@ hosts = ["api.example.com", "api2.example.com"]
                 alias: "operations".to_string(),
                 egress: Some(EgressDecision::SeedDeclared),
             }),
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| announced.set(true),
         ))
         .await
@@ -24564,6 +25447,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config1,
             admitted,
             request(),
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| announced.set(true),
         ))
         .await
@@ -24590,6 +25474,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config2,
             admitted,
             request(),
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
@@ -24647,6 +25532,7 @@ hosts = ["api.example.com", "api2.example.com"]
                 &mut config,
                 admitted,
                 None,
+                crate::plugins::channel_instance::EgressDecision::SeedDeclared,
                 |_| {},
             ))
             .await
@@ -25165,6 +26051,7 @@ hosts = ["api.example.com", "api2.example.com"]
             &mut config,
             admitted,
             None,
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
@@ -25717,6 +26604,7 @@ hosts = ["api.example.com", "api2.example.com"]
                 alias: "operations".to_string(),
                 egress: Some(EgressDecision::SeedDeclared),
             }),
+            crate::plugins::channel_instance::EgressDecision::SeedDeclared,
             |_| {},
         ))
         .await
