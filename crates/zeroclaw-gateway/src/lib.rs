@@ -1090,6 +1090,8 @@ async fn initialize_gateway_boot_state<'a>(
                     let model_provider_ref = format!("{boot_family}.{boot_alias}");
                     match e.downcast::<zeroclaw_providers::auth::ProviderCredentialRefreshError>() {
                         Ok(error) => {
+                            // Vendor error bodies may contain credentials; keep boot logs generic.
+                            // The original error remains available to direct provider consumers.
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(

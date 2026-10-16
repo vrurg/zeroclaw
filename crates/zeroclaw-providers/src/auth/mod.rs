@@ -36,9 +36,8 @@ static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 /// This is not evidence of missing configuration. Consumers may retain
 /// configured readiness, but must still propagate the failed request.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{source}")]
+#[error(transparent)]
 pub struct ProviderCredentialRefreshError {
-    #[source]
     source: Arc<dyn std::error::Error + Send + Sync>,
 }
 
@@ -1949,6 +1948,23 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn credential_refresh_error_preserves_chain_without_duplicate_message() {
+        let source = anyhow::Error::msg("token endpoint unavailable")
+            .context("OAuth refresh failed (HTTP 503)");
+        let expected = format!("{source:#}");
+        let error = anyhow::Error::new(ProviderCredentialRefreshError::new(source));
+        let marker = error
+            .downcast_ref::<ProviderCredentialRefreshError>()
+            .expect("refresh failure must remain typed");
+
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(
+            format!("{:#}", anyhow::Error::new(marker.clone())),
+            expected
+        );
+    }
 
     #[test]
     fn normalize_provider_aliases() {

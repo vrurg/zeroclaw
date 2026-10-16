@@ -1360,11 +1360,8 @@ pub struct AnthropicModelProviderConfig {
 impl AnthropicModelProviderConfig {
     /// OAuth setup tokens are accepted only by Anthropic's public API.
     pub fn has_official_oauth_endpoint(api_url: Option<&str>) -> bool {
-        // OAuth is deliberately an exact-root allowlist. The native provider
-        // appends its own API path, so endpoint variants (including a version
-        // path, query, fragment, or trailing slash) are not OAuth endpoints.
-        // Match the provider factory's normalization so validation and
-        // construction accept and reject the same submitted endpoint.
+        // The native provider appends its own API path. Normalize only surrounding
+        // whitespace; canonicalizing URL paths could bypass this exact-root allowlist.
         api_url.is_none_or(|url| url.trim() == AnthropicEndpoint::Default.uri())
     }
 }
