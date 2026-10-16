@@ -173,10 +173,6 @@ impl SqliteSessionBackend {
                 "principal_id",
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
-            (
-                "prompt_incarnation",
-                "ALTER TABLE session_metadata ADD COLUMN prompt_incarnation TEXT",
-            ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
@@ -868,6 +864,13 @@ impl SqliteSessionBackend {
     /// transaction serializes schema detection, adoption and stale-row cleanup.
     fn reconcile_prompt_ownership(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Serialize the parent-column check with its addition too: concurrent
+        // upgrade opens must not race before ownership reconciliation begins.
+        Self::ensure_metadata_column(
+            &tx,
+            "prompt_incarnation",
+            "ALTER TABLE session_metadata ADD COLUMN prompt_incarnation TEXT",
+        )?;
         // Metadata remains the canonical owner, including empty sessions
         // created by routing or import; no process-local generation registry.
         tx.execute_batch(
@@ -2553,36 +2556,108 @@ mod tests {
 
     #[test]
     fn session_prompt_concurrent_legacy_opens_serialize_binding_migration() {
+        for missing_metadata_binding in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let owner = backend.admit_session_prompt_owner("chat").unwrap();
+            backend
+                .set_session_prompt_for_owner(&owner, "task", "retained", None)
+                .unwrap();
+            drop(backend);
+            let raw = legacy_prompt_connection(tmp.path());
+            if missing_metadata_binding {
+                raw.execute_batch(
+                    "DROP TRIGGER session_metadata_prompt_owner;
+                 ALTER TABLE session_metadata DROP COLUMN prompt_incarnation;",
+                )
+                .unwrap();
+            }
+            drop(raw);
+            let barrier = Arc::new(Barrier::new(3));
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..2 {
+                    let start = Arc::clone(&barrier);
+                    let root = tmp.path();
+                    handles.push(scope.spawn(move || {
+                        start.wait();
+                        SqliteSessionBackend::new(root)
+                    }));
+                }
+                barrier.wait();
+                let mut migrated_owner = None;
+                for handle in handles {
+                    let opened = handle.join().unwrap().unwrap();
+                    let current = opened.admit_session_prompt_owner("chat").unwrap();
+                    if !missing_metadata_binding {
+                        assert!(current == owner);
+                    }
+                    if let Some(previous) = &migrated_owner {
+                        assert!(*previous == current);
+                    }
+                    assert_eq!(
+                        opened.list_session_prompts_for_owner(&current).unwrap()[0].content,
+                        "retained"
+                    );
+                    assert_eq!(prompt_row_count(&opened.conn.lock(), "chat"), 1);
+                    migrated_owner = Some(current);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn session_prompt_failed_migration_rolls_back_both_binding_columns() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let owner = backend.admit_session_prompt_owner("chat").unwrap();
         backend
-            .set_session_prompt_for_owner(&owner, "task", "retained", None)
+            .set_session_prompt("kept", "task", "retained")
+            .unwrap();
+        backend
+            .set_session_prompt("gone", "task", "orphan")
             .unwrap();
         drop(backend);
-        drop(legacy_prompt_connection(tmp.path()));
-        let barrier = Arc::new(Barrier::new(3));
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for _ in 0..2 {
-                let start = Arc::clone(&barrier);
-                let root = tmp.path();
-                handles.push(scope.spawn(move || {
-                    start.wait();
-                    SqliteSessionBackend::new(root)
-                }));
-            }
-            barrier.wait();
-            for handle in handles {
-                let opened = handle.join().unwrap().unwrap();
-                assert!(opened.admit_session_prompt_owner("chat").unwrap() == owner);
-                assert_eq!(
-                    opened.list_session_prompts_for_owner(&owner).unwrap()[0].content,
-                    "retained"
-                );
-                assert_eq!(prompt_row_count(&opened.conn.lock(), "chat"), 1);
-            }
-        });
+        let raw = legacy_prompt_connection(tmp.path());
+        raw.execute_batch(
+            "DROP TRIGGER session_metadata_prompt_owner;
+             ALTER TABLE session_metadata DROP COLUMN prompt_incarnation;
+             DELETE FROM session_metadata WHERE session_key = 'gone';
+             CREATE TRIGGER reject_prompt_reconciliation BEFORE DELETE ON session_prompts
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        )
+        .unwrap();
+
+        assert!(SqliteSessionBackend::new(tmp.path()).is_err());
+        for table in ["session_metadata", "session_prompts"] {
+            let has_binding: bool = raw.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = 'prompt_incarnation'",
+                [table], |row| row.get(0),
+            ).unwrap();
+            assert!(
+                !has_binding,
+                "failed migration retained {table} binding column"
+            );
+        }
+        assert_eq!(prompt_row_count(&raw, "kept"), 1);
+        assert_eq!(prompt_row_count(&raw, "gone"), 1);
+        raw.execute_batch("DROP TRIGGER reject_prompt_reconciliation")
+            .unwrap();
+        drop(raw);
+
+        let migrated = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let owner = migrated.admit_session_prompt_owner("kept").unwrap();
+        assert_eq!(
+            migrated.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+            "retained"
+        );
+        assert_eq!(prompt_row_count(&migrated.conn.lock(), "gone"), 0);
+        drop(migrated);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(reopened.admit_session_prompt_owner("kept").unwrap() == owner);
+        assert_eq!(
+            reopened.list_session_prompts_for_owner(&owner).unwrap()[0].content,
+            "retained"
+        );
     }
 
     #[test]
