@@ -13,9 +13,10 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage,
 };
+#[cfg(test)]
+use crate::terminal::TerminalUsageChargeability;
 use crate::terminal::{
-    TerminalRecoveryDisposition, TerminalUsageChargeability, default_terminal_policy,
-    terminal_completion_context,
+    TerminalRecoveryDisposition, default_terminal_policy, terminal_completion_context,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -393,27 +394,21 @@ fn record_provider_fallback(
     fallback
 }
 
-/// Retain refusal accounting and presentation data independently from the
-/// terminal cause. A later candidate failure may replace the terminal error,
-/// while the billed usage and a successful-rescue notice must still survive.
-fn remember_refusal(
+/// Retain rejected usage and refusal presentation independently from the
+/// terminal cause. Direct structured callers receive combined usage after recovery;
+/// accounted callers instead retain rejected usage in the physical ledger.
+fn remember_rejected_attempt(
     refusal_seen: &mut Option<AnthropicRefusalError>,
     rejected_attempt_usage: &mut Option<TokenUsage>,
     error: &anyhow::Error,
 ) {
-    if let Some(refusal) = crate::model_refusal_from_error(error) {
-        // A canonical terminal context is authoritative for rejected-attempt
-        // accounting. In particular, a pre-output refusal can advance to a
-        // different candidate while remaining informational rather than being
-        // folded into either a later accepted response or an exhaustion sidecar.
-        if terminal_completion_context(error).is_none_or(|context| {
-            context.policy().usage_chargeability() == TerminalUsageChargeability::Billable
-        }) {
-            accumulate_usage(rejected_attempt_usage, refusal.usage.as_deref());
-        }
-        if refusal_seen.is_none() {
-            *refusal_seen = Some(refusal.clone());
-        }
+    if !has_reliable_call_accounting() {
+        accumulate_usage(rejected_attempt_usage, terminal_error_usage(error).as_ref());
+    }
+    if let Some(refusal) = crate::model_refusal_from_error(error)
+        && refusal_seen.is_none()
+    {
+        *refusal_seen = Some(refusal.clone());
     }
 }
 
@@ -1981,6 +1976,10 @@ pub(crate) fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&To
             &mut accumulated.cached_input_tokens,
             usage.cached_input_tokens,
         ),
+        (
+            &mut accumulated.cache_creation_input_tokens,
+            usage.cache_creation_input_tokens,
+        ),
     ] {
         if let Some(value) = value {
             *target = Some(target.unwrap_or(0).saturating_add(value));
@@ -2691,7 +2690,11 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            remember_rejected_attempt(
+                                &mut refusal_seen,
+                                &mut rejected_attempt_usage,
+                                &e,
+                            );
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -3003,7 +3006,11 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            remember_rejected_attempt(
+                                &mut refusal_seen,
+                                &mut rejected_attempt_usage,
+                                &e,
+                            );
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -3442,7 +3449,11 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            remember_rejected_attempt(
+                                &mut refusal_seen,
+                                &mut rejected_attempt_usage,
+                                &e,
+                            );
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -3828,7 +3839,11 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            remember_rejected_attempt(
+                                &mut refusal_seen,
+                                &mut rejected_attempt_usage,
+                                &e,
+                            );
                             final_cause_is_semantic_empty = false;
                             if let Some(recovery) = terminal_recovery_disposition(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -5597,6 +5612,142 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    /// One physical result per leaf; an unexpected retry fails the fixture.
+    struct OneShotUsageOutcomeMock {
+        outcome: Mutex<Option<anyhow::Result<ChatResponse>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl OneShotUsageOutcomeMock {
+        fn take_outcome(&self) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcome
+                .lock()
+                .expect("fixture outcome lock")
+                .take()
+                .expect("a completed leaf must not be replayed")
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for OneShotUsageOutcomeMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("fixture requires a structured request")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.take_outcome()
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.take_outcome()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for OneShotUsageOutcomeMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "usage-fixture"
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RejectedUsageFixture {
+        SemanticEmpty,
+        Terminal,
+        ContextualTerminal,
+        Refusal,
+        InformationalRefusal,
+        NestedAggregate,
+    }
+
+    impl RejectedUsageFixture {
+        fn error(self) -> anyhow::Error {
+            use zeroclaw_api::model_provider::{
+                SemanticEmptyTerminalFailure, TerminalCompletionError, TerminalCompletionFailure,
+            };
+
+            let usage = TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(7),
+                cached_input_tokens: Some(4),
+                cache_creation_input_tokens: Some(2),
+            };
+            let terminal = || {
+                TerminalCompletionFailure::new(
+                    TerminalCompletionError::OutputTokenLimit,
+                    Some(usage.clone()),
+                )
+            };
+            match self {
+                Self::SemanticEmpty => {
+                    anyhow::Error::new(SemanticEmptyTerminalFailure::new(Some(usage)))
+                }
+                Self::Terminal => anyhow::Error::new(terminal()),
+                Self::ContextualTerminal => crate::terminal::terminal_completion_context_error(
+                    terminal(),
+                    default_terminal_policy(TerminalCompletionError::OutputTokenLimit),
+                ),
+                Self::Refusal | Self::InformationalRefusal => {
+                    let refusal = AnthropicRefusalError {
+                        requested_model: "test".to_string(),
+                        category: None,
+                        usage: Some(Box::new(usage.clone())),
+                        provider_executed_tool_activity: false,
+                        attempted_candidate: None,
+                        attempted_candidate_index: None,
+                    };
+                    if matches!(self, Self::InformationalRefusal) {
+                        crate::terminal::terminal_completion_context_error_with_source(
+                            TerminalCompletionFailure::new(
+                                TerminalCompletionError::Refusal,
+                                Some(usage),
+                            ),
+                            crate::terminal::TerminalCompletionPolicy::new(
+                                TerminalRecoveryDisposition::NextCandidate,
+                                TerminalUsageChargeability::Informational,
+                            ),
+                            refusal,
+                        )
+                    } else {
+                        anyhow::Error::new(refusal)
+                    }
+                }
+                Self::NestedAggregate => {
+                    anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                        usage.clone(),
+                        FailureEvents::default(),
+                        anyhow::Error::new(terminal()),
+                    ))
+                }
+            }
+        }
+    }
+
     struct UsagePersistentEmptyMock {
         calls: Arc<AtomicUsize>,
     }
@@ -6331,6 +6482,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unscoped_typed_error_recovery_preserves_billed_usage() {
+        assert_typed_error_recovery_usage(false).await;
+    }
+
+    #[tokio::test]
+    async fn accounted_typed_error_recovery_preserves_billed_usage_separately() {
+        assert_typed_error_recovery_usage(true).await;
+    }
+
+    async fn assert_typed_error_recovery_usage(accounted: bool) {
+        for fixture in [
+            RejectedUsageFixture::SemanticEmpty,
+            RejectedUsageFixture::Terminal,
+            RejectedUsageFixture::ContextualTerminal,
+            RejectedUsageFixture::Refusal,
+            RejectedUsageFixture::InformationalRefusal,
+            RejectedUsageFixture::NestedAggregate,
+        ] {
+            for with_tools in [false, true] {
+                let primary_calls = Arc::new(AtomicUsize::new(0));
+                let fallback_calls = Arc::new(AtomicUsize::new(0));
+                let reliable = ReliableModelProvider::new(
+                    "test",
+                    vec![
+                        (
+                            "primary".into(),
+                            Box::new(OneShotUsageOutcomeMock {
+                                outcome: Mutex::new(Some(Err(fixture.error()))),
+                                calls: Arc::clone(&primary_calls),
+                            }) as Box<dyn ModelProvider>,
+                        ),
+                        (
+                            "fallback".into(),
+                            Box::new(OneShotUsageOutcomeMock {
+                                outcome: Mutex::new(Some(Ok(ChatResponse {
+                                    text: Some("recovered".to_string()),
+                                    tool_calls: Vec::new(),
+                                    usage: Some(TokenUsage {
+                                        input_tokens: Some(3),
+                                        output_tokens: Some(2),
+                                        cached_input_tokens: Some(1),
+                                        cache_creation_input_tokens: Some(1),
+                                    }),
+                                    reasoning_content: None,
+                                }))),
+                                calls: Arc::clone(&fallback_calls),
+                            }) as Box<dyn ModelProvider>,
+                        ),
+                    ],
+                    0,
+                    1,
+                );
+                let messages = [ChatMessage::user("hello")];
+                let request = ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                };
+                let (response, rejected) = if accounted {
+                    let dispatch = ProviderDispatch::from_ref(&reliable);
+                    let result = if with_tools {
+                        dispatch
+                            .chat_with_tools_accounted(&messages, &[], "test", None)
+                            .await
+                    } else {
+                        dispatch.chat_accounted(request, "test", None).await
+                    }
+                    .expect("fallback succeeds");
+                    (result.response, result.rejected_attempt_usage)
+                } else {
+                    let response = if with_tools {
+                        reliable.chat_with_tools(&messages, &[], "test", None).await
+                    } else {
+                        reliable.chat(request, "test", None).await
+                    }
+                    .expect("fallback succeeds");
+                    (response, None)
+                };
+                let counters = |usage: &TokenUsage| {
+                    [
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_input_tokens,
+                        usage.cache_creation_input_tokens,
+                    ]
+                };
+                let billable = !matches!(fixture, RejectedUsageFixture::InformationalRefusal);
+                let expected = if accounted || !billable {
+                    [Some(3), Some(2), Some(1), Some(1)]
+                } else {
+                    [Some(15), Some(9), Some(5), Some(3)]
+                };
+                assert_eq!(response.text.as_deref(), Some("recovered"));
+                assert_eq!(
+                    response.usage.as_ref().map(counters),
+                    Some(expected),
+                    "{fixture:?}, accounted={accounted}, tools={with_tools}"
+                );
+                let expected_rejected =
+                    (accounted && billable).then_some([Some(12), Some(7), Some(4), Some(2)]);
+                assert_eq!(
+                    rejected.as_ref().map(counters),
+                    expected_rejected,
+                    "{fixture:?}, accounted={accounted}, tools={with_tools}"
+                );
+                assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn accounted_chat_keeps_rejected_usage_out_of_accepted_response() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -6863,7 +7126,7 @@ mod tests {
         );
         let mut refusal_seen = None;
         let mut rejected_usage = None;
-        remember_refusal(&mut refusal_seen, &mut rejected_usage, &error);
+        remember_rejected_attempt(&mut refusal_seen, &mut rejected_usage, &error);
 
         assert!(
             refusal_seen.is_some(),

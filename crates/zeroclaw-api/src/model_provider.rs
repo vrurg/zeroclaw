@@ -213,6 +213,8 @@ impl std::error::Error for SemanticEmptyTerminalCompletion {}
 /// context usage.
 #[derive(Debug)]
 pub struct SemanticEmptyTerminalFailure {
+    /// Provider-observed usage for the rejected attempt. Accounted consumers
+    /// retain it separately from accepted-response context usage.
     pub usage: Option<TokenUsage>,
     /// Provider-side tool activity occurred before the empty terminal result.
     /// Replaying this request could duplicate work even though no client tool
@@ -226,6 +228,8 @@ pub struct SemanticEmptyTerminalFailure {
 }
 
 impl SemanticEmptyTerminalFailure {
+    /// Construct a semantic-empty failure without observed provider-side tool
+    /// work or an explicit replay ban. Higher-level recovery policy still applies.
     #[must_use]
     pub const fn new(usage: Option<TokenUsage>) -> Self {
         Self {
@@ -236,6 +240,8 @@ impl SemanticEmptyTerminalFailure {
         }
     }
 
+    /// Construct a semantic-empty failure after provider-side tool work,
+    /// marking it ineligible for replay so that work cannot be duplicated.
     #[must_use]
     pub const fn with_pre_executed_tool_activity(usage: Option<TokenUsage>) -> Self {
         Self {
@@ -258,11 +264,16 @@ impl SemanticEmptyTerminalFailure {
         }
     }
 
+    /// Report whether provider-owned tool work was observed before termination.
     #[must_use]
     pub const fn has_pre_executed_tool_activity(&self) -> bool {
         self.pre_executed_tool_activity
     }
 
+    /// Report whether this carrier lacks an explicit replay ban.
+    ///
+    /// This does not authorize retry: callers must also apply delivery, tool
+    /// activity, cancellation, and configured recovery constraints.
     #[must_use]
     pub const fn is_replayable(&self) -> bool {
         !self.no_replay
@@ -603,14 +614,24 @@ pub type StreamResult<T> = std::result::Result<T, StreamError>;
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("anthropic refusal: model declined this request (safety classifiers)")]
 pub struct ModelRefusalError {
+    /// Model requested on the refusing physical attempt.
     pub requested_model: String,
+    /// Provider-supplied diagnostic category, not user-facing refusal text.
     pub category: Option<String>,
+    /// Provider-observed rejected-attempt usage. Contextual terminal policy
+    /// determines whether it contributes to billed usage.
     pub usage: Option<Box<TokenUsage>>,
     /// Anthropic completed provider-owned work before refusing. Replaying the
     /// request could duplicate that work, even when no client tool call or
     /// final display text was produced.
     pub provider_executed_tool_activity: bool,
+    /// Exact Reliable candidate that emitted a streamed refusal.
+    ///
+    /// Leaf providers leave this unset. Composites set it while forwarding a
+    /// stream so recovery can skip the already-attempted candidate.
     pub attempted_candidate: Option<String>,
+    /// Position in the active reliability domain, disambiguating fallback
+    /// models that share a configured candidate or cooldown identity.
     pub attempted_candidate_index: Option<usize>,
 }
 
@@ -646,11 +667,15 @@ pub enum TerminalCompletionError {
 /// so runtime accounting does not lose a billed attempt.
 #[derive(Debug, Clone)]
 pub struct TerminalCompletionFailure {
+    /// Canonical classification of the incomplete terminal outcome.
     pub reason: TerminalCompletionError,
+    /// Optional provider-observed usage for the rejected physical attempt.
     pub usage: Option<TokenUsage>,
 }
 
 impl TerminalCompletionFailure {
+    /// Preserve the supplied terminal reason and usage without selecting a
+    /// recovery or chargeability policy. Missing usage remains unknown.
     pub fn new(reason: TerminalCompletionError, usage: Option<TokenUsage>) -> Self {
         Self { reason, usage }
     }
@@ -748,6 +773,9 @@ pub fn terminal_completion_failure(error: &anyhow::Error) -> Option<&TerminalCom
     })
 }
 
+/// Find a typed terminal reason through supported failure wrappers, streamed
+/// refusals, or a legacy bare reason. Return `None` when no recognized typed
+/// classification exists; diagnostic strings never establish terminal state.
 pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
     terminal_completion_failure(error)
         .map(|failure| failure.reason)

@@ -98,17 +98,24 @@ pub(crate) fn contextualize_terminal_stream_error(
 /// provider candidate. This never permits replaying the failed candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalRecoveryDisposition {
+    /// Do not replay the request, including advancing to another candidate.
     NoReplay,
+    /// Permit advancing to a distinct configured candidate, subject to the
+    /// caller's other safety gates; never replay the failed candidate.
     NextCandidate,
 }
 
 /// Whether provider-reported rejected usage contributes to cost accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalUsageChargeability {
+    /// Include provider-reported terminal usage in rejected-attempt accounting.
     Billable,
+    /// Retain the outcome as information without charging its terminal usage.
     Informational,
 }
 
+/// Keep provider-owned recovery and usage chargeability decisions independent
+/// in one immutable terminal policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalCompletionPolicy {
     recovery: TerminalRecoveryDisposition,
@@ -116,6 +123,7 @@ pub struct TerminalCompletionPolicy {
 }
 
 impl TerminalCompletionPolicy {
+    /// Pair the supplied decisions without inferring either from the other.
     #[must_use]
     pub const fn new(
         recovery: TerminalRecoveryDisposition,
@@ -127,11 +135,13 @@ impl TerminalCompletionPolicy {
         }
     }
 
+    /// Return the provider-owned recovery disposition.
     #[must_use]
     pub const fn recovery(self) -> TerminalRecoveryDisposition {
         self.recovery
     }
 
+    /// Return whether reported terminal usage contributes to billed attempts.
     #[must_use]
     pub const fn usage_chargeability(self) -> TerminalUsageChargeability {
         self.usage_chargeability
@@ -187,11 +197,13 @@ impl std::error::Error for TerminalCompletionContextWithSource {
 }
 
 impl TerminalCompletionContext {
+    /// Borrow the canonical terminal classification and observed usage.
     #[must_use]
     pub fn failure(&self) -> &TerminalCompletionFailure {
         &self.failure
     }
 
+    /// Return the contextual policy that governs recovery and chargeability.
     #[must_use]
     pub const fn policy(&self) -> TerminalCompletionPolicy {
         self.policy
@@ -246,6 +258,8 @@ pub(crate) fn terminal_completion_typed_source(
     })
 }
 
+/// Find the canonical terminal context through the error chain, including its
+/// provider-provenance wrapper. Return `None` for errors without such a context.
 #[must_use]
 pub fn terminal_completion_context(error: &anyhow::Error) -> Option<&TerminalCompletionContext> {
     error.chain().find_map(|cause| {
