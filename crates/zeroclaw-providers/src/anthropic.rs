@@ -3684,9 +3684,9 @@ impl AnthropicModelProvider {
             return stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
                 .boxed();
         }
-        let profile_name = self.alias.clone();
         stream::once(async move {
-            let credential = Self::resolve_profile_credential(&auth_service, &profile_name).await;
+            let credential =
+                Self::resolve_profile_credential(&auth_service, &transport.alias).await;
             match credential {
                 Ok(credential) => Self::stream_prepared(prepared, credential, transport),
                 Err(error) => {

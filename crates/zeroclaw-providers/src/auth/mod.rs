@@ -31,6 +31,25 @@ const OAUTH_REFRESH_MAX_ATTEMPTS: std::num::NonZeroUsize =
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
+/// A configured provider could not refresh its credential during construction.
+///
+/// This is not evidence of missing configuration. Consumers may retain
+/// configured readiness, but must still propagate the failed request.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{source}")]
+pub struct ProviderCredentialRefreshError {
+    #[source]
+    source: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl ProviderCredentialRefreshError {
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self {
+            source: Arc::from(error.into_boxed_dyn_error()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthService {
     store: AuthProfilesStore,

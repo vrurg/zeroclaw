@@ -1073,6 +1073,7 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(crate::MINIMAX_OAUTH_DEFAULT_CLIENT_ID);
                 crate::refresh_minimax_oauth_access_token(refresh_token, client_id, self.endpoint)
+                    .map_err(crate::auth::ProviderCredentialRefreshError::new)
             })
             .transpose()?;
         let resolved_key = refreshed_key.as_deref().or(key);
@@ -1666,6 +1667,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(crate::QWEN_OAUTH_DEFAULT_CLIENT_ID);
                 crate::refresh_qwen_oauth_access_token(refresh_token, client_id)
+                    .map_err(crate::auth::ProviderCredentialRefreshError::new)
             })
             .transpose()?;
 

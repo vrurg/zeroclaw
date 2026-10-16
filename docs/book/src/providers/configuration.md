@@ -174,6 +174,14 @@ Several providers accept OAuth or subscription-style tokens instead of raw API k
 - **Grok Build CLI**: `[providers.models.grok_cli.<alias>]` shells out through the documented `grok agent stdio` ACP surface. The assembled prompt is JSON-RPC on stdin, never argv or a prompt file. Auth uses the CLI login cache by default. For API-key auth, export `XAI_API_KEY` into the daemon environment and explicitly add `env_passthrough = ["XAI_API_KEY"]` to the alias; the typed alias `api_key` remains unsupported. An existing absolute `working_directory` is required and defines both the child cwd and ACP session boundary. The child environment is cleared before spawn, and `env_passthrough` defaults to empty. Other provider-owned `XAI_*` names and all `GROK_*` names are rejected. ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`, an empty built-in tool set, and fail-closed ACP permission responses. `extra_args` is the explicit per-alias opt-in for relaxing those controls. The bypass flags `--always-approve`, `--dangerously-skip-permissions`, `--yolo`, and `--permission-mode=bypassPermissions` make the headless ACP client select `allow_once`; other permission modes continue to select `reject_once`. ACP transport/model/session/cwd flags plus positional and short arguments are reserved; unknown value-taking long options use `--flag=value`. Alias `vision = true` only opts ZeroClaw into sending ACP image blocks; Grok still advertises `promptCapabilities.image = false` through 0.2.118 and does not reliably use the image content - leave unset for production; see [ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
 - **Qwen / MiniMax**: set `auth_mode = "o_auth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
 
+Gateway boot and the foundation-only CLI isolate synchronous credential refresh
+from async workers. If the gateway's seed alias cannot refresh its credential,
+the gateway retains its configured-model state rather than requiring Quickstart
+again. Requests still construct the selected agent's provider: the affected
+agent receives its credential error, while other configured agents remain
+available. This is not a credential-health guarantee. Missing models and invalid
+seed configuration retain their existing Quickstart admission behavior.
+
 ## OpenAI Astra setup
 
 OpenAI's public API model ID is `gpt-6-astra`. The
