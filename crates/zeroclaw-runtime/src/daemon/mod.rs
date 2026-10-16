@@ -4551,14 +4551,20 @@ mod tests {
             }));
             let (exit, current) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
                 tokio::join!(
-                    run(
-                        config.clone(),
-                        "127.0.0.1".into(),
-                        0,
-                        registry,
-                        false,
-                        false
-                    ),
+                    async {
+                        // Preserve startup errors instead of masking them with
+                        // a closed observation channel in the sibling future.
+                        run(
+                            config.clone(),
+                            "127.0.0.1".into(),
+                            0,
+                            registry,
+                            false,
+                            false,
+                        )
+                        .await
+                        .expect("coordination fixture daemon must start and reload")
+                    },
                     async {
                         let (first, _) = gateway_rx.recv().await.unwrap();
                         let rpc = rpc_rx.recv().await.unwrap();
@@ -4574,7 +4580,7 @@ mod tests {
             })
             .await
             .expect("supervised restart and reload must complete");
-            assert_eq!(exit.unwrap(), DaemonExit::Reload);
+            assert_eq!(exit, DaemonExit::Reload);
             if let Some(old) = previous {
                 assert!(!Arc::ptr_eq(old.queue(), current.queue()));
                 assert!(!Arc::ptr_eq(old.cancellations(), current.cancellations()));
