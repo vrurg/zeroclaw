@@ -1035,6 +1035,14 @@ cli-plugin-egress-repair-incomplete = {$name}: after the printed command the run
 cli-plugin-egress-deployment-rejected = The runtime rejects every plugin egress policy in this deployment ({$reason}), so no plugin's grant can take effect until it is fixed. Check `security.nat64_prefixes` and `plugins.limits.max_connections_per_instance`.
 cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
 cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
+cli-plugin-install-unadmitted-package = install failed: '{$name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {$name}`, then install again.
+cli-plugin-remove-unadmitted-package = `zeroclaw plugin remove` left '{$name}' in place: {$reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{$name}' by hand if it should go.
+cli-plugin-install-retained = Install could not publish the package and kept the staged copy at {$path}: {$reason}. Resolve the occupied name or filesystem error, then run the install again.
+cli-plugin-install-move-unsupported = Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({$reason}). Nothing was installed and no staged copy was kept. This build refuses that move on FreeBSD and other Unix systems besides Linux, Android and macOS. Linux before 3.15 and NFS mounts without no-replace support also lack the operation; choose a plugins directory on a filesystem that supports atomic no-replace moves.
+cli-plugin-install-move-unsupported-cleanup = Install cannot safely publish on this platform or filesystem ({$reason}). Nothing was installed. Cleanup of its unpublished transaction could not be confirmed at {$path}. Repair safe no-replace move support and resolve this cleanup failure before attempting another install.
+cli-plugin-recovery-retained = Recovery retained files at {$path}: {$reason}. Resolve the occupied destination or filesystem error, then retry plugin remove.
+cli-plugin-staging-retained = Retained staging at {$path} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.
+cli-plugin-namespace-changed = Plugin operation refused because filesystem ownership changed: {$reason}. Inspect the plugins directory before retrying.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
@@ -1193,6 +1201,9 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-single-tool-rounds-prompt = Use at most one tool call in each response. Wait for its result before choosing another tool call.
+turn-single-tool-rounds-unsupported = [Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]
+turn-single-tool-rounds-violation = The provider returned multiple tool calls under single-tool policy. No tools from this response were executed.
 turn-provider-images-quarantined =
     { $count_plural ->
         [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.

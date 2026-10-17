@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
@@ -134,6 +136,18 @@ impl Drop for GatewayCancelTokenRegistration<'_> {
     fn drop(&mut self) {
         remove_cancel_token_if_current(&self.state.cancel_tokens, &self.cancel_key, &self.token);
     }
+}
+
+fn gateway_steering_input(content: String) -> SteeringInput {
+    SteeringInput::new(content).with_ingress(IngressContext {
+        message_id: None,
+        source_class: SourceClass::External,
+        sender: None,
+        transport: Transport::Gateway,
+        trust: TrustClass::Untrusted,
+        origin: TurnOrigin::Interactive,
+        internal_principal: None,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2229,7 +2243,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
-                                        match steering_tx.try_send(content.into()) {
+                                        match steering_tx.try_send(gateway_steering_input(content)) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({
