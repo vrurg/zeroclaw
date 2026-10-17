@@ -790,6 +790,16 @@ fn single_tool_round_error() -> anyhow::Error {
 fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
     let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
     if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        // Keep attachments opaque and last: export redaction removes this suffix,
+        // not the host's tool-round instruction or other diagnostic context.
+        let private_section = format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        );
+        let attachments = system
+            .content
+            .find(&private_section)
+            .map(|start| system.content.split_off(start));
         system.content = system.content.replace(
             crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS,
             &instruction,
@@ -797,6 +807,9 @@ fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
         if !system.content.ends_with(&instruction) {
             system.content.push_str("\n\n");
             system.content.push_str(&instruction);
+        }
+        if let Some(attachments) = attachments {
+            system.content.push_str(&attachments);
         }
         false
     } else {
@@ -4865,6 +4878,43 @@ mod surface3_tests {
         assert_eq!(no_system[0].role, "system");
         assert_eq!(no_system[0].content, instruction);
         assert_eq!(no_system[1].content, user.content);
+    }
+
+    #[test]
+    fn single_tool_prompt_keeps_host_instruction_visible_and_attachments_opaque() {
+        let protocol = crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: format!("Private attachment canary: {protocol}"),
+                updated_at: String::new(),
+            },
+        ]);
+        for host_protocol in ["", protocol] {
+            let mut messages = vec![ChatMessage::system(format!(
+                "Host context.\n{host_protocol}\n\n{section}"
+            ))];
+            assert!(!apply_single_tool_round_prompt(&mut messages));
+            let provider_prompt = &messages[0].content;
+            assert!(provider_prompt.ends_with(&section));
+            let boundary = format!(
+                "\n\n{}",
+                zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+            );
+            let (host, _) = provider_prompt.split_once(&boundary).unwrap();
+            assert!(host.ends_with(&instruction));
+            assert!(!host.contains(protocol));
+            let exported =
+                crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages);
+            assert!(exported[0].content.contains(&instruction));
+            assert!(exported[0].content.contains("Host context."));
+            assert!(!exported[0].content.contains("Private attachment canary"));
+            assert!(!exported[0].content.contains(protocol));
+            let once = messages[0].content.clone();
+            assert!(!apply_single_tool_round_prompt(&mut messages));
+            assert_eq!(messages[0].content, once);
+        }
     }
 
     fn make_system_prompt(anchor: &str) -> ChatMessage {
