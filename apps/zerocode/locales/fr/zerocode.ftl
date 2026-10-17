@@ -471,6 +471,7 @@ zc-chat-help-navigate = Naviguer
 zc-chat-help-select-agent = Sélectionner un agent
 zc-chat-help-quit = Quitter
 zc-chat-help-switch-session = Changer de session
+zc-keybinding-focus-session = Aller à la session { $n }
 zc-chat-help-close = Fermer
 zc-chat-help-cancel = Annuler
 zc-chat-help-approve = Approuver

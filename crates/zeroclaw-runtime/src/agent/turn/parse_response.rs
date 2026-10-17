@@ -348,6 +348,7 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     accepted_route: Option<&AcceptedRoute>,
+    accounting: &mut super::provider_call::ProviderCallAccounting,
 ) {
     // An accepted route is the canonical physical identity whenever Reliable
     // produced one. Its fallback flag describes recovery observability, not
@@ -388,6 +389,7 @@ pub(crate) async fn record_accepted_chat_response(
     let cost_usd = usage
         .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
+    accounting.mark_accepted_settled();
     // Exactly-one per accepted response, even when the provider returned no
     // usage data, so terminal identity and context-window accounting always
     // describe the accepted serving provider/model. The caller settles
@@ -986,6 +988,7 @@ mod cost_usd_regression_tests {
                     now,
                     0,
                     None,
+                    &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
                 )
                 .await;
             })
@@ -1188,6 +1191,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
         )
         .await;
 
@@ -1256,6 +1260,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
         )
         .await;
 
@@ -1314,6 +1319,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
         )
         .await;
 
@@ -1358,6 +1364,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
         )
         .await;
 

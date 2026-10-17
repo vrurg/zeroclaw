@@ -471,6 +471,7 @@ zc-chat-help-navigate = 导航
 zc-chat-help-select-agent = 选择代理
 zc-chat-help-quit = 退出
 zc-chat-help-switch-session = 切换会话
+zc-keybinding-focus-session = 切换到会话 { $n }
 zc-chat-help-close = 关闭
 zc-chat-help-cancel = 取消
 zc-chat-help-approve = 批准

@@ -471,6 +471,7 @@ zc-chat-help-navigate = 移動
 zc-chat-help-select-agent = エージェントを選択
 zc-chat-help-quit = 終了
 zc-chat-help-switch-session = セッションを切り替え
+zc-keybinding-focus-session = セッション { $n } へ移動
 zc-chat-help-close = 閉じる
 zc-chat-help-cancel = キャンセル
 zc-chat-help-approve = 承認
