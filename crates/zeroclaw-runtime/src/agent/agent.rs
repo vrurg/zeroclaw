@@ -9,6 +9,7 @@ use crate::live_config_authority::AgentExecutionCapability;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
@@ -16,6 +17,7 @@ use chrono::{Datelike, Timelike};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
+use zeroclaw_api::ingress::IngressDecision;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -2115,6 +2117,13 @@ impl Agent {
                 return prepared;
             }
             for input in batch {
+                match steering_policy(input.text(), input.ingress(), &IngressPolicy::default()) {
+                    IngressDecision::Drop { .. } => continue,
+                    IngressDecision::Loop | IngressDecision::Annotate { .. } => {}
+                    IngressDecision::Gate { .. } => {
+                        // SOP diversion is not wired yet; preserve Loop behavior.
+                    }
+                }
                 if !self.admit_steering_input(&input, turn_id) {
                     continue;
                 }
@@ -4623,11 +4632,16 @@ impl Agent {
                 }
             };
             round_added.extend(steering_messages);
+            let initial_ingress_subject = if round == 0 {
+                crate::agent::turn::InitialIngressSubject::Original(user_message)
+            } else {
+                crate::agent::turn::InitialIngressSubject::AlreadyAdmitted
+            };
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    Box::pin(crate::agent::loop_::run_tool_call_loop(
+                    Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress(
                         crate::agent::loop_::ToolLoop {
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
@@ -4734,6 +4748,7 @@ impl Agent {
                                 })
                             }),
                         },
+                        initial_ingress_subject,
                     )),
                 ),
             );
@@ -5215,6 +5230,22 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::observability_traits::ObserverMetric;
+
+    fn steering_context(
+        message_id: &str,
+        sender: &str,
+        transport: zeroclaw_api::ingress::Transport,
+    ) -> zeroclaw_api::ingress::IngressContext {
+        zeroclaw_api::ingress::IngressContext {
+            message_id: Some(message_id.to_string()),
+            source_class: zeroclaw_api::ingress::SourceClass::External,
+            sender: Some(sender.to_string()),
+            transport,
+            trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+            origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+            internal_principal: None,
+        }
+    }
 
     #[test]
     fn build_session_model_provider_rejects_undotted_ref() {
@@ -7762,6 +7793,599 @@ mod tests {
     }
 
     struct MockTool;
+
+    type RoundRequests = Arc<
+        Mutex<
+            Vec<(
+                zeroclaw_api::model_provider::ToolRoundPolicy,
+                Vec<ChatMessage>,
+            )>,
+        >,
+    >;
+
+    struct RoundPolicyProvider {
+        responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+        requests: RoundRequests,
+        streaming: bool,
+        capable: bool,
+        fail_stream_after_calls: bool,
+    }
+
+    impl RoundPolicyProvider {
+        fn respond(
+            &self,
+            request: ChatRequest<'_>,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> zeroclaw_providers::ChatResponse {
+            self.requests
+                .lock()
+                .push((policy, request.messages.to_vec()));
+            self.responses.lock().remove(0)
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RoundPolicyProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "custom.rounds"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RoundPolicyProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+            self.capable
+        }
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.streaming
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("fixture uses structured requests")
+        }
+
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(self.respond(request, policy))
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt;
+            use zeroclaw_providers::traits::{StreamChunk, StreamEvent};
+            let response = self.respond(request, policy);
+            let mut events = vec![Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                response.text.unwrap_or_default(),
+            )))];
+            events.extend(
+                response
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| Ok(StreamEvent::ToolCall(call))),
+            );
+            events.push(Ok(StreamEvent::Usage(response.usage.unwrap())));
+            if self.fail_stream_after_calls {
+                events.push(Err(zeroclaw_api::model_provider::StreamError::Http(
+                    "fixture disconnect".into(),
+                )));
+            } else {
+                events.push(Ok(StreamEvent::Final));
+            }
+            futures_util::stream::iter(events).boxed()
+        }
+    }
+
+    struct RoundCountingTool(Arc<AtomicUsize>);
+
+    impl zeroclaw_api::attribution::Attributable for RoundCountingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "echo"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RoundCountingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Returns a counted fixture result"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("result-{n}").into(),
+                error: None,
+            })
+        }
+    }
+
+    fn round_response(
+        text: &str,
+        ids: &[&str],
+        input_tokens: u64,
+    ) -> zeroclaw_providers::ChatResponse {
+        zeroclaw_providers::ChatResponse {
+            text: Some(text.into()),
+            tool_calls: ids
+                .iter()
+                .map(|id| zeroclaw_providers::ToolCall {
+                    id: (*id).into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                })
+                .collect(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(5),
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    fn round_agent(
+        responses: Vec<zeroclaw_providers::ChatResponse>,
+        streaming: bool,
+        capable: bool,
+        opt_in: Option<bool>,
+    ) -> (Agent, RoundRequests, Arc<AtomicUsize>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn ModelProvider> = Box::new(RoundPolicyProvider {
+            responses: Mutex::new(responses),
+            requests: Arc::clone(&requests),
+            streaming,
+            capable: true,
+            fail_stream_after_calls: false,
+        });
+        let provider: Box<dyn ModelProvider> = if capable {
+            provider
+        } else {
+            // A capable primary cannot promise the policy for an unsupported fallback.
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "rounds",
+                vec![
+                    ("custom.rounds".into(), provider),
+                    (
+                        "custom.unsupported".into(),
+                        Box::new(RoundPolicyProvider {
+                            responses: Mutex::new(vec![]),
+                            requests: Arc::clone(&requests),
+                            streaming,
+                            capable: false,
+                            fail_stream_after_calls: false,
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            ))
+        };
+        let mut agent = blank_input_agent(provider);
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            RoundCountingTool(Arc::clone(&executions)),
+        )]);
+        agent.agent_alias = "round-agent".into();
+        agent.model_provider_name = "custom.rounds".into();
+        agent.model_name = "round-model".into();
+        // The blank builder's resolver still points at its unconfigured provider.
+        agent.set_model_route_resolver(Arc::new(
+            zeroclaw_providers::router::ModelRouteResolver::new(
+                vec![],
+                agent.model_provider_name.clone(),
+                agent.model_name.clone(),
+            ),
+        ));
+        agent.config.resolved.max_tool_iterations = 3;
+        let mut config = Config::default();
+        config.agents.insert(
+            "round-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "interactive".into(),
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "interactive".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                single_tool_rounds: opt_in,
+                ..Default::default()
+            },
+        );
+        agent.provider_switch_config = Some(ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live_config: None,
+            live: None,
+        });
+        (agent, requests, executions)
+    }
+
+    fn round_cost_context() -> crate::agent::cost::ToolLoopCostTrackingContext {
+        let mut context = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
+        context.model_provider_pricing = Arc::new(HashMap::from([(
+            "custom.rounds".into(),
+            HashMap::from([
+                ("round-model.input".into(), 1.0),
+                ("round-model.output".into(), 2.0),
+            ]),
+        )]));
+        context
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_full_turn_pairs_results_orders_events_and_accounts_usage() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+        for streaming in [false, true] {
+            let (mut agent, requests, executions) = round_agent(
+                vec![
+                    round_response("before-first", &["call-one"], 10),
+                    round_response("after-first", &["call-two"], 20),
+                    round_response("done", &[], 30),
+                ],
+                streaming,
+                true,
+                Some(true),
+            );
+            let cost = round_cost_context();
+            let usage = Arc::clone(&cost.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let (reply, _) = TOOL_LOOP_TURN_USAGE
+                .scope(
+                    Some(Arc::clone(&usage)),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        Some(cost),
+                        agent.turn_streamed("perform two steps", tx, None),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(reply.ends_with("done"));
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 3);
+            assert!(
+                captured
+                    .iter()
+                    .all(|(policy, _)| *policy == ToolRoundPolicy::Single)
+            );
+            for (index, id, output) in [(1, "call-one", "result-1"), (2, "call-two", "result-2")] {
+                let messages = &captured[index].1;
+                let result = messages.iter().rfind(|m| m.role == "tool").unwrap();
+                let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                assert_eq!(result["tool_call_id"], id);
+                assert_eq!(result["content"], output);
+                let assistant = messages.iter().rfind(|m| m.role == "assistant").unwrap();
+                let assistant: serde_json::Value =
+                    serde_json::from_str(&assistant.content).unwrap();
+                assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
+                assert_eq!(assistant["tool_calls"][0]["id"], id);
+            }
+            let mut ordered = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    TurnEvent::Chunk { delta } if !delta.is_empty() => {
+                        ordered.push(format!("text:{delta}"))
+                    }
+                    TurnEvent::ToolCall { id, .. } => ordered.push(format!("call:{id}")),
+                    TurnEvent::ToolResult { id, .. } => ordered.push(format!("result:{id}")),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                ordered,
+                [
+                    "text:before-first",
+                    "call:call-one",
+                    "result:call-one",
+                    "text:after-first",
+                    "call:call-two",
+                    "result:call-two",
+                    "text:done"
+                ]
+            );
+            let usage = *usage.lock();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (60, 15));
+            assert!((usage.cost_usd - 0.00009).abs() < 1e-10);
+            let calls = agent
+                .history()
+                .iter()
+                .filter_map(|message| match message {
+                    ConversationMessage::AssistantToolCalls { tool_calls, .. } => Some(tool_calls),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|batch| batch.len() == 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_rpc_transcript_matches_final_renderer_fixture() {
+        let fixture_text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/single-tool-rounds.json"
+        ));
+        // Each published crate is self-contained; workspace tests also pin their copies.
+        let zerocode = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/zerocode");
+        if zerocode.join("Cargo.toml").is_file() {
+            assert_eq!(
+                std::fs::read_to_string(zerocode.join("tests/fixtures/single-tool-rounds.json"))
+                    .unwrap(),
+                fixture_text
+            );
+        }
+        let fixture: serde_json::Value = serde_json::from_str(fixture_text).unwrap();
+        let notice = crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+        assert_eq!(fixture["unsupported_notice"], notice);
+        for streaming in [false, true] {
+            for capable in [true, false] {
+                let (mut agent, _, executions) = round_agent(
+                    vec![
+                        round_response("before-first", &["call-one"], 10),
+                        round_response("after-first", &["call-two"], 20),
+                        round_response("done", &[], 30),
+                    ],
+                    streaming,
+                    capable,
+                    Some(true),
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed("perform two steps", tx, None)
+                    .await
+                    .unwrap();
+                assert_eq!(executions.load(Ordering::SeqCst), 2);
+                // Only transcript events affect this fixture; usage has separate coverage.
+                let notifications = std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            TurnEvent::Chunk { .. }
+                                | TurnEvent::ToolCall { .. }
+                                | TurnEvent::ToolResult { .. }
+                        )
+                    })
+                    .map(|event| {
+                        let encoded = crate::rpc::dispatch::notification_for_turn_event_for_test(
+                            "sess-1", &event,
+                        )
+                        .unwrap();
+                        serde_json::from_str::<serde_json::Value>(&encoded).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected = fixture["updates"].as_array().unwrap().clone();
+                if !capable {
+                    expected.insert(0, serde_json::json!({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                    }));
+                }
+                assert_eq!(
+                    notifications, expected,
+                    "streaming={streaming}, capable={capable}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_round_violation_rejects_native_and_normalized_calls_without_history_or_replay()
+     {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        for streaming in [false, true] {
+            for kind in ["native", "text", "mixed"] {
+                let response = match kind {
+                    "native" => round_response("before-rejection", &["one", "two"], 10),
+                    "mixed" => round_response(
+                        r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"unknown","arguments":{}}</tool_call>"#,
+                        &[],
+                        10,
+                    ),
+                    _ => round_response(
+                        r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"echo","arguments":{}}</tool_call>"#,
+                        &[],
+                        10,
+                    ),
+                };
+                let (mut agent, requests, executions) =
+                    round_agent(vec![response], streaming, true, Some(true));
+                let cost = round_cost_context();
+                let usage = Arc::clone(&cost.turn_usage);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let error = TOOL_LOOP_TURN_USAGE
+                    .scope(
+                        Some(Arc::clone(&usage)),
+                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                            .scope(Some(cost), agent.turn_streamed("perform a step", tx, None)),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("multiple tool calls"), "{error}");
+                assert_eq!(requests.lock().len(), 1);
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                assert!(!agent.history().iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { .. }
+                        | ConversationMessage::ToolResults(_)
+                )));
+                let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. }
+                )));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    TurnEvent::Usage {
+                        accepted: false,
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        ..
+                    }
+                )));
+                let recorded = *usage.lock();
+                assert_eq!((recorded.input_tokens, recorded.output_tokens), (10, 5));
+                assert!((recorded.cost_usd - 0.00002).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_round_violation_before_stream_failure_is_terminal_and_accounted() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        for native in [false, true] {
+            let response = if native {
+                round_response("", &["one", "two"], 10)
+            } else {
+                round_response(
+                    r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"unknown","arguments":{}}</tool_call>"#,
+                    &[],
+                    10,
+                )
+            };
+            let (mut agent, requests, executions) = round_agent(vec![], true, true, Some(true));
+            agent.model_provider = Box::new(RoundPolicyProvider {
+                responses: Mutex::new(vec![response]),
+                requests: Arc::clone(&requests),
+                streaming: true,
+                capable: true,
+                fail_stream_after_calls: true,
+            });
+            let cost = round_cost_context();
+            let usage = Arc::clone(&cost.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let error = TOOL_LOOP_TURN_USAGE
+                .scope(
+                    Some(Arc::clone(&usage)),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(Some(cost), agent.turn_streamed("perform a step", tx, None)),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("multiple tool calls"), "{error}");
+            assert_eq!(requests.lock().len(), 1);
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert!(!agent.history().iter().any(|message| matches!(
+                message,
+                ConversationMessage::AssistantToolCalls { .. }
+                    | ConversationMessage::ToolResults(_)
+            )));
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                TurnEvent::Usage {
+                    accepted: false,
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..
+                }
+            )));
+            let recorded = *usage.lock();
+            assert_eq!((recorded.input_tokens, recorded.output_tokens), (10, 5));
+            assert!((recorded.cost_usd - 0.00002).abs() < 1e-10);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_unsupported_route_is_visible_and_default_batch_is_unchanged() {
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+        for (capable, opt_in) in [(false, Some(true)), (true, None), (true, Some(false))] {
+            let (mut agent, requests, executions) = round_agent(
+                vec![
+                    round_response("batch", &["one", "two"], 10),
+                    round_response("done", &[], 20),
+                ],
+                false,
+                capable,
+                opt_in,
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let (reply, _) = agent
+                .turn_streamed("perform two steps", tx, None)
+                .await
+                .unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            assert!(
+                requests
+                    .lock()
+                    .iter()
+                    .all(|(policy, _)| *policy == ToolRoundPolicy::Batch)
+            );
+            let notice =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+            assert_eq!(reply.contains(&notice), opt_in == Some(true));
+            let visible = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(
+                    |event| matches!(event, TurnEvent::Chunk { delta } if delta.contains(&notice)),
+                )
+                .count();
+            assert_eq!(visible, usize::from(opt_in == Some(true)));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_keep_the_existing_iteration_cap() {
+        let (mut agent, requests, executions) = round_agent(
+            vec![
+                round_response("first", &["one"], 10),
+                round_response("second", &["two"], 20),
+                round_response("unreachable", &[], 30),
+            ],
+            false,
+            true,
+            Some(true),
+        );
+        agent.config.resolved.max_tool_iterations = 2;
+        assert!(agent.turn("perform steps").await.is_err());
+        assert_eq!(requests.lock().len(), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+    }
 
     #[async_trait]
     impl Tool for MockTool {
@@ -14187,6 +14811,254 @@ mod tests {
         assert!(
             key.is_none(),
             "multimodal prompt with [IMAGE:] marker must skip response cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_admission_keeps_per_injection_context() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer = Arc::new(CapturingObserver::default());
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let first_context =
+            steering_context("rpc-1", "actor-a", zeroclaw_api::ingress::Transport::Rpc);
+        let second_context = steering_context(
+            "gateway-2",
+            "actor-b",
+            zeroclaw_api::ingress::Transport::Gateway,
+        );
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("accepted-a").with_ingress(first_context.clone()),
+            )
+            .await
+            .expect("first steering message should enqueue");
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::with_admission(
+                    "drop-me",
+                    Box::new(|| {
+                        crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
+                            tool_ceiling: Some(Vec::new()),
+                            disable_principal_unaware_nested_tools: false,
+                        })
+                    }),
+                )
+                .with_ingress(second_context.clone()),
+            )
+            .await
+            .expect("second steering message should enqueue");
+        steering_tx
+            .send(crate::agent::SteeringInput::new("legacy".to_string()))
+            .await
+            .expect("legacy steering message should enqueue");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = crate::security::ingress::with_test_policy_probe(
+            observations.clone(),
+            Some("drop-me".to_string()),
+            agent.turn_streamed_with_steering_state(
+                "original",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn should succeed");
+
+        assert_eq!(
+            agent.tool_names(),
+            ["echo"],
+            "provenance-dropped steering must not narrow the session's tools"
+        );
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["accepted-a", "drop-me", "legacy", "original"],
+            "the wrapper must admit each injection, then the loop must admit only the original user"
+        );
+        assert_eq!(observations[0].ingress, Some(first_context));
+        assert_eq!(observations[1].ingress, Some(second_context));
+        assert!(observations[2].ingress.is_none());
+        assert_eq!(
+            observations[3].ingress,
+            Some(zeroclaw_api::ingress::IngressContext::agent_direct())
+        );
+
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("original"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("accepted-a"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("legacy"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-me")),
+            "a dropped injection must not reach transcript history"
+        );
+
+        let memory_stores = observer
+            .events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::MemoryStore { .. }))
+            .count();
+        assert_eq!(
+            memory_stores, 3,
+            "only the original and two admitted injections should reach auto-save"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_drop_only_after_round_does_not_replay_model() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent.config.resolved.max_tool_iterations = 2;
+
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let probe_observations = observations.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            crate::security::ingress::with_test_policy_probe(
+                probe_observations,
+                Some("drop-late".to_string()),
+                agent.turn_streamed_with_steering_state(
+                    "original",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send(crate::agent::SteeringInput::new("drop-late".to_string()))
+                        .await
+                        .expect("late steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "draft");
+        assert_eq!(
+            seen_messages.lock().len(),
+            1,
+            "a late injection dropped at the wrapper must not trigger another model request"
+        );
+
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["original", "drop-late"]
+        );
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-late")),
+            "a late dropped injection must not reach transcript history"
         );
     }
 

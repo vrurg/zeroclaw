@@ -94,6 +94,7 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     auth_service: Option<AuthService>,
     base_url: String,
+    single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -675,6 +676,7 @@ pub struct AnthropicBuilder {
     credential: Option<String>,
     auth_service: Option<AuthService>,
     base_url: Option<String>,
+    single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
@@ -682,6 +684,11 @@ pub struct AnthropicBuilder {
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs are normalized
     /// to `None` so a stray `Some("   ")` from config cannot produce a
     /// bogus `Bearer    ` header.
@@ -744,6 +751,7 @@ impl AnthropicBuilder {
             credential: self.credential,
             auth_service: self.auth_service,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -766,6 +774,7 @@ impl AnthropicModelProvider {
             credential: None,
             auth_service: None,
             base_url: None,
+            single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
@@ -2984,6 +2993,10 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
     fn supports_exact_request_replay(
         &self,
         request: crate::traits::ChatRequest<'_>,
@@ -3088,6 +3101,22 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ProviderChatResponse> {
         commit_safeguard_fallback(None);
         if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
             crate::dispatch::accounting::suppress_current_attempt();
@@ -3111,7 +3140,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -3305,7 +3342,24 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        self.stream_chat_impl(request, model, temperature, options)
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_impl(request, model, temperature, options, policy)
     }
 }
 
@@ -3315,6 +3369,7 @@ impl AnthropicModelProvider {
         request: ProviderChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> PreparedStreamRequest {
         let (system, mut messages) = Self::convert_messages(request.messages, self.cache_ttl);
         if Self::should_cache_conversation(request.messages) {
@@ -3325,9 +3380,21 @@ impl AnthropicModelProvider {
             .ok()
             .flatten();
         let tools = self.convert_tools(request.tools);
-        let tool_choice = tools
-            .as_ref()
-            .and_then(|_| tool_choice_override.map(|choice| serde_json::json!({ "type": choice })));
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
         let (temperature, thinking, max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
         PreparedStreamRequest {
@@ -3639,6 +3706,7 @@ impl AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
         options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         // The accepted streaming response supersedes any safeguard attribution
         // from a prior rejected attempt or tool-loop round in this turn.
@@ -3647,7 +3715,7 @@ impl AnthropicModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let prepared = self.prepare_stream_request(request, model, temperature);
+        let prepared = self.prepare_stream_request(request, model, temperature, policy);
         let use_native_thinking_fallback = prepared
             .thinking
             .as_ref()
@@ -4890,6 +4958,97 @@ data: {\"type\":\"message_stop\"}\n\n";
             events.as_slice(),
             [Err(StreamError::ModelProvider(message))] if message.contains("credentials not set")
         ));
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_single_tool_stream_resolves_profile_at_poll_time() {
+        // The policy-aware trait entrypoint must retain the same lazy profile
+        // boundary as ordinary streams, not resolve credentials during setup.
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile before creating stream");
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service.clone())
+            .single_tool_rounds_supported(true)
+            .build();
+        let messages = [ChatMessage::user("hello")];
+        let stream = provider.stream_chat_with_tool_round_policy(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-opus-4-6",
+            None,
+            StreamOptions::new(true),
+            zeroclaw_api::model_provider::ToolRoundPolicy::Single,
+        );
+        auth_service
+            .remove_profile("anthropic", "subscription")
+            .await
+            .expect("remove profile after stream creation");
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(message))] if message.contains("credentials not set")
+        ));
+    }
+
+    #[test]
+    fn prepared_stream_keeps_single_tool_policy_and_batch_defaults() {
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+
+        // Request preparation precedes OAuth resolution; carrying the policy
+        // here keeps the ordinary SSE and native-thinking fallback in sync.
+        let messages = [ChatMessage::user("hello")];
+        let tools = [ToolSpec::new(
+            "fixture_tool",
+            "Fixture tool",
+            serde_json::json!({
+                "type": "object", "properties": {}
+            }),
+        )];
+        for (supported, policy, include_tools, expected) in [
+            (
+                true,
+                ToolRoundPolicy::Single,
+                true,
+                Some(serde_json::json!({
+                    "type": "auto", "disable_parallel_tool_use": true
+                })),
+            ),
+            (true, ToolRoundPolicy::Batch, true, None),
+            (false, ToolRoundPolicy::Single, true, None),
+            (true, ToolRoundPolicy::Single, false, None),
+        ] {
+            let provider = AnthropicModelProvider::builder("subscription")
+                .single_tool_rounds_supported(supported)
+                .build();
+            let prepared = provider.prepare_stream_request(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: include_tools.then_some(tools.as_slice()),
+                    thinking: None,
+                },
+                "claude-opus-4-6",
+                None,
+                policy,
+            );
+            assert_eq!(prepared.tool_choice, expected);
+            assert_eq!(prepared.tools.is_some(), include_tools);
+        }
     }
 
     #[tokio::test]
@@ -10401,6 +10560,78 @@ data: {\"type\":\"message_stop\"}\n\n";
             headers.get("anthropic-beta").is_none(),
             "no beta when every entry is blank"
         );
+    }
+
+    #[tokio::test]
+    async fn single_tool_policy_reaches_oauth_chat_and_thinking_stream_wire() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ToolRoundPolicy};
+
+        // Exercise both public entrypoints: checking prepared payloads alone
+        // would miss a policy dropped by the stream forwarding boundary.
+        for streaming in [false, true] {
+            let (addr, captured, server) = spawn_capturing_server().await;
+            let provider = AnthropicModelProvider::builder("fixture")
+                .credential(Some("sk-ant-oat01-fixture"))
+                .base_url(&format!("http://{addr}"))
+                .single_tool_rounds_supported(true)
+                .build();
+            let messages = [ChatMessage::user("hello")];
+            let tools = [ToolSpec::new(
+                "fixture_tool",
+                "Fixture tool",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )];
+            let request = ProviderChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 1024,
+                    display: None,
+                }),
+            };
+            if streaming {
+                // Hidden thinking uses the production nonstream fallback, so
+                // the fixture's JSON response must complete successfully.
+                let events: Vec<_> = provider
+                    .stream_chat_with_tool_round_policy(
+                        request,
+                        "claude-sonnet-4-6",
+                        None,
+                        StreamOptions::new(true),
+                        ToolRoundPolicy::Single,
+                    )
+                    .collect()
+                    .await;
+                server.abort();
+                assert!(events.iter().all(Result::is_ok), "{events:?}");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Ok(StreamEvent::Final)))
+                );
+            } else {
+                let result = provider
+                    .chat_with_tool_round_policy(
+                        request,
+                        "claude-sonnet-4-6",
+                        None,
+                        ToolRoundPolicy::Single,
+                    )
+                    .await;
+                server.abort();
+                assert!(result.is_ok(), "{result:?}");
+            }
+            let (headers, body) = captured.lock().unwrap().take().unwrap();
+            assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+            assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-fixture");
+            assert!(headers.get("x-api-key").is_none());
+            assert!(
+                body["system"]
+                    .to_string()
+                    .contains("You are Claude Code, Anthropic's official CLI for Claude."),
+                "OAuth identity must survive policy forwarding: {body}"
+            );
+        }
     }
 
     #[tokio::test]
