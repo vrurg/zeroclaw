@@ -32704,6 +32704,8 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            allow_always: true,
+            scroll_offset: 0,
         });
         assert!(
             chat.claims_session_shortcut(&shortcut),
