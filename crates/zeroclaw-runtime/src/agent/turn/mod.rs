@@ -2354,11 +2354,16 @@ async fn run_tool_call_loop_impl<'a>(
                     .map(|message| message.content.as_str()),
             );
         }
+        // Preserve post-hook messages before the request-only instruction is
+        // inserted inside the canonical prompt. A trim must match that complete
+        // prompt first, then reapply the instruction without removing host text.
+        let mut post_hook_snapshot = provider_request_messages.clone();
         if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
             && apply_single_tool_round_prompt(&mut provider_request_messages)
         {
             // A request-only system row must survive whole-turn trimming.
             prepared_source_rows.insert(0, usize::MAX);
+            post_hook_snapshot.insert(0, provider_request_messages[0].clone());
         }
 
         if context_token_budget > 0 {
@@ -2425,9 +2430,6 @@ async fn run_tool_call_loop_impl<'a>(
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
         let tokens_before_dispatch = dispatch_tokens(reported_population_estimated);
-        // Snapshot the post-hook request so trimming can preserve its
-        // mutations to retained messages rather than discarding them.
-        let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
         let original_body_start = turn_state
             .history
@@ -4887,7 +4889,7 @@ mod surface3_tests {
         let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
             zeroclaw_infra::session_prompts::SessionPrompt {
                 id: "task".into(),
-                content: format!("Private attachment canary: {protocol}"),
+                content: "Private attachment canary: \"quoted\"\nsecond line".into(),
                 updated_at: String::new(),
             },
         ]);
@@ -4910,7 +4912,6 @@ mod surface3_tests {
             assert!(exported[0].content.contains(&instruction));
             assert!(exported[0].content.contains("Host context."));
             assert!(!exported[0].content.contains("Private attachment canary"));
-            assert!(!exported[0].content.contains(protocol));
             let once = messages[0].content.clone();
             assert!(!apply_single_tool_round_prompt(&mut messages));
             assert_eq!(messages[0].content, once);

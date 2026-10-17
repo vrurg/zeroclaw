@@ -8171,6 +8171,101 @@ mod tests {
         (agent, requests, executions)
     }
 
+    #[tokio::test]
+    async fn single_tool_rounds_trim_preserves_host_prompt_and_private_suffix() {
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+
+        for streaming in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(
+                workspace.path().join("TOOLS.md"),
+                "## Tools\nHOST_POLICY_SURVIVES_TRIM\nKeep the operator's instructions intact.",
+            )
+            .unwrap();
+            let (mut agent, requests, _) = round_agent(
+                vec![round_response("done", &[], 10)],
+                streaming,
+                true,
+                Some(true),
+            );
+            agent.workspace_dir = workspace.path().to_path_buf();
+            agent.agent_workspace_dir = workspace.path().to_path_buf();
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"PRIVATE_TRIM_CANARY\"\n".into(),
+            );
+            agent.seed_history(&[
+                ChatMessage::user("old context ".repeat(20_000)),
+                ChatMessage::assistant("old answer"),
+            ]);
+            let canonical = agent.system_prompt_for_test().unwrap();
+            assert!(canonical.contains("HOST_POLICY_SURVIVES_TRIM"));
+            agent.context_limits_resolver = Some(Arc::new(|_, _| {
+                zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 100_000,
+                    context_token_budget: 12_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                }
+            }));
+            let inputs = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SessionPromptBeforeLlmProbe {
+                calls: Arc::clone(&calls),
+                seen_inputs: Arc::clone(&inputs),
+                cancel: false,
+            }));
+            agent.hook_runner = Some(Arc::new(hooks));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            agent
+                .turn_streamed("current request", tx, None)
+                .await
+                .unwrap();
+            assert!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|event| matches!(event, TurnEvent::HistoryTrimmed { .. })),
+                "the regression must exercise dispatch-time trimming"
+            );
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].0, ToolRoundPolicy::Single);
+            let system = captured[0]
+                .1
+                .iter()
+                .find(|message| message.role == "system")
+                .unwrap();
+            assert!(system.content.contains("HOST_POLICY_SURVIVES_TRIM"));
+            let instruction =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+            assert!(system.content.contains(&instruction));
+            assert!(system.content.ends_with(
+                "## Session Prompts\n- id: \"task\"; content: \"PRIVATE_TRIM_CANARY\"\n"
+            ));
+            assert!(
+                !captured[0]
+                    .1
+                    .iter()
+                    .any(|message| message.content.contains("old context"))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let inputs = inputs.lock();
+            assert_eq!(inputs.len(), 1);
+            let exported_system = inputs[0]
+                .0
+                .iter()
+                .find(|message| message.role == "system")
+                .unwrap();
+            assert!(
+                exported_system
+                    .content
+                    .contains("HOST_POLICY_SURVIVES_TRIM")
+            );
+            assert!(exported_system.content.contains(&instruction));
+            assert!(!exported_system.content.contains("PRIVATE_TRIM_CANARY"));
+        }
+    }
+
     fn round_cost_context() -> crate::agent::cost::ToolLoopCostTrackingContext {
         let mut context = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
         context.model_provider_pricing = Arc::new(HashMap::from([(
