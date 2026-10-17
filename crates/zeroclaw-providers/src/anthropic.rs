@@ -3749,18 +3749,24 @@ impl AnthropicModelProvider {
             .boxed();
         };
         if let Err(error) = self.ensure_profile_auth_official_endpoint() {
-            return stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
-                .boxed();
+            return stream::once(async move {
+                Err(StreamError::ModelProvider(super::format_error_chain(
+                    error.as_ref(),
+                )))
+            })
+            .boxed();
         }
         stream::once(async move {
             let credential =
                 Self::resolve_profile_credential(&auth_service, &transport.alias).await;
             match credential {
                 Ok(credential) => Self::stream_prepared(prepared, credential, transport),
-                Err(error) => {
-                    stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
-                        .boxed()
-                }
+                Err(error) => stream::once(async move {
+                    Err(StreamError::ModelProvider(super::format_error_chain(
+                        error.as_ref(),
+                    )))
+                })
+                .boxed(),
             }
         })
         .flatten()
@@ -4914,6 +4920,62 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await
             .expect("the builder must normalize schema-accepted whitespace");
         assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_stream_preserves_store_load_error_causes() {
+        // Both streaming policies must retain actionable storage diagnostics
+        // without echoing profile contents or reaching the vendor endpoint.
+        for corrupt_json in [true, false] {
+            let state_dir = tempfile::tempdir().expect("temporary state directory");
+            let store_path = state_dir.path().join("auth-profiles.json");
+            let expected_cause = if corrupt_json {
+                tokio::fs::write(&store_path, b"{\"token\":\"synthetic-profile-token\",")
+                    .await
+                    .expect("write corrupt synthetic store");
+                "EOF while parsing a value".to_string()
+            } else {
+                tokio::fs::create_dir(&store_path)
+                    .await
+                    .expect("make store path unreadable as a file");
+                tokio::fs::read(&store_path)
+                    .await
+                    .expect_err("directory must not read as a profile store")
+                    .to_string()
+            };
+            let provider = AnthropicModelProvider::builder("subscription")
+                .auth_profile(AuthService::new(state_dir.path(), false))
+                .build();
+            let messages = [ChatMessage::user("hello")];
+            for policy in [
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Single,
+            ] {
+                let events = provider
+                    .stream_chat_with_tool_round_policy(
+                        ProviderChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "claude-opus-4-6",
+                        None,
+                        StreamOptions::new(true),
+                        policy,
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+                let [Err(StreamError::ModelProvider(message))] = events.as_slice() else {
+                    panic!("store failure must produce one provider error: {events:?}");
+                };
+                assert!(message.contains("auth profile store at"), "{message}");
+                assert!(message.contains(&expected_cause), "{message}");
+                assert!(!message.contains("synthetic-profile-token"), "{message}");
+                if corrupt_json {
+                    assert!(message.contains("line 1 column"), "{message}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
