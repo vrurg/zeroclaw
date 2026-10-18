@@ -4880,19 +4880,30 @@ async fn drive_live_sop_actions(
 }
 
 fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
-    if let Some(first) = history.first_mut()
-        && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
-            || first.content.contains(NO_TOOLS_TASK_FRAMING))
-    {
+    if let Some(first) = history.first_mut() {
+        // Framing belongs to the host. Identical phrases in the approved
+        // opaque attachment suffix must reach the provider unchanged.
+        let private_section = format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        );
+        let host_end = first
+            .content
+            .find(&private_section)
+            .unwrap_or(first.content.len());
+        let host = &first.content[..host_end];
+        if !host.contains(NATIVE_TOOLS_TASK_FRAMING) && !host.contains(NO_TOOLS_TASK_FRAMING) {
+            return;
+        }
         let desired = if use_native_tools {
             NATIVE_TOOLS_TASK_FRAMING
         } else {
             NO_TOOLS_TASK_FRAMING
         };
-        first.content = first
-            .content
+        let refreshed = host
             .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
             .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+        first.content.replace_range(..host_end, &refreshed);
     }
 }
 
@@ -5331,6 +5342,78 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+
+    #[test]
+    fn prompt_anchor_preserves_attachment_bytes_in_both_directions() {
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: format!(
+                    "界\n{NATIVE_TOOLS_TASK_FRAMING}\n{NO_TOOLS_TASK_FRAMING}\n\"quoted\"  "
+                ),
+                updated_at: String::new(),
+            },
+        ]);
+        for native in [false, true] {
+            let desired = if native {
+                NATIVE_TOOLS_TASK_FRAMING
+            } else {
+                NO_TOOLS_TASK_FRAMING
+            };
+            for anchor in [NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING, "custom"] {
+                let host = make_system_prompt(anchor).content;
+                let expected_host = if anchor == "custom" {
+                    host.clone()
+                } else {
+                    make_system_prompt(desired).content
+                };
+                let user = ChatMessage::user(format!("Quote {NO_TOOLS_TASK_FRAMING}"));
+                let mut history = vec![
+                    ChatMessage::system(format!("{host}\n\n{section}")),
+                    user.clone(),
+                ];
+                for _ in 0..2 {
+                    refresh_prompt_anchor(&mut history, native);
+                    assert_eq!(history[0].content, format!("{expected_host}\n\n{section}"));
+                    assert_eq!(history[1].content, user.content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_prompt_anchor_preserves_attachment_in_history_and_request() {
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: format!("{NATIVE_TOOLS_TASK_FRAMING}\n{NO_TOOLS_TASK_FRAMING}"),
+                updated_at: String::new(),
+            },
+        ]);
+        let native = format!(
+            "{}\n\n{section}",
+            make_system_prompt(NATIVE_TOOLS_TASK_FRAMING).content
+        );
+        let text = format!(
+            "{}\n\n{section}",
+            make_system_prompt(NO_TOOLS_TASK_FRAMING).content
+        );
+        let prompts = Arc::new(ToolProtocolPrompts::with_required_prompts(
+            native.clone(),
+            text.clone(),
+        ));
+        scope_tool_protocol_prompts(prompts, async {
+            let mut history = vec![ChatMessage::system(native.clone())];
+            for use_native in [true, false, false, true] {
+                let mut request = history.clone();
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, use_native);
+                let expected = if use_native { &native } else { &text };
+                assert_eq!(&history[0].content, expected);
+                assert_eq!(&request[0].content, expected);
+            }
+        })
+        .await;
     }
 }
 

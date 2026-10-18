@@ -10468,6 +10468,45 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn provider_prompt_anchor_preserves_approved_attachment_on_later_turns() {
+            let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+                zeroclaw_infra::session_prompts::SessionPrompt {
+                    id: "task".into(),
+                    content: format!(
+                        "Quote both literally: {} / {}",
+                        crate::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+                        crate::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+                    ),
+                    updated_at: String::new(),
+                },
+            ]);
+            for native in [false, true] {
+                for streamed in [false, true] {
+                    let (provider, captured) = capturing_provider(native);
+                    let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+                    agent.set_session_prompt_attachments(section.clone());
+                    for _ in 0..2 {
+                        if streamed {
+                            let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                            agent.turn_streamed("continue", tx, None).await.unwrap();
+                        } else {
+                            agent.turn("continue").await.unwrap();
+                        }
+                    }
+                    let requests = captured.lock();
+                    assert_eq!(requests.len(), 2);
+                    for request in requests.iter() {
+                        let system = request
+                            .iter()
+                            .find(|message| message.role == "system")
+                            .unwrap();
+                        assert!(system.content.ends_with(&section));
+                    }
+                }
+            }
+        }
+
         // Sensitive requests bypass modifying hooks without changing provider bytes;
         // ordinary requests retain mutation, model selection, and cancellation.
         #[tokio::test]
