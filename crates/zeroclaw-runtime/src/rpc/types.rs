@@ -783,6 +783,9 @@ rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
         pub set: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -842,6 +845,9 @@ rpc_type! {
     pub struct ConfigDeleteResult {
         pub prop: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -883,6 +889,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub created: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -898,6 +907,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 

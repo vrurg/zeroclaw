@@ -1939,7 +1939,8 @@ fn localized_action_label(action_key: &str, fallback: &str) -> String {
     {
         return crate::i18n::t_args("zc-keybinding-focus-session", &[("n", n)]);
     }
-    fallback.to_string()
+    let label_key = format!("zc-keybinding-{}", action_key.replace(['.', '_'], "-"));
+    crate::i18n::try_t(&label_key).unwrap_or_else(|| fallback.to_string())
 }
 
 /// Resolve the compile-time default chords for a single `"tag.variant"`
@@ -1986,6 +1987,47 @@ mod tests {
     use super::*;
     use crate::keymap::InputBarAction;
     use crossterm::event::{KeyCode, KeyEvent};
+
+    #[test]
+    fn provider_alias_rename_binding_label_uses_locale() {
+        const CHILD: &str = "ZEROCODE_RENAME_LABEL_TEST_CHILD";
+        // i18n is process-global; isolate this locale from other pane tests.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "zerocode_pane::tests::provider_alias_rename_binding_label_uses_locale",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locale_dir = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&locale_dir).unwrap();
+        std::fs::write(
+            locale_dir.join("zerocode.ftl"),
+            "zc-keybinding-config-tab-rename-alias = Renommer le fournisseur\n",
+        )
+        .unwrap();
+        crate::i18n::init("fr", dir.path());
+        let pane = ZerocodePane::new(dir.path());
+        let row = pane
+            .rows
+            .iter()
+            .find(|row| row.action_key == "config_tab.rename_alias")
+            .unwrap();
+        assert_eq!(row.label, "Renommer le fournisseur");
+        assert!(!row.chords.is_empty());
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

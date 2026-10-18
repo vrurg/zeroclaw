@@ -1252,6 +1252,7 @@ impl SessionStore {
         id: &str,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
@@ -1263,6 +1264,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
@@ -1280,6 +1284,7 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let done = self.wait_test_gate().await;
         let merged = match self.preview_overrides(id, &patch).await {
             Some(merged) => merged,
@@ -1308,6 +1313,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);

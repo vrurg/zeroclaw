@@ -81,6 +81,18 @@ session_persistence = true
 session_prompts_enabled = true
 ```
 
+The default full built-in selection includes these tools when the prerequisites
+above hold. With minimal tools, select their names explicitly:
+
+```toml
+[tools]
+optional = ["session_prompt_list", "session_prompt_set", "session_prompt_delete"]
+```
+
+Selection does not enable the feature or grant execution permission. It controls
+the mutation/list tools, not injection of already-stored prompts into an enabled
+primary Chat turn. Reload after changing tool selection.
+
 Gateway WebSocket chat also requires gateway session persistence:
 
 ```toml
@@ -108,7 +120,9 @@ access.
 
 ## Agent tools
 
-The current chat session receives three tools when the feature is enabled:
+The current chat session receives three tools when the feature is enabled and
+the tools are selected. Full selection includes them by default; minimal
+selection requires their names as described above.
 
 | Tool | Purpose |
 | --- | --- |

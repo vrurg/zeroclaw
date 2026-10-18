@@ -15,6 +15,7 @@ use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -44,6 +45,11 @@ type SessionModelProvider = (
     String,
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
+
+struct TurnModelSelection {
+    selector: String,
+    allowed_provider_refs: Option<Arc<HashSet<String>>>,
+}
 
 pub fn build_session_model_provider(
     config: &Config,
@@ -521,6 +527,9 @@ pub struct Agent {
     history_has_trim_breadcrumb: bool,
     history_trim_generation: u64,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
+    /// True while the configured baseline may be replaced by automatic routing.
+    /// Explicit session and in-turn selection set this false.
+    automatic_model_routing: bool,
     /// The exact immutable route table used by `model_provider` for hint
     /// dispatch. It is replaced atomically with the provider on model switch.
     model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
@@ -1336,6 +1345,7 @@ impl AgentBuilder {
             history_has_trim_breadcrumb: false,
             history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
+            automatic_model_routing: true,
             model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
@@ -1915,6 +1925,11 @@ impl Agent {
 
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
+    }
+
+    /// Mark the current model/provider selection as an explicit runtime choice.
+    pub fn disable_automatic_model_routing(&mut self) {
+        self.automatic_model_routing = false;
     }
 
     pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
@@ -3739,7 +3754,54 @@ impl Agent {
         }
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
+    fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
+        let resolved_agent = self
+            .full_config()
+            .and_then(|config| config.resolved_agent_config(&self.agent_alias));
+        let effort_policy = resolved_agent.as_ref().map_or_else(
+            || self.config.resolved.effort_routing.as_ref(),
+            |agent| agent.resolved.effort_routing.as_ref(),
+        );
+
+        if !self.automatic_model_routing && effort_policy.is_some() {
+            return Ok(TurnModelSelection {
+                selector: self.model_name.clone(),
+                allowed_provider_refs: None,
+            });
+        }
+
+        if let Some(policy) = effort_policy {
+            let config = self.full_config().ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but the agent has no model-route config snapshot",
+                )
+            })?;
+            let selection = super::eval::resolve_effort_route(
+                policy,
+                &config.model_routes,
+                user_message,
+            )
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous",
+                )
+            })?;
+            let selector = format!("hint:{}", selection.route.hint);
+            let installed_route = self.model_route_resolver.resolve(&selector);
+            if installed_route.provider_name != selection.route.model_provider
+                || installed_route.model != selection.route.model
+            {
+                return Err(anyhow::Error::msg(
+                    "effort routing changed after this provider generation was installed; retry after the model configuration refresh completes",
+                ));
+            }
+            super::eval::log_effort_route_selection(&selection, user_message.len(), "agent");
+            return Ok(TurnModelSelection {
+                selector,
+                allowed_provider_refs: Some(Arc::new(selection.allowed_provider_refs)),
+            });
+        }
+
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
             && self.model_route_resolver.has_hint(&decision.hint)
@@ -3749,7 +3811,10 @@ impl Agent {
                 .configured_model_for_hint(&decision.hint)
                 .unwrap_or("unknown");
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
-            return format!("hint:{}", decision.hint);
+            return Ok(TurnModelSelection {
+                selector: format!("hint:{}", decision.hint),
+                allowed_provider_refs: None,
+            });
         }
 
         // Fallback: auto-classify by complexity when no rule matched.
@@ -3759,11 +3824,17 @@ impl Agent {
                 && self.model_route_resolver.has_hint(hint)
             {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
-                return format!("hint:{hint}");
+                return Ok(TurnModelSelection {
+                    selector: format!("hint:{hint}"),
+                    allowed_provider_refs: None,
+                });
             }
         }
 
-        self.model_name.clone()
+        Ok(TurnModelSelection {
+            selector: self.model_name.clone(),
+            allowed_provider_refs: None,
+        })
     }
 
     fn replay_loop_messages(
@@ -3974,7 +4045,9 @@ impl Agent {
         // reports come from the same generation.
         self.sync_config_generation();
 
-        let effective_model = self.classify_model(user_message);
+        let model_selection = self.classify_model(user_message)?;
+        let effective_model = model_selection.selector;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let selected_route = self.model_route_resolver.resolve(&effective_model);
         let context_limits =
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
@@ -4021,31 +4094,42 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
-                )
-                .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let _ = self.trim_history(Some(&turn_id));
-                        return Err(error);
-                    }
-                };
-            let (active_provider, active_model): (&dyn ModelProvider, &str) =
-                vision_provider_box.as_ref().map_or(
-                    (self.model_provider.as_ref(), effective_model.as_str()),
-                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
-                );
-            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
+            let resolved = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                async {
+                    let (vision_provider_box, _degrade_strip_images) =
+                        crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                            self.full_config(),
+                            self.model_provider.as_ref(),
+                            &base_provider_messages,
+                            &self.multimodal_config,
+                            &selected_route.provider_name,
+                            &selected_route.model,
+                            &effective_model,
+                            Some(self.security.as_ref()),
+                            attempt_allowlist.as_deref(),
+                        )
+                        .await?;
+                    let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                        vision_provider_box.as_ref().map_or(
+                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                        );
+                    Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
+                        &self.config,
+                        active_provider,
+                        active_model,
+                    ))
+                },
+            )
+            .await;
+            match resolved {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let _ = self.trim_history(Some(&turn_id));
+                    return Err(error);
+                }
+            }
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -4101,6 +4185,8 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
+            yield_to_steering: false,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -4233,18 +4319,21 @@ impl Agent {
             turn_safeguard_fallback,
         ) = zeroclaw_providers::scope_safeguard_fallback(async {
             let (result, recovery, context_truncated) =
-                zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = crate::agent::turn::scope_tool_protocol_prompts(
-                        Arc::clone(&tool_protocol_prompts),
-                        turn_loop,
-                    )
-                    .await;
-                    (
-                        result,
-                        zeroclaw_providers::reliable::take_last_provider_fallback(),
-                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
-                    )
-                })
+                zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    zeroclaw_providers::reliable::scope_provider_fallback(async {
+                        let result = crate::agent::turn::scope_tool_protocol_prompts(
+                            Arc::clone(&tool_protocol_prompts),
+                            turn_loop,
+                        )
+                        .await;
+                        (
+                            result,
+                            zeroclaw_providers::reliable::take_last_provider_fallback(),
+                            zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                        )
+                    }),
+                )
                 .await;
             (
                 result,
@@ -4501,7 +4590,15 @@ impl Agent {
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
-        let mut effective_model = self.classify_model(user_message);
+        let model_selection =
+            self.classify_model(user_message)
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                })?;
+        let mut effective_model = model_selection.selector;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -4526,36 +4623,47 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
-                )
-                .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
-                        return Err(StreamedTurnError {
-                            error,
-                            committed_response: String::new(),
-                            new_messages: new_msgs,
-                        });
-                    }
-                };
-            let (active_provider, active_model): (&dyn ModelProvider, &str) =
-                vision_provider_box.as_ref().map_or(
-                    (self.model_provider.as_ref(), effective_model.as_str()),
-                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
-                );
-            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
+            let resolved = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                async {
+                    let (vision_provider_box, _degrade_strip_images) =
+                        crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                            self.full_config(),
+                            self.model_provider.as_ref(),
+                            &base_provider_messages,
+                            &self.multimodal_config,
+                            &selected_route.provider_name,
+                            &selected_route.model,
+                            &effective_model,
+                            Some(self.security.as_ref()),
+                            attempt_allowlist.as_deref(),
+                        )
+                        .await?;
+                    let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                        vision_provider_box.as_ref().map_or(
+                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                        );
+                    Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
+                        &self.config,
+                        active_provider,
+                        active_model,
+                    ))
+                },
+            )
+            .await;
+            match resolved {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    return Err(StreamedTurnError {
+                        error,
+                        committed_response: String::new(),
+                        new_messages: new_msgs,
+                    });
+                }
+            }
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -4640,11 +4748,15 @@ impl Agent {
                 )) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
-        let knobs = crate::agent::loop_::LoopKnobs {
+        let mut knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
+            // This wrapper judges and writes steering itself; the loop only
+            // stops after a tool round when a message is waiting.
+            yield_to_steering: true,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -4677,7 +4789,11 @@ impl Agent {
         // Steering prepared and judged at the end of a round, consumed at the
         // top of the next with no await in between.
         let mut steered_continuation: Option<Vec<ChatMessage>> = None;
+        // Provider-reported usage handed over by a run that yielded to
+        // steering, so the resumed run keeps the same token calibration.
+        let mut carried_reported_usage: Option<crate::agent::turn::ReportedRequestUsage> = None;
         for round in 0..self.config.resolved.max_tool_iterations {
+            knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -4805,7 +4921,7 @@ impl Agent {
                                 .as_ref()
                                 .map(crate::agent::tool_receipts::ReceiptScope::collector),
                             event_tx: Some(event_tx.clone()),
-                            steering: None,
+                            steering: steering_rx.as_deref_mut(),
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(crate::agent::turn::ToolLoopImageState {
                                 cache: &mut self.image_cache,
@@ -4840,6 +4956,7 @@ impl Agent {
                             }),
                         },
                         initial_ingress_subject,
+                        carried_reported_usage.take(),
                     )),
                 ),
             );
@@ -4852,19 +4969,22 @@ impl Agent {
             let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
                 zeroclaw_providers::scope_safeguard_fallback(async {
                     let (result, fallback, context_truncated) =
-                        zeroclaw_providers::reliable::scope_provider_fallback(async {
-                            let result = crate::agent::turn::scope_tool_protocol_prompts(
-                                Arc::clone(&tool_protocol_prompts),
-                                round_loop,
-                            )
-                            .await;
-                            (
-                                result,
-                                zeroclaw_providers::reliable::take_last_provider_fallback(),
-                                zeroclaw_providers::reliable::take_last_provider_context_truncation(
-                                ),
-                            )
-                        })
+                        zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                            attempt_allowlist.clone(),
+                            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                                let result = crate::agent::turn::scope_tool_protocol_prompts(
+                                    Arc::clone(&tool_protocol_prompts),
+                                    round_loop,
+                                )
+                                .await;
+                                (
+                                    result,
+                                    zeroclaw_providers::reliable::take_last_provider_fallback(),
+                                    zeroclaw_providers::reliable::take_last_provider_context_truncation(
+                                    ),
+                                )
+                            }),
+                        )
                         .await;
                     (
                         result,
@@ -5062,6 +5182,36 @@ impl Agent {
                         safeguard_fallback: turn_safeguard_fallback,
                     });
                 }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::agent::turn::SteeringPending>()
+                        .is_some() =>
+                {
+                    // The loop stopped after a tool round because steering is
+                    // waiting. The round's messages are replayed above; commit
+                    // its text, then judge the steering exactly as at the end
+                    // of a round, so it reaches the model at the next step
+                    // instead of after the final answer. A cancelled turn
+                    // prepares nothing; the next round's top records the
+                    // interruption.
+                    if let Ok(pending) = error.downcast::<crate::agent::turn::SteeringPending>() {
+                        committed_response.push_str(&pending.display_text);
+                        carried_reported_usage = pending.reported_usage;
+                    }
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    let cancelled = cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                        }
+                    }
+                    continue;
+                }
                 Err(error) => {
                     // Model switch requested mid-turn: the unified loop
                     // signals a pending `model_switch` by returning
@@ -5258,6 +5408,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
+    let explicit_model_selection = provider_override.is_some() || model_override.is_some();
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -5283,6 +5434,9 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    if explicit_model_selection {
+        agent.disable_automatic_model_routing();
+    }
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -7172,6 +7326,181 @@ mod tests {
         fn alias(&self) -> &str {
             "ModelCaptureModelProvider"
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct EffortRoutingProbe {
+        model: String,
+        local_allowed: bool,
+        cloud_allowed: bool,
+    }
+
+    struct EffortRoutingProbeProvider {
+        observations: Arc<Mutex<Vec<EffortRoutingProbe>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for EffortRoutingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.observations.lock().push(EffortRoutingProbe {
+                model: model.to_string(),
+                local_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.local",
+                ),
+                cloud_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.cloud",
+                ),
+            });
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EffortRoutingProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "EffortRoutingProbeProvider"
+        }
+    }
+
+    fn effort_routing_test_agent(
+        cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
+        routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+    ) -> (Agent, Arc<Mutex<Vec<EffortRoutingProbe>>>) {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let agent = effort_routing_test_agent_with_provider(
+            cloud_escalation,
+            routes,
+            Box::new(EffortRoutingProbeProvider {
+                observations: Arc::clone(&observations),
+            }),
+            Vec::new(),
+        );
+        (agent, observations)
+    }
+
+    fn effort_routing_test_agent_with_provider(
+        cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
+        routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+        provider: Box<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Agent {
+        let policy = zeroclaw_config::scattered_types::EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation,
+        };
+        let mut config = zeroclaw_config::schema::Config {
+            model_routes: routes.clone(),
+            ..Default::default()
+        };
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(policy),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "effort-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("effort-agent")
+            .expect("effort agent must resolve");
+        let resolver_routes = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.hint.clone(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: route.model_provider.clone(),
+                        model: route.model.clone(),
+                    },
+                )
+            })
+            .collect();
+        let route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            resolver_routes,
+            "custom.local".into(),
+            "base-model".into(),
+        ));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..Default::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let config = Arc::new(config);
+        Agent::builder()
+            .model_provider(provider)
+            .model_provider_name("custom.local".into())
+            .model_name("base-model".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                tools,
+            ))
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("effort-agent".into())
+            .config(agent_config)
+            .model_route_resolver(route_resolver)
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(config),
+                live_config: None,
+                live: None,
+            })
+            .build()
+            .expect("effort routing test agent must build")
+    }
+
+    fn effort_routing_test_routes() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
+        vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ]
     }
 
     struct TranscriptCaptureModelProvider {
@@ -10989,6 +11318,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_turn_entry_points_apply_effort_route_and_attempt_boundary() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let (mut simple_agent, simple_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        assert_eq!(simple_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            simple_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut complex_agent, complex_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        assert_eq!(
+            complex_agent
+                .turn_streamed(
+                    "Please analyze and compare these architecture tradeoffs.",
+                    event_tx,
+                    None,
+                )
+                .await
+                .unwrap()
+                .0,
+            "done"
+        );
+        assert_eq!(
+            complex_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:cloud".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+
+        let (mut local_only_agent, local_only_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Never, effort_routing_test_routes());
+        assert_eq!(
+            local_only_agent
+                .turn("Please analyze and compare these architecture tradeoffs.")
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            local_only_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut manual_agent, manual_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        manual_agent.set_model_name("operator-model".into());
+        manual_agent.disable_automatic_model_routing();
+        assert_eq!(manual_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            manual_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "operator-model".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_turn_preserves_admitted_native_tool_history_across_turns() {
+        assert_admitted_native_tool_history_across_turns(false).await;
+    }
+
+    #[tokio::test]
+    async fn agent_turn_streamed_preserves_admitted_native_tool_history_across_turns() {
+        assert_admitted_native_tool_history_across_turns(true).await;
+    }
+
+    async fn assert_admitted_native_tool_history_across_turns(streaming: bool) {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let requests: RoundRequests = Arc::new(Mutex::new(Vec::new()));
+        let cloud_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "custom.local",
+            vec![
+                (
+                    "custom.local".into(),
+                    Box::new(RoundPolicyProvider {
+                        responses: Mutex::new(vec![
+                            round_response("", &["local-call"], 10),
+                            round_response("first turn done", &[], 20),
+                            round_response("second turn done", &[], 30),
+                        ]),
+                        requests: Arc::clone(&requests),
+                        streaming,
+                        capable: true,
+                        fail_stream_after_calls: false,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.cloud".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: false,
+                        requests: Arc::clone(&cloud_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = effort_routing_test_agent_with_provider(
+            CloudEscalationPolicy::Never,
+            effort_routing_test_routes(),
+            Box::new(reliable),
+            vec![Box::new(MockTool)],
+        );
+
+        for (message, expected) in [
+            ("use echo", "first turn done"),
+            ("what was the result?", "second turn done"),
+        ] {
+            let response = if streaming {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .unwrap()
+                    .0
+            } else {
+                agent.turn(message).await.unwrap()
+            };
+            assert_eq!(response, expected);
+        }
+
+        assert!(
+            cloud_requests.lock().is_empty(),
+            "the excluded non-native cloud fallback must receive no requests"
+        );
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 3, "two turns must include one tool round");
+        let second_turn = &requests[2].1;
+        let call = second_turn
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .filter_map(|message| serde_json::from_str::<serde_json::Value>(&message.content).ok())
+            .find(|message| message["tool_calls"][0]["id"] == "local-call")
+            .expect("the next turn must retain the structured assistant tool call");
+        let result = second_turn
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the next turn must retain the structured tool result");
+        let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(result["tool_call_id"], call["tool_calls"][0]["id"]);
+        assert_eq!(result["content"], "tool-out");
+    }
+
+    #[tokio::test]
+    async fn agent_effort_routing_missing_hint_fails_before_provider_dispatch() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        let (mut agent, observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, routes);
+
+        let error = agent
+            .turn("hi")
+            .await
+            .expect_err("a missing cloud hint must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("local/cloud hints are missing or ambiguous")
+        );
+        assert!(observations.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn classified_route_keeps_selector_for_tool_protocol_and_unchanged_hook() {
         let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
         let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
@@ -11278,6 +11794,13 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
+        config.tools.optional = vec![
+            "delegate".into(),
+            "sessions_list".into(),
+            "sessions_history".into(),
+            "sessions_current".into(),
+            "sessions_send".into(),
+        ];
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
         config
@@ -15808,6 +16331,306 @@ mod tests {
         );
     }
 
+    /// Steering sent while a tool runs reaches the model at the very next
+    /// step of the same turn, after that tool's result, not after the model's
+    /// final answer.
+    #[tokio::test]
+    async fn steering_sent_during_a_tool_reaches_the_next_step() {
+        // Sends once, during the first tool call only.
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        let tool_step = |id: &str| zeroclaw_providers::ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: id.into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(TranscriptCaptureModelProvider {
+            alias: "steer-step".into(),
+            // Two tool steps, then an answer: if steering waited for the
+            // final answer, neither the second nor third call would see it.
+            responses: Mutex::new(vec![
+                tool_step("call-1"),
+                tool_step("call-2"),
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: seen.clone(),
+        });
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish")
+        .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "final");
+
+        let seen = seen.lock();
+        let second_call = seen.get(1).expect("the turn must make a second model call");
+        let steer_at = second_call
+            .iter()
+            .position(|m| m.role == "user" && m.content.ends_with("]\n\nsteer-now"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the step after the tool must see the steering message: {:?}",
+                    second_call
+                        .iter()
+                        .map(|m| (&m.role, &m.content))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let tool_result_at = second_call
+            .iter()
+            .position(|m| m.role == "tool" || m.content.contains("tool-out"))
+            .expect("the step after the tool must see its result");
+        assert!(
+            tool_result_at < steer_at,
+            "the steering message must follow the tool result it was sent during"
+        );
+        assert_eq!(
+            outcome
+                .new_messages
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    ConversationMessage::Chat(c) if c.role == "user" && c.content.ends_with("steer-now")
+                ))
+                .count(),
+            1,
+            "each steering message is persisted once as its own user turn"
+        );
+    }
+
+    /// The provider's reported usage from the step before a steering yield
+    /// still calibrates the step after it. Here that usage says the request
+    /// was far larger than estimated, so the resumed step must be refused
+    /// before dispatch instead of being sent on the raw estimate.
+    #[tokio::test]
+    async fn steering_yield_keeps_reported_usage_for_the_next_step() {
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        // Answers the first request with a tool call and a usage report a
+        // thousand times its own estimate; any later request gets a plain
+        // answer.
+        struct UndercountedProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for UndercountedProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("final".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                let estimated = crate::agent::history::estimate_history_tokens(request.messages)
+                    + request
+                        .tools
+                        .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * 1_000),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        output_tokens: Some(1),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for UndercountedProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "undercounted"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(UndercountedProvider {
+                calls: Arc::clone(&calls),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the step after the yield must be refused on the carried usage, not dispatched"
+        );
+        let mut calibrated_trim = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                ..
+            } = event
+            {
+                calibrated_trim = true;
+            }
+        }
+        assert!(
+            calibrated_trim,
+            "the resumed step must count its request with the carried calibration"
+        );
+    }
+
     #[tokio::test]
     async fn tree_budget_final_completion_is_terminal_when_steering_arrives() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -19437,6 +20260,10 @@ model_provider = "custom.only"
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
+        assert!(
+            agent.automatic_model_routing,
+            "a model-issued switch must preserve automatic routing for the next turn"
+        );
     }
 
     /// Regression: model_provider_context_window_opt follows the in-turn
@@ -19786,6 +20613,123 @@ model_provider = "custom.only"
                 error: None,
             })
         }
+    }
+
+    /// A tool that queues a model switch and, in the same call, a steering
+    /// message. The switch must still apply: steering waits for the switched
+    /// provider instead of resuming on the old one.
+    struct SwitchAndSteerTool {
+        steer: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+    }
+
+    #[async_trait]
+    impl Tool for SwitchAndSteerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a model switch and a steering message"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() = Some(("ollama".to_string(), "llama3".to_string()));
+            let steer = self.steer.lock().take();
+            if let Some(steer) = steer {
+                steer
+                    .send("steer-during-switch".into())
+                    .await
+                    .expect("the running turn must accept steering");
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+    zeroclaw_api::mock_tool_attribution!(SwitchAndSteerTool);
+
+    #[test]
+    fn steering_in_the_same_batch_as_a_model_switch_keeps_the_switch() {
+        let initial_calls = Arc::new(Mutex::new(0usize));
+        let provider = Box::new(StreamSwitchTriggerProvider {
+            call_count: Arc::clone(&initial_calls),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+                reliability: zeroclaw_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..zeroclaw_config::schema::ReliabilityConfig::default()
+                },
+                ..zeroclaw_config::schema::Config::default()
+            })),
+            live_config: None,
+            live: None,
+        };
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SwitchAndSteerTool {
+                    steer: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+            // The switched provider has no live server, so the turn errors
+            // after the switch; the timeout only guards against a hang.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed_with_steering_state(
+                    "please switch the model",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            (
+                agent.model_provider_name.as_str(),
+                agent.model_name.as_str()
+            ),
+            ("ollama", "llama3"),
+            "steering in the same batch must not drop the requested model switch"
+        );
+        assert_eq!(
+            *initial_calls.lock(),
+            1,
+            "the steered round must not go back to the original provider"
+        );
     }
 
     #[test]
