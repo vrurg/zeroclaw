@@ -578,7 +578,6 @@ zc-config-status-skill-saved = 已保存 { $name }
 zc-config-status-skill-deleting = 正在删除 { $name }...
 zc-config-status-skill-archived = 已归档 { $name }
 zc-config-status-fetching-models = 正在获取 { $family } 的模型...
-zc-config-status-field-set = 已设置 { $prop }
 zc-config-status-invalid-float = { $prop } 的值无效：应为数字
 zc-config-status-invalid-integer = { $prop } 的值无效：应为整数
 zc-config-status-set-failed = 设置失败：{ $err }

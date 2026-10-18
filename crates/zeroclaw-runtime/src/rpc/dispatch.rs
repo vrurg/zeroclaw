@@ -3206,7 +3206,7 @@ impl RpcDispatcher {
         mut commit: crate::live_config_authority::ConfigCommit,
         snapshot: zeroclaw_config::schema::Config,
         effects: RpcConfigCommitEffects,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_config::live::ConfigRevision, JsonRpcError> {
         snapshot.validate_auth().map_err(|e| {
             rpc_err(
                 INVALID_PARAMS,
@@ -3297,7 +3297,7 @@ impl RpcDispatcher {
                     Self::refresh_memory_embedder_for_model_provider(&ctx, &accepted, &provider);
                 }
             }
-            result
+            result.map(|()| revision)
         }));
         task.await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config commit task failed: {e}")))?
@@ -9317,21 +9317,22 @@ impl RpcDispatcher {
                 }),
             ..RpcConfigCommitEffects::default()
         };
-        if let Some(scope) = refresh_scope.as_ref() {
+        let revision = if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 *config,
                 config_commit,
                 scope,
                 effects,
             ))
-            .await?;
+            .await?
         } else {
             self.save_and_publish_config(config_commit, *config, effects)
-                .await?;
-        }
+                .await?
+        };
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
+            revision: Some(revision.into()),
         })
     }
 
@@ -9611,7 +9612,7 @@ impl RpcDispatcher {
         config_commit: crate::live_config_authority::ConfigCommit,
         scope: &LiveSessionRefreshScope,
         mut effects: RpcConfigCommitEffects,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_config::live::ConfigRevision, JsonRpcError> {
         let prepared =
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
         // Test-only: park after preparation so a regression can drive other
@@ -10031,21 +10032,22 @@ impl RpcDispatcher {
             channel_generation: channel_generation_revocation,
             ..RpcConfigCommitEffects::default()
         };
-        if let Some(scope) = refresh_scope.as_ref() {
+        let revision = if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
                 config_commit,
                 scope,
                 effects,
             ))
-            .await?;
+            .await?
         } else {
             self.save_and_publish_config(config_commit, working, effects)
-                .await?;
-        }
+                .await?
+        };
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
+            revision: Some(revision.into()),
         })
     }
 
@@ -10108,25 +10110,30 @@ impl RpcDispatcher {
             config_reservations: _agent_config_reservation.into_iter().collect(),
             ..RpcConfigCommitEffects::default()
         };
+        let mut revision = None;
         let created = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             created
         } else {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                self.save_and_publish_config(config_commit, working, effects)
-                    .await?;
+                revision = Some(
+                    self.save_and_publish_config(config_commit, working, effects)
+                        .await?,
+                );
             }
             created
         };
@@ -10134,6 +10141,7 @@ impl RpcDispatcher {
             path: req.path,
             key: req.key,
             created,
+            revision: revision.map(Into::into),
         })
     }
 
@@ -10163,6 +10171,7 @@ impl RpcDispatcher {
                 path: req.path,
                 key: result.alias,
                 deleted: true,
+                revision: None,
             });
         }
         let config_commit = self
@@ -10210,17 +10219,20 @@ impl RpcDispatcher {
             channel_generation: channel_generation_revocation,
             ..RpcConfigCommitEffects::default()
         };
+        let mut revision = None;
         let deleted = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let deleted = delete_plain(&mut working)?;
             if deleted {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             deleted
         } else if let Some(kind) = provider_model_alias_kind {
@@ -10246,21 +10258,25 @@ impl RpcDispatcher {
                 // widest safe scope: it refreshes every session regardless of
                 // their provider ref, ensuring the deleted alias is never
                 // consulted again.
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             deleted
         } else {
             let mut working = old_config;
             let deleted = delete_plain(&mut working)?;
             if deleted {
-                self.save_and_publish_config(config_commit, working, effects)
-                    .await?;
+                revision = Some(
+                    self.save_and_publish_config(config_commit, working, effects)
+                        .await?,
+                );
             }
             deleted
         };
@@ -10268,6 +10284,7 @@ impl RpcDispatcher {
             path: req.path,
             key: req.key,
             deleted,
+            revision: revision.map(Into::into),
         })
     }
 
@@ -37371,6 +37388,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_application_map_receipts_require_a_committed_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let params = json!({"path": "cost.rates.providers.models.openai", "key": "gpt-4.1"});
+        let created = dispatcher
+            .handle_config_map_key_create(&params)
+            .await
+            .unwrap();
+        assert_eq!(created["created"], true);
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            created["revision"],
+            status["application"]["published_revision"]
+        );
+        let unchanged = dispatcher
+            .handle_config_map_key_create(&params)
+            .await
+            .unwrap();
+        assert_eq!(unchanged["created"], false);
+        assert!(unchanged.get("revision").is_none());
+        let saved = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok", "value": 1.5
+            }))
+            .await
+            .unwrap();
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record["revision"] == saved["revision"]
+                        && record["path"]
+                            == json!([
+                                "cost",
+                                "rates",
+                                "providers",
+                                "models",
+                                "openai",
+                                "gpt-4.1",
+                                "input_per_mtok"
+                            ])
+                })
+        );
+        let deleted = dispatcher
+            .handle_config_map_key_delete(&params)
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true);
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            deleted["revision"],
+            status["application"]["published_revision"]
+        );
+        let unchanged = dispatcher
+            .handle_config_map_key_delete(&params)
+            .await
+            .unwrap();
+        assert_eq!(unchanged["deleted"], false);
+        assert!(unchanged.get("revision").is_none());
+    }
+
+    #[tokio::test]
     async fn config_application_status_waits_for_the_real_session_acknowledgement() {
         use zeroclaw_api::grants::{Resource, Verb};
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
@@ -37463,11 +37545,12 @@ mod tests {
         let applied_revision = record["revision"].clone();
         dispatcher.ctx.sessions.clear_test_gated_op_pause();
         release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        assert_eq!(saved["revision"], applied_revision);
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "new-model"
@@ -37519,6 +37602,32 @@ mod tests {
             .find(|record| record["target"]["id"] == session_id)
             .unwrap();
         assert_eq!(record["revision"], applied_revision);
+        // A subsequent write to the same path replaces its ledger records.
+        // Its receipt must not be attributable to the earlier request.
+        let newer = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model", "value": "newer-model"
+            }))
+            .await
+            .unwrap();
+        let latest = dispatcher.handle_config_status().await.unwrap();
+        assert_ne!(newer["revision"], saved["revision"]);
+        assert_eq!(
+            newer["revision"],
+            latest["application"]["published_revision"]
+        );
+        let same_path_records: Vec<_> = latest["application"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| {
+                record["path"] == json!(["providers", "models", "openai", "test-provider", "model"])
+            })
+            .collect();
+        assert!(!same_path_records.is_empty());
+        assert!(same_path_records.iter().all(|record| {
+            record["revision"] == newer["revision"] && record["revision"] != saved["revision"]
+        }));
         dispatcher.ctx.sessions.remove(&session_id).await;
         let retired = dispatcher.handle_config_status().await.unwrap();
         assert!(
@@ -38930,7 +39039,20 @@ mod tests {
                 "prop": "providers.models.openai.test-provider.temperature",
             }))
             .await;
-        assert!(res.is_ok(), "config/delete must succeed: {res:?}");
+        let res = res.expect("config/delete must succeed");
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(res["revision"], status["application"]["published_revision"]);
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record["revision"] == res["revision"]
+                        && record["target"]["id"] == session_id
+                        && record["outcome"] == "applied_live"
+                })
+        );
 
         wait_for_temperature(&dispatcher, &session_id, None).await;
     }
@@ -41141,15 +41263,44 @@ mod tests {
         std::fs::write(&blocked_parent, b"").unwrap();
         let mut cfg = make_two_provider_test_config(&tmp);
         cfg.config_path = blocked_parent.join("config.toml");
-        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let (mut dispatcher, mut rx, _) = make_dispatcher_with_capture(cfg);
+        dispatcher.set_authenticated_for_test();
         let before = dispatcher.ctx.config.snapshot_with_revision();
 
         let params = json!({
             "prop": "providers.models.anthropic.default.model",
             "value": "doomed-value"
         });
-        let result = dispatcher.handle_config_set(&params).await;
-        assert!(result.is_err(), "config/set must fail on the blocked path");
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", params).await;
+        assert!(
+            response.get("error").is_some(),
+            "config/set must fail on the blocked path"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Config save failed:"),
+            "the request must reach the persistence failure: {response}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "a failed save must not return a receipt"
+        );
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            status["application"]["published_revision"],
+            serde_json::to_value(crate::config_application::PublishedConfigRevision::from(
+                before.1
+            ))
+            .unwrap()
+        );
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         let after = dispatcher.ctx.config.snapshot_with_revision();
         assert!(

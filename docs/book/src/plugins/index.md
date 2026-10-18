@@ -240,11 +240,15 @@ store, runs the call, and drops it. Channels and memory backends are stateful
 by nature, so they hold one warm store for the plugin's lifetime; the host
 refuels it before every call so a long-lived plugin gets a full budget per
 call rather than draining over time. A deadline interruption discards the warm
-store instead of resuming partially unwound guest state, and a channel also
-discards one whose call trapped, because Wasmtime refuses every later call into
-a trapped store. Channels recreate the instance on the next call, waiting when
-failures outrun a rebuild budget; memory stays unavailable until its owner
-rebuilds it.
+store instead of resuming partially unwound guest state. Channels and memory
+backends also discard a store whose call failed inside Wasmtime: Wasmtime
+refuses every later call into a store after a trap, exhausted fuel, or a failed
+host import, and a result it could not lift skips the export's cleanup.
+Channels recreate the instance on the next call, waiting when failures outrun a
+rebuild budget. Memory stays unavailable until its owner rebuilds it, and every
+call that reaches the plugin in the meantime fails with the same
+`plugin instance is unavailable` error. A memory plugin keeps its entries only
+in its own instance, so a rebuilt one starts empty.
 During an authorized channel call, `config.get` and `secrets.get` materialize at
 most one revision of that admitted instance's canonical config. The host drops
 the view when the call ends. A compliant channel plugin **must** resolve both at

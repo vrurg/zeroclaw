@@ -578,7 +578,6 @@ zc-config-status-skill-saved = { $name } enregistré
 zc-config-status-skill-deleting = Suppression de { $name }...
 zc-config-status-skill-archived = { $name } archivé
 zc-config-status-fetching-models = Récupération des modèles pour { $family }...
-zc-config-status-field-set = { $prop } défini
 zc-config-status-invalid-float = Valeur invalide pour { $prop } : nombre attendu
 zc-config-status-invalid-integer = Valeur invalide pour { $prop } : entier attendu
 zc-config-status-set-failed = Échec de la définition : { $err }
