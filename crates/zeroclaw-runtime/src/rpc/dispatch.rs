@@ -10675,6 +10675,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -13792,6 +13795,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
+        },
         _ => return None,
     };
 
@@ -14127,7 +14140,11 @@ mod tests {
     #[tokio::test]
     async fn local_session_factory_populates_channels_and_resume_preserves_them() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
         dispatcher.set_tui_id_for_test(Some("tui-local".into()));
@@ -14431,7 +14448,11 @@ mod tests {
     #[tokio::test]
     async fn local_acp_rehydration_restores_session_channels() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let data_dir = config.data_dir.clone();
         let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -27409,6 +27430,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -28695,6 +28733,19 @@ mod tests {
         risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
 
         zeroclaw_config::schema::Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec![
+                    "calculator",
+                    "delegate",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_current",
+                    "sessions_send",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),
             providers,
@@ -28702,6 +28753,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(
@@ -39274,6 +39358,49 @@ mod tests {
         dispatcher.process_line(&line.to_string()).await;
         let frame = rx.recv().await.expect("RPC response frame");
         serde_json::from_str(&frame).expect("response frame is valid JSON")
+    }
+
+    /// `config/validate` checks an opt-in tool's own settings only in a build
+    /// that carries the tool. A build without project intelligence accepts an
+    /// enabled section whose templates directory does not exist here; a
+    /// build with it still reports the config invalid.
+    #[tokio::test]
+    async fn config_validate_checks_an_opt_in_tool_only_where_it_is_compiled() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir =
+            Some(tmp.path().join("absent-templates").display().to_string());
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/validate", json!({})).await;
+        let compiled = OptInTool::ProjectIntel.compiled();
+        assert_eq!(response["result"]["valid"], json!(!compiled), "{response}");
+        if compiled {
+            assert!(
+                response["result"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("project_intel.templates_dir")),
+                "{response}"
+            );
+        }
     }
 
     fn alice_user_sets() -> Value {
