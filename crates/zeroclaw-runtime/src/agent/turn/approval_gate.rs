@@ -28,6 +28,25 @@ pub(crate) async fn gate_tool_approval(
     iteration: usize,
     position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
+    if crate::agent::tool_execution::is_sensitive_session_prompt_tool(tool_name)
+        && !zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .try_with(|allowed| *allowed)
+            .unwrap_or(false)
+    {
+        // A nested SOP step can retain the parent's session key without its
+        // primary-turn capability. Reject after hook rewrites and before any
+        // approval preview: approval cannot grant an unsupported invocation.
+        // The concrete tool still rechecks its session owner at dispatch.
+        return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+            output: crate::i18n::get_required_cli_string("session-prompt-context-unavailable"),
+            success: false,
+            error_reason: Some("session prompt context unavailable".into()),
+            duration: Duration::ZERO,
+            receipt: None,
+            output_data: None,
+            attachments: Vec::new(),
+        });
+    }
     let session_prompt_mutation = is_session_prompt_mutation(tool_name);
     if session_prompt_mutation && ctx.session_prompt_approval_required {
         return gate_session_prompt_approval(ctx, tool_name, tool_args, position).await;
@@ -1128,6 +1147,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absent_session_prompt_capability_is_denied() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing, None, None);
+        let outcome = gate_tool_approval(
+            &ctx,
+            "session_prompt_list",
+            &serde_json::json!({}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await;
+        let ApprovalGateOutcome::Deny(result) = outcome else {
+            panic!("an absent capability must fail closed");
+        };
+        assert!(!result.success);
+        assert_eq!(
+            result.output,
+            crate::i18n::get_required_cli_string("session-prompt-context-unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_session_prompt_calls_never_request_approval() {
+        let marker = "synthetic-sop-private-proposal";
+        for required in [true, false] {
+            for tool in zeroclaw_api::SESSION_PROMPT_TOOL_NAMES {
+                let channel = CapturingApprovalChannel {
+                    response: Some(ChannelApprovalResponse::Approve),
+                    source: ApprovalSource::Operator,
+                    delivery_error: false,
+                    requests: Mutex::new(Vec::new()),
+                };
+                let approval =
+                    ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let mut ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
+                ctx.session_prompt_approval_required = required;
+                // Same-agent SOP steps inherit the parent's session identity,
+                // but deliberately scope away its prompt-tool capability.
+                let outcome = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                    .scope(
+                        Some("parent-chat-session".into()),
+                        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(false, async {
+                            gate_tool_approval(
+                                &ctx,
+                                tool,
+                                &serde_json::json!({"id": "task", "content": marker}),
+                                0,
+                                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                            )
+                            .await
+                        }),
+                    )
+                    .await;
+                let ApprovalGateOutcome::Deny(result) = outcome else {
+                    panic!("unsupported prompt calls must be rejected before approval");
+                };
+                assert!(!result.success);
+                assert!(!result.output.contains(marker));
+                assert!(channel.requests.lock().is_empty());
+                assert!(approval.audit_log().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unavailable_or_failed_strict_delivery_is_not_an_operator_refusal() {
         let marker = "session-prompt-private-marker";
         for (delivery_error, reason_key) in [
@@ -1145,17 +1232,23 @@ mod tests {
             let observer = NoopObserver;
             let pacing = PacingConfig::default();
             let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
-            let outcome = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-                .scope(Some("approval-test-session".into()), async {
-                    gate_tool_approval(
-                        &ctx,
-                        "session_prompt_set",
-                        &serde_json::json!({"id": "task", "content": marker}),
-                        0,
-                        zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
-                    )
-                    .await
-                })
+            let outcome = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .scope(
+                    true,
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("approval-test-session".into()),
+                        async {
+                            gate_tool_approval(
+                                &ctx,
+                                "session_prompt_set",
+                                &serde_json::json!({"id": "task", "content": marker}),
+                                0,
+                                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                            )
+                            .await
+                        },
+                    ),
+                )
                 .await;
             let ApprovalGateOutcome::Deny(result) = outcome else {
                 panic!("unsupported strict delivery must deny the mutation");
@@ -1211,17 +1304,23 @@ mod tests {
                 let observer = NoopObserver;
                 let pacing = PacingConfig::default();
                 let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
-                let outcome = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-                    .scope(Some("approval-test-session".into()), async {
-                        gate_tool_approval(
-                            &ctx,
-                            "session_prompt_set",
-                            &serde_json::json!({"id": "task", "content": marker}),
-                            0,
-                            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
-                        )
-                        .await
-                    })
+                let outcome = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .scope(
+                        true,
+                        zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                            Some("approval-test-session".into()),
+                            async {
+                                gate_tool_approval(
+                                    &ctx,
+                                    "session_prompt_set",
+                                    &serde_json::json!({"id": "task", "content": marker}),
+                                    0,
+                                    zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                                )
+                                .await
+                            },
+                        ),
+                    )
                     .await;
                 if should_approve {
                     assert!(matches!(
@@ -1302,14 +1401,18 @@ mod tests {
                 serving_model: None,
             };
 
-            let _ = gate_tool_approval(
-                &ctx,
-                "session_prompt_set",
-                &serde_json::json!({"id": "task", "content": marker}),
-                0,
-                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
-            )
-            .await;
+            let _ = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .scope(
+                    true,
+                    gate_tool_approval(
+                        &ctx,
+                        "session_prompt_set",
+                        &serde_json::json!({"id": "task", "content": marker}),
+                        0,
+                        zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                    ),
+                )
+                .await;
 
             let requests = channel.requests.lock();
             assert_eq!(requests.len(), 1);

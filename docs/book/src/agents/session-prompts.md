@@ -117,6 +117,10 @@ subagents, inline runs, and SOP steps assigned to another agent, use their own s
 prompt, without inheriting the parent's attached prompts. A same-agent inline
 SOP step continues the primary turn's shared transcript without prompt-tool
 access.
+Unsupported prompt-tool calls are rejected before either dedicated or ordinary
+approval, even when an inline step retains its parent's session identity.
+Prompt-tool arguments and results are excluded from SOP step audit capture;
+ordinary tool-call capture is unchanged.
 
 ## Agent tools
 

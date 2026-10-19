@@ -788,6 +788,17 @@ mod tests {
                 .unwrap()
                 .push(format!("tool={tool};args={args};result={}", result.output));
         }
+
+        async fn on_tool_call_abandoned(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            tool: &str,
+        ) {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(format!("abandoned:{tool}"));
+        }
     }
 
     fn lifecycle_ctx<'a>(
@@ -886,6 +897,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_rewritten_session_prompt_abandons_its_hook_once() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RewriteToSessionPromptRecorder {
+            observations: Arc::clone(&observations),
+            target: "session_prompt_set",
+        }));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        ctx.session_prompt_approval_required = false;
+        let calls = [parsed_call(
+            "ordinary_tool",
+            serde_json::json!({}),
+            "rewrite",
+        )];
+        let prepared = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                false,
+                prepare_tool_calls(
+                    &ctx,
+                    &[],
+                    None,
+                    &calls,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                    0,
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(prepared.executable_calls.is_empty());
+        let (name, _, result) = prepared.ordered_results[0].as_ref().unwrap();
+        assert_eq!(name, "session_prompt_set");
+        assert!(!result.success);
+        assert_eq!(
+            *observations.lock().unwrap(),
+            ["abandoned:session_prompt_set"]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_sop_capture_omits_payloads_but_retains_ordinary_calls() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(16);
+        let ctx = test_ctx(&observer, &pacing, &tx);
+        let marker = "synthetic-sop-private-payload";
+        let mut calls: Vec<_> = zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+            .iter()
+            .map(|name| parsed_call(name, serde_json::json!({"content": marker}), "prompt"))
+            .collect();
+        calls.push(parsed_call(
+            "ordinary_tool",
+            serde_json::json!({"value": "public"}),
+            "ordinary",
+        ));
+        let outcomes = calls.iter().map(|call| ToolExecutionOutcome {
+            output: if call.name == "ordinary_tool" { "public" } else { marker }.into(),
+            output_data: Some(serde_json::json!({"value": if call.name == "ordinary_tool" { "public" } else { marker }})),
+            error_reason: Some(if call.name == "ordinary_tool" { "ordinary failure" } else { marker }.into()),
+            success: false,
+            attachments: Vec::new(),
+            duration: Duration::ZERO,
+            receipt: None,
+        }).collect();
+        let sink = crate::sop::executor::new_step_call_sink();
+        let mut results = (0..calls.len()).map(|_| None).collect::<Vec<_>>();
+        crate::sop::executor::scope_step_call_sink(Arc::clone(&sink), async {
+            record_executed_outcomes(
+                &ctx,
+                &(0..calls.len()).collect::<Vec<_>>(),
+                &calls,
+                &vec![None; calls.len()],
+                &(0..calls.len()).map(|_| None).collect::<Vec<_>>(),
+                outcomes,
+                &mut results,
+                0,
+            )
+            .await;
+        })
+        .await;
+        let captured = crate::sop::executor::drain_step_calls(&sink);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].tool, "ordinary_tool");
+        assert_eq!(captured[0].args, serde_json::json!({"value": "public"}));
+        assert_eq!(captured[0].output, "public");
+        assert_eq!(
+            captured[0].output_data,
+            Some(serde_json::json!({"value": "public"}))
+        );
+        assert_eq!(captured[0].error.as_deref(), Some("ordinary failure"));
+        assert!(!serde_json::to_string(&captured).unwrap().contains(marker));
+        assert!(
+            results.iter().all(Option::is_some),
+            "provider results remain intact"
+        );
+        for result in &results[..zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.len()] {
+            assert_eq!(result.as_ref().unwrap().2.output, marker);
+        }
+    }
+
+    #[tokio::test]
     async fn direct_session_prompt_call_never_enters_the_hook_lifecycle() {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -906,18 +1022,22 @@ mod tests {
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
 
-        let prepared = prepare_tool_calls(
-            &ctx,
-            &[],
-            None,
-            &calls,
-            &mut seen,
-            &mut prompt_seen,
-            0,
-            false,
-        )
-        .await
-        .expect("session-prompt preparation completes");
+        let prepared = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                prepare_tool_calls(
+                    &ctx,
+                    &[],
+                    None,
+                    &calls,
+                    &mut seen,
+                    &mut prompt_seen,
+                    0,
+                    false,
+                ),
+            )
+            .await
+            .expect("session-prompt preparation completes");
 
         assert!(prepared.hook_contexts[0].is_none());
         assert!(
@@ -949,18 +1069,22 @@ mod tests {
         )];
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
-        let mut prepared = prepare_tool_calls(
-            &ctx,
-            &[],
-            None,
-            &calls,
-            &mut seen,
-            &mut prompt_seen,
-            0,
-            false,
-        )
-        .await
-        .expect("the rewritten call remains executable");
+        let mut prepared = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                prepare_tool_calls(
+                    &ctx,
+                    &[],
+                    None,
+                    &calls,
+                    &mut seen,
+                    &mut prompt_seen,
+                    0,
+                    false,
+                ),
+            )
+            .await
+            .expect("the rewritten call remains executable");
 
         assert!(prepared.hook_contexts[0].is_some());
         assert_eq!(prepared.executable_calls[0].name, "session_prompt_set");
@@ -1017,18 +1141,22 @@ mod tests {
             let marker = "synthetic-session-prompt-result";
             let arguments = serde_json::json!({"content": marker});
             let calls = [parsed_call("ordinary_tool", arguments.clone(), "call-1")];
-            let mut prepared = prepare_tool_calls(
-                &ctx,
-                &[],
-                None,
-                &calls,
-                &mut HashSet::new(),
-                &mut HashSet::new(),
-                0,
-                false,
-            )
-            .await
-            .unwrap();
+            let mut prepared = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .scope(
+                    true,
+                    prepare_tool_calls(
+                        &ctx,
+                        &[],
+                        None,
+                        &calls,
+                        &mut HashSet::new(),
+                        &mut HashSet::new(),
+                        0,
+                        false,
+                    ),
+                )
+                .await
+                .unwrap();
             assert_eq!(prepared.executable_calls[0].name, target);
             record_executed_outcomes(
                 &ctx,

@@ -122,8 +122,10 @@ pub(crate) async fn record_executed_outcomes(
                 .await;
         }
 
-        // Capture into the innermost live SOP step scope (no-op otherwise).
-        if crate::sop::executor::step_capture_active() {
+        // SOP audit is a generic persistent export, not a provider or explicit
+        // list result. Exclude prompt-tool proposals and results even if a
+        // caller reaches this path despite unsupported-scope preflight denial.
+        if !sensitive_session_prompt && crate::sop::executor::step_capture_active() {
             crate::sop::executor::record_step_tool_call(
                 &call.name,
                 &call.arguments,

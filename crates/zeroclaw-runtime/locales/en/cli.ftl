@@ -1625,6 +1625,7 @@ channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
 channel-approval-title = Approve { $tool }?
 session-prompt-approval-heading = Approve persistent session-prompt mutation
+session-prompt-context-unavailable = Error: No active chat-session context. This tool is unavailable to auxiliary calls.
 session-prompt-approval-unavailable = the approval surface cannot present the exact session confirmation safely
 session-prompt-approval-delivery-failed = the runtime could not deliver the session confirmation
 channel-approval-opt-allow-once = Allow once
