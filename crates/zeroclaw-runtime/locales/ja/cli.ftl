@@ -1370,3 +1370,4 @@ session-prompt-approval-manager-unavailable = 承認マネージャーを利用�
 session-prompt-approval-channel-unavailable = 承認に対応したチャネルを利用できません
 session-prompt-approval-runtime-denial = 操作担当者の判断が得られなかったため、システムがポリシーに基づいて拒否しました。ユーザーによる判断ではありません。
 session-prompt-approval-not-granted = 一度限りの承認が得られませんでした
+session-prompt-context-unavailable = Error: アクティブなチャットセッションコンテキストがありません。このツールは補助呼び出しでは利用できません。

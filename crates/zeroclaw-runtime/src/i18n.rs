@@ -1977,6 +1977,33 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_context_refusal_preserves_each_locale() {
+        let key = "session-prompt-context-unavailable";
+        for (locale, tools) in [
+            ("en", include_str!("../locales/en/tools.ftl")),
+            ("es", include_str!("../locales/es/tools.ftl")),
+            ("fr", include_str!("../locales/fr/tools.ftl")),
+            ("ja", include_str!("../locales/ja/tools.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/tools.ftl")),
+        ] {
+            let source = if locale == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(locale).expect("locale must have a built-in CLI catalog")
+            };
+            let refusal =
+                format_ftl_message(tools, locale, "tool-session-prompt-error-no-context", &[])
+                    .expect("locale must define the existing tool refusal");
+            let expected = format!("Error: {refusal}");
+            let actual = format_ftl_message(source, locale, key, &[])
+                .unwrap_or_else(|| panic!("{locale}: {key} must not use English fallback"));
+            assert_eq!(actual, expected, "{locale}: preserve the existing refusal");
+            let loaded = load_cli_strings_from_sources(locale, Some(source), None);
+            assert_eq!(loaded.get(key), Some(&expected), "{locale}: CLI loader");
+        }
+    }
+
+    #[test]
     fn session_prompt_approval_messages_format_in_every_locale() {
         for locale in available_locales() {
             let sources = load_cli_ftl_sources(locale.code.as_str());

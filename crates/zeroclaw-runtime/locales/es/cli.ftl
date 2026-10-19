@@ -1372,3 +1372,4 @@ session-prompt-approval-manager-unavailable = no hay un gestor de aprobaciones d
 session-prompt-approval-channel-unavailable = no hay un canal que permita aprobar disponible
 session-prompt-approval-runtime-denial = no hubo una decisión del operador, por lo que el sistema denegó la operación según la política. No fue una decisión del usuario.
 session-prompt-approval-not-granted = no se concedió una aprobación de un solo uso
+session-prompt-context-unavailable = Error: No hay un contexto de sesión de chat activo. Esta herramienta no está disponible para llamadas auxiliares.

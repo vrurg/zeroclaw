@@ -1375,3 +1375,4 @@ session-prompt-approval-manager-unavailable = aucun gestionnaire d’approbation
 session-prompt-approval-channel-unavailable = aucun canal permettant l’approbation n’est disponible
 session-prompt-approval-runtime-denial = aucune décision de l’opérateur n’était disponible ; le système a donc refusé selon la politique. Ce n’était pas une décision de l’utilisateur.
 session-prompt-approval-not-granted = aucune approbation ponctuelle n’a été accordée
+session-prompt-context-unavailable = Error: Aucun contexte de session de discussion actif. Cet outil n’est pas disponible pour les appels auxiliaires.

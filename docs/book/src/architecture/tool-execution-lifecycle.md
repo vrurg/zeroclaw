@@ -122,6 +122,8 @@ calls rewritten into a session-prompt tool are still checked at dispatch; the
 rewrite does not grant access to an unsupported or stale session context.
 Alternative hook policies require a separate architectural decision rather than
 an implicit exception to this feature's contract.
+Unsupported prompt-tool calls are rejected before approval and excluded from
+SOP step audit capture; see [Persistent session prompts](../agents/session-prompts.md).
 
 Likewise, `before_llm_call` is skipped for requests carrying attached prompt
 text or prompt-tool exchanges, including graceful summaries. The prepared

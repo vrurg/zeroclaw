@@ -1374,3 +1374,4 @@ session-prompt-approval-manager-unavailable = 没有可用的批准管理器
 session-prompt-approval-channel-unavailable = 没有支持批准的可用渠道
 session-prompt-approval-runtime-denial = 未获得操作人员的决定，因此系统根据策略拒绝了操作。这不是用户的决定。
 session-prompt-approval-not-granted = 未获得一次性批准
+session-prompt-context-unavailable = Error: 没有活动的聊天会话上下文。此工具不适用于辅助调用。
