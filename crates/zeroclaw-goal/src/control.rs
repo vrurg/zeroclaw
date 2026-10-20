@@ -783,6 +783,13 @@ impl GoalRuntime {
         GoalExecutionEngine::new(self.clone(), accounting_factory)
     }
 
+    /// Submit one typed Goal command using settings borrowed from the
+    /// canonical config current for this command. Build them immediately
+    /// before this call and use the same settings value for host admission
+    /// and the controller transition; do not reuse it for another command.
+    /// Start and Resume fail closed with the typed configuration error before
+    /// session binding. Commands that do not start or resume work produce no
+    /// execution request.
     pub async fn submit(
         &self,
         settings: &GoalHostSettings<'_>,
@@ -820,6 +827,10 @@ impl GoalRuntime {
     ///
     /// The caller supplies the request returned by [`Self::submit`]; this
     /// method deliberately has no route- or session-key lookup path.
+    /// Build settings from the canonical config separately for this
+    /// acquisition, immediately before calling this method; never reuse the
+    /// settings supplied to `submit`. Invalid config fails before the driver
+    /// is asked to acquire execution.
     pub async fn acquire_execution(
         &self,
         settings: &GoalHostSettings<'_>,

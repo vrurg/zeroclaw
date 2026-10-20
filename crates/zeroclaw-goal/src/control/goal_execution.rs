@@ -58,6 +58,12 @@ impl GoalExecutionEngine {
     /// A continuation keeps only a process-local transcript; intermediate
     /// candidates and verifier feedback do not become authoritative user
     /// history. Every model call uses the runtime's per-scope accountant.
+    /// `settings` is used only for execution acquisition and must be built
+    /// from the current canonical config immediately before that call.
+    /// Errors before the first parent attempt—including objective lookup,
+    /// acquisition or its config refusal, resume-response append, and history
+    /// access—make no durable lifecycle change. The owning caller must settle
+    /// the exact execution epoch when such an error follows a transition.
     pub async fn run(
         &self,
         settings: &GoalHostSettings<'_>,

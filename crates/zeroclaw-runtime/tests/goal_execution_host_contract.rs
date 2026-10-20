@@ -2167,6 +2167,162 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
 }
 
 #[tokio::test]
+async fn runtime_rejects_dangling_verifier_for_start_and_resume_but_allows_status() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let invalid = goal_config(
+        true,
+        "openai.missing",
+        ConfigGoalBudgetLimits {
+            token_limit: Some(100),
+            cost_limit_usd: Some(1.0),
+        },
+    );
+
+    for command in [
+        GoalCommand::Start {
+            budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+            objective: "must not start".into(),
+        },
+        GoalCommand::Resume { response: None },
+    ] {
+        let error = match runtime
+            .submit(
+                &host_settings(&invalid),
+                ingress.clone(),
+                driver.clone(),
+                command,
+            )
+            .await
+        {
+            Ok(_) => panic!("invalid verifier must reject Start and Resume"),
+            Err(error) => error,
+        };
+        assert_admission_error(
+            error,
+            ConfigApiCode::DanglingReference,
+            "goal.verifier.model_provider",
+        );
+    }
+
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected Start and Resume must not create a goal row"
+    );
+
+    let (response, execution) = runtime
+        .submit(
+            &host_settings(&invalid),
+            ingress,
+            driver.clone(),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    assert!(matches!(response, GoalResponse::NoCurrentGoal));
+    assert!(execution.is_none());
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn runtime_rechecks_dangling_verifier_before_execution_acquisition() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let ingress = matrix_ingress();
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
+    });
+    let valid = valid_goal_config(true);
+    let (response, request) = runtime
+        .submit(
+            &host_settings(&valid),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "acquire only while the verifier remains configured".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    assert!(matches!(response, GoalResponse::Started(_)));
+    let request = match request {
+        Some(request) => request,
+        None => panic!("a valid Start must return its execution request"),
+    };
+
+    let invalid = goal_config(
+        true,
+        "openai.missing",
+        ConfigGoalBudgetLimits {
+            token_limit: Some(100),
+            cost_limit_usd: Some(1.0),
+        },
+    );
+    let error = match runtime
+        .acquire_execution(&host_settings(&invalid), request)
+        .await
+    {
+        Ok(_) => panic!("dangling verifier must refuse execution acquisition"),
+        Err(error) => error,
+    };
+    assert_admission_error(
+        error,
+        ConfigApiCode::DanglingReference,
+        "goal.verifier.model_provider",
+    );
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    // Settlement after a refused acquisition belongs to the later executor.
+
+    let fresh_store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let fresh_runtime = GoalRuntime::new(fresh_store as Arc<dyn GoalTaskRegistry>);
+    let fresh_ingress = matrix_ingress();
+    let fresh_driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(fresh_ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
+    });
+    let fresh_valid = valid_goal_config(true);
+    let (response, request) = fresh_runtime
+        .submit(
+            &host_settings(&fresh_valid),
+            fresh_ingress,
+            fresh_driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "acquire with fresh valid settings".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    assert!(matches!(response, GoalResponse::Started(_)));
+    let request = match request {
+        Some(request) => request,
+        None => panic!("a valid Start must return its execution request"),
+    };
+    let acquisition_settings = host_settings(&fresh_valid);
+    let lease = fresh_runtime
+        .acquire_execution(&acquisition_settings, request)
+        .await
+        .unwrap();
+    drop(lease);
+    assert_eq!(fresh_driver.execution_acquires.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() {
     let config = valid_goal_config(true);
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());

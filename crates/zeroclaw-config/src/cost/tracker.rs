@@ -2509,6 +2509,44 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_and_required_resolution_share_one_tracker_per_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+        let disabled = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let required =
+            CostTracker::resolve_global_required(&trackers, disabled.clone(), tmp.path())
+                .expect("required resolution opens the ledger while ordinary tracking is disabled");
+        let ordinary = CostTracker::resolve_global(&trackers, disabled, tmp.path())
+            .expect("ordinary resolution reuses the resident tracker");
+
+        assert!(Arc::ptr_eq(&required, &ordinary));
+        assert!(matches!(
+            required.check_budget(1.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+
+        required
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1, 1, 0, 1.0, 1.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            required
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .unwrap()
+                .0,
+            2,
+            "required accounting persists task usage while ordinary budgeting stays disabled"
+        );
+    }
+
+    #[test]
     fn task_usage_totals_include_appended_records() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
