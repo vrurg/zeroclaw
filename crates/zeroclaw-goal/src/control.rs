@@ -9,7 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
-use anyhow::{Error, Result, bail};
+use anyhow::{Context, Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
+use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
 
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
@@ -532,17 +532,23 @@ impl GoalExecutionHost {
     /// Validate a typed command against the exact trusted driver supplied by
     /// the caller. Local disabled/help responses return without binding; all
     /// other commands do not mutate lifecycle state or start model work.
+    /// Build settings from the current canonical
+    /// [`zeroclaw_config::schema::Config`] for each command;
+    /// never reuse them for a later command or hold a config lock across an
+    /// await. Start and Resume fail closed with the canonical typed Goal
+    /// configuration error, while administrative commands do not consult the
+    /// verifier.
     /// [`GoalController`] borrows the returned submission for durable
     /// transitions. A later executor consumes it to acquire the same exact
     /// driver; it must never resolve a value-equivalent replacement driver.
     pub async fn submit(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalSubmission> {
-        if !settings.enabled || matches!(command, GoalCommand::Help) {
+        if !settings.enabled() || matches!(command, GoalCommand::Help) {
             return Ok(GoalSubmission(GoalSubmissionState::Unavailable {
                 ingress,
                 command,
@@ -550,6 +556,13 @@ impl GoalExecutionHost {
         }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
+        }
+
+        if matches!(
+            command,
+            GoalCommand::Start { .. } | GoalCommand::Resume { .. }
+        ) {
+            settings.require_execution_admissible()?;
         }
 
         let lease = driver.bind(&ingress).await?;
@@ -567,7 +580,11 @@ impl GoalExecutionHost {
 
     /// Acquire execution only through the same exact trusted driver boundary
     /// used for command admission. This never selects a driver from route text
-    /// and refuses while Goal Mode is disabled.
+    /// and refuses while Goal Mode is disabled. Build settings from the current
+    /// canonical [`zeroclaw_config::schema::Config`] separately for each
+    /// acquisition; never reuse them
+    /// from command admission or hold a config lock across an await. Invalid
+    /// Goal configuration fails closed with its canonical typed error.
     ///
     /// The admission lease is released immediately before the driver acquires
     /// foreground execution so a driver can take its own session guard. The
@@ -578,11 +595,11 @@ impl GoalExecutionHost {
     /// epoch, and ingress ownership.
     pub async fn acquire_execution(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: GoalSubmission,
         scope: &GoalExecutionScope,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
-        if !settings.enabled {
+        if !settings.enabled() {
             bail!("Goal Mode is disabled");
         }
         let GoalSubmission(GoalSubmissionState::Bound {
@@ -600,6 +617,7 @@ impl GoalExecutionHost {
         if scope.session_id() != ingress.session_key().durable_id() {
             bail!("Goal execution scope session does not match trusted ingress");
         }
+        settings.require_execution_admissible()?;
         drop(lease);
         let lease = driver.acquire_execution(&ingress, scope).await?;
         if lease.session_key() != ingress.session_key() {
@@ -634,89 +652,71 @@ fn require_canonical_nonblank(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Process-local settings already validated from the active Goal configuration.
-#[derive(Debug, PartialEq)]
-pub struct GoalHostSettings {
-    enabled: bool,
-    default_limits: GoalBudgetLimits,
+/// Borrowed settings for one operation against the current canonical config.
+pub struct GoalHostSettings<'a> {
+    config: &'a zeroclaw_config::schema::Config,
     owner_pid: u32,
     owner_boot_id: String,
 }
 
-impl GoalHostSettings {
-    /// Build settings resolved from the active Goal configuration for one
-    /// controller admission.
+impl fmt::Debug for GoalHostSettings<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalHostSettings")
+            .field("enabled", &self.enabled())
+            .field("owner_pid", &self.owner_pid)
+            .finish()
+    }
+}
+
+impl<'a> GoalHostSettings<'a> {
+    /// Borrow settings from the canonical config current for this operation.
     ///
-    /// When enabled, this constructor requires at least one finite default.
-    /// Call [`Self::from_config`] for an enabled configuration whose explicit
-    /// zero values mean unlimited; that path retains the operator's declaration
-    /// provenance before normalization.
+    /// Construct a fresh value for every command and every execution
+    /// acquisition. Never reuse it across operations or borrow from a config
+    /// lock held across `.await`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the owner boot ID is blank or a semantic default
-    /// limit is invalid. Configuration loading must normalize an explicit
-    /// unlimited default to `None` before constructing this value.
-    pub fn new(
-        enabled: bool,
-        default_limits: ConfigGoalBudgetLimits,
+    /// Returns an error if the owner boot ID is blank.
+    pub fn from_config(
+        config: &'a zeroclaw_config::schema::Config,
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
-        if enabled
-            && default_limits.token_limit.is_none()
-            && default_limits.cost_limit_usd.is_none()
-        {
-            bail!(
-                "enabled Goal Mode unlimited defaults require validated configuration provenance"
-            );
-        }
-        validate_default_limits(default_limits)?;
-        let ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        } = default_limits;
         Ok(Self {
-            enabled,
-            default_limits: GoalBudgetLimits {
-                token_limit,
-                cost_limit_usd,
-            },
+            config,
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
     }
 
-    /// Resolve settings from the active configuration without losing whether
-    /// unlimited defaults were explicitly selected by the operator.
-    ///
-    /// This is the only construction path that permits an enabled Goal Mode
-    /// with both normalized default limits unlimited. It first runs
-    /// [`GoalConfig::effective_limits`], which requires both raw defaults to
-    /// have been declared even when they normalize from explicit zeroes.
-    pub fn from_config(
-        config: &GoalConfig,
-        owner_pid: u32,
-        owner_boot_id: impl Into<String>,
-    ) -> Result<Self> {
+    fn enabled(&self) -> bool {
+        self.config.goal.enabled
+    }
+
+    fn require_execution_admissible(&self) -> Result<()> {
+        self.config
+            .validate_goal_config()
+            .context("Goal configuration does not admit execution")
+    }
+
+    fn default_limits(&self) -> Result<GoalBudgetLimits> {
         let ConfigGoalBudgetLimits {
             token_limit,
             cost_limit_usd,
-        } = config
+        } = self
+            .config
+            .goal
             .effective_limits()
-            .map_err(|error| Error::msg(format!("Goal configuration is invalid: {error:?}")))?;
+            .map_err(|_| Error::msg("Goal default limits are invalid"))?;
         validate_default_limits(ConfigGoalBudgetLimits {
             token_limit,
             cost_limit_usd,
         })?;
-        Ok(Self {
-            enabled: config.enabled,
-            default_limits: GoalBudgetLimits {
-                token_limit,
-                cost_limit_usd,
-            },
-            owner_pid,
-            owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
+        Ok(GoalBudgetLimits {
+            token_limit,
+            cost_limit_usd,
         })
     }
 }
@@ -808,17 +808,23 @@ impl GoalController {
     }
 
     /// Apply a previously host-validated Goal submission through guarded
-    /// durable transitions without consuming its exact driver proof.
+    /// durable transitions without consuming its exact driver proof. Construct
+    /// settings from the current canonical
+    /// [`zeroclaw_config::schema::Config`] for each command and do
+    /// not reuse them across commands or hold a config lock across `.await`.
+    /// Start and Resume fail closed with the canonical typed Goal
+    /// configuration error; administrative commands do not consult the
+    /// verifier.
     ///
     /// The caller must keep `settings` current for this admission. A disabled
     /// setting returns [`GoalResponse::Disabled`] for every command, local help
     /// included, without a lifecycle change.
     pub async fn submit(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: &GoalSubmission,
     ) -> Result<GoalResponse> {
-        if !settings.enabled {
+        if !settings.enabled() {
             return Ok(GoalResponse::Disabled);
         }
         if submission.is_unavailable() {
@@ -846,13 +852,14 @@ impl GoalController {
 
     async fn start(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
         selection: GoalBudgetSelection,
         objective: &str,
     ) -> Result<GoalResponse> {
+        settings.require_execution_admissible()?;
         validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-        let limits = select_limits(settings.default_limits, selection)?;
+        let limits = select_limits(settings.default_limits()?, selection)?;
         let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
@@ -1029,9 +1036,10 @@ impl GoalController {
 
     async fn resume(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
     ) -> Result<GoalResponse> {
+        settings.require_execution_admissible()?;
         let session_id = ingress.session_key().durable_id();
         let Some(task) = self.current(ingress, &session_id).await? else {
             return Ok(GoalResponse::NoCurrentGoal);

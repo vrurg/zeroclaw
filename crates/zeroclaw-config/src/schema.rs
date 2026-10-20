@@ -26208,7 +26208,13 @@ impl Config {
         Ok(())
     }
 
-    fn validate_goal_config(&self) -> Result<()> {
+    /// Validate local `[goal]` configuration and, when Goal Mode is enabled,
+    /// resolve its verifier through `providers.models`.
+    ///
+    /// This returns the same structured error used by [`Config::validate`].
+    /// Goal execution admission calls this against the current config at each
+    /// Start, Resume, and execution acquisition. Do not cache its result.
+    pub fn validate_goal_config(&self) -> Result<()> {
         if let Err(error) = self.goal.validate() {
             match error {
                 GoalConfigError::MissingVerifierProvider => validation_bail!(
