@@ -7,6 +7,7 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
+use crate::goal::GoalConfigError;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
@@ -26209,11 +26210,29 @@ impl Config {
 
     fn validate_goal_config(&self) -> Result<()> {
         if let Err(error) = self.goal.validate() {
-            validation_bail!(
-                InvalidFormat,
-                "goal",
-                "goal configuration is invalid: {error:?}"
-            );
+            match error {
+                GoalConfigError::MissingVerifierProvider => validation_bail!(
+                    RequiredFieldEmpty,
+                    "goal.verifier.model_provider",
+                    "goal.verifier.model_provider is required when goal.enabled is true"
+                ),
+                GoalConfigError::TokenLimitOutOfRange => validation_bail!(
+                    InvalidNumericRange,
+                    "goal.default_token_limit",
+                    "goal.default_token_limit must be less than or equal to {}",
+                    i64::MAX
+                ),
+                GoalConfigError::InvalidCostLimit => validation_bail!(
+                    InvalidNumericRange,
+                    "goal.default_cost_limit_usd",
+                    "goal.default_cost_limit_usd must be finite and non-negative"
+                ),
+                GoalConfigError::EmptyVerifierModel => validation_bail!(
+                    RequiredFieldEmpty,
+                    "goal.verifier.model",
+                    "goal.verifier.model must not be empty when provided"
+                ),
+            }
         }
         if !self.goal.enabled {
             return Ok(());
@@ -26221,20 +26240,29 @@ impl Config {
 
         let verifier = self.goal.verifier.model_provider.as_str().trim();
         let Some((provider_type, provider_alias)) = verifier.split_once('.') else {
-            anyhow::bail!(
-                "goal.verifier.model_provider must be a configured <type>.<alias> reference"
+            validation_bail!(
+                InvalidFormat,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider must use `<type>.<alias>` format (got {verifier:?})"
             );
         };
-        if provider_type.is_empty()
-            || provider_alias.is_empty()
-            || self
-                .providers
-                .models
-                .find(provider_type, provider_alias)
-                .is_none()
+        if provider_type.is_empty() || provider_alias.is_empty() {
+            validation_bail!(
+                InvalidFormat,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider must use non-empty `<type>.<alias>` components (got {verifier:?})"
+            );
+        }
+        if self
+            .providers
+            .models
+            .find(provider_type, provider_alias)
+            .is_none()
         {
-            anyhow::bail!(
-                "goal.verifier.model_provider '{verifier}' does not resolve in providers.models"
+            validation_bail!(
+                DanglingReference,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider = {verifier:?} but no matching providers.models entry is configured"
             );
         }
         Ok(())
