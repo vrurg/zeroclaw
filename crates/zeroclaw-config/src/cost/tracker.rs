@@ -420,10 +420,6 @@ impl CostTracker {
         self.session_totals.lock()
     }
 
-    fn storage_path(&self) -> PathBuf {
-        self.lock_storage().path.clone()
-    }
-
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         self.check_budget_at_period(estimated_cost_usd, ReportingPeriod::current())
@@ -863,7 +859,7 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         storage.ensure_period_cache_current_at(period)?;
         let period = storage.reporting_period();
-        let records = storage.current_month_records(period)?;
+        let (records, _) = storage.current_month_records(period)?;
         Ok(build_model_stats(records.iter()))
     }
 
@@ -872,11 +868,11 @@ impl CostTracker {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost, records) = {
+        let (daily_cost, monthly_cost, records, rejected_records) = {
             let mut storage = self.lock_storage();
             let (d, m) = storage.get_aggregated_costs()?;
-            let recs = storage.records_in_bounds(from, to)?;
-            (d, m, recs)
+            let (recs, rejected) = storage.records_in_bounds(from, to)?;
+            (d, m, recs, rejected)
         };
         let total_cost: f64 = records.iter().map(|r| r.usage.cost_usd).sum();
         let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
@@ -893,6 +889,7 @@ impl CostTracker {
             monthly_cost_usd: monthly_cost,
             total_tokens,
             request_count,
+            rejected_records,
             by_model,
             by_agent,
         })
@@ -959,14 +956,14 @@ impl CostTracker {
         agent_filter: Option<&str>,
         period: ReportingPeriod,
     ) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost, period, current_month_records) = {
+        let (daily_cost, monthly_cost, period, current_month_records, rejected_records) = {
             let mut storage = self.lock_storage();
             storage.ensure_period_cache_current_at(period)?;
             let period = storage.reporting_period();
             let daily_cost = storage.daily_cost_usd;
             let monthly_cost = storage.monthly_cost_usd;
-            let records = storage.current_month_records(period)?;
-            (daily_cost, monthly_cost, period, records)
+            let (records, rejected) = storage.current_month_records(period)?;
+            (daily_cost, monthly_cost, period, records, rejected)
         };
 
         let (session_cost, total_tokens, request_count) = {
@@ -1028,6 +1025,7 @@ impl CostTracker {
             monthly_cost_usd: monthly_total,
             total_tokens,
             request_count,
+            rejected_records,
             by_model,
             by_agent,
         })
@@ -1046,68 +1044,63 @@ impl CostTracker {
     }
 }
 
-// ── Process-global singleton ────────────────────────────────────────
+// ── Process-global trackers ─────────────────────────────────────────
 // Both the gateway and the channels supervisor share a single CostTracker
-// so that budget enforcement is consistent across all paths.
+// per ledger so that budget enforcement is consistent across all paths.
+// Trackers are keyed by ledger path: resolving one ledger never replaces or
+// reconfigures the tracker that owns another.
 
-static GLOBAL_COST_TRACKER: OnceLock<RwLock<Option<Arc<CostTracker>>>> = OnceLock::new();
+static GLOBAL_COST_TRACKERS: OnceLock<RwLock<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
 
 impl CostTracker {
-    /// Return the process-global `CostTracker`, applying `config` to the
-    /// existing tracker on later calls and reusing the same `Arc`. Returns
-    /// `None` while cost tracking is disabled and no tracker exists yet; a
-    /// later reload flipping `enabled` to `true` constructs it on demand.
+    /// Return the process-global `CostTracker` for the ledger under
+    /// `workspace_dir`, applying `config` to the existing tracker on later
+    /// calls and reusing the same `Arc`. Returns `None` while cost tracking is
+    /// disabled and no tracker exists for that ledger yet; a later reload
+    /// flipping `enabled` to `true` constructs it on demand.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
-        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
-        Self::resolve_global(slot, config, workspace_dir)
+        let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
+        Self::resolve_global(trackers, config, workspace_dir)
     }
 
-    /// Obtain the canonical process-global ledger even when ordinary cost
-    /// tracking is disabled.
-    ///
-    /// This is intentionally strict about an already-resident tracker at a
-    /// different path: a caller relying on durable task accounting must not
-    /// silently write to a ledger selected by another runtime configuration.
+    /// Obtain the process-global tracker for the canonical ledger under
+    /// `workspace_dir`, even when ordinary cost tracking is disabled.
+    /// Trackers are keyed by ledger path, so this returns the tracker ordinary
+    /// resolution uses for that ledger and never one bound to another ledger.
+    /// Unlike `get_or_init_global`, path-resolution or construction failure is
+    /// an error: durable task accounting fails closed.
     pub fn get_or_init_global_required(
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Result<Arc<Self>> {
-        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
-        Self::resolve_global_required(slot, config, workspace_dir)
+        let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
+        Self::resolve_global_required(trackers, config, workspace_dir)
     }
 
     fn resolve_global_required(
-        slot: &RwLock<Option<Arc<CostTracker>>>,
+        trackers: &RwLock<HashMap<PathBuf, Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Result<Arc<Self>> {
         let storage_path = resolve_storage_path(workspace_dir)?;
-        if let Some(tracker) = slot.read().as_ref().cloned() {
-            anyhow::ensure!(
-                tracker.storage_path() == storage_path,
-                "required cost tracker storage path differs from the resident tracker"
-            );
+        if let Some(tracker) = trackers.read().get(&storage_path).cloned() {
             tracker.update_config(config);
             return Ok(tracker);
         }
 
-        let mut guard = slot.write();
-        if let Some(tracker) = guard.as_ref().cloned() {
-            anyhow::ensure!(
-                tracker.storage_path() == storage_path,
-                "required cost tracker storage path differs from the resident tracker"
-            );
+        let mut guard = trackers.write();
+        if let Some(tracker) = guard.get(&storage_path).cloned() {
             tracker.update_config(config);
             return Ok(tracker);
         }
 
         let tracker = Arc::new(Self::new(config, workspace_dir)?);
-        *guard = Some(Arc::clone(&tracker));
+        guard.insert(storage_path, Arc::clone(&tracker));
         Ok(tracker)
     }
 
     fn resolve_global(
-        slot: &RwLock<Option<Arc<CostTracker>>>,
+        trackers: &RwLock<HashMap<PathBuf, Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Option<Arc<Self>> {
@@ -1125,9 +1118,7 @@ impl CostTracker {
             }
         };
 
-        if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
-        {
+        if let Some(ct) = trackers.read().get(&storage_path).cloned() {
             ct.update_config(config);
             return Some(ct);
         }
@@ -1136,10 +1127,8 @@ impl CostTracker {
             return None;
         }
 
-        let mut guard = slot.write();
-        if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
-        {
+        let mut guard = trackers.write();
+        if let Some(ct) = guard.get(&storage_path).cloned() {
             ct.update_config(config);
             return Some(ct);
         }
@@ -1147,7 +1136,7 @@ impl CostTracker {
         match Self::new(config, workspace_dir) {
             Ok(ct) => {
                 let ct = Arc::new(ct);
-                *guard = Some(ct.clone());
+                guard.insert(storage_path, ct.clone());
                 Some(ct)
             }
             Err(e) => {
@@ -1309,6 +1298,8 @@ struct CostSummaryAccumulator {
     total_tokens: u64,
     /// Number of scanned usage records.
     request_count: usize,
+    /// Ledger lines the scan could not read as complete records.
+    rejected_records: usize,
     /// Per-model rollup keyed by model id.
     by_model: HashMap<String, ModelStats>,
     /// Per-agent rollup keyed by agent alias.
@@ -1337,6 +1328,7 @@ impl CostSummaryAccumulator {
             monthly_cost_usd: self.monthly_cost,
             total_tokens: self.total_tokens,
             request_count: self.request_count,
+            rejected_records: self.rejected_records,
             by_model: self.by_model,
             by_agent: self.by_agent,
         }
@@ -1443,12 +1435,18 @@ impl CostStorage {
         Ok(())
     }
 
-    fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
+    /// Scan every non-empty ledger line, handing each complete record to
+    /// `on_record`. Returns the number of lines that could not be read as
+    /// complete records: a line whose single parse fails and whose
+    /// concatenated-record recovery also fails leaves unreadable bytes
+    /// behind. Callers use that count to report the ledger as incomplete;
+    /// the raw lines are never rewritten.
+    fn for_each_record<F>(&self, mut on_record: F) -> Result<usize>
     where
         F: FnMut(CostRecord),
     {
         if !self.path.exists() {
-            return Ok(());
+            return Ok(0);
         }
 
         let file = File::open(&self.path).with_context(|| {
@@ -1459,6 +1457,7 @@ impl CostStorage {
         })?;
         let reader = BufReader::new(file);
 
+        let mut rejected_records = 0_usize;
         for (line_number, line) in reader.lines().enumerate() {
             let raw_line = line.with_context(|| {
                 format!(
@@ -1475,9 +1474,11 @@ impl CostStorage {
 
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
-                Err(_) => {
-                    if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
+                Err(parse_error) => {
+                    if let Err(recovery_error) =
+                        Self::recover_concatenated_records(trimmed, &mut on_record)
                     {
+                        rejected_records += 1;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1488,7 +1489,8 @@ impl CostStorage {
                             .with_attrs(::serde_json::json!({
                                 "path": self.path.display().to_string(),
                                 "line": line_number + 1,
-                                "error": error.to_string(),
+                                "parse_error": parse_error.to_string(),
+                                "recovery_error": recovery_error.to_string(),
                             })),
                             "skipping malformed cost record"
                         );
@@ -1497,7 +1499,7 @@ impl CostStorage {
             }
         }
 
-        Ok(())
+        Ok(rejected_records)
     }
 
     fn for_each_record_strict<F>(&self, mut on_record: F) -> Result<()>
@@ -1733,23 +1735,23 @@ impl CostStorage {
     /// Snapshot every record whose timestamp falls within the current
     /// calendar month. Used to build per-agent rollups without folding a
     /// new aggregate table into the JSONL file.
-    fn current_month_records(&self, period: ReportingPeriod) -> Result<Vec<CostRecord>> {
+    fn current_month_records(&self, period: ReportingPeriod) -> Result<(Vec<CostRecord>, usize)> {
         let mut out = Vec::new();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             if period.contains_month(record.usage.timestamp) {
                 out.push(record);
             }
         })?;
-        Ok(out)
+        Ok((out, rejected_records))
     }
 
     fn records_in_bounds(
         &mut self,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
-    ) -> Result<Vec<CostRecord>> {
+    ) -> Result<(Vec<CostRecord>, usize)> {
         let mut out = Vec::new();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             let ts = record.usage.timestamp;
             if from.is_some_and(|f| ts < f) {
                 return;
@@ -1759,18 +1761,19 @@ impl CostStorage {
             }
             out.push(record);
         })?;
-        Ok(out)
+        Ok((out, rejected_records))
     }
 
     fn summary_for_task(&mut self, task_id: &str, period: ReportingPeriod) -> Result<CostSummary> {
         self.ensure_period_cache_current_at(period)?;
         let period = self.reporting_period();
         let mut summary = CostSummaryAccumulator::default();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             if record.task_id.as_deref() == Some(task_id) {
                 summary.record(&record, period);
             }
         })?;
+        summary.rejected_records = rejected_records;
         Ok(summary.finish())
     }
 
@@ -2330,9 +2333,9 @@ mod tests {
     #[test]
     fn required_global_tracker_opens_the_canonical_ledger_while_disabled() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
         let tracker = CostTracker::resolve_global_required(
-            &slot,
+            &trackers,
             CostConfig {
                 enabled: false,
                 ..Default::default()
@@ -2462,18 +2465,47 @@ mod tests {
     }
 
     #[test]
-    fn required_global_tracker_rejects_a_different_resident_ledger() {
+    fn required_global_tracker_binds_each_ledger_to_its_own_tracker() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
-        CostTracker::resolve_global_required(&slot, enabled_config(), first.path())
-            .expect("first required tracker opens its canonical ledger");
+        let tracker_a =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), first.path())
+                .expect("first required tracker opens its canonical ledger");
+        let tracker_b =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), second.path())
+                .expect("second required tracker opens its own canonical ledger");
 
-        assert!(
-            CostTracker::resolve_global_required(&slot, enabled_config(), second.path()).is_err(),
-            "Goal accounting must not silently reuse a tracker bound to another data directory"
+        assert!(!Arc::ptr_eq(&tracker_a, &tracker_b));
+
+        tracker_b
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1, 1, 0, 1.0, 1.0, 0.0),
+                Some("agent-b"),
+                Some("goal-b".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker_b
+                .get_strict_usage_totals_for_task_with_pricing("goal-b")
+                .unwrap()
+                .0,
+            2
         );
+        assert_eq!(
+            tracker_a
+                .get_strict_usage_totals_for_task_with_pricing("goal-b")
+                .unwrap()
+                .0,
+            0
+        );
+
+        let tracker_a_again =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), first.path())
+                .expect("re-resolving ledger A returns its existing tracker");
+        assert!(Arc::ptr_eq(&tracker_a, &tracker_a_again));
     }
 
     #[test]
@@ -2979,14 +3011,14 @@ mod tests {
     #[test]
     fn get_or_init_global_applies_reloaded_config_to_existing_tracker() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let boot = CostConfig {
             enabled: true,
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first = CostTracker::resolve_global(&slot, boot, tmp.path())
+        let first = CostTracker::resolve_global(&trackers, boot, tmp.path())
             .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
@@ -2994,7 +3026,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, reloaded, tmp.path())
             .expect("reload yields a tracker");
 
         assert_eq!(
@@ -3012,11 +3044,11 @@ mod tests {
     fn get_or_init_global_replaces_tracker_when_data_dir_changes() {
         let first_tmp = TempDir::new().unwrap();
         let second_tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
-        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path())
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
             .expect("first init yields a tracker");
-        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path())
+        let after = CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
             .expect("data-dir change yields a tracker");
 
         assert!(
@@ -3036,7 +3068,7 @@ mod tests {
     #[test]
     fn get_or_init_global_constructs_tracker_when_enabled_after_disabled_boot() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let disabled_boot = CostConfig {
             enabled: false,
@@ -3044,7 +3076,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&slot, disabled_boot, tmp.path()).is_none(),
+            CostTracker::resolve_global(&trackers, disabled_boot, tmp.path()).is_none(),
             "disabled boot must not construct a tracker"
         );
 
@@ -3053,7 +3085,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path())
+        let constructed = CostTracker::resolve_global(&trackers, enable, tmp.path())
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
@@ -3062,7 +3094,7 @@ mod tests {
         );
 
         let again = CostTracker::resolve_global(
-            &slot,
+            &trackers,
             CostConfig {
                 enabled: true,
                 daily_limit_usd: 14000.0,
@@ -3080,14 +3112,14 @@ mod tests {
     #[test]
     fn get_or_init_global_leaves_tracker_resident_when_disabled_on_reload() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let enabled_boot = CostConfig {
             enabled: true,
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path())
+        let tracker = CostTracker::resolve_global(&trackers, enabled_boot, tmp.path())
             .expect("enabled boot yields a tracker");
 
         let disable = CostConfig {
@@ -3095,7 +3127,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, disable, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, disable, tmp.path())
             .expect("disable reload leaves the tracker resident");
         assert!(
             Arc::ptr_eq(&tracker, &after),
@@ -3108,6 +3140,68 @@ mod tests {
         assert!(
             matches!(after.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "a disabled resident tracker must short-circuit enforcement"
+        );
+    }
+
+    /// One process can resolve several ledgers. Resolving another ledger must
+    /// not evict this ledger's tracker: the next resolution would build a
+    /// second tracker over the same ledger, whose session totals never see
+    /// what the first one recorded.
+    #[test]
+    fn get_or_init_global_keeps_each_ledgers_tracker_when_another_resolves() {
+        let first_tmp = TempDir::new().unwrap();
+        let second_tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger yields a tracker");
+        first
+            .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
+            .expect("second ledger yields a tracker");
+
+        let again = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger still yields a tracker");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "resolving another ledger must not replace this ledger's tracker"
+        );
+        assert_eq!(
+            again.get_summary().unwrap().request_count,
+            1,
+            "the tracker resolved again must still carry this ledger's session totals"
+        );
+    }
+
+    /// A disabled resolution reconfigures only its own ledger's tracker.
+    #[test]
+    fn get_or_init_global_disabled_resolution_leaves_other_ledgers_enabled() {
+        let first_tmp = TempDir::new().unwrap();
+        let second_tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger yields a tracker");
+        let disabled = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            CostTracker::resolve_global(&trackers, disabled, second_tmp.path()).is_none(),
+            "a disabled ledger without a tracker must not construct one or borrow another's"
+        );
+        assert!(
+            first.config().enabled,
+            "a disabled resolution for another ledger must not disable this one"
+        );
+        first
+            .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        assert_eq!(
+            first.get_summary().unwrap().request_count,
+            1,
+            "this ledger's tracker must keep recording"
         );
     }
 
@@ -4134,5 +4228,113 @@ mod tests {
             ),
             "day D must read zero descendant spend: the older record was dropped"
         );
+    }
+
+    #[test]
+    fn torn_trailing_line_is_reported_as_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
+        let valid_record = CostRecord::new("session-a", valid_usage.clone());
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&valid_record).unwrap()).unwrap();
+        // A daemon killed mid-append leaves a truncated object at EOF.
+        writeln!(
+            file,
+            "{{\"usage\":{{\"timestamp\":\"2026-10-01T12:00:00Z\",\"cost_usd\":0.5"
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 1, "the intact record still counts");
+        assert!((summary.session_cost_usd - valid_usage.cost_usd).abs() < f64::EPSILON);
+        // `/api/cost` serializes `CostSummary` directly, so the wire field is
+        // what tells a consumer the totals above are incomplete.
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(1));
+
+        // The torn bytes stay on disk: the reader never rewrites the ledger.
+        let raw = fs::read_to_string(&storage_path).unwrap();
+        assert!(raw.contains("\"cost_usd\":0.5"));
+    }
+
+    #[test]
+    fn torn_tail_after_a_complete_record_is_reported_as_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
+        let valid_record = CostRecord::new("session-a", valid_usage);
+
+        // Concatenated-record recovery keeps the complete prefix, but the
+        // unreadable tail still makes the line incomplete.
+        let mut line = serde_json::to_string(&valid_record).unwrap();
+        line.push_str("{\"usage\":{\"timestamp\":\"2026-10-01T12:00:00Z\",\"cost_usd\":0.5");
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 1, "recovery keeps the prefix");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn fully_recovered_concatenated_records_are_not_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let first = CostRecord::new(
+            "session-a",
+            TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0),
+        );
+        let second = CostRecord::new(
+            "session-b",
+            TokenUsage::new("test/model", 2000, 0, 0, 1.0, 1.0, 0.0),
+        );
+
+        let mut line = serde_json::to_string(&first).unwrap();
+        line.push_str(&serde_json::to_string(&second).unwrap());
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 2, "both complete records count");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(0));
     }
 }

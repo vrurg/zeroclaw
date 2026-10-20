@@ -60,7 +60,7 @@ impl GoalExecutionEngine {
     /// history. Every model call uses the runtime's per-scope accountant.
     pub async fn run(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         request: GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
