@@ -241,6 +241,7 @@ fn prop_kind_wire(kind: zeroclaw_config::traits::PropKind) -> &'static str {
         PropKind::StringArray => "string-array",
         PropKind::ObjectArray => "object-array",
         PropKind::Object => "object",
+        PropKind::SecretMap => "secret-map",
     }
 }
 
@@ -341,6 +342,8 @@ fn lookup_prop_field(
                     tab: zeroclaw_config::traits::ConfigTab::None,
                     alias_source: None,
                     multiline: false,
+                    setup: None,
+                    application: Default::default(),
                 }
             })
         })
@@ -1299,6 +1302,7 @@ pub struct ReloadStatusResponse {
     /// Whether any config write has landed since the last admin reload and may
     /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
+    pub application: zeroclaw_runtime::config_application::ConfigApplicationStatus,
 }
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
@@ -1307,7 +1311,12 @@ pub async fn handle_reload_status(State(state): State<AppState>) -> Response {
     let pending_reload = state
         .pending_reload
         .load(std::sync::atomic::Ordering::Relaxed);
-    axum::Json(ReloadStatusResponse { pending_reload }).into_response()
+    let application = state.config_authority.application_status();
+    axum::Json(ReloadStatusResponse {
+        pending_reload,
+        application,
+    })
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3634,6 +3643,78 @@ mod tests {
     // live `~/.zeroclaw/config.toml`.
 
     #[tokio::test]
+    async fn config_application_reload_status_does_not_infer_adoption_from_flag_clearing() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_paired".into()];
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &config.gateway.paired_tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &config,
+                Arc::clone(&state.pairing),
+            )
+            .unwrap(),
+        );
+        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let read = || {
+            axum::http::Request::builder()
+                .uri("/api/config/reload-status")
+                .header("authorization", "Bearer zc_paired")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let denied = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/config/reload-status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let (status, initial) = response_json(router.clone().oneshot(read()).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(initial["application"]["records"], serde_json::json!([]));
+        let write = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/config/prop")
+            .header("authorization", "Bearer zc_paired")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"path":"gateway.port","value":42618}"#,
+            ))
+            .unwrap();
+        let (status, _) = response_json(router.clone().oneshot(write).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, saved) = response_json(router.clone().oneshot(read()).await.unwrap()).await;
+        assert_eq!(saved["pending_reload"], true);
+        let records = saved["application"]["records"].as_array().unwrap();
+        assert!(records.iter().any(|record| record["path"]
+            == serde_json::json!(["gateway", "port"])
+            && record["outcome"] == "queued_for_reload"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record["target"]["kind"] == "daemon")
+        );
+        state
+            .pending_reload
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (_, cleared) = response_json(router.oneshot(read()).await.unwrap()).await;
+        assert_eq!(cleared["pending_reload"], false);
+        assert_eq!(cleared["application"], saved["application"]);
+    }
+
+    #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
@@ -4603,6 +4684,273 @@ mod tests {
         );
     }
 
+    /// Enabling an opt-in tool through the config API follows the build. A
+    /// build without Microsoft 365 saves the section without its credentials
+    /// and says once that the tool is compiled out; a build with it still
+    /// refuses the section until its credentials are set.
+    #[tokio::test]
+    async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/microsoft365/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        if OptInTool::Microsoft365.compiled() {
+            assert_ne!(status, StatusCode::OK, "{json}");
+            assert!(
+                json.to_string().contains("microsoft365.tenant_id"),
+                "{json}"
+            );
+            assert!(!state.config.read().microsoft365.enabled);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["saved"], true);
+            assert!(state.config.read().microsoft365.enabled);
+            let compiled_out: Vec<_> = json["warnings"]
+                .as_array()
+                .expect("warnings is an array")
+                .iter()
+                .filter(|warning| warning["code"] == "tool_compiled_out")
+                .collect();
+            assert_eq!(compiled_out.len(), 1, "{json}");
+            assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
+    }
+
+    fn goal_configure_test_verifier(config: &mut zeroclaw_config::schema::Config) {
+        config
+            .providers
+            .models
+            .openai
+            .insert("default".to_string(), Default::default());
+        config.goal.verifier.model_provider = "openai.default".into();
+    }
+
+    #[tokio::test]
+    async fn goal_patch_rejects_dangling_verifier_without_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let state = test_state(config);
+        let published_before = serde_json::to_value(state.config.read().clone()).unwrap();
+        let revision_before = state.config.revision();
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/verifier/model_provider",
+                    "value": "openai.missing"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "dangling_reference", "{json}");
+        assert_eq!(json["path"], "goal.verifier.model_provider", "{json}");
+        assert!(
+            json["message"].as_str().is_some_and(|message| {
+                message.contains("goal.verifier.model_provider")
+                    && message.contains("openai.missing")
+            }),
+            "{json}"
+        );
+        assert_eq!(state.config.revision(), revision_before);
+        assert_eq!(
+            state.config.read().goal.verifier.model_provider.as_str(),
+            "openai.default"
+        );
+        assert_eq!(
+            serde_json::to_value(state.config.read().clone()).unwrap(),
+            published_before
+        );
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_enabling_disabled_config_saves_with_verifier_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        assert!(!config.goal.enabled);
+        assert!(config.goal.verifier.model_provider.as_str().is_empty());
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        assert!(state.config.read().goal.enabled);
+        let goal_warnings: Vec<_> = json["warnings"]
+            .as_array()
+            .expect("warnings is an array")
+            .iter()
+            .filter(|warning| warning["path"] == "goal.verifier.model_provider")
+            .collect();
+        assert_eq!(goal_warnings.len(), 1, "{json}");
+        assert_eq!(goal_warnings[0]["code"], "pre_existing_validation_error");
+        assert!(
+            goal_warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("goal.verifier.model_provider"))
+        );
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn goal_patch_unrelated_save_warns_for_existing_dangling_verifier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.missing".into();
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/gateway/websocket_ping_interval_secs",
+                    "value": 45
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let goal_warnings: Vec<_> = json["warnings"]
+            .as_array()
+            .expect("warnings is an array")
+            .iter()
+            .filter(|warning| warning["path"] == "goal.verifier.model_provider")
+            .collect();
+        assert_eq!(goal_warnings.len(), 1, "{json}");
+        assert_eq!(goal_warnings[0]["code"], "pre_existing_validation_error");
+        assert!(
+            goal_warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("goal.verifier.model_provider"))
+        );
+        assert!(state.config.read().goal.enabled);
+        assert_eq!(state.config.read().gateway.websocket_ping_interval_secs, 45);
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["gateway"]["websocket_ping_interval_secs"].as_integer(),
+            Some(45)
+        );
+        assert_eq!(
+            persisted["goal"]["verifier"]["model_provider"].as_str(),
+            Some("openai.missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_valid_enabled_config_allows_unrelated_save_without_goal_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/gateway/websocket_ping_interval_secs",
+                    "value": 45
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        if let Some(warnings) = json["warnings"].as_array() {
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| warning["path"] != "goal.verifier.model_provider")
+            );
+        }
+        assert!(state.config.read().validate().is_ok());
+        assert!(state.config.read().goal.enabled);
+        assert_eq!(
+            state.config.read().goal.verifier.model_provider.as_str(),
+            "openai.default"
+        );
+        assert_eq!(state.config.read().gateway.websocket_ping_interval_secs, 45);
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            persisted["goal"]["verifier"]["model_provider"].as_str(),
+            Some("openai.default")
+        );
+        assert_eq!(
+            persisted["gateway"]["websocket_ping_interval_secs"].as_integer(),
+            Some(45)
+        );
+    }
+
     #[tokio::test]
     async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5449,6 +5797,31 @@ mod tests {
         // Don't save — file does not exist.
         let drift = compute_drift(&cfg).await;
         assert!(drift.is_empty());
+    }
+
+    /// An upgraded file without `[tools]`, or with a `[tools]` section that
+    /// omits `optional`, loads full both through the loader and through the
+    /// plain parse drift compares against, so it reports no drift.
+    #[tokio::test]
+    async fn compute_drift_ignores_an_omitted_tools_selector() {
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+        for raw in [
+            format!("schema_version = {version}\n"),
+            format!("schema_version = {version}\n[tools]\n"),
+        ] {
+            let (_tmp, path) = temp_config_path();
+            tokio::fs::write(&path, &raw).await.unwrap();
+            let mut cfg = zeroclaw_config::migration::migrate_to_current_salvaged(&raw).config;
+            cfg.config_path = path.clone();
+            assert_eq!(cfg.tools.optional, ["*"], "{raw}");
+
+            let drift = try_compute_drift(&cfg).await.expect("drift");
+            assert!(
+                drift.iter().all(|entry| !entry.path.starts_with("tools")),
+                "{raw}: {drift:?}"
+            );
+            assert!(drift.is_empty(), "{raw}: {drift:?}");
+        }
     }
 
     #[tokio::test]

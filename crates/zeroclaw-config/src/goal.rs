@@ -92,6 +92,7 @@ impl GoalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_error::{ConfigApiCode, ConfigApiError};
     use crate::schema::Config;
 
     #[test]
@@ -278,13 +279,129 @@ mod tests {
             "#,
         )
         .expect("configuration parses");
-        assert!(
+        let error = ConfigApiError::from_validation(
             unresolved
                 .validate()
-                .expect_err("unresolved verifier must fail")
-                .to_string()
-                .contains("goal.verifier.model_provider")
+                .expect_err("unresolved verifier must fail"),
         );
+        assert_eq!(error.code, ConfigApiCode::DanglingReference);
+        assert_eq!(error.path.as_deref(), Some("goal.verifier.model_provider"));
+        assert!(error.message.contains("no matching providers.models entry"));
+    }
+
+    #[test]
+    fn goal_validation_projects_typed_field_errors_at_config_boundary() {
+        fn assert_error(config: Config, code: ConfigApiCode, path: &str, message: &str) {
+            let error = ConfigApiError::from_validation(
+                config
+                    .validate()
+                    .expect_err("invalid Goal config must fail"),
+            );
+            assert_eq!(error.code, code);
+            assert_eq!(error.path.as_deref(), Some(path));
+            assert_eq!(error.message, message);
+            assert!(!error.message.contains("MissingVerifierProvider"));
+            assert!(!error.message.contains("TokenLimitOutOfRange"));
+            assert!(!error.message.contains("InvalidCostLimit"));
+            assert!(!error.message.contains("EmptyVerifierModel"));
+        }
+
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        assert_error(
+            config,
+            ConfigApiCode::RequiredFieldEmpty,
+            "goal.verifier.model_provider",
+            "goal.verifier.model_provider is required when goal.enabled is true",
+        );
+
+        let mut config = Config::default();
+        config.goal.default_token_limit = i64::MAX as u64 + 1;
+        assert_error(
+            config,
+            ConfigApiCode::InvalidNumericRange,
+            "goal.default_token_limit",
+            &format!(
+                "goal.default_token_limit must be less than or equal to {}",
+                i64::MAX
+            ),
+        );
+
+        let mut config = Config::default();
+        config.goal.default_cost_limit_usd = f64::NAN;
+        assert_error(
+            config,
+            ConfigApiCode::InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+            "goal.default_cost_limit_usd must be finite and non-negative",
+        );
+
+        let mut config = Config::default();
+        config.goal.verifier.model = Some(" \t ".into());
+        assert_error(
+            config,
+            ConfigApiCode::RequiredFieldEmpty,
+            "goal.verifier.model",
+            "goal.verifier.model must not be empty when provided",
+        );
+
+        for (reference, expected) in [
+            (
+                "openai",
+                "goal.verifier.model_provider must use `<type>.<alias>` format (got \"openai\")",
+            ),
+            (
+                ".default",
+                "goal.verifier.model_provider must use non-empty `<type>.<alias>` components (got \".default\")",
+            ),
+            (
+                "openai.",
+                "goal.verifier.model_provider must use non-empty `<type>.<alias>` components (got \"openai.\")",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.goal.enabled = true;
+            config.goal.verifier.model_provider = ModelProviderRef::new(reference);
+            assert_error(
+                config,
+                ConfigApiCode::InvalidFormat,
+                "goal.verifier.model_provider",
+                expected,
+            );
+        }
+
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = ModelProviderRef::new("openai.missing");
+        assert_error(
+            config,
+            ConfigApiCode::DanglingReference,
+            "goal.verifier.model_provider",
+            "goal.verifier.model_provider = \"openai.missing\" but no matching providers.models entry is configured",
+        );
+    }
+
+    #[test]
+    fn goal_validation_preserves_valid_and_disabled_config_behavior() {
+        let disabled = Config::default();
+        assert!(disabled.validate().is_ok());
+
+        let mut disabled_with_unresolved_verifier = Config::default();
+        disabled_with_unresolved_verifier
+            .goal
+            .verifier
+            .model_provider = ModelProviderRef::new("openai.missing");
+        assert!(disabled_with_unresolved_verifier.validate().is_ok());
+
+        let mut enabled = Config::default();
+        enabled.goal.enabled = true;
+        enabled.goal.verifier.model_provider = ModelProviderRef::new("openai.default");
+        enabled
+            .providers
+            .models
+            .openai
+            .insert("default".into(), Default::default());
+        assert!(enabled.validate().is_ok());
     }
 
     #[test]
