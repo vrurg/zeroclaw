@@ -31,10 +31,10 @@ use crate::{
 };
 
 use super::{
-    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext, GoalParentTurn,
-    GoalResponse, GoalRuntime, GoalRuntimeSubmission, GoalSessionDriver, GoalSessionExecutionLease,
-    GoalSessionLease, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierTurn,
-    goal_verifier_feedback_message,
+    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalHostSettingsSource,
+    GoalIngressContext, GoalParentTurn, GoalResponse, GoalRuntime, GoalRuntimeSubmission,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease, GoalTurnBoundary,
+    GoalVerifierAttribution, GoalVerifierTurn, goal_verifier_feedback_message,
 };
 
 mod deferred_control;
@@ -386,9 +386,11 @@ impl GoalExecutionSupervisor {
     /// epoch first, preserving the durable epoch fence instead of relying on
     /// a best-effort detached task.
     /// The caller must retain admission custody until worker registration.
+    /// Supply the host generation's canonical live-config source; settings
+    /// are resolved by the worker immediately before execution acquisition.
     pub async fn launch(
         &self,
-        settings: GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
     ) -> Result<()> {
         let scope = request.scope().clone();
@@ -405,9 +407,10 @@ impl GoalExecutionSupervisor {
         let checkpoint = GoalParentTurnCheckpoint::new();
         let worker_checkpoint = checkpoint.clone();
         let (completion_tx, completion) = watch::channel(None);
+        let source = source.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine
-                .run(&settings, request, worker_checkpoint.clone())
+                .run(&source, request, worker_checkpoint.clone())
                 .await;
             worker_checkpoint.close();
 
@@ -453,9 +456,10 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`GoalSupervisorRetired`] before admission
     /// has any effects. The adapter must select a current supervisor before
     /// retrying the command.
+    /// Build settings from the current canonical config for this command.
     pub async fn submit(
         &self,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -467,7 +471,7 @@ impl GoalExecutionSupervisor {
 
     async fn submit_with_custody(
         &self,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -484,7 +488,7 @@ impl GoalExecutionSupervisor {
         let runtime_submission = self
             .engine
             .runtime
-            .submit(&settings, ingress, driver, command)
+            .submit(settings, ingress, driver, command)
             .await?;
         Ok(self.execution_submission(
             runtime_submission,
@@ -552,9 +556,11 @@ impl GoalExecutionSupervisor {
 
     /// Start a newly admitted Goal only after its owning surface has delivered
     /// the started/resumed response.
+    /// Pass the host generation's canonical live-config source, not settings
+    /// resolved before a predecessor drain or worker registration.
     pub async fn launch_after_response(
         &self,
-        settings: GoalHostSettings,
+        source: &GoalHostSettingsSource,
         submission: &mut GoalExecutionSubmission,
     ) -> Result<Option<GoalResponse>> {
         let mut launch_guard = submission.launch_guard.take();
@@ -586,7 +592,7 @@ impl GoalExecutionSupervisor {
             if !self.execution_is_current(&scope).await? {
                 return Ok(None);
             }
-            if let Err(error) = self.launch(settings, request).await {
+            if let Err(error) = self.launch(source, request).await {
                 return Err(error).context("Goal executor launch failed");
             }
             drop(lease);
@@ -1247,9 +1253,16 @@ impl GoalExecutionEngine {
     /// A continuation keeps only a process-local transcript; intermediate
     /// candidates and verifier feedback do not become authoritative user
     /// history. Every model call uses the runtime's per-scope accountant.
+    /// Resolve `source` once, immediately before execution acquisition. The
+    /// operation-local config and borrowed settings are dropped before model
+    /// work; no live-config read guard is held across an await.
+    /// Errors before the first parent attempt—including objective lookup,
+    /// acquisition or its config refusal, resume-response append, and history
+    /// access—make no durable lifecycle change. The owning caller must settle
+    /// the exact execution epoch when such an error follows a transition.
     pub async fn run(
         &self,
-        settings: &GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
         checkpoint: GoalParentTurnCheckpoint,
     ) -> Result<GoalExecutionOutcome> {
@@ -1259,11 +1272,18 @@ impl GoalExecutionEngine {
             return Ok(GoalExecutionOutcome::Fenced);
         };
         let accountant = self.accounting_factory.for_scope(scope.clone());
-        let mut lease = match self
-            .runtime
-            .acquire_execution(settings, request, &checkpoint)
-            .await
-        {
+        let acquired = {
+            let config = source.snapshot();
+            match source.settings(&config) {
+                Ok(settings) => {
+                    self.runtime
+                        .acquire_execution(&settings, request, &checkpoint)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let mut lease = match acquired {
             Ok(lease) => lease,
             Err(error) => {
                 if self.exact_running_task_or_fenced(&scope).await?.is_none() {
@@ -2101,16 +2121,30 @@ mod tests {
         let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
             runtime.execution_engine(Arc::new(NoModelAccounting)),
         )));
-        let settings = GoalHostSettings::new(
-            true,
-            zeroclaw_commands::goal::GoalBudgetLimits {
-                token_limit: Some(1000),
-                cost_limit_usd: None,
+        let mut config = zeroclaw_config::schema::Config {
+            goal: zeroclaw_config::goal::GoalConfig {
+                enabled: true,
+                default_token_limit: 1000,
+                default_cost_limit_usd: 0.0,
+                verifier: zeroclaw_config::goal::GoalVerifierConfig {
+                    model_provider: zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.default",
+                    ),
+                    model: None,
+                },
             },
-            1,
-            "fixture-boot",
-        )
-        .unwrap();
+            ..Default::default()
+        };
+        config.providers.models.openai.insert(
+            "default".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-test".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let settings = GoalHostSettings::from_config(&config, 1, "fixture-boot").unwrap();
         let driver = Arc::new(BoundaryDriver {
             key,
             command: Arc::new(Mutex::new(())),
@@ -2119,7 +2153,7 @@ mod tests {
         let ordinary = driver.boundary.clone().lock_owned().await;
         let GoalControlAdmission::Queued { deferred, .. } = supervisor
             .admit_control(
-                settings.clone(),
+                &settings,
                 ingress,
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -2145,7 +2179,7 @@ mod tests {
         assert!(driver.command.try_lock().is_err());
         assert!(driver.boundary.try_lock().is_err());
         assert!(registry.0.lock().unwrap().transitions.is_empty());
-        let committed = ready.commit(settings).await.unwrap();
+        let committed = ready.commit(&settings).await.unwrap();
         drop(committed.release());
         assert!(supervisor.try_retire().await);
     }

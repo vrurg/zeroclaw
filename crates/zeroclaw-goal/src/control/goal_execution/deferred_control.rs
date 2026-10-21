@@ -197,9 +197,11 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`super::GoalSupervisorRetired`] before
     /// admission has any effects. The adapter must select a current supervisor
     /// before retrying the command.
+    /// Build settings from the current canonical config for this command;
+    /// queued controls retain intent, not these resolved settings.
     pub async fn admit_control(
         self: &Arc<Self>,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -223,13 +225,13 @@ impl GoalExecutionSupervisor {
             .engine
             .runtime
             .host
-            .submit(&settings, ingress.clone(), driver.clone(), command.clone())
+            .submit(settings, ingress.clone(), driver.clone(), command.clone())
             .await?;
         let (rejection, current) = self
             .engine
             .runtime
             .controller
-            .preflight_normal(&settings, &submission)
+            .preflight_normal(settings, &submission)
             .await?;
         if let Some(response) = rejection {
             let result = GoalRuntimeSubmission {
@@ -260,7 +262,7 @@ impl GoalExecutionSupervisor {
             )?;
             if self.owns_scope(&scope).await {
                 guard = Some(
-                    self.record_intent(&settings, &ingress, &command, current.as_ref())
+                    self.record_intent(settings, &ingress, &command, current.as_ref())
                         .await?,
                 );
                 if let Some(ticket) = self.register_deferred_control(&scope).await? {
@@ -315,7 +317,7 @@ impl GoalExecutionSupervisor {
             let result = self
                 .engine
                 .runtime
-                .apply_submission(&settings, submission)
+                .apply_submission(settings, submission)
                 .await?;
             return Ok(GoalControlAdmission::Direct(self.execution_submission(
                 result,
@@ -331,7 +333,7 @@ impl GoalExecutionSupervisor {
         let mut guard = match guard {
             Some(guard) => guard,
             None => {
-                self.record_intent(&settings, &ingress, &command, current.as_ref())
+                self.record_intent(settings, &ingress, &command, current.as_ref())
                     .await?
             }
         };
@@ -361,7 +363,7 @@ impl GoalExecutionSupervisor {
 
     async fn record_intent(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
         command: &GoalCommand,
         current: Option<&TaskRecord>,
@@ -644,7 +646,8 @@ impl GoalDeferredReady {
 
     /// Claim once and commit through the same driver lease. This performs no
     /// predecessor drain, successor launch, lifecycle publication or rebind.
-    pub async fn commit(mut self, settings: GoalHostSettings) -> Result<GoalDeferredCommit> {
+    /// Build settings from the current canonical config after `wait` returns.
+    pub async fn commit(mut self, settings: &GoalHostSettings<'_>) -> Result<GoalDeferredCommit> {
         let control = &mut self.control;
         let command = control
             .command
@@ -711,7 +714,7 @@ impl GoalDeferredReady {
                 .engine
                 .runtime
                 .submit_bound(
-                    &settings,
+                    settings,
                     control.ingress.clone(),
                     control.driver.clone(),
                     command,

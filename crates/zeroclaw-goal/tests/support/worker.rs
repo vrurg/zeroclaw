@@ -164,6 +164,9 @@ async fn running_worker() -> (
     Arc<Registry>,
     Arc<GoalExecutionSupervisor>,
 ) {
+    let config = goal_config();
+    let live = LiveConfig::new(config.clone());
+    let settings_source = source(&live);
     let (ordinary, ingress) = serialized_fixture();
     let driver = Arc::new(WorkerDriver {
         ordinary,
@@ -176,7 +179,7 @@ async fn running_worker() -> (
     )));
     let mut submission = supervisor
         .submit(
-            settings(),
+            &settings(&config),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Start {
@@ -187,7 +190,7 @@ async fn running_worker() -> (
         .await
         .unwrap();
     supervisor
-        .launch_after_response(settings(), &mut submission)
+        .launch_after_response(&settings_source, &mut submission)
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), driver.script.entered.acquire())
@@ -233,6 +236,9 @@ async fn custody_completed_worker_remains_owned_until_exact_drain() {
 
 #[tokio::test]
 async fn worker_pause_and_budget_wait_for_published_parent_and_release_before_drain() {
+    let config = goal_config();
+    let live = LiveConfig::new(config.clone());
+    let settings_source = source(&live);
     for (command, kind) in [
         (
             GoalCommand::Pause { immediate: false },
@@ -246,7 +252,7 @@ async fn worker_pause_and_budget_wait_for_published_parent_and_release_before_dr
         let (driver, ingress, registry, supervisor) = running_worker().await;
         let deferred = queued(
             supervisor
-                .admit_control(settings(), ingress.clone(), driver.clone(), command)
+                .admit_control(&settings(&config), ingress.clone(), driver.clone(), command)
                 .await
                 .unwrap(),
             kind,
@@ -263,16 +269,17 @@ async fn worker_pause_and_budget_wait_for_published_parent_and_release_before_dr
             .unwrap();
         assert_eq!(driver.script.published.load(Ordering::SeqCst), 1);
         assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
-        let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
-            .await
-            .expect("commit must not drain the worker waiting on this ticket")
-            .unwrap();
+        let committed =
+            tokio::time::timeout(Duration::from_secs(1), ready.commit(&settings(&config)))
+                .await
+                .expect("commit must not drain the worker waiting on this ticket")
+                .unwrap();
         assert!(driver.ordinary.boundary.clone().try_lock_owned().is_err());
         assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
         let mut submission = committed.release();
         tokio::time::timeout(
             Duration::from_secs(1),
-            supervisor.launch_after_response(settings(), &mut submission),
+            supervisor.launch_after_response(&settings_source, &mut submission),
         )
         .await
         .expect("release must precede predecessor drain")
@@ -300,6 +307,7 @@ async fn worker_pause_and_budget_wait_for_published_parent_and_release_before_dr
 
 #[tokio::test]
 async fn running_worker_rejects_start_and_resume_without_creating_intents() {
+    let config = goal_config();
     let (driver, ingress, registry, supervisor) = running_worker().await;
     for command in [
         GoalCommand::Start {
@@ -311,7 +319,7 @@ async fn running_worker_rejects_start_and_resume_without_creating_intents() {
         },
     ] {
         let GoalControlAdmission::Direct(submission) = supervisor
-            .admit_control(settings(), ingress.clone(), driver.clone(), command)
+            .admit_control(&settings(&config), ingress.clone(), driver.clone(), command)
             .await
             .unwrap()
         else {
@@ -340,11 +348,14 @@ async fn running_worker_rejects_start_and_resume_without_creating_intents() {
 
 #[tokio::test]
 async fn worker_controls_apply_fifo_without_admitting_a_verifier_between_them() {
+    let config = goal_config();
+    let live = LiveConfig::new(config.clone());
+    let settings_source = source(&live);
     let (driver, ingress, registry, supervisor) = running_worker().await;
     let first = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress.clone(),
                 driver.clone(),
                 GoalCommand::SetBudget(GoalBudgetSelection::Unlimited),
@@ -356,7 +367,7 @@ async fn worker_controls_apply_fifo_without_admitting_a_verifier_between_them() 
     let second = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress.clone(),
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -375,9 +386,13 @@ async fn worker_controls_apply_fifo_without_admitting_a_verifier_between_them() 
         !second_wait.is_finished(),
         "registration order, not waiter order, owns FIFO"
     );
-    let mut first_submission = first_ready.commit(settings()).await.unwrap().release();
+    let mut first_submission = first_ready
+        .commit(&settings(&config))
+        .await
+        .unwrap()
+        .release();
     supervisor
-        .launch_after_response(settings(), &mut first_submission)
+        .launch_after_response(&settings_source, &mut first_submission)
         .await
         .unwrap();
     let second_ready = tokio::time::timeout(Duration::from_secs(1), second_wait)
@@ -386,10 +401,14 @@ async fn worker_controls_apply_fifo_without_admitting_a_verifier_between_them() 
         .unwrap()
         .unwrap();
     assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
-    let mut second_submission = second_ready.commit(settings()).await.unwrap().release();
+    let mut second_submission = second_ready
+        .commit(&settings(&config))
+        .await
+        .unwrap()
+        .release();
     tokio::time::timeout(
         Duration::from_secs(1),
-        supervisor.launch_after_response(settings(), &mut second_submission),
+        supervisor.launch_after_response(&settings_source, &mut second_submission),
     )
     .await
     .unwrap()
@@ -412,11 +431,14 @@ async fn worker_controls_apply_fifo_without_admitting_a_verifier_between_them() 
 
 #[tokio::test]
 async fn immediate_cancel_closes_a_scheduled_control_before_draining_the_worker() {
+    let config = goal_config();
+    let live = LiveConfig::new(config.clone());
+    let settings_source = source(&live);
     let (driver, ingress, registry, supervisor) = running_worker().await;
     let deferred = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress.clone(),
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -436,7 +458,12 @@ async fn immediate_cancel_closes_a_scheduled_control_before_draining_the_worker(
     // Keep the deferred owner alive. Cancel must close its issuing checkpoint;
     // waiting for that owner's release while holding the command lock deadlocks.
     let GoalControlAdmission::Direct(mut cancellation) = supervisor
-        .admit_control(settings(), ingress, driver.clone(), GoalCommand::Cancel)
+        .admit_control(
+            &settings(&config),
+            ingress,
+            driver.clone(),
+            GoalCommand::Cancel,
+        )
         .await
         .unwrap()
     else {
@@ -444,7 +471,7 @@ async fn immediate_cancel_closes_a_scheduled_control_before_draining_the_worker(
     };
     tokio::time::timeout(
         Duration::from_secs(1),
-        supervisor.launch_after_response(settings(), &mut cancellation),
+        supervisor.launch_after_response(&settings_source, &mut cancellation),
     )
     .await
     .expect("immediate fence must close the checkpoint before drain")
@@ -470,11 +497,12 @@ async fn immediate_cancel_closes_a_scheduled_control_before_draining_the_worker(
 
 #[tokio::test]
 async fn dropping_a_worker_control_abandons_the_intent_and_releases_execution() {
+    let config = goal_config();
     let (driver, ingress, registry, supervisor) = running_worker().await;
     let deferred = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress,
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -513,6 +541,7 @@ async fn dropping_a_worker_control_abandons_the_intent_and_releases_execution() 
 
 #[tokio::test]
 async fn completed_worker_falls_back_to_the_ordinary_boundary_without_duplicate_intents() {
+    let config = goal_config();
     let (driver, ingress, registry, supervisor) = running_worker().await;
     driver.script.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -532,7 +561,7 @@ async fn completed_worker_falls_back_to_the_ordinary_boundary_without_duplicate_
     let deferred = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress,
                 driver.clone(),
                 GoalCommand::Start {
@@ -558,7 +587,7 @@ async fn completed_worker_falls_back_to_the_ordinary_boundary_without_duplicate_
         .await
         .unwrap()
         .unwrap();
-    let mut submission = ready.commit(settings()).await.unwrap().release();
+    let mut submission = ready.commit(&settings(&config)).await.unwrap().release();
     assert!(matches!(submission.response(), GoalResponse::Started(_)));
     // This case proves admission fallback, not a second provider execution.
     supervisor
@@ -575,6 +604,9 @@ async fn completed_worker_falls_back_to_the_ordinary_boundary_without_duplicate_
 
 #[tokio::test]
 async fn pause_registered_during_verification_precedes_the_verifiers_completion_transition() {
+    let config = goal_config();
+    let live = LiveConfig::new(config.clone());
+    let settings_source = source(&live);
     let (driver, ingress, registry, supervisor) = running_worker().await;
     driver.script.hold_verifier.store(true, Ordering::SeqCst);
     driver.script.release.add_permits(1);
@@ -589,7 +621,7 @@ async fn pause_registered_during_verification_precedes_the_verifiers_completion_
     let deferred = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress,
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -616,14 +648,14 @@ async fn pause_registered_during_verification_precedes_the_verifiers_completion_
         registry.0.lock().unwrap().task.as_ref().unwrap().status,
         TaskStatus::Running
     );
-    let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(settings()))
+    let committed = tokio::time::timeout(Duration::from_secs(1), ready.commit(&settings(&config)))
         .await
         .unwrap()
         .unwrap();
     let mut submission = committed.release();
     tokio::time::timeout(
         Duration::from_secs(1),
-        supervisor.launch_after_response(settings(), &mut submission),
+        supervisor.launch_after_response(&settings_source, &mut submission),
     )
     .await
     .unwrap()
@@ -639,11 +671,12 @@ async fn pause_registered_during_verification_precedes_the_verifiers_completion_
 
 #[tokio::test]
 async fn dropping_ready_without_commit_releases_the_ticket_and_abandons_the_intent() {
+    let config = goal_config();
     let (driver, ingress, registry, supervisor) = running_worker().await;
     let deferred = queued(
         supervisor
             .admit_control(
-                settings(),
+                &settings(&config),
                 ingress,
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
