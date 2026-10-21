@@ -89,6 +89,224 @@ async fn retire_without_waiting(supervisor: &GoalExecutionSupervisor) -> bool {
 }
 
 #[tokio::test]
+async fn deferred_start_rechecks_commit_config_and_persists_fresh_defaults() {
+    use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+
+    for verifier in ["openai.missing", "openai.default"] {
+        let live = LiveConfig::new(goal_config());
+        let (driver, ingress) = serialized_fixture();
+        let registry = Arc::new(Registry::default());
+        let supervisor = supervisor(registry.clone());
+        let ordinary = driver.boundary.clone().lock_owned().await;
+        let snapshot = live.handle().snapshot();
+        assert_eq!(snapshot.goal.default_token_limit, 1000);
+        let deferred = queued(
+            supervisor
+                .admit_control(
+                    &settings(&snapshot),
+                    ingress,
+                    driver.clone(),
+                    launch_command(false),
+                )
+                .await
+                .unwrap(),
+            GoalQueuedControl::Start,
+        );
+        {
+            let state = registry.0.lock().unwrap();
+            assert!(state.task.is_none());
+            assert!(state.transitions.is_empty());
+            assert_eq!(state.intents.len(), 1);
+            assert_eq!(state.intents[0].1, IntentState::Pending);
+        }
+        drop(ordinary);
+        let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        live.publish(
+            live.next_revision().unwrap(),
+            goal_config_with(2000, verifier, true),
+        )
+        .unwrap();
+        let snapshot = live.handle().snapshot();
+        let result = ready.commit(&settings(&snapshot)).await;
+        if verifier == "openai.missing" {
+            let error = match result {
+                Ok(_) => panic!("dangling commit config must reject the deferred Start"),
+                Err(error) => error,
+            };
+            let structured = ConfigApiError::from_validation(error);
+            assert_eq!(structured.code, ConfigApiCode::DanglingReference);
+            assert_eq!(
+                structured.path.as_deref(),
+                Some("goal.verifier.model_provider")
+            );
+            assert!(driver.command.try_lock().is_ok());
+            assert!(driver.boundary.try_lock().is_ok());
+            assert!(matches!(
+                wait_for_settlement(&registry).await,
+                IntentState::Settled(GoalControlIntentSettlement::Abandoned { .. })
+            ));
+            let state = registry.0.lock().unwrap();
+            assert!(state.task.is_none());
+            assert!(state.goal.is_none());
+            assert!(state.transitions.is_empty());
+            assert_eq!(state.intents.len(), 1);
+        } else {
+            let committed = result.unwrap();
+            assert!(matches!(committed.response(), GoalResponse::Started(_)));
+            {
+                let state = registry.0.lock().unwrap();
+                assert_eq!(state.transitions, ["start"]);
+                assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Running);
+                assert_eq!(
+                    state.goal.as_ref().unwrap().effective_token_limit,
+                    Some(2000)
+                );
+                assert_ne!(
+                    state.goal.as_ref().unwrap().effective_token_limit,
+                    Some(1000)
+                );
+            }
+            assert_eq!(
+                wait_for_settlement(&registry).await,
+                IntentState::Settled(GoalControlIntentSettlement::Applied)
+            );
+            let mut submission = committed.release();
+            supervisor
+                .pause_before_launch(
+                    &mut submission,
+                    zeroclaw_goal::GoalPauseReason::OperatorPaused,
+                )
+                .await
+                .unwrap();
+            drop(submission);
+            assert!(driver.command.try_lock().is_ok());
+            assert!(driver.boundary.try_lock().is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn deferred_intake_checks_execution_config_but_preserves_admin_controls() {
+    use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+
+    let live = LiveConfig::new(goal_config_with(1000, "openai.missing", true));
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    registry.seed(&ingress.session_key().durable_id(), TaskStatus::Paused);
+    let execution_supervisor = supervisor(registry.clone());
+    for command in [launch_command(false), launch_command(true)] {
+        let snapshot = live.handle().snapshot();
+        let error = execution_supervisor
+            .admit_control(
+                &settings(&snapshot),
+                ingress.clone(),
+                driver.clone(),
+                command,
+            )
+            .await
+            .unwrap_err();
+        let structured = ConfigApiError::from_validation(error);
+        assert_eq!(structured.code, ConfigApiCode::DanglingReference);
+        assert_eq!(
+            structured.path.as_deref(),
+            Some("goal.verifier.model_provider")
+        );
+        assert_eq!(
+            driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let state = registry.0.lock().unwrap();
+        assert!(state.intents.is_empty());
+        assert!(state.transitions.is_empty());
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Paused);
+        assert_eq!(state.task.as_ref().unwrap().execution_epoch, 1);
+    }
+    live.publish(
+        live.next_revision().unwrap(),
+        goal_config_with(1000, "openai.missing", false),
+    )
+    .unwrap();
+    let snapshot = live.handle().snapshot();
+    let GoalControlAdmission::Direct(disabled) = execution_supervisor
+        .admit_control(
+            &settings(&snapshot),
+            ingress,
+            driver.clone(),
+            launch_command(false),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("disabled Goal Mode must return directly");
+    };
+    assert_eq!(disabled.response(), &GoalResponse::Disabled);
+    drop(disabled);
+    assert_eq!(
+        driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    {
+        let state = registry.0.lock().unwrap();
+        assert!(state.intents.is_empty());
+        assert!(state.transitions.is_empty());
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Paused);
+        assert_eq!(state.task.as_ref().unwrap().execution_epoch, 1);
+    }
+
+    for (command, kind) in [
+        (GoalCommand::Status, 0),
+        (GoalCommand::Pause { immediate: false }, 1),
+        (GoalCommand::Cancel, 2),
+    ] {
+        let live = LiveConfig::new(goal_config_with(1000, "openai.missing", true));
+        let (driver, ingress) = serialized_fixture();
+        let registry = Arc::new(Registry::default());
+        registry.seed(&ingress.session_key().durable_id(), TaskStatus::Running);
+        let supervisor = supervisor(registry.clone());
+        let ordinary = driver.boundary.clone().lock_owned().await;
+        let snapshot = live.handle().snapshot();
+        let admission = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.admit_control(&settings(&snapshot), ingress, driver.clone(), command),
+        )
+        .await
+        .expect("admin intake must not wait for the ordinary turn")
+        .unwrap();
+        match (kind, admission) {
+            (0, GoalControlAdmission::Direct(submission)) => {
+                assert!(matches!(submission.response(), GoalResponse::Status(_)));
+                drop(submission);
+                assert!(registry.0.lock().unwrap().intents.is_empty());
+            }
+            (1, admission) => {
+                let deferred = queued(admission, GoalQueuedControl::Pause);
+                assert!(registry.0.lock().unwrap().transitions.is_empty());
+                drop(deferred);
+                assert!(matches!(
+                    wait_for_settlement(&registry).await,
+                    IntentState::Settled(GoalControlIntentSettlement::Abandoned { .. })
+                ));
+            }
+            (2, GoalControlAdmission::Direct(submission)) => {
+                assert!(matches!(
+                    submission.response(),
+                    GoalResponse::Cancelled(_) | GoalResponse::TransitionPending(_)
+                ));
+                drop(submission);
+                assert!(registry.0.lock().unwrap().intents.is_empty());
+            }
+            _ => panic!("admin control must retain its ordinary classification"),
+        }
+        assert!(driver.command.try_lock().is_ok());
+        drop(ordinary);
+        assert!(driver.boundary.try_lock().is_ok());
+    }
+}
+
+#[tokio::test]
 async fn custody_retired_supervisor_rejects_before_any_admission_effect() {
     let config = goal_config();
     let (driver, ingress) = serialized_fixture();

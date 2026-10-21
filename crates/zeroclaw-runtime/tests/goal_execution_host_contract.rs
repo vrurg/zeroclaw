@@ -161,6 +161,7 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
 
 struct PausingExecutionDriver {
     binding: GoalSessionBinding,
+    execution_acquires: AtomicUsize,
     parent_started: Arc<Notify>,
     release_parent: Arc<Notify>,
     verifier_calls: Arc<AtomicUsize>,
@@ -182,6 +183,7 @@ impl GoalSessionDriver for PausingExecutionDriver {
         _scope: &GoalExecutionScope,
         _checkpoint: &GoalParentTurnCheckpoint,
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(PausingExecutionLease {
             session_key: self.binding.session_key().clone(),
             parent_started: Arc::clone(&self.parent_started),
@@ -3004,6 +3006,185 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
 }
 
 #[tokio::test]
+async fn supervisor_rechecks_live_config_at_acquisition_and_settles_refusal() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let live = LiveConfig::new(valid_goal_config(true));
+    let settings_source = GoalHostSettingsSource::new(live.handle(), 42, "test-boot").unwrap();
+    let ingress = matrix_ingress();
+    let session_id = ingress.session_key().durable_id();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let accounting_factory = Arc::new(
+        RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
+        )
+        .unwrap(),
+    );
+    let supervisor =
+        GoalExecutionSupervisor::new(Arc::new(runtime.execution_engine(accounting_factory)));
+    let snapshot = live.handle().snapshot();
+    let mut started = supervisor
+        .submit(
+            &host_settings(&snapshot),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "refuse acquisition after the verifier is removed".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let GoalResponse::Started(started_projection) = started.response() else {
+        panic!("valid intake must admit Start");
+    };
+    let failed_task_id = started_projection.task_id.clone();
+    let failed_scope = GoalExecutionScope::new(
+        failed_task_id.as_str(),
+        session_id.clone(),
+        started_projection.execution_epoch,
+    )
+    .unwrap();
+    let mut invalid = live.handle().snapshot();
+    invalid.goal.verifier.model_provider = ModelProviderRef::new("openai.missing");
+    live.publish(live.next_revision().unwrap(), invalid)
+        .unwrap();
+    assert!(
+        supervisor
+            .launch_after_response(&settings_source, &mut started)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let failed = timeout(Duration::from_secs(1), async {
+        loop {
+            let current = store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.id, failed_task_id);
+            if current.status.is_terminal() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refused acquisition must settle the admitted epoch");
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal(&failed_task_id, &session_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("executor_failed")
+    );
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    assert!(
+        timeout(Duration::from_millis(20), parent_started.notified())
+            .await
+            .is_err(),
+        "refused acquisition must not start a parent turn"
+    );
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    let goal = store.get_goal_task(&failed_task_id).await.unwrap().unwrap();
+    assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    assert!(goal.pending_call_id.is_none());
+    assert!(goal.pending_call_epoch.is_none());
+    assert!(
+        timeout(Duration::from_secs(1), supervisor.drain(&failed_scope))
+            .await
+            .unwrap()
+            .is_err(),
+        "the exact refused worker must report its acquisition error"
+    );
+    drop(started);
+
+    live.publish(live.next_revision().unwrap(), valid_goal_config(true))
+        .unwrap();
+    let snapshot = live.handle().snapshot();
+    let mut restored = supervisor
+        .submit(
+            &host_settings(&snapshot),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "execute a new goal after restoring valid config".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let GoalResponse::Started(restored_projection) = restored.response() else {
+        panic!("restored valid config must admit a new Goal");
+    };
+    assert_ne!(restored_projection.task_id, failed_task_id);
+    assert!(
+        supervisor
+            .launch_after_response(&settings_source, &mut restored)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    timeout(Duration::from_secs(1), parent_started.notified())
+        .await
+        .expect("the restored valid config must allow the new parent to start");
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    let snapshot = live.handle().snapshot();
+    let mut cancelled = supervisor
+        .submit(
+            &host_settings(&snapshot),
+            ingress,
+            driver.clone(),
+            GoalCommand::Cancel,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        cancelled.response(),
+        GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Cancel)
+    ));
+    release_parent.notify_one();
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(1),
+            supervisor.launch_after_response(&settings_source, &mut cancelled),
+        )
+        .await
+        .expect("cleanup must drain the admitted parent after cancellation")
+        .unwrap(),
+        Some(GoalResponse::Cancelled(_))
+    ));
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn supervisor_immediate_pause_acknowledges_before_draining_parent() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
@@ -3015,6 +3196,7 @@ async fn supervisor_immediate_pause_acknowledges_before_draining_parent() {
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -3231,6 +3413,7 @@ async fn supervisor_pauses_without_starting_when_the_surface_cannot_acknowledge(
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
         parent_started: Arc::clone(&parent_started),
         release_parent,
         verifier_calls: Arc::clone(&verifier_calls),
@@ -3550,6 +3733,7 @@ async fn daemon_restart_fences_goal_until_explicit_resume_in_the_next_generation
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        execution_acquires: AtomicUsize::new(0),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
