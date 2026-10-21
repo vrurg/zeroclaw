@@ -14,6 +14,7 @@ pub mod builtin_tools;
 pub mod comment_writer;
 pub mod cost;
 pub mod domain_matcher;
+mod edit_validation;
 pub mod env_overrides;
 pub mod field_visibility;
 pub mod goal;
