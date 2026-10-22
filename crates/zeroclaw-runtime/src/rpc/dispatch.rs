@@ -5657,7 +5657,7 @@ impl RpcDispatcher {
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
-        let lifecycle_cancellation =
+        let pending_lifecycle_cancellation =
             if let Some(generation) = requested_generation {
                 let cancellation = self
                     .ctx
@@ -5688,6 +5688,9 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // Move ownership after the queue permit so every later exit releases
+        // this handler's fence share before admitting queued surviving work.
+        let lifecycle_cancellation = pending_lifecycle_cancellation;
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await
@@ -5765,8 +5768,8 @@ impl RpcDispatcher {
         let mut durable_kill = None;
         if matches!(chat_mode, ChatMode::Acp) {
             let Some(store) = self.ctx.acp_session_store.clone() else {
-                // Keep the queue permit until the failed kill has removed its
-                // generation-scoped cancellation state. Otherwise a queued
+                // Keep the queue permit until the failed kill releases its
+                // generation-scoped fence share. Otherwise a queued
                 // prompt could inherit the rejected administrative kill.
                 drop(lifecycle_cancellation);
                 return Err(rpc_err(
