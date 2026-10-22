@@ -267,6 +267,18 @@ hooks. Ordinary requests and restored redaction placeholders retain normal
 hook behavior. Alternative prompt-hook policies require a separate
 architectural decision.
 
+Avoid a standalone `## Session Prompts` heading in custom host prompt text,
+including workspace files and skill or tool descriptions. Host tool-format and
+prompt-framing updates treat the first
+occurrence of this heading, preceded by a blank line, as the start of the private
+attachment section. A matching heading in custom host text can therefore leave
+later host instructions unchanged, even when session prompts are disabled. For
+example, batch-tool instructions can remain alongside a single-tool instruction.
+Diagnostic and export views also mask host text from that heading onward.
+Dispatch still rejects disallowed multi-tool calls, but conflicting instructions
+can cause a failed turn; a client may retry. Use a different heading in host text;
+this limitation does not grant attachments higher priority than safety policy.
+
 Masking does not remove content-derived fingerprints. Generic approval and
 audit arguments can include the attachment's full `content_sha256`; LLM request
 telemetry can include a truncated `system_sha256` covering the system prompt,
