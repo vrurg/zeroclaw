@@ -4,6 +4,7 @@ pub mod a2a_wire;
 pub mod agent;
 pub mod attribution;
 pub mod channel;
+pub mod conversation_binding;
 pub mod elicitation;
 pub mod grants;
 pub mod hook;
@@ -75,6 +76,12 @@ tokio::task_local! {
     /// absent from ACP, one-shot, delegate, cron, and auxiliary executions so
     /// session prompt tools cannot create unsupported attachment records.
     pub static TOOL_LOOP_SESSION_PROMPTS_ALLOWED: bool;
+
+    /// The conversation the current turn is serving, when its surface
+    /// supports conversation binding. Scoped beside `TOOL_LOOP_SESSION_KEY`
+    /// by that surface; read by tools that record a binding.
+    pub static TOOL_LOOP_ACTIVE_CONVERSATION:
+        Option<crate::conversation_binding::ActiveConversation>;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
