@@ -1230,15 +1230,12 @@ impl AgentBuilder {
             tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
         }
 
-        // ACP sessions exclude persistent memory: strip memory tools,
-        // replace the backend with NoneMemory, and force auto_save off.
+        // Memory exclusion strips memory tools, replaces the backend with
+        // NoneMemory, and forces auto_save off. It does not identify a session
+        // mode: Chat sessions can exclude memory while retaining attachments.
         let exclude_memory = self.exclude_memory;
         if exclude_memory {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
-            // ACP/Code sessions opt into this isolated construction path.
-            // Prompt attachments are chat-session state and must not even be
-            // advertised there until the stacked ACP follow-up lands.
-            tools.retain(|tool| !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()));
         }
 
         let memory: Arc<dyn Memory> = if exclude_memory {
@@ -2995,9 +2992,11 @@ impl Agent {
         // Persistent prompt attachments are a daemon-owned primary-chat
         // capability. A generic/one-shot Agent has no durable current-session
         // identity, so advertising these tools there is misleading even though
-        // their task-local execution gate would reject the call. ACP agents
-        // are likewise excluded until their stacked implementation exists.
-        if live_config.is_none() || exclude_memory {
+        // their task-local execution gate would reject the call. ACP's owned
+        // store view already excludes these tools in the registry factory;
+        // its delivery-only constructor must also exclude them when no store
+        // is attached. Neither ACP boundary is inferred from memory exclusion.
+        if live_config.is_none() || acp_delivery {
             all_tools_result
                 .tools
                 .retain(|tool| !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()));
@@ -10853,7 +10852,7 @@ mod tests {
         }
 
         #[test]
-        fn acp_style_agent_does_not_advertise_session_prompt_tools() {
+        fn memory_exclusion_preserves_explicit_session_prompt_tools() {
             let (provider, _) = capturing_provider(true);
             let memory_cfg = zeroclaw_config::schema::MemoryConfig {
                 backend: "none".into(),
@@ -10879,12 +10878,9 @@ mod tests {
                 .build()
                 .unwrap();
 
-            assert!(
-                agent
-                    .tools
-                    .iter()
-                    .all(|tool| tool.name() != "session_prompt_list")
-            );
+            assert!(agent.tool_names().contains(&"session_prompt_list"));
+            assert!(!agent.inject_memory);
+            assert!(!agent.auto_save);
         }
 
         #[test]
@@ -11840,6 +11836,12 @@ mod tests {
             "sessions_current".into(),
             "sessions_send".into(),
         ];
+        config.channels.session_prompts_enabled = true;
+        config.tools.optional.extend(
+            zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
         config
@@ -11915,6 +11917,12 @@ mod tests {
         .expect("managed ACP agent construction");
 
         for agent in [&agent, &managed] {
+            assert!(
+                agent
+                    .tool_names()
+                    .iter()
+                    .all(|name| { !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(name) })
+            );
             zeroclaw_api::TOOL_LOOP_SESSION_KEY
                 .scope(Some(current.to_string()), async {
                     let listed = agent

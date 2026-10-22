@@ -93,6 +93,11 @@ Selection does not enable the feature or grant execution permission. It controls
 the mutation/list tools, not injection of already-stored prompts into an enabled
 primary Chat turn. Reload after changing tool selection.
 
+RPC Chat sessions may set the `session/new` parameter `exclude_memory: true`
+without losing these tools or their attached prompts. That option disables
+long-term memory, not durable Chat-session metadata. ACP sessions remain
+unsupported regardless of their memory setting.
+
 Gateway WebSocket chat also requires gateway session persistence:
 
 ```toml

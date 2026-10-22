@@ -43801,7 +43801,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_prompt_tool_registration_follows_mode_not_memory_exclusion() {
+        for mode in ["chat", "acp"] {
+            for exclude_memory in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_acp_test_config(&tmp);
+                config.channels.session_prompts_enabled = true;
+                config.channels.session_persistence = true;
+                config.tools.optional.extend(
+                    zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                    4, 10, 60,
+                ));
+                let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+                let backend = Arc::new(
+                    zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+                );
+                let acp_store = Arc::new(
+                    zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap(),
+                );
+                let ctx = RpcContext::for_persistence_tests(
+                    config,
+                    Arc::clone(&sessions),
+                    Some(backend),
+                    Some(acp_store),
+                );
+                let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-mode:pid=1".into());
+                dispatcher.set_authenticated_for_test();
+                let response = dispatcher
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "chat_mode": mode,
+                        "exclude_memory": exclude_memory,
+                    }))
+                    .await
+                    .expect("session/new should construct either supported session mode");
+                let agent = sessions
+                    .get_agent(response["session_id"].as_str().unwrap())
+                    .await
+                    .unwrap();
+                let agent = agent.lock().await;
+                let names = agent.tool_names();
+                for name in zeroclaw_api::SESSION_PROMPT_TOOL_NAMES {
+                    assert_eq!(
+                        names.contains(&name),
+                        mode == "chat",
+                        "{mode}, exclude_memory={exclude_memory}: {name}"
+                    );
+                }
+                if exclude_memory || mode == "acp" {
+                    assert!(
+                        names
+                            .iter()
+                            .all(|name| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name)),
+                        "ordinary memory tools must remain excluded"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn rpc_chat_session_prompt_mutation_is_persisted_and_injected_on_next_turn() {
+        assert_rpc_chat_prompt_mutation_and_next_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_memory_free_chat_prompt_mutation_is_persisted_and_injected_on_next_turn() {
+        assert_rpc_chat_prompt_mutation_and_next_turn(true).await;
+    }
+
+    async fn assert_rpc_chat_prompt_mutation_and_next_turn(exclude_memory: bool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = Arc::new(
             zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
@@ -43855,6 +43929,7 @@ mod tests {
             .tool_dispatcher(Box::new(crate::agent::dispatcher::XmlToolDispatcher))
             .workspace_dir(tmp.path().to_path_buf())
             .agent_alias("test-agent".to_string())
+            .exclude_memory(exclude_memory)
             .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
                 config: Some(Arc::new(agent_config)),
                 live_config: None,
