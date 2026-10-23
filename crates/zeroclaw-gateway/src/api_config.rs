@@ -4838,6 +4838,79 @@ mod tests {
         let disk = std::fs::read_to_string(config_path).unwrap();
         let persisted: toml::Value = toml::from_str(&disk).unwrap();
         assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+        let goal = persisted["goal"].as_table().unwrap();
+        assert!(!goal.contains_key("default_token_limit"));
+        assert!(!goal.contains_key("default_cost_limit_usd"));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, None);
+    }
+
+    #[tokio::test]
+    async fn goal_patch_budget_default_remove_and_zero_persist_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(500);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_cost_limit_usd",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["goal"]["default_cost_limit_usd"].as_float(),
+            Some(0.0)
+        );
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "remove",
+                    "path": "/goal/default_token_limit"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert!(
+            !persisted["goal"]
+                .as_table()
+                .unwrap()
+                .contains_key("default_token_limit")
+        );
+        assert_eq!(state.config.read().goal.default_token_limit, None);
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(0.0));
     }
 
     #[tokio::test]

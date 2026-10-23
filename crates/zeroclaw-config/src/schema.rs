@@ -26583,19 +26583,16 @@ impl Config {
         // operator's actual choices (no hundreds of lines of struct
         // defaults the operator never touched). The schema's
         // `#[serde(default = "...")]` annotations re-supply the
-        // defaults on load. Required Goal budget keys are retained whenever
-        // the pruned table still contains an explicit Goal table.
+        // defaults on load.
         let mut new_table: toml::Table = toml::Value::try_from(&config_to_save)
             .context("Failed to serialize config to TOML value")?
             .try_into()
             .context("Serialized config is not a TOML table")?;
-        let unpruned_table = new_table.clone();
         let default_table: toml::Table = toml::Value::try_from(Config::default())
             .ok()
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
         prune_default_values(&mut new_table, &default_table);
-        retain_goal_required_keys(&mut new_table, &unpruned_table);
         // Keep the selection even when it is the full default. Pruning it would
         // leave an omitted section that `config migrate` then has to normalize.
         new_table
@@ -26700,18 +26697,8 @@ impl Config {
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
             .context("Failed to parse existing config for incremental save")?;
-        let goal_preexisting = doc.as_table().contains_key("goal");
-
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
-        }
-        if !goal_preexisting
-            && doc
-                .get("goal")
-                .and_then(toml_edit::Item::as_table_like)
-                .is_some()
-        {
-            write_created_goal_required_keys(doc.as_table_mut(), &full_table);
         }
 
         let selector_dirty = self
@@ -27533,8 +27520,7 @@ fn apply_dirty_map_key_path(
 
 /// Shared tail of the generic and map-key dirty-path walkers: reconcile
 /// the resolved `segs` against the doc — delete the leaf when the
-/// in-memory value is absent or equals the schema default, except
-/// default-equal required Goal budget leaves, which are written. Otherwise
+/// in-memory value is absent or equals the schema default. Otherwise
 /// write the pruned in-memory value. One copy so a future fix to the
 /// delete-vs-write rule cannot land in one walker only.
 fn write_or_delete_leaf(
@@ -27548,7 +27534,7 @@ fn write_or_delete_leaf(
 
     let should_delete = match (mem_val, default_val) {
         (None, _) => true,
-        (Some(m), Some(d)) if m == d && !is_goal_required_leaf(segs) => true,
+        (Some(m), Some(d)) if m == d => true,
         _ => false,
     };
 
@@ -27558,48 +27544,6 @@ fn write_or_delete_leaf(
         let mut pruned = value.clone();
         prune_empty_leaves(&mut pruned);
         set_path_in_doc(root, segs, &pruned);
-    }
-}
-
-/// Required budget keys for an explicit `[goal]` table (`GoalConfig`'s
-/// required fields). Writers retain these keys even at their zero defaults.
-const GOAL_REQUIRED_KEYS: [&str; 2] = ["default_token_limit", "default_cost_limit_usd"];
-
-fn retain_goal_required_keys(pruned: &mut toml::Table, unpruned: &toml::Table) {
-    let Some(pruned_goal) = pruned.get_mut("goal").and_then(toml::Value::as_table_mut) else {
-        return;
-    };
-    let Some(unpruned_goal) = unpruned.get("goal").and_then(toml::Value::as_table) else {
-        return;
-    };
-
-    for key in GOAL_REQUIRED_KEYS {
-        if !pruned_goal.contains_key(key)
-            && let Some(value) = unpruned_goal.get(key)
-        {
-            pruned_goal.insert(key.to_string(), value.clone());
-        }
-    }
-}
-
-fn is_goal_required_leaf(segs: &[&str]) -> bool {
-    segs.len() == 2 && segs[0] == "goal" && GOAL_REQUIRED_KEYS.contains(&segs[1])
-}
-
-fn write_created_goal_required_keys(root: &mut toml_edit::Table, full_table: &toml::Table) {
-    for key in GOAL_REQUIRED_KEYS {
-        let already_present = root
-            .get("goal")
-            .and_then(toml_edit::Item::as_table_like)
-            .is_some_and(|goal| goal.contains_key(key));
-        if !already_present
-            && let Some(value) = full_table
-                .get("goal")
-                .and_then(toml::Value::as_table)
-                .and_then(|goal| goal.get(key))
-        {
-            set_path_in_doc(root, &["goal", key], value);
-        }
     }
 }
 
@@ -35271,7 +35215,7 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(&dir).await;
     }
 
-    fn goal_required_budgets_config(temp: &tempfile::TempDir) -> Config {
+    fn goal_budget_defaults_config(temp: &tempfile::TempDir) -> Config {
         Config {
             config_path: temp.path().join("config.toml"),
             data_dir: temp.path().join("data"),
@@ -35279,32 +35223,27 @@ default_temperature = 0.7
         }
     }
 
-    fn assert_goal_required_budgets_round_trip(
+    fn assert_goal_budget_defaults_round_trip(
         raw: &str,
         enabled: bool,
-        token_limit: u64,
-        cost_limit_usd: f64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
     ) {
         let value: toml::Value = toml::from_str(raw).expect("saved TOML parses");
-        let goal = value
-            .get("goal")
-            .and_then(toml::Value::as_table)
-            .expect("saved config retains an explicit [goal] table");
+        let goal = value.get("goal").and_then(toml::Value::as_table);
         assert_eq!(
-            goal.get("default_token_limit")
-                .and_then(toml::Value::as_integer),
-            Some(token_limit as i64),
-            "raw [goal] token budget; got:\n{raw}"
+            goal.and_then(|table| table.get("default_token_limit"))
+                .is_some(),
+            token_limit.is_some()
         );
         assert_eq!(
-            goal.get("default_cost_limit_usd")
-                .and_then(toml::Value::as_float),
-            Some(cost_limit_usd),
-            "raw [goal] cost budget; got:\n{raw}"
+            goal.and_then(|table| table.get("default_cost_limit_usd"))
+                .is_some(),
+            cost_limit_usd.is_some()
         );
 
         let loaded =
-            crate::migration::migrate_to_current(raw).expect("saved [goal] strictly migrates");
+            crate::migration::migrate_to_current(raw).expect("saved config strictly migrates");
         assert_eq!(loaded.goal.enabled, enabled);
         assert_eq!(loaded.goal.default_token_limit, token_limit);
         assert_eq!(loaded.goal.default_cost_limit_usd, cost_limit_usd);
@@ -35318,15 +35257,14 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_and_tool_selection_survive_full_and_dirty_saves() {
+    async fn goal_budget_defaults_unrelated_saves_keep_absence_and_tool_selection() {
         for selected in [
             Vec::new(),
             vec!["calculator".to_owned()],
             vec!["*".to_owned()],
         ] {
             let temp = tempfile::TempDir::new().unwrap();
-            let mut config = goal_required_budgets_config(&temp);
-            config.goal.verifier.model = Some("fixture-model".to_owned());
+            let mut config = goal_budget_defaults_config(&temp);
             config.tools.optional = selected.clone();
             config.save().await.unwrap();
 
@@ -35338,7 +35276,9 @@ default_temperature = 0.7
                     config.save_dirty().await.unwrap();
                 }
                 let raw = fs::read_to_string(&config.config_path).await.unwrap();
-                assert_goal_required_budgets_round_trip(&raw, false, 0, 0.0);
+                assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+                assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+                assert_goal_budget_defaults_round_trip(&raw, false, None, None);
                 let value: toml::Value = toml::from_str(&raw).unwrap();
                 assert_eq!(
                     value["tools"]["optional"],
@@ -35352,123 +35292,183 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_full_save_create_keeps_zero_keys() {
+    async fn goal_budget_defaults_full_save_of_enabled_goal_writes_no_budget_keys() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut config = goal_required_budgets_config(&temp);
+        let mut config = goal_budget_defaults_config(&temp);
         config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.default".into();
 
         config.save().await.unwrap();
 
         let raw = fs::read_to_string(&config.config_path).await.unwrap();
-        assert!(raw.contains("default_token_limit = 0"), "got:\n{raw}");
-        assert!(raw.contains("default_cost_limit_usd = 0.0"), "got:\n{raw}");
-        assert_goal_required_budgets_round_trip(&raw, true, 0, 0.0);
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, None);
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .goal
+                .default_budget(),
+            Ok(crate::goal::GoalDefaultBudget::Unconfigured)
+        );
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_dirty_save_creating_goal_writes_both_keys() {
+    async fn goal_budget_defaults_dirty_save_creating_goal_writes_no_budget_keys() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut config = goal_required_budgets_config(&temp);
+        let mut config = goal_budget_defaults_config(&temp);
         config.save().await.unwrap();
+        let initial = fs::read_to_string(&config.config_path).await.unwrap();
+        assert!(
+            !initial.contains("[goal]"),
+            "fixture must start without Goal:\n{initial}"
+        );
 
         config.set_prop_persistent("goal.enabled", "true").unwrap();
         config.save_dirty().await.unwrap();
 
         let raw = fs::read_to_string(&config.config_path).await.unwrap();
-        assert!(raw.contains("default_token_limit = 0"), "got:\n{raw}");
-        assert!(raw.contains("default_cost_limit_usd = 0.0"), "got:\n{raw}");
-        assert_goal_required_budgets_round_trip(&raw, true, 0, 0.0);
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, None);
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_dirty_save_of_zero_budget_keeps_key() {
+    async fn goal_budget_defaults_explicit_values_survive_full_dirty_and_force_saves() {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("config.toml");
-        let seed = format!(
-            "schema_version = {}\n\n[goal]\nenabled = true\ndefault_token_limit = 500\ndefault_cost_limit_usd = 2.5\n",
-            crate::migration::CURRENT_SCHEMA_VERSION
-        );
-        fs::write(&config_path, seed).await.unwrap();
-
-        let mut config = goal_required_budgets_config(&temp);
-        config.goal.enabled = true;
-        config.goal.default_token_limit = 500;
-        config.goal.default_cost_limit_usd = 2.5;
-        config
-            .set_prop_persistent("goal.default_token_limit", "0")
-            .unwrap();
-        config
-            .set_prop_persistent("goal.default_cost_limit_usd", "0.0")
-            .unwrap();
-        config.save_dirty().await.unwrap();
-
-        let raw = fs::read_to_string(&config_path).await.unwrap();
-        assert!(raw.contains("default_token_limit = 0"), "got:\n{raw}");
-        assert!(raw.contains("default_cost_limit_usd = 0.0"), "got:\n{raw}");
-        assert_goal_required_budgets_round_trip(&raw, true, 0, 0.0);
-    }
-
-    #[tokio::test]
-    async fn goal_required_budgets_unrelated_dirty_save_preserves_keys() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("config.toml");
-        let seed = format!(
-            "schema_version = {}\n\n[goal]\nenabled = true\ndefault_token_limit = 0\ndefault_cost_limit_usd = 0.0\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
-            crate::migration::CURRENT_SCHEMA_VERSION
-        );
-        fs::write(&config_path, &seed).await.unwrap();
-
-        let token_line = seed
-            .lines()
-            .find(|line| line.starts_with("default_token_limit ="))
-            .unwrap();
-        let cost_line = seed
-            .lines()
-            .find(|line| line.starts_with("default_cost_limit_usd ="))
-            .unwrap();
-        let mut config = goal_required_budgets_config(&temp);
-        config.set_prop_persistent("goal.enabled", "true").unwrap();
-        config.save_dirty().await.unwrap();
-
-        let raw = fs::read_to_string(&config_path).await.unwrap();
-        assert!(raw.lines().any(|line| line == token_line), "got:\n{raw}");
-        assert!(raw.lines().any(|line| line == cost_line), "got:\n{raw}");
-        assert_goal_required_budgets_round_trip(&raw, true, 0, 0.0);
-    }
-
-    #[tokio::test]
-    async fn goal_required_budgets_save_and_force_save_of_loaded_file_keep_keys() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("config.toml");
-        let seed = format!(
-            "schema_version = {}\n\n[goal]\ndefault_token_limit = 0\ndefault_cost_limit_usd = 0.0\n\n[goal.verifier]\nmodel = \"fixture-model\"\n",
-            crate::migration::CURRENT_SCHEMA_VERSION
-        );
-        fs::write(&config_path, seed).await.unwrap();
-
         let _env_lock = env_override_lock().await;
         let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", temp.path());
         let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
         let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
-        // Use the real loader; never fabricate loaded_from or enable verifier admission.
-        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
-        assert_eq!(loaded.config_path, config_path);
-        loaded.save().await.unwrap();
 
-        let raw_after_loaded_save = fs::read_to_string(&config_path).await.unwrap();
-        assert_goal_required_budgets_round_trip(&raw_after_loaded_save, false, 0, 0.0);
+        for (token, cost) in [
+            (Some(0), Some(0.0)),
+            (Some(500), Some(2.5)),
+            (Some(500), Some(0.0)),
+            (Some(500), None),
+        ] {
+            let mut seed = format!(
+                "schema_version = {}\n\n[goal]\nenabled = true\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            if let Some(value) = token {
+                seed.push_str(&format!("default_token_limit = {value}\n"));
+            }
+            if let Some(value) = cost {
+                seed.push_str(&format!("default_cost_limit_usd = {value:?}\n"));
+            }
+            seed.push_str("\n[goal.verifier]\nmodel_provider = \"openai.default\"\n");
+            fs::write(&config_path, &seed).await.unwrap();
 
-        let mut force = goal_required_budgets_config(&temp);
-        force.goal.verifier.model = Some("fixture-model".to_owned());
-        force.force_save().await.unwrap();
-        let raw_after_force_save = fs::read_to_string(&config_path).await.unwrap();
-        assert_goal_required_budgets_round_trip(&raw_after_force_save, false, 0, 0.0);
+            let mut loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(loaded.goal.default_token_limit, token);
+            assert_eq!(loaded.goal.default_cost_limit_usd, cost);
+            loaded
+                .set_prop_persistent("observability.backend", "log")
+                .unwrap();
+            loaded.save_dirty().await.unwrap();
+            let raw_dirty = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_dirty.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_dirty}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_dirty, true, token, cost);
+
+            loaded.save().await.unwrap();
+            let raw_save = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_save.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_save}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_save, true, token, cost);
+
+            let mut force = goal_budget_defaults_config(&temp);
+            force.goal.enabled = true;
+            force.goal.verifier.model_provider = "openai.default".into();
+            force.goal.default_token_limit = token;
+            force.goal.default_cost_limit_usd = cost;
+            force.force_save().await.unwrap();
+            let raw_force = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_force.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_force}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_force, true, token, cost);
+            let reloaded = crate::migration::migrate_to_current(&raw_force).unwrap();
+            assert_eq!(reloaded.goal.default_budget(), loaded.goal.default_budget());
+        }
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_all_default_goal_is_still_omitted() {
+    async fn goal_budget_defaults_dirty_set_zero_and_unset_persist_presence() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config = goal_required_budgets_config(&temp);
+        let config_path = temp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[goal]\nenabled = true\ndefault_token_limit = 500\ndefault_cost_limit_usd = 2.5\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        fs::write(&config_path, &seed).await.unwrap();
+
+        let mut config = goal_budget_defaults_config(&temp);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.default".into();
+        config
+            .set_prop_persistent("goal.default_token_limit", "0")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            raw.lines().any(|line| line == "default_token_limit = 0"),
+            "got:\n{raw}"
+        );
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), Some(2.5));
+
+        config
+            .set_prop_persistent("goal.default_cost_limit_usd", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), None);
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .goal
+                .default_budget(),
+            Ok(crate::goal::GoalDefaultBudget::Unconfigured)
+        );
+
+        config
+            .set_prop_persistent("goal.default_cost_limit_usd", "2.5")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            raw.lines()
+                .any(|line| line == "default_cost_limit_usd = 2.5"),
+            "got:\n{raw}"
+        );
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), Some(2.5));
+        config
+            .set_prop_persistent("goal.default_token_limit", crate::traits::UNSET_DISPLAY)
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, Some(2.5));
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_all_default_goal_is_still_omitted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = goal_budget_defaults_config(&temp);
         config.save().await.unwrap();
 
         let raw = fs::read_to_string(&config.config_path).await.unwrap();
@@ -35479,43 +35479,40 @@ default_temperature = 0.7
         let loaded = crate::migration::migrate_to_current(&raw)
             .expect("config without [goal] loads with Goal defaults");
         assert!(!loaded.goal.enabled);
-        assert_eq!(loaded.goal.default_token_limit, 0);
-        assert_eq!(loaded.goal.default_cost_limit_usd, 0.0);
+        assert_eq!(loaded.goal.default_token_limit, None);
+        assert_eq!(loaded.goal.default_cost_limit_usd, None);
     }
 
     #[tokio::test]
-    async fn goal_required_budgets_preexisting_invalid_section_is_not_repaired() {
+    async fn goal_budget_defaults_malformed_existing_section_is_not_repaired() {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("config.toml");
         let seed = format!(
-            "schema_version = {}\n\n[observability]\nbackend = \"none\"\n\n[goal]\nenabled = true\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
+            "schema_version = {}\n\n[observability]\nbackend = \"none\"\n\n[goal]\nenabled = true\ndefault_token_limit = \"unbounded\"\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
             crate::migration::CURRENT_SCHEMA_VERSION
         );
         fs::write(&config_path, &seed).await.unwrap();
 
-        let mut config = goal_required_budgets_config(&temp);
+        let mut config = goal_budget_defaults_config(&temp);
         config.goal.enabled = true;
         config.set_prop_persistent("goal.enabled", "true").unwrap();
         config.save_dirty().await.unwrap();
 
         let after_goal_save = fs::read_to_string(&config_path).await.unwrap();
-        assert!(!after_goal_save.contains("default_token_limit"));
-        assert!(!after_goal_save.contains("default_cost_limit_usd"));
+        assert!(after_goal_save.contains("default_token_limit = \"unbounded\""));
         let error = crate::migration::migrate_to_current(&after_goal_save)
-            .expect_err("writer must not repair a pre-existing invalid [goal]");
+            .expect_err("writer must not repair a malformed pre-existing [goal]");
         assert!(
             format!("{error:#}").contains("default_token_limit"),
-            "strict load should name the first missing budget: {error:#}"
+            "strict load should name the malformed budget: {error:#}"
         );
         let salvaged = crate::migration::migrate_to_current_salvaged(&after_goal_save);
         assert!(
             salvaged.dropped.iter().any(|path| path == "goal"),
-            "salvage should report the invalid Goal table as dropped: {:?}",
+            "salvage should report malformed Goal as dropped: {:?}",
             salvaged.dropped
         );
 
-        // Goal is the final table, so later rewrites of the existing
-        // observability block must leave this exact suffix byte-for-byte.
         let goal_bytes = after_goal_save
             .split("[goal]")
             .nth(1)
@@ -35525,7 +35522,6 @@ default_temperature = 0.7
             .set_prop_persistent("observability.backend", "otel")
             .unwrap();
         config.save_dirty().await.unwrap();
-
         let after_unrelated_save = fs::read_to_string(&config_path).await.unwrap();
         assert_eq!(
             after_unrelated_save
@@ -35533,62 +35529,8 @@ default_temperature = 0.7
                 .nth(1)
                 .expect("Goal table remains present"),
             goal_bytes,
-            "non-Goal dirty save must preserve the existing Goal bytes"
+            "non-Goal dirty save must preserve existing Goal bytes"
         );
-        assert!(!after_unrelated_save.contains("default_token_limit"));
-        assert!(!after_unrelated_save.contains("default_cost_limit_usd"));
-    }
-
-    #[tokio::test]
-    async fn goal_required_budgets_list_matches_goal_config_serde() {
-        const TEST_GOAL_REQUIRED_KEYS: &[&str] = &GOAL_REQUIRED_KEYS;
-
-        let default_goal = toml::Value::try_from(crate::goal::GoalConfig::default())
-            .expect("default GoalConfig serializes");
-        let default_goal = default_goal
-            .as_table()
-            .expect("GoalConfig serializes as a TOML table");
-        let mut only_required = toml::Table::new();
-        for &key in TEST_GOAL_REQUIRED_KEYS {
-            only_required.insert(
-                key.to_owned(),
-                default_goal
-                    .get(key)
-                    .unwrap_or_else(|| panic!("GoalConfig serialization lacks {key}"))
-                    .clone(),
-            );
-        }
-
-        for &missing in TEST_GOAL_REQUIRED_KEYS {
-            let mut incomplete = only_required.clone();
-            assert!(
-                incomplete.remove(missing).is_some(),
-                "test fixture does not contain {missing}"
-            );
-            let mut root = toml::Table::new();
-            root.insert(
-                "schema_version".to_owned(),
-                toml::Value::Integer(crate::migration::CURRENT_SCHEMA_VERSION as i64),
-            );
-            root.insert("goal".to_owned(), toml::Value::Table(incomplete));
-            let raw = toml::to_string(&root).expect("incomplete fixture serializes");
-            let error = toml::from_str::<Config>(&raw)
-                .expect_err("omitting any listed required key must fail strict deserialization");
-            assert!(
-                error.to_string().contains(missing),
-                "serde should identify missing {missing}; got: {error}"
-            );
-        }
-
-        let mut root = toml::Table::new();
-        root.insert(
-            "schema_version".to_owned(),
-            toml::Value::Integer(crate::migration::CURRENT_SCHEMA_VERSION as i64),
-        );
-        root.insert("goal".to_owned(), toml::Value::Table(only_required));
-        let raw = toml::to_string(&root).expect("required-only fixture serializes");
-        toml::from_str::<Config>(&raw)
-            .expect("a [goal] table containing only the listed required keys deserializes");
     }
 
     #[tokio::test]
