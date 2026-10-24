@@ -4838,6 +4838,202 @@ mod tests {
         let disk = std::fs::read_to_string(config_path).unwrap();
         let persisted: toml::Value = toml::from_str(&disk).unwrap();
         assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+        let goal = persisted["goal"].as_table().unwrap();
+        assert!(!goal.contains_key("default_token_limit"));
+        assert!(!goal.contains_key("default_cost_limit_usd"));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, None);
+    }
+
+    #[tokio::test]
+    async fn goal_patch_budget_default_remove_and_zero_persist_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(500);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_cost_limit_usd",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["goal"]["default_cost_limit_usd"].as_float(),
+            Some(0.0)
+        );
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "remove",
+                    "path": "/goal/default_token_limit"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert!(
+            !persisted["goal"]
+                .as_table()
+                .unwrap()
+                .contains_key("default_token_limit")
+        );
+        assert_eq!(state.config.read().goal.default_token_limit, None);
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn goal_patch_budget_default_null_replace_clears_and_keeps_explicit_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(500);
+        config.goal.default_cost_limit_usd = Some(0.0);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        // A cleared optional integer must disappear without changing its zero sibling.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_token_limit",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        let goal = persisted["goal"].as_table().unwrap();
+        assert!(!goal.contains_key("default_token_limit"));
+        assert_eq!(goal["default_cost_limit_usd"].as_float(), Some(0.0));
+        assert_eq!(state.config.read().goal.default_token_limit, None);
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(0.0));
+
+        // Typing zero is an explicit value, unlike clearing the same input.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_token_limit",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["goal"]["default_token_limit"].as_integer(),
+            Some(0)
+        );
+        assert_eq!(state.config.read().goal.default_token_limit, Some(0));
+
+        // Optional floats use the same null-clear contract and survive reload.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_cost_limit_usd",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert!(
+            !persisted["goal"]
+                .as_table()
+                .unwrap()
+                .contains_key("default_cost_limit_usd")
+        );
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, None);
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, Some(0));
+        assert_eq!(reloaded.goal.default_cost_limit_usd, None);
+
+        // Required numbers still reject null without publishing or writing anything.
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let port_before = state.config.read().gateway.port;
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/gateway/port",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}: {json}");
+        assert_eq!(json["path"], "gateway.port", "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::ValidationFailed),
+            "{json}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), disk_before);
+        assert_eq!(state.config.read().gateway.port, port_before);
     }
 
     #[tokio::test]
