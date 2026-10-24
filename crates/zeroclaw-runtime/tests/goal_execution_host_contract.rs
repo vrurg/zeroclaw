@@ -527,8 +527,10 @@ fn goal_config(enabled: bool, verifier: &str, limits: ConfigGoalBudgetLimits) ->
     let mut config = Config {
         goal: GoalConfig {
             enabled,
-            default_token_limit: limits.token_limit.unwrap_or_default(),
-            default_cost_limit_usd: limits.cost_limit_usd.unwrap_or_default(),
+            // A normalized `None` means explicitly unlimited in these legacy
+            // fixtures, not an unconfigured default.
+            default_token_limit: Some(limits.token_limit.unwrap_or(0)),
+            default_cost_limit_usd: Some(limits.cost_limit_usd.unwrap_or(0.0)),
             verifier: zeroclaw_config::goal::GoalVerifierConfig {
                 model_provider: ModelProviderRef::new(verifier),
                 model: None,
@@ -1086,6 +1088,233 @@ async fn explicit_unlimited_goal_defaults_remain_unlimited() {
     };
     assert_eq!(started.token_limit, None);
     assert_eq!(started.cost_limit_usd, None);
+}
+
+#[tokio::test]
+async fn start_without_budget_flags_or_defaults_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let driver = recording_driver(&ingress);
+        let mut config = valid_goal_config(true);
+        config.goal.default_token_limit = None;
+        config.goal.default_cost_limit_usd = None;
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "start without a configured budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_command_budgets_start_without_configured_defaults() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        for (budget, expected_tokens, expected_cost) in [
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: None,
+                }),
+                Some(10),
+                None,
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: None,
+                    cost_limit_usd: Some(2.5),
+                }),
+                None,
+                Some(2.5),
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: Some(2.5),
+                }),
+                Some(10),
+                Some(2.5),
+            ),
+            (GoalBudgetSelection::Unlimited, None, None),
+        ] {
+            let mut config = valid_goal_config(true);
+            config.goal.default_token_limit = None;
+            config.goal.default_cost_limit_usd = None;
+            let driver = recording_driver(&ingress);
+            let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+            let submission = GoalExecutionHost::new()
+                .submit(
+                    &host_settings(&config),
+                    ingress.clone(),
+                    driver,
+                    GoalCommand::Start {
+                        budget,
+                        objective: "start with the explicit command budget".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let GoalResponse::Started(started) = controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap()
+            else {
+                panic!("expected explicit command budget to admit Goal start");
+            };
+            assert_eq!(started.token_limit, expected_tokens);
+            assert_eq!(started.cost_limit_usd, expected_cost);
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_positive_default_starts_with_that_limit() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(500),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "use the single configured token limit".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(started) = controller
+            .submit(&host_settings(&config), &submission)
+            .await
+            .unwrap()
+        else {
+            panic!("expected positive token default to admit Goal start");
+        };
+        assert_eq!(started.token_limit, Some(500));
+        assert_eq!(started.cost_limit_usd, None);
+    }
+}
+
+#[tokio::test]
+async fn zero_token_default_without_cost_default_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(0),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "do not treat a zero-only default as a budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn invalid_defaults_reject_explicit_budget_start_with_typed_path() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(-1.0),
+            },
+        );
+        let driver = recording_driver(&ingress);
+        let error = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                        token_limit: Some(10),
+                        cost_limit_usd: None,
+                    }),
+                    objective: "invalid defaults must reject before binding".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_admission_error(
+            error,
+            ConfigApiCode::InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+        );
+        assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]

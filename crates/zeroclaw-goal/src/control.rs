@@ -22,7 +22,7 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
+use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalDefaultBudget};
 
 use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
@@ -701,23 +701,23 @@ impl<'a> GoalHostSettings<'a> {
             .context("Goal configuration does not admit execution")
     }
 
-    fn default_limits(&self) -> Result<GoalBudgetLimits> {
-        let ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        } = self
+    fn default_limits(&self) -> Result<Option<GoalBudgetLimits>> {
+        self.require_execution_admissible()?;
+        match self
             .config
             .goal
-            .effective_limits()
-            .map_err(|_| Error::msg("Goal default limits are invalid"))?;
-        validate_default_limits(ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        })?;
-        Ok(GoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        })
+            .default_budget()
+            .map_err(|_| Error::msg("Goal default limits are invalid"))?
+        {
+            GoalDefaultBudget::Configured(limits) => {
+                validate_default_limits(limits)?;
+                Ok(Some(GoalBudgetLimits {
+                    token_limit: limits.token_limit,
+                    cost_limit_usd: limits.cost_limit_usd,
+                }))
+            }
+            GoalDefaultBudget::Unconfigured => Ok(None),
+        }
     }
 }
 
@@ -752,6 +752,8 @@ pub enum GoalResponse {
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
     AlreadyActive,
+    /// A start without budget flags found no configured default budget; no Goal was created.
+    BudgetRequired,
     Terminal(GoalStatusProjection),
     Stale,
 }
@@ -859,7 +861,9 @@ impl GoalController {
     ) -> Result<GoalResponse> {
         settings.require_execution_admissible()?;
         validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-        let limits = select_limits(settings.default_limits()?, selection)?;
+        let Some(limits) = select_limits(|| settings.default_limits(), selection)? else {
+            return Ok(GoalResponse::BudgetRequired);
+        };
         let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
@@ -1227,16 +1231,16 @@ fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
 }
 
 fn select_limits(
-    defaults: GoalBudgetLimits,
+    defaults: impl FnOnce() -> Result<Option<GoalBudgetLimits>>,
     selection: GoalBudgetSelection,
-) -> Result<GoalBudgetLimits> {
+) -> Result<Option<GoalBudgetLimits>> {
     match selection {
-        GoalBudgetSelection::Defaults => Ok(defaults),
-        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits),
-        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => defaults(),
+        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits).map(Some),
+        GoalBudgetSelection::Unlimited => Ok(Some(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        }),
+        })),
     }
 }
 
@@ -1300,10 +1304,10 @@ mod tests {
         ] {
             assert!(
                 select_limits(
-                    GoalBudgetLimits {
+                    || Ok(Some(GoalBudgetLimits {
                         token_limit: Some(1),
                         cost_limit_usd: None,
-                    },
+                    })),
                     GoalBudgetSelection::Limits(limits),
                 )
                 .is_err()
