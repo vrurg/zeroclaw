@@ -218,6 +218,12 @@ mod tests {
         error
     }
 
+    fn isolate_config_path(config: &mut Config) -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().expect("temporary config directory");
+        config.config_path = tempdir.path().join("config.toml");
+        tempdir
+    }
+
     fn config_with_valid_goal_verifier() -> Config {
         let mut config = Config::default();
         config
@@ -233,6 +239,7 @@ mod tests {
     fn p1_goal_enable_introducing_missing_verifier_is_rejected() {
         let baseline = Config::default();
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("goal.enabled", "true")
             .expect("goal.enabled is an editable property");
@@ -248,6 +255,7 @@ mod tests {
     fn p3_goal_enable_with_resolvable_verifier_is_accepted() {
         let baseline = config_with_valid_goal_verifier();
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("goal.enabled", "true")
             .expect("goal.enabled is an editable property");
@@ -262,6 +270,7 @@ mod tests {
         let mut baseline = Config::default();
         baseline.gateway.host.clear();
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("delegate.timeout_secs", "0")
             .expect("delegate.timeout_secs is an editable property");
@@ -355,6 +364,7 @@ mod tests {
         baseline.security.otp.token_ttl_secs = 100;
         baseline.security.otp.cache_valid_secs = 50;
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("gateway.websocket_ping_interval_secs", "45")
             .expect("gateway ping interval is an editable property");
@@ -396,6 +406,7 @@ mod tests {
     fn p12_noncontinuable_plugin_host_error_blocks_an_unrelated_edit() {
         let baseline = malformed_plugin_baseline();
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("gateway.websocket_ping_interval_secs", "45")
             .expect("gateway ping interval is an editable property");
@@ -457,6 +468,7 @@ mod tests {
     fn p16_valid_edit_has_no_retained_validation_warning() {
         let baseline = Config::default();
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("gateway.websocket_ping_interval_secs", "45")
             .expect("gateway ping interval is an editable property");
@@ -506,6 +518,7 @@ mod tests {
             );
         }
         let mut candidate = baseline.clone();
+        let _config_tempdir = isolate_config_path(&mut candidate);
         candidate
             .set_prop_persistent("gateway.websocket_ping_interval_secs", "45")
             .expect("gateway ping interval is an editable property");
