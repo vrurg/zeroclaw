@@ -5191,7 +5191,7 @@ mod tests {
     async fn editor_validation_regression_p10_unrelated_edit_retains_goal_cost_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config.goal.default_cost_limit_usd = -1.0;
+        config.goal.default_cost_limit_usd = Some(-1.0);
         config.save().await.unwrap();
         let state = test_state(config);
         let (status, json) = response_json(
@@ -5221,7 +5221,7 @@ mod tests {
     async fn editor_validation_regression_p10_dirty_verifier_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config.goal.default_cost_limit_usd = -1.0;
+        config.goal.default_cost_limit_usd = Some(-1.0);
         assert_editor_patch_rejected_without_mutation(
             config,
             serde_json::json!([{

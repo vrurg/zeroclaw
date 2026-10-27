@@ -2436,6 +2436,71 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
 }
 
 #[tokio::test]
+async fn runtime_start_without_budget_defaults_returns_budget_required_without_execution() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    // Missing defaults stop admission without handing off execution; explicit limits admit it.
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let mut config = valid_goal_config(true);
+        config.goal.default_token_limit = None;
+        config.goal.default_cost_limit_usd = None;
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let settings = host_settings(&config);
+        let driver = Arc::new(ExecutionDriver {
+            binding: GoalSessionBinding::new(ingress.session_key().clone()),
+            execution_acquires: AtomicUsize::new(0),
+            delivered: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let (response, execution) = runtime
+            .submit(
+                &settings,
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "start without configured budget defaults".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(matches!(response, GoalResponse::BudgetRequired));
+        assert!(execution.is_none());
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (response, execution) = runtime
+            .submit(
+                &settings,
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                        token_limit: Some(10),
+                        cost_limit_usd: None,
+                    }),
+                    objective: "start with explicit budget limits".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(matches!(response, GoalResponse::Started(_)));
+        assert!(execution.is_some());
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn runtime_rejects_dangling_verifier_for_start_and_resume_but_allows_status() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);

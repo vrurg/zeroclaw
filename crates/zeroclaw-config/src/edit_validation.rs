@@ -305,10 +305,42 @@ mod tests {
     #[test]
     fn p10_goal_helper_scope_blocks_a_dirty_goal_sibling() {
         let mut baseline = Config::default();
-        baseline.goal.default_cost_limit_usd = -1.0;
+        baseline.goal.default_cost_limit_usd = Some(-1.0);
         let mut candidate = baseline.clone();
         candidate.goal.verifier.model = Some("  ".to_string());
         candidate.mark_dirty("goal.verifier.model");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("goal.default_cost_limit_usd"),
+        );
+    }
+
+    #[test]
+    fn goal_scope_retains_existing_goal_error_for_unrelated_provider_edit() {
+        // An unrelated provider edit retains an existing Goal verifier error.
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.goal.enabled = true;
+        baseline.goal.verifier.model_provider = ModelProviderRef::from("openai.missing");
+        let mut candidate = baseline.clone();
+        candidate.mark_dirty("providers.models.openai.default.model");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("an unrelated provider edit must retain the baseline Goal error");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, PRE_EXISTING_VALIDATION_ERROR);
+        assert_eq!(warnings[0].path, "goal.verifier.model_provider");
+    }
+
+    #[test]
+    fn goal_scope_rejects_retention_when_the_verifier_profile_is_dirty() {
+        // A dirty verifier profile must not retain an invalid Goal budget.
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.goal.enabled = true;
+        baseline.goal.default_cost_limit_usd = Some(-1.0);
+        let mut candidate = baseline.clone();
+        candidate.mark_dirty("providers.models.openai.default.model");
 
         assert_error(
             validate_without_mutation(&candidate, &baseline),
