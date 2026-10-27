@@ -2810,7 +2810,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
 }
 
 async fn status_for_registry(
-    config: &GoalHostSettings,
+    config: &GoalHostSettings<'_>,
     ingress: &GoalIngressContext,
     registry: Arc<LeaseObservingRegistry>,
 ) -> GoalResponse {
