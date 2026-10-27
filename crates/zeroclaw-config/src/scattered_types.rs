@@ -99,7 +99,7 @@ impl Default for ThinkingConfig {
 
 impl ThinkingConfig {
     pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
-        // Guard: only levels that have a built-in budget can use native thinking.
+        // Only budgeted levels can use the token-budget payload.
         let default = level.default_budget_tokens()?;
         Some(
             self.budget_tokens
