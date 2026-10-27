@@ -765,6 +765,79 @@ mod native_effort {
     }
 
     #[tokio::test]
+    async fn legacy_codex_factories_map_native_levels_in_turn_stream_and_one_shot_payloads() {
+        for name in ["openai-codex", "openai_codex", "codex"] {
+            let server = CapturedOpenAi::start().await;
+            let state = tempfile::tempdir().unwrap();
+            let provider = crate::create_model_provider_with_options(
+                name,
+                Some("fixture-key"),
+                &crate::ModelProviderRuntimeOptions {
+                    provider_api_url: Some(server.url.clone()),
+                    zeroclaw_dir: Some(state.path().to_path_buf()),
+                    secrets_encrypt: false,
+                    reasoning_effort: Some("high".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let messages = [ChatMessage::user("inspect")];
+            let tools = tool_fixture();
+            for (model, level) in [
+                ("gpt-6.1-sol", Some(ThinkingLevel::Low)),
+                ("gpt-6.1-sol", None),
+                ("gpt-6.1-sol", Some(ThinkingLevel::Max)),
+                ("unverified-model", Some(ThinkingLevel::Max)),
+            ] {
+                provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: Some(&tools),
+                            thinking: None,
+                            thinking_level: level,
+                        },
+                        model,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                    thinking_level: Some(ThinkingLevel::Minimal),
+                },
+                "gpt-6.1-sol",
+                None,
+                StreamOptions::new(true),
+            );
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            zeroclaw_api::ONE_SHOT_NATIVE_THINKING_LEVEL
+                .scope(Some(ThinkingLevel::Off), async {
+                    provider
+                        .chat_with_system(None, "inspect", "gpt-6.1-sol", None)
+                        .await
+                        .unwrap();
+                })
+                .await;
+            let bodies = server.bodies();
+            assert_eq!(bodies.len(), 6, "{name}");
+            for (body, expected) in bodies
+                .iter()
+                .zip(["low", "high", "max", "high", "low", "low"])
+            {
+                assert_eq!(body["reasoning"]["effort"], expected, "{name}");
+            }
+            assert!(!bodies[4]["tools"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn the_same_model_uses_distinct_public_and_subscription_wire_capabilities() {
         let server = CapturedOpenAi::start().await;
         let public = server.provider(zeroclaw_config::schema::WireApi::Responses);
