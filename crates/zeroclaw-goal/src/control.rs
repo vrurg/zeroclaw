@@ -27,7 +27,7 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
+use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalDefaultBudget};
 
 mod goal_execution;
 
@@ -88,14 +88,11 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded key, a key whose existing shared
     /// sanitizer would change it, or a key outside the `matrix_` namespace.
     pub fn matrix(history_key: impl Into<String>) -> Result<Self> {
-        let history_key = canonical_nonblank("Matrix history key", history_key.into())?;
-        if sanitize_session_key(&history_key) != history_key {
-            bail!("Matrix Goal history key is not canonical");
-        }
-        if !history_key.starts_with("matrix_") {
-            bail!("Matrix Goal history key is outside the Matrix namespace");
-        }
-        Ok(Self::Matrix { history_key })
+        let key = Self::Matrix {
+            history_key: history_key.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
     }
 
     /// Build a ZeroCode key from the adapter's canonical raw session ID.
@@ -109,11 +106,32 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded ID, or an ID whose existing
     /// shared sanitizer would change it.
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
-        let raw_session_id = canonical_nonblank("ZeroCode session id", raw_session_id.into())?;
-        if sanitize_session_key(&raw_session_id) != raw_session_id {
-            bail!("ZeroCode Goal session id is not canonical");
+        let key = Self::ZeroCode {
+            raw_session_id: raw_session_id.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        match self {
+            Self::Matrix { history_key } => {
+                require_canonical_nonblank("Matrix history key", history_key)?;
+                if sanitize_session_key(history_key) != *history_key {
+                    bail!("Matrix Goal history key is not canonical");
+                }
+                if !history_key.starts_with("matrix_") {
+                    bail!("Matrix Goal history key is outside the Matrix namespace");
+                }
+            }
+            Self::ZeroCode { raw_session_id } => {
+                require_canonical_nonblank("ZeroCode session id", raw_session_id)?;
+                if sanitize_session_key(raw_session_id) != *raw_session_id {
+                    bail!("ZeroCode Goal session id is not canonical");
+                }
+            }
         }
-        Ok(Self::ZeroCode { raw_session_id })
+        Ok(())
     }
 
     pub const fn surface(&self) -> GoalSurface {
@@ -194,7 +212,8 @@ impl GoalIngressContext {
     /// # Errors
     ///
     /// Returns an error if the principal surface differs from the session key,
-    /// or if the agent, route, or principal is blank.
+    /// the directly constructed session key is not canonical, or if the agent,
+    /// route, or principal is blank.
     pub fn trusted(
         session_key: GoalSessionKey,
         agent: impl Into<String>,
@@ -204,6 +223,7 @@ impl GoalIngressContext {
         if session_key.surface() != principal.surface() {
             bail!("Goal ingress principal does not match the session surface");
         }
+        session_key.validate_canonical()?;
         principal.validate()?;
         Ok(Self {
             session_key,
@@ -916,25 +936,27 @@ impl<'a> GoalHostSettings<'a> {
             .context("Goal configuration does not admit execution")
     }
 
-    fn default_limits(&self) -> Result<GoalBudgetLimits> {
-        let ConfigGoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        } = self
+    fn default_limits(&self) -> Result<Option<GoalBudgetLimits>> {
+        self.require_execution_admissible()?;
+        match self
             .config
             .goal
-            .effective_limits()
-            .map_err(|_| Error::msg("Goal default limits are invalid"))?;
-        let limits = GoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        };
-        validate_default_limits(limits)?;
-        Ok(limits)
+            .default_budget()
+            .map_err(|_| Error::msg("Goal default limits are invalid"))?
+        {
+            GoalDefaultBudget::Configured(limits) => {
+                validate_default_limits(limits)?;
+                Ok(Some(GoalBudgetLimits {
+                    token_limit: limits.token_limit,
+                    cost_limit_usd: limits.cost_limit_usd,
+                }))
+            }
+            GoalDefaultBudget::Unconfigured => Ok(None),
+        }
     }
 }
 
-fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
+fn validate_default_limits(limits: ConfigGoalBudgetLimits) -> Result<()> {
     if limits
         .token_limit
         .is_some_and(|limit| !is_valid_finite_goal_token_limit(limit))
@@ -965,6 +987,8 @@ pub enum GoalResponse {
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
     AlreadyActive,
+    /// A start without budget flags found no configured default budget; no Goal was created.
+    BudgetRequired,
     Terminal(GoalStatusProjection),
     Stale,
 }
@@ -1088,7 +1112,9 @@ impl GoalController {
     ) -> Result<GoalResponse> {
         settings.require_execution_admissible()?;
         validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-        let limits = select_limits(settings.default_limits()?, selection)?;
+        let Some(limits) = select_limits(|| settings.default_limits(), selection)? else {
+            return Ok(GoalResponse::BudgetRequired);
+        };
         let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
@@ -1409,14 +1435,29 @@ impl GoalController {
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, &goal))),
+            Some(goal) => {
+                // The extension read can overlap a lifecycle transition. Fence
+                // the projection with a fresh canonical task snapshot so its
+                // status and epoch cannot come from different moments.
+                let current = self.current(ingress, session_id).await?;
+                if current
+                    .as_ref()
+                    .is_none_or(|current| !same_task_snapshot(current, task))
+                {
+                    return Ok(None);
+                }
+                Ok(Some(GoalStatusProjection::from_parts(task, &goal)))
+            }
             None => {
                 // A terminal predecessor can be atomically replaced between
-                // the current-task read and extension read. Recheck only on
-                // that exceptional missing-extension path so a genuine
-                // corrupt current task remains an error.
+                // the current-task read and extension read. Keep reporting a
+                // genuine missing-extension error only while the same task
+                // snapshot remains current.
                 let current = self.current(ingress, session_id).await?;
-                if current.as_ref().is_none_or(|current| current.id != task.id) {
+                if current
+                    .as_ref()
+                    .is_none_or(|current| !same_task_snapshot(current, task))
+                {
                     Ok(None)
                 } else {
                     bail!("Goal task extension is missing")
@@ -1450,22 +1491,28 @@ impl GoalController {
     }
 }
 
+fn same_task_snapshot(current: &TaskRecord, original: &TaskRecord) -> bool {
+    current.id == original.id
+        && current.status == original.status
+        && current.execution_epoch == original.execution_epoch
+}
+
 fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
     ingress.surface() != GoalSurface::Matrix
         || task.principal_id.as_deref() == ingress.durable_principal_id()
 }
 
 fn select_limits(
-    defaults: GoalBudgetLimits,
+    defaults: impl FnOnce() -> Result<Option<GoalBudgetLimits>>,
     selection: GoalBudgetSelection,
-) -> Result<GoalBudgetLimits> {
+) -> Result<Option<GoalBudgetLimits>> {
     match selection {
-        GoalBudgetSelection::Defaults => Ok(defaults),
-        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits),
-        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => defaults(),
+        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits).map(Some),
+        GoalBudgetSelection::Unlimited => Ok(Some(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        }),
+        })),
     }
 }
 
@@ -1529,10 +1576,10 @@ mod tests {
         ] {
             assert!(
                 select_limits(
-                    GoalBudgetLimits {
+                    || Ok(Some(GoalBudgetLimits {
                         token_limit: Some(1),
                         cost_limit_usd: None,
-                    },
+                    })),
                     GoalBudgetSelection::Limits(limits),
                 )
                 .is_err()
@@ -1604,6 +1651,77 @@ mod tests {
         assert_eq!(decoded["objective"].as_str(), Some(turn.objective.as_str()));
         assert_eq!(decoded["candidate"].as_str(), Some(turn.candidate.as_str()));
         assert_eq!(messages[1].content.matches("\\n").count(), 5);
+    }
+
+    #[test]
+    fn trusted_ingress_rejects_noncanonical_public_session_variants() {
+        for session_key in [
+            GoalSessionKey::Matrix {
+                history_key: "rpc_shared".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: " matrix_room ".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "matrix_room with spaces".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "same session".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: " padded ".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "".into(),
+            },
+        ] {
+            let principal = match session_key.surface() {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            assert!(GoalIngressContext::trusted(session_key, "main", "direct", principal).is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_ingress_preserves_valid_canonical_session_variants() {
+        for (session_key, expected_durable_id) in [
+            (
+                GoalSessionKey::Matrix {
+                    history_key: "matrix_room_primary".into(),
+                },
+                "matrix_room_primary",
+            ),
+            (
+                GoalSessionKey::ZeroCode {
+                    raw_session_id: "same-session".into(),
+                },
+                "rpc_same-session",
+            ),
+        ] {
+            let expected_session_key = session_key.clone();
+            let expected_surface = session_key.surface();
+            let principal = match expected_surface {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            let ingress =
+                GoalIngressContext::trusted(session_key, "main", "direct", principal).unwrap();
+            assert_eq!(ingress.surface(), expected_surface);
+            assert_eq!(ingress.session_key(), &expected_session_key);
+            assert_eq!(ingress.session_key().durable_id(), expected_durable_id);
+        }
     }
 
     #[test]

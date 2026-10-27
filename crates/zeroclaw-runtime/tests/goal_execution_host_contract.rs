@@ -18,8 +18,8 @@ use zeroclaw_goal::{
     GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
-    GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
-    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
+    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
+    GoalTransitionResult, SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 
 struct RecordingDriver {
@@ -269,6 +269,9 @@ struct LeaseObservingRegistry {
     pause_observed: AtomicUsize,
     replacement_after_missing_goal: Option<TaskRecord>,
     missing_goal_observed: AtomicBool,
+    task_after_goal_read: Option<TaskRecord>,
+    goal_after_goal_read: Option<GoalTaskRecord>,
+    goal_read_observed: AtomicBool,
 }
 
 impl LeaseObservingRegistry {
@@ -303,6 +306,9 @@ impl LeaseObservingRegistry {
             pause_observed: AtomicUsize::new(0),
             replacement_after_missing_goal: None,
             missing_goal_observed: AtomicBool::new(false),
+            task_after_goal_read: None,
+            goal_after_goal_read: None,
+            goal_read_observed: AtomicBool::new(false),
         }
     }
 
@@ -312,6 +318,29 @@ impl LeaseObservingRegistry {
         let mut replacement = registry.task.clone();
         replacement.id = "replacement-goal".to_owned();
         registry.replacement_after_missing_goal = Some(replacement);
+        registry
+    }
+
+    fn paused_with_change_after_goal_read(
+        ingress: &GoalIngressContext,
+        changed_status: TaskStatus,
+        changed_epoch: i64,
+    ) -> Self {
+        let mut registry = Self::running_for(ingress, Arc::new(AtomicUsize::new(1)));
+        registry.task.status = TaskStatus::Paused;
+        registry.goal.pause_reason = Some(GoalPauseReason::OperatorPaused);
+        registry.goal.pause_description = Some("paused by operator".to_owned());
+        let mut changed_task = registry.task.clone();
+        changed_task.status = changed_status;
+        changed_task.execution_epoch = changed_epoch;
+        if changed_status == TaskStatus::Running {
+            let mut resumed_goal = registry.goal.clone();
+            resumed_goal.pause_reason = None;
+            resumed_goal.pause_description = None;
+            resumed_goal.blockers.clear();
+            registry.goal_after_goal_read = Some(resumed_goal);
+        }
+        registry.task_after_goal_read = Some(changed_task);
         registry
     }
 
@@ -357,7 +386,13 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
             self.missing_goal_observed.store(true, Ordering::SeqCst);
             return Ok(None);
         }
-        Ok(Some(self.goal.clone()))
+        self.goal_read_observed.store(true, Ordering::SeqCst);
+        Ok(Some(
+            self.goal_after_goal_read
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.goal.clone()),
+        ))
     }
 
     async fn update_goal_limits(
@@ -397,13 +432,18 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>> {
         assert_eq!(self.task.session_id.as_deref(), Some(session_id));
-        Ok(Some(
+        Ok(Some(if self.goal_read_observed.load(Ordering::SeqCst) {
+            self.task_after_goal_read
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.task.clone())
+        } else {
             self.replacement_after_missing_goal
                 .as_ref()
                 .filter(|_| self.missing_goal_observed.load(Ordering::SeqCst))
                 .cloned()
-                .unwrap_or_else(|| self.task.clone()),
-        ))
+                .unwrap_or_else(|| self.task.clone())
+        }))
     }
 
     async fn terminal_reason_for_session_goal(
@@ -531,8 +571,10 @@ fn goal_config(enabled: bool, verifier: &str, limits: ConfigGoalBudgetLimits) ->
     let mut config = Config {
         goal: GoalConfig {
             enabled,
-            default_token_limit: limits.token_limit.unwrap_or_default(),
-            default_cost_limit_usd: limits.cost_limit_usd.unwrap_or_default(),
+            // A normalized `None` means explicitly unlimited in these legacy
+            // fixtures, not an unconfigured default.
+            default_token_limit: Some(limits.token_limit.unwrap_or(0)),
+            default_cost_limit_usd: Some(limits.cost_limit_usd.unwrap_or(0.0)),
             verifier: zeroclaw_config::goal::GoalVerifierConfig {
                 model_provider: ModelProviderRef::new(verifier),
                 model: None,
@@ -1090,6 +1132,233 @@ async fn explicit_unlimited_goal_defaults_remain_unlimited() {
     };
     assert_eq!(started.token_limit, None);
     assert_eq!(started.cost_limit_usd, None);
+}
+
+#[tokio::test]
+async fn start_without_budget_flags_or_defaults_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let driver = recording_driver(&ingress);
+        let mut config = valid_goal_config(true);
+        config.goal.default_token_limit = None;
+        config.goal.default_cost_limit_usd = None;
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "start without a configured budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_command_budgets_start_without_configured_defaults() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        for (budget, expected_tokens, expected_cost) in [
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: None,
+                }),
+                Some(10),
+                None,
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: None,
+                    cost_limit_usd: Some(2.5),
+                }),
+                None,
+                Some(2.5),
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: Some(2.5),
+                }),
+                Some(10),
+                Some(2.5),
+            ),
+            (GoalBudgetSelection::Unlimited, None, None),
+        ] {
+            let mut config = valid_goal_config(true);
+            config.goal.default_token_limit = None;
+            config.goal.default_cost_limit_usd = None;
+            let driver = recording_driver(&ingress);
+            let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+            let submission = GoalExecutionHost::new()
+                .submit(
+                    &host_settings(&config),
+                    ingress.clone(),
+                    driver,
+                    GoalCommand::Start {
+                        budget,
+                        objective: "start with the explicit command budget".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let GoalResponse::Started(started) = controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap()
+            else {
+                panic!("expected explicit command budget to admit Goal start");
+            };
+            assert_eq!(started.token_limit, expected_tokens);
+            assert_eq!(started.cost_limit_usd, expected_cost);
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_positive_default_starts_with_that_limit() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(500),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "use the single configured token limit".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(started) = controller
+            .submit(&host_settings(&config), &submission)
+            .await
+            .unwrap()
+        else {
+            panic!("expected positive token default to admit Goal start");
+        };
+        assert_eq!(started.token_limit, Some(500));
+        assert_eq!(started.cost_limit_usd, None);
+    }
+}
+
+#[tokio::test]
+async fn zero_token_default_without_cost_default_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(0),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "do not treat a zero-only default as a budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn invalid_defaults_reject_explicit_budget_start_with_typed_path() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(-1.0),
+            },
+        );
+        let driver = recording_driver(&ingress);
+        let error = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                        token_limit: Some(10),
+                        cost_limit_usd: None,
+                    }),
+                    objective: "invalid defaults must reject before binding".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_admission_error(
+            error,
+            ConfigApiCode::InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+        );
+        assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -2724,6 +2993,113 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         driver.reconnect_is_allowed(),
         "the lease may release after the guarded lifecycle submission is settled"
     );
+}
+
+async fn status_for_registry(
+    config: &GoalHostSettings<'_>,
+    ingress: &GoalIngressContext,
+    registry: Arc<LeaseObservingRegistry>,
+) -> GoalResponse {
+    let controller = GoalController::new(registry as Arc<dyn GoalTaskRegistry>);
+    let submission = GoalExecutionHost::new()
+        .submit(
+            config,
+            ingress.clone(),
+            recording_driver(ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    controller.submit(config, &submission).await.unwrap()
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_resume_changes_status_and_epoch() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Running,
+        2,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_terminal_status_change() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Cancelled,
+        1,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_epoch_only_change() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Paused,
+        2,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_preserves_stable_running_and_paused_snapshots() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let mut running_fixture =
+        LeaseObservingRegistry::running_for(&ingress, Arc::new(AtomicUsize::new(1)));
+    running_fixture.goal.effective_token_limit = Some(100);
+    running_fixture.goal.effective_cost_limit_usd = Some(0.75);
+    let running = Arc::new(running_fixture);
+
+    let GoalResponse::Status(running) = status_for_registry(&settings, &ingress, running).await
+    else {
+        panic!("stable running task should project as status");
+    };
+    assert_eq!(running.status, TaskStatus::Running);
+    assert_eq!(running.execution_epoch, 1);
+    assert_eq!(running.pause_reason, None);
+    assert_eq!(running.token_limit, Some(100));
+    assert_eq!(running.cost_limit_usd, Some(0.75));
+    assert_eq!(running.accounting_state, GoalAccountingState::Complete);
+    assert!(!running.resumable);
+
+    let mut paused = LeaseObservingRegistry::running_for(&ingress, Arc::new(AtomicUsize::new(1)));
+    paused.task.status = TaskStatus::Paused;
+    paused.goal.pause_reason = Some(GoalPauseReason::OperatorPaused);
+    paused.goal.pause_description = Some("paused by operator".to_owned());
+    let GoalResponse::Status(paused) =
+        status_for_registry(&settings, &ingress, Arc::new(paused)).await
+    else {
+        panic!("stable paused task should project as status");
+    };
+    assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(paused.execution_epoch, 1);
+    assert_eq!(paused.pause_reason, Some(GoalPauseReason::OperatorPaused));
+    assert!(paused.resumable);
 }
 
 #[tokio::test]
