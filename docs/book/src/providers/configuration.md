@@ -329,6 +329,9 @@ To roll back per-profile effort, set `native_thinking = false` on the affected
 profile. This restores the global/default wire behavior without changing the
 profile's configured level. Apply the change through the runtime's existing
 reload or restart lifecycle, including recreating existing Agent/RPC sessions.
+The same toggle controls existing native token budgets for other providers.
+For a mixed-provider profile, revert the feature if those budgets must remain
+enabled while restoring the previous OpenAI behavior.
 Reverting the feature also requires reverting Rust
 request-constructor updates described in the [custom-provider guide](./custom.md#rust-request-construction).
 
