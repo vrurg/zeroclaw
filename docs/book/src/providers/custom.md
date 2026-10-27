@@ -149,6 +149,11 @@ of `default_budget_tokens()` must import
 `zeroclaw_config::scattered_types::ThinkingLevelBudget`, which keeps the budget
 policy in configuration. Existing TOML keys, values and budgets are unchanged.
 
+Downstream literals of the runtime's `ThinkingParams` also need its new
+`native_level` field. Use `apply_thinking_level_with_config` to resolve it from
+the existing opt-in and selected level; use `None` for a context without an
+explicit native level.
+
 ## Implementing a new `ModelProvider` trait
 
 If the endpoint isn't OpenAI-compatible and isn't one of the local-server slots, you need code.

@@ -359,9 +359,9 @@ pub(crate) async fn finish_after_max_iterations(
             }
             let summary_request = zeroclaw_providers::ChatRequest {
                 messages: &messages,
+                // No tools — force a text response.
                 tools: None,
                 thinking_level: zeroclaw_api::current_native_thinking_level(),
-                // No tools — force a text response
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
