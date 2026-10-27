@@ -2332,6 +2332,7 @@ while IFS= read -r line; do :; done
             let request = ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             };
             let reply = model_provider

@@ -23,6 +23,7 @@ pub mod ollama;
 mod ollama_wire;
 pub mod openai;
 pub mod openai_codex;
+mod openai_reasoning;
 pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
@@ -3532,6 +3533,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -3621,6 +3623,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -3658,6 +3661,7 @@ mod tests {
         let bare_request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -4122,6 +4126,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test-model",
