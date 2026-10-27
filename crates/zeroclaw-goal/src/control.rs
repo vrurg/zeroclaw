@@ -73,14 +73,11 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded key, a key whose existing shared
     /// sanitizer would change it, or a key outside the `matrix_` namespace.
     pub fn matrix(history_key: impl Into<String>) -> Result<Self> {
-        let history_key = canonical_nonblank("Matrix history key", history_key.into())?;
-        if sanitize_session_key(&history_key) != history_key {
-            bail!("Matrix Goal history key is not canonical");
-        }
-        if !history_key.starts_with("matrix_") {
-            bail!("Matrix Goal history key is outside the Matrix namespace");
-        }
-        Ok(Self::Matrix { history_key })
+        let key = Self::Matrix {
+            history_key: history_key.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
     }
 
     /// Build a ZeroCode key from the adapter's canonical raw session ID.
@@ -94,11 +91,32 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded ID, or an ID whose existing
     /// shared sanitizer would change it.
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
-        let raw_session_id = canonical_nonblank("ZeroCode session id", raw_session_id.into())?;
-        if sanitize_session_key(&raw_session_id) != raw_session_id {
-            bail!("ZeroCode Goal session id is not canonical");
+        let key = Self::ZeroCode {
+            raw_session_id: raw_session_id.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        match self {
+            Self::Matrix { history_key } => {
+                require_canonical_nonblank("Matrix history key", history_key)?;
+                if sanitize_session_key(history_key) != *history_key {
+                    bail!("Matrix Goal history key is not canonical");
+                }
+                if !history_key.starts_with("matrix_") {
+                    bail!("Matrix Goal history key is outside the Matrix namespace");
+                }
+            }
+            Self::ZeroCode { raw_session_id } => {
+                require_canonical_nonblank("ZeroCode session id", raw_session_id)?;
+                if sanitize_session_key(raw_session_id) != *raw_session_id {
+                    bail!("ZeroCode Goal session id is not canonical");
+                }
+            }
         }
-        Ok(Self::ZeroCode { raw_session_id })
+        Ok(())
     }
 
     pub const fn surface(&self) -> GoalSurface {
@@ -179,7 +197,8 @@ impl GoalIngressContext {
     /// # Errors
     ///
     /// Returns an error if the principal surface differs from the session key,
-    /// or if the agent, route, or principal is blank.
+    /// the directly constructed session key is not canonical, or if the agent,
+    /// route, or principal is blank.
     pub fn trusted(
         session_key: GoalSessionKey,
         agent: impl Into<String>,
@@ -189,6 +208,7 @@ impl GoalIngressContext {
         if session_key.surface() != principal.surface() {
             bail!("Goal ingress principal does not match the session surface");
         }
+        session_key.validate_canonical()?;
         principal.validate()?;
         Ok(Self {
             session_key,
@@ -1184,14 +1204,29 @@ impl GoalController {
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, &goal))),
+            Some(goal) => {
+                // The extension read can overlap a lifecycle transition. Fence
+                // the projection with a fresh canonical task snapshot so its
+                // status and epoch cannot come from different moments.
+                let current = self.current(ingress, session_id).await?;
+                if current
+                    .as_ref()
+                    .is_none_or(|current| !same_task_snapshot(current, task))
+                {
+                    return Ok(None);
+                }
+                Ok(Some(GoalStatusProjection::from_parts(task, &goal)))
+            }
             None => {
                 // A terminal predecessor can be atomically replaced between
-                // the current-task read and extension read. Recheck only on
-                // that exceptional missing-extension path so a genuine
-                // corrupt current task remains an error.
+                // the current-task read and extension read. Keep reporting a
+                // genuine missing-extension error only while the same task
+                // snapshot remains current.
                 let current = self.current(ingress, session_id).await?;
-                if current.as_ref().is_none_or(|current| current.id != task.id) {
+                if current
+                    .as_ref()
+                    .is_none_or(|current| !same_task_snapshot(current, task))
+                {
                     Ok(None)
                 } else {
                     bail!("Goal task extension is missing")
@@ -1223,6 +1258,12 @@ impl GoalController {
             .await?
             .map_or(GoalResponse::Stale, response))
     }
+}
+
+fn same_task_snapshot(current: &TaskRecord, original: &TaskRecord) -> bool {
+    current.id == original.id
+        && current.status == original.status
+        && current.execution_epoch == original.execution_epoch
 }
 
 fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
@@ -1337,6 +1378,77 @@ mod tests {
     fn zerocode_key_must_keep_the_existing_canonical_session_form() {
         assert!(GoalSessionKey::zero_code("same session").is_err());
         assert!(GoalSessionKey::zero_code("same-session").is_ok());
+    }
+
+    #[test]
+    fn trusted_ingress_rejects_noncanonical_public_session_variants() {
+        for session_key in [
+            GoalSessionKey::Matrix {
+                history_key: "rpc_shared".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: " matrix_room ".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "matrix_room with spaces".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "same session".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: " padded ".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "".into(),
+            },
+        ] {
+            let principal = match session_key.surface() {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            assert!(GoalIngressContext::trusted(session_key, "main", "direct", principal).is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_ingress_preserves_valid_canonical_session_variants() {
+        for (session_key, expected_durable_id) in [
+            (
+                GoalSessionKey::Matrix {
+                    history_key: "matrix_room_primary".into(),
+                },
+                "matrix_room_primary",
+            ),
+            (
+                GoalSessionKey::ZeroCode {
+                    raw_session_id: "same-session".into(),
+                },
+                "rpc_same-session",
+            ),
+        ] {
+            let expected_session_key = session_key.clone();
+            let expected_surface = session_key.surface();
+            let principal = match expected_surface {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            let ingress =
+                GoalIngressContext::trusted(session_key, "main", "direct", principal).unwrap();
+            assert_eq!(ingress.surface(), expected_surface);
+            assert_eq!(ingress.session_key(), &expected_session_key);
+            assert_eq!(ingress.session_key().durable_id(), expected_durable_id);
+        }
     }
 
     #[test]
