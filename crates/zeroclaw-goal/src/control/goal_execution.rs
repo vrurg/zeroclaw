@@ -27,6 +27,10 @@ use super::{
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
 const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
+/// Maximum UTF-8 bytes accepted before parsing a verifier response.
+const MAX_VERIFIER_RESPONSE_BYTES: usize = 1_048_576;
+/// Maximum compact-JSON bytes retained for one blocker payload.
+pub(super) const MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES: usize = 4_096;
 
 /// Terminal or paused result of one owned Goal execution epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +425,12 @@ enum VerifierDecision {
 }
 
 fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
+    // The raw limit bounds parsing and the payload limit bounds stored pause
+    // state. Neither limit alters an accepted value.
+    ensure!(
+        raw.len() <= MAX_VERIFIER_RESPONSE_BYTES,
+        "verifier response is too large"
+    );
     let response: VerifierWireResponse =
         serde_json::from_str(raw).context("verifier response is not strict JSON")?;
     let reason = response.reason.trim().to_owned();
@@ -439,6 +449,14 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
                 && blocker.message.chars().count() <= MAX_VERIFIER_BLOCKER_MESSAGE_CHARS,
             "verifier blocker message is invalid"
         );
+        if let Some(payload) = &blocker.payload {
+            let encoded = serde_json::to_string(payload)
+                .context("verifier blocker payload cannot be encoded")?;
+            ensure!(
+                encoded.len() <= MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES,
+                "verifier blocker payload is too large"
+            );
+        }
     }
 
     match response.decision {
@@ -568,5 +586,71 @@ mod tests {
             pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::ExternalDependency)]),
             GoalPauseReason::ExternalDependency
         );
+    }
+
+    #[test]
+    fn verifier_protocol_accepts_a_blocker_payload_at_the_byte_limit() {
+        // Multibyte data at the compact-JSON byte ceiling remains unchanged.
+        let payload = serde_json::json!({"context": "é".repeat(2_041)});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let VerifierDecision::Blocked { blockers } = parse_verifier_response(&raw).unwrap() else {
+            panic!("expected a bounded blocked decision");
+        };
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].payload.as_ref(), Some(&payload));
+    }
+
+    #[test]
+    fn verifier_protocol_rejects_a_blocker_payload_over_the_byte_limit() {
+        // One ASCII byte over the multibyte boundary rejects the whole value.
+        let payload = serde_json::json!({"context": format!("{}x", "é".repeat(2_041))});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES + 1
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("payload is too large"));
+    }
+
+    #[test]
+    fn verifier_protocol_bounds_the_raw_response_bytes() {
+        // Whitespace counts toward the pre-parse UTF-8 response ceiling.
+        let mut raw =
+            r#"{"decision":"continue","reason":"finish the criterion","blockers":[]}"#.to_owned();
+        raw.extend(std::iter::repeat_n(
+            ' ',
+            MAX_VERIFIER_RESPONSE_BYTES - raw.len(),
+        ));
+        assert_eq!(raw.len(), MAX_VERIFIER_RESPONSE_BYTES);
+        assert!(matches!(
+            parse_verifier_response(&raw).unwrap(),
+            VerifierDecision::Continue { .. }
+        ));
+        raw.push(' ');
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("response is too large"));
     }
 }
