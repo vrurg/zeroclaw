@@ -10,7 +10,9 @@ use zeroclaw_api::{
 };
 
 use crate::{
-    accounting::{GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory},
+    accounting::{
+        GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOperationAccountingFactory,
+    },
     task::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
         GoalTaskRegistry, GoalTransitionResult,
@@ -40,6 +42,13 @@ pub struct GoalExecutionEngine {
     runtime: GoalRuntime,
     registry: Arc<dyn GoalTaskRegistry>,
     accounting_factory: Arc<dyn GoalOperationAccountingFactory>,
+}
+
+// Context layers may wrap a failure, but only its type determines accounting classification.
+fn is_accounting_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<GoalAccountingFailure>())
 }
 
 impl GoalExecutionEngine {
@@ -145,8 +154,15 @@ impl GoalExecutionEngine {
                     }
                 }
                 Err(error) => {
-                    self.fail(scope, "parent_operation_failed").await?;
-                    return Err(error).context("Goal parent operation failed");
+                    let (reason, error) = if is_accounting_failure(&error) {
+                        ("accounting_missing_or_invalid", error)
+                    } else {
+                        (
+                            "parent_operation_failed",
+                            error.context("Goal parent operation failed"),
+                        )
+                    };
+                    return Err(self.fail_with(scope, reason, error).await);
                 }
             };
 
@@ -171,8 +187,15 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
-                    self.fail(scope, "verifier_operation_failed").await?;
-                    return Err(error).context("Goal verifier operation failed");
+                    let (reason, error) = if is_accounting_failure(&error) {
+                        ("accounting_missing_or_invalid", error)
+                    } else {
+                        (
+                            "verifier_operation_failed",
+                            error.context("Goal verifier operation failed"),
+                        )
+                    };
+                    return Err(self.fail_with(scope, reason, error).await);
                 }
             };
 
@@ -211,8 +234,13 @@ impl GoalExecutionEngine {
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
-            self.fail(scope, "accounting_missing_or_invalid").await?;
-            bail!("Goal accounting is incomplete");
+            let error = anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.accounting_state,
+                goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some(),
+            ));
+            return Err(self
+                .fail_with(scope, "accounting_missing_or_invalid", error)
+                .await);
         }
         if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
             self.fail(scope, "pricing_unavailable").await?;
@@ -290,6 +318,19 @@ impl GoalExecutionEngine {
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
                 bail!("Goal verifier pause lost its execution fence")
             }
+        }
+    }
+
+    // A failed lifecycle transition must not replace the operation's original error.
+    async fn fail_with(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.fail(scope, reason).await {
+            Ok(()) => error,
+            Err(transition_error) => error.context(format!("{transition_error:#}")),
         }
     }
 
@@ -438,6 +479,24 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounting_failures_are_classified_by_type_through_context_layers() {
+        // Context preserves typed classification, while an identical message is insufficient.
+        let failure = GoalAccountingFailure::settled(
+            GoalAccountingState::Invalid,
+            &["fixture pricing failed".to_owned()],
+        );
+        let same_text = failure.to_string();
+        let error = anyhow::Error::new(failure)
+            .context("fixture turn context")
+            .context("fixture outer context");
+        assert!(is_accounting_failure(&error));
+        assert!(!is_accounting_failure(&anyhow::anyhow!(same_text)));
+        assert!(!is_accounting_failure(&anyhow::Error::new(
+            crate::accounting::GoalOperationFenced::NOT_RUNNING,
+        )));
+    }
 
     #[test]
     fn verifier_continuation_feedback_is_user_role_data() {

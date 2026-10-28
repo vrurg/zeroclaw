@@ -491,11 +491,15 @@ pub trait GoalSessionExecutionLease: Send {
     async fn append_resume_response(&mut self, _response: String) -> Result<()> {
         bail!("Goal session driver cannot durably append a resume response")
     }
+    /// Return the turn's error without replacing its error object. Context
+    /// layers are allowed; the engine classifies Goal accounting failures by type.
     async fn run_parent_turn(
         &mut self,
         scope: &GoalExecutionScope,
         turn: GoalParentTurn,
     ) -> Result<String>;
+    /// Return the turn's error without replacing its error object. Context
+    /// layers are allowed; the engine classifies Goal accounting failures by type.
     async fn run_verifier(
         &mut self,
         scope: &GoalExecutionScope,
