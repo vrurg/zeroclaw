@@ -5679,6 +5679,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editor_validation_regression_cross_field_input_edit_is_rejected_without_publishing() {
+        // An unchanged TTL error still rejects edits to its announce-interval input.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.nodes.mdns.peer_ttl_secs = 30;
+        config.nodes.mdns.announce_interval_secs = 60;
+
+        assert_editor_patch_rejected_without_mutation(
+            config,
+            serde_json::json!([{
+                "op": "replace",
+                "path": "/nodes/mdns/announce_interval_secs",
+                "value": 120
+            }]),
+            "invalid_numeric_range",
+            Some("nodes.mdns.peer_ttl_secs"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn editor_validation_regression_unrelated_edit_keeps_cross_field_warning() {
+        // Unrelated saves preserve the TTL warning and the complete persisted state.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.nodes.mdns.peer_ttl_secs = 30;
+        config.nodes.mdns.announce_interval_secs = 60;
+        let max_tasks = config.scheduler.max_tasks + 1;
+        config.save().await.unwrap();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/scheduler/max_tasks",
+                    "value": max_tasks
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let warnings: Vec<_> = json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "pre_existing_validation_error")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{json}");
+        assert_eq!(warnings[0]["path"], "nodes.mdns.peer_ttl_secs", "{json}");
+        assert_eq!(state.config.read().scheduler.max_tasks, max_tasks);
+        assert_eq!(state.config.read().nodes.mdns.peer_ttl_secs, 30);
+        assert_eq!(state.config.read().nodes.mdns.announce_interval_secs, 60);
+        let reloaded = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&state.config.read().config_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(state.config.read().clone()).unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn goal_patch_enabling_with_configured_verifier_saves_without_budget_keys() {
         // A valid enable-only save must not invent default budget values.
         let tmp = tempfile::tempdir().unwrap();

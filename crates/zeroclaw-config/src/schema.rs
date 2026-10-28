@@ -24304,6 +24304,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("runtime_profiles.{profile_alias}.effort_routing"),
+                        related = &[format!("runtime_profiles.{profile_alias}.auto_classify")],
                         "runtime_profiles.{profile_alias}.effort_routing cannot be combined with runtime_profiles.{profile_alias}.auto_classify"
                     );
                 }
@@ -24330,6 +24331,9 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        related = &[format!(
+                            "runtime_profiles.{profile_alias}.effort_routing.local_hint"
+                        )],
                         "runtime_profiles.{profile_alias}.effort_routing local_hint and cloud_hint must name distinct model_routes"
                     );
                 }
@@ -24339,6 +24343,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("runtime_profiles.{profile_alias}.effort_routing.{field}"),
+                            related = &["model_routes".to_string()],
                             "runtime_profiles.{profile_alias}.effort_routing.{field} = {hint:?} but no model_routes entry has that hint"
                         );
                     }
@@ -24389,6 +24394,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "tunnel.openvpn.config_file",
+                    related = &["tunnel.tunnel_provider".to_string()],
                     "tunnel.openvpn.config_file must not be empty"
                 );
             }
@@ -24397,6 +24403,7 @@ impl Config {
                     pass,
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
+                    related = &["tunnel.tunnel_provider".to_string()],
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
                 );
             }
@@ -24463,7 +24470,10 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
-            pass.helper(tg.validate_bot_token(alias), &[])?;
+            pass.helper(
+                tg.validate_bot_token(alias),
+                &[format!("channels.telegram.{alias}.enabled")],
+            )?;
             pass.helper(
                 validate_http_base_url(
                     &format!("channels.telegram.{alias}.api_base_url"),
@@ -24493,7 +24503,10 @@ impl Config {
         }
 
         for (alias, dc) in &self.channels.discord {
-            pass.helper(dc.validate_bot_token(alias), &[])?;
+            pass.helper(
+                dc.validate_bot_token(alias),
+                &[format!("channels.discord.{alias}.enabled")],
+            )?;
         }
 
         // Signal and Voice Call: like Telegram/Discord's bot_token, these
@@ -24517,7 +24530,7 @@ impl Config {
                     vc.enabled,
                     &vc.account_id,
                 ),
-                &[],
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
             pass.helper(
                 validate_required_field(
@@ -24526,7 +24539,7 @@ impl Config {
                     vc.enabled,
                     &vc.auth_token,
                 ),
-                &[],
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
             pass.helper(
                 validate_required_field(
@@ -24535,7 +24548,7 @@ impl Config {
                     vc.enabled,
                     &vc.from_number,
                 ),
-                &[],
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
         }
 
@@ -24554,12 +24567,22 @@ impl Config {
                         pass,
                         RequiredFieldEmpty,
                         path,
+                        related = &[
+                            format!("channels.git.{alias}.enabled"),
+                            format!("channels.git.{alias}.provider")
+                        ],
                         "{path} is required when provider = \"{provider}\": set the \
                          instance's API base URL including /api/v1 (e.g. \
                          https://git.example.org/api/v1); no default host is assumed \
                          because API requests carry the access token"
                     ),
-                    Some(url) => pass.helper(validate_http_base_url(&path, url), &[])?,
+                    Some(url) => pass.helper(
+                        validate_http_base_url(&path, url),
+                        &[
+                            format!("channels.git.{alias}.enabled"),
+                            format!("channels.git.{alias}.provider"),
+                        ],
+                    )?,
                 }
             }
         }
@@ -24618,6 +24641,7 @@ impl Config {
                 pass,
                 InvalidNumericRange,
                 "nodes.mdns.peer_ttl_secs",
+                related = &["nodes.mdns.announce_interval_secs".to_string()],
                 "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
             );
         }
@@ -24665,6 +24689,11 @@ impl Config {
                     pass,
                     InvalidFormat,
                     flag_path,
+                    related = &[
+                        "memory.backend".to_string(),
+                        "memory.types.enabled".to_string(),
+                        "memory.consolidation_extract_facts".to_string()
+                    ],
                     "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
@@ -24676,6 +24705,10 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
+                        related = &[
+                            "memory.types.enabled".to_string(),
+                            "memory.consolidation_extract_facts".to_string()
+                        ],
                         "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
@@ -24700,6 +24733,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "heartbeat.agent",
+                    related = &["heartbeat.enabled".to_string()],
                     "heartbeat.agent must reference a configured agent when heartbeat.enabled = true"
                 );
             }
@@ -24708,6 +24742,10 @@ impl Config {
                     pass,
                     DanglingReference,
                     "heartbeat.agent",
+                    related = &[
+                        "heartbeat.enabled".to_string(),
+                        format!("agents.{hb_agent}")
+                    ],
                     "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
                 );
             }
@@ -24907,6 +24945,11 @@ impl Config {
                 pass,
                 ValidationFailed,
                 "wss.enabled",
+                related = &[
+                    "oidc".to_string(),
+                    "gateway.paired_tokens".to_string(),
+                    "gateway.require_pairing".to_string()
+                ],
                 "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
             );
         }
@@ -25061,6 +25104,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("model_routes[{i}].model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -25115,6 +25159,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("embedding_routes[{i}].model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -25335,6 +25380,7 @@ impl Config {
                     pass,
                     InvalidNumericRange,
                     "knowledge.max_nodes",
+                    related = &["knowledge.enabled".to_string()],
                     "knowledge.max_nodes must be greater than 0"
                 );
             }
@@ -25343,6 +25389,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "knowledge.db_path",
+                    related = &["knowledge.enabled".to_string()],
                     "knowledge.db_path must not be empty"
                 );
             }
@@ -25580,6 +25627,7 @@ impl Config {
                     pass,
                     InvalidNumericRange,
                     "notion.poll_interval_secs",
+                    related = &["notion.enabled".to_string()],
                     "notion.poll_interval_secs must be greater than 0"
                 );
             }
@@ -25588,6 +25636,7 @@ impl Config {
                     pass,
                     InvalidNumericRange,
                     "notion.max_concurrent",
+                    related = &["notion.enabled".to_string()],
                     "notion.max_concurrent must be greater than 0"
                 );
             }
@@ -25596,6 +25645,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "notion.status_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.status_property must not be empty"
                 );
             }
@@ -25604,6 +25654,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "notion.input_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.input_property must not be empty"
                 );
             }
@@ -25612,6 +25663,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     "notion.result_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.result_property must not be empty"
                 );
             }
@@ -25723,6 +25775,7 @@ impl Config {
                             format!(
                                 "runtime_profiles.{palias}.context_compression.summary_provider"
                             ),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -25774,6 +25827,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
@@ -25806,6 +25860,7 @@ impl Config {
                                 pass,
                                 DanglingReference,
                                 format!("agents.{alias}.channels[{i}]"),
+                                related = &[format!("channels.{ty}.{inner}")],
                                 "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
                             );
                         }
@@ -25860,6 +25915,7 @@ impl Config {
                                 pass,
                                 DanglingReference,
                                 format!("agents.{alias}.{field}"),
+                                related = &[format!("{section_prefix}.{ty}.{inner}")],
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
@@ -25903,6 +25959,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("agents.{alias}.{field}[{i}]"),
+                            related = &[format!("{section}.{trimmed}")],
                             "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
                         );
                     }
@@ -25929,6 +25986,7 @@ impl Config {
                         pass,
                         DanglingReference,
                         format!("agents.{alias}.{field}"),
+                        related = &[format!("{section}.{trimmed}")],
                         "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
                     );
                 }
@@ -25943,6 +26001,7 @@ impl Config {
                     pass,
                     RequiredFieldEmpty,
                     format!("agents.{alias}.risk_profile"),
+                    related = &[format!("agents.{alias}.enabled")],
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
                 );
             }
@@ -25976,6 +26035,7 @@ impl Config {
                         pass,
                         DanglingReference,
                         format!("agents.{alias}.delegates[{i}].agent"),
+                        related = &[format!("agents.{target_str}")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -25984,6 +26044,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("agents.{alias}.delegates[{i}].agent"),
+                        related = &[format!("agents.{alias}.delegates")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
                     );
                 }
@@ -26006,6 +26067,7 @@ impl Config {
                         pass,
                         DanglingReference,
                         format!("agents.{alias}.workspace.access.{target_str}"),
+                        related = &[format!("agents.{target_str}")],
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -26040,6 +26102,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        related = &[format!("agents.{alias}.workspace.read_memory_from")],
                         "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
                     );
                 }
@@ -26068,6 +26131,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        related = &[format!("agents.{alias}.memory.backend")],
                         "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
                     );
                 }
@@ -26077,6 +26141,10 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        related = &[
+                            format!("agents.{alias}.memory.backend"),
+                            format!("agents.{target_str}.memory.backend")
+                        ],
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
                     );
                 }
@@ -26120,6 +26188,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -26136,6 +26205,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -26144,6 +26214,7 @@ impl Config {
                             pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}.{alias}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
                         );
                     }
@@ -26174,6 +26245,10 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
+                        related = &[
+                            format!("agents.{member_str}.channels"),
+                            format!("peer_groups.{group_name}.channel")
+                        ],
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
                     );
                 }
@@ -26276,6 +26351,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
+                        related = &[format!("plugins.entries.{}.egress_hosts", entry.name)],
                         "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
@@ -26302,6 +26378,7 @@ impl Config {
                         pass,
                         InvalidFormat,
                         format!("{path}.name"),
+                        related = &[format!("plugins.entries.{}.tls_profiles", entry.name)],
                         "plugins.entries.{}.tls_profiles has more than one profile named {:?}",
                         entry.name,
                         profile.name
@@ -26330,6 +26407,7 @@ impl Config {
                             pass,
                             InvalidFormat,
                             format!("{path}.hosts"),
+                            related = &[format!("plugins.entries.{}.egress_hosts", entry.name)],
                             "{path}.hosts lists {host:?}, which is not granted by plugins.entries.{}.egress_hosts; a TLS profile selects certificates for a granted destination, it does not grant one",
                             entry.name
                         );

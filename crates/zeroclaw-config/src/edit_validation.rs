@@ -66,6 +66,15 @@ impl<'a> ValidationPass<'a> {
 }
 
 macro_rules! retainable_bail {
+    // A retained check must name its other inputs so their edits are not unrelated.
+    ($pass:expr, $code:ident, $path:expr, related = $related:expr, $($msg:tt)*) => {{
+        let err = $crate::api_error::ConfigApiError::new(
+            $crate::api_error::ConfigApiCode::$code,
+            format!($($msg)*),
+        )
+        .with_path($path);
+        $pass.helper(::std::result::Result::Err(::anyhow::Error::from(err)), $related)?;
+    }};
     ($pass:expr, $code:ident, $path:expr, $($msg:tt)*) => {{
         let err = $crate::api_error::ConfigApiError::new(
             $crate::api_error::ConfigApiCode::$code,
@@ -115,8 +124,9 @@ impl Config {
     ///
     /// Structured diagnostics may be retained as warnings only when their
     /// exact code, path, and message already occur in `baseline`, neither the
-    /// diagnostic nor the checks skipped at its site overlap a dirty path, and
-    /// validation can continue past that site. New, dirty-related, pathless,
+    /// diagnostic nor the checks skipped at its site, including every other
+    /// input the retained check reads, overlap a dirty path, and validation can
+    /// continue past that site. New, dirty-related, pathless,
     /// unstructured, repeated, and baseline-overflow diagnostics fail closed.
     /// Candidate and baseline values are never mutated or default-substituted.
     pub fn validate_edit_against(
@@ -527,6 +537,128 @@ mod tests {
             validate_without_mutation(&candidate, &baseline),
             ConfigApiCode::RequiredFieldEmpty,
             Some("storage.lucid.256.binary_path"),
+        );
+    }
+
+    #[test]
+    fn cross_field_input_edit_rejects_retained_mdns_ttl_error() {
+        // The announce interval is another input of the unchanged TTL diagnostic.
+        let mut baseline = Config::default();
+        baseline.nodes.mdns.peer_ttl_secs = 30;
+        baseline.nodes.mdns.announce_interval_secs = 60;
+        let mut candidate = baseline.clone();
+        candidate.nodes.mdns.announce_interval_secs = 120;
+        candidate.mark_dirty("nodes.mdns.announce_interval_secs");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("nodes.mdns.peer_ttl_secs"),
+        );
+    }
+
+    #[test]
+    fn unrelated_edit_retains_mdns_ttl_error_as_warning() {
+        // A scheduler edit does not participate in the failing TTL relation.
+        let mut baseline = Config::default();
+        baseline.nodes.mdns.peer_ttl_secs = 30;
+        baseline.nodes.mdns.announce_interval_secs = 60;
+        let mut candidate = baseline.clone();
+        candidate.scheduler.max_tasks = baseline.scheduler.max_tasks + 1;
+        candidate.mark_dirty("scheduler.max_tasks");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("unrelated edit retains the existing TTL diagnostic");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, PRE_EXISTING_VALIDATION_ERROR);
+        assert_eq!(warnings[0].path, "nodes.mdns.peer_ttl_secs");
+    }
+
+    #[test]
+    fn repairing_mdns_announce_interval_saves_without_warning() {
+        // Repairing the related input removes the baseline error completely.
+        let mut baseline = Config::default();
+        baseline.nodes.mdns.peer_ttl_secs = 30;
+        baseline.nodes.mdns.announce_interval_secs = 60;
+        let mut candidate = baseline.clone();
+        candidate.nodes.mdns.announce_interval_secs = 20;
+        candidate.mark_dirty("nodes.mdns.announce_interval_secs");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("a repaired TTL relation must validate");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn final_state_mdns_repair_across_both_fields_saves() {
+        // A multi-field edit is checked as one valid final state, not intermediate states.
+        let mut baseline = Config::default();
+        baseline.nodes.mdns.peer_ttl_secs = 30;
+        baseline.nodes.mdns.announce_interval_secs = 60;
+        let mut candidate = baseline.clone();
+        candidate.nodes.mdns.announce_interval_secs = 120;
+        candidate.nodes.mdns.peer_ttl_secs = 240;
+        candidate.mark_dirty("nodes.mdns.announce_interval_secs");
+        candidate.mark_dirty("nodes.mdns.peer_ttl_secs");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("the valid final TTL relation must validate");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn typed_memory_flag_edit_rejects_retained_agent_backend_error() {
+        // Both global typed-memory flags participate in the agent-backend diagnostic.
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.memory.backend = "sqlite".to_string();
+        baseline.memory.types.enabled = true;
+        baseline.memory.consolidation_extract_facts = false;
+        baseline
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        let mut agent = AliasedAgentConfig {
+            model_provider: ModelProviderRef::from("openai.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        baseline.agents.insert("a".to_string(), agent);
+        let mut candidate = baseline.clone();
+        candidate.memory.consolidation_extract_facts = true;
+        candidate.mark_dirty("memory.consolidation_extract_facts");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidFormat,
+            Some("agents.a.memory.backend"),
+        );
+
+        let mut unrelated = baseline.clone();
+        unrelated.scheduler.max_tasks = baseline.scheduler.max_tasks + 1;
+        unrelated.mark_dirty("scheduler.max_tasks");
+        let warnings = validate_without_mutation(&unrelated, &baseline)
+            .expect("an unrelated scheduler edit retains the agent-backend error");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, PRE_EXISTING_VALIDATION_ERROR);
+        assert_eq!(warnings[0].path, "agents.a.memory.backend");
+    }
+
+    #[test]
+    fn strict_validation_keeps_mdns_ttl_diagnostic_identity() {
+        // Adding related metadata must not alter strict validation's original diagnostic.
+        let mut config = Config::default();
+        config.nodes.mdns.peer_ttl_secs = 30;
+        config.nodes.mdns.announce_interval_secs = 60;
+
+        let error = config.validate().expect_err("the TTL relation is invalid");
+        let structured = error
+            .downcast_ref::<ConfigApiError>()
+            .expect("the TTL diagnostic remains structured");
+        assert_eq!(structured.code, ConfigApiCode::InvalidNumericRange);
+        assert_eq!(structured.path.as_deref(), Some("nodes.mdns.peer_ttl_secs"));
+        assert_eq!(
+            structured.message,
+            "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
         );
     }
 }
