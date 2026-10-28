@@ -4,6 +4,8 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use std::{collections::VecDeque, path::PathBuf, sync::Mutex as StdMutex};
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_commands::goal::GoalCommand;
 use zeroclaw_config::{
     api_error::{ConfigApiCode, ConfigApiError},
@@ -11,12 +13,17 @@ use zeroclaw_config::{
     providers::ModelProviderRef,
     schema::{Config, OpenAIModelProviderConfig},
 };
+use zeroclaw_goal::accounting::{
+    GoalAccountingFailure, GoalOperationAccounting, GoalOperationAccountingFactory,
+    GoalOperationRequest, GoalOperationSettlement,
+};
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
     GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionBinding,
     GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
     GoalVerifierResult, GoalVerifierTurn,
 };
+use zeroclaw_infra::{session_backend::SessionBackend, session_sqlite::SqliteSessionBackend};
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
@@ -62,7 +69,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         })
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -235,7 +242,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
         anyhow::bail!("lease execution test does not run verifier turns")
     }
 
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         anyhow::bail!("lease execution test does not deliver candidates")
     }
 }
@@ -1564,12 +1571,698 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         "verifier:candidate"
     );
     lease
-        .append_verified_candidate("candidate".into())
+        .append_parent_candidate("candidate".into())
         .await
         .unwrap();
 
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptedStep {
+    Parent(Vec<(String, String)>),
+    Append(String, TaskStatus, i64),
+    Verifier(String),
+    Resume(String),
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedFault {
+    FailAppend,
+    PauseDuringAppend,
+    PauseDuringVerifier,
+    ParentError,
+    PauseThenParentError,
+    ParentAccountingFailure,
+    VerifierAccountingFailure,
+    SettleIncomplete,
+}
+
+struct ExecutionScript {
+    parents: VecDeque<String>,
+    verifiers: VecDeque<String>,
+    steps: Vec<ScriptedStep>,
+    fault: Option<ScriptedFault>,
+}
+
+struct ScriptedDriver {
+    binding: GoalSessionBinding,
+    store: Arc<SqliteTaskStore>,
+    sessions: Arc<SqliteSessionBackend>,
+    script: Arc<StdMutex<ExecutionScript>>,
+}
+
+struct ScriptedLease {
+    session_key: GoalSessionKey,
+    store: Arc<SqliteTaskStore>,
+    sessions: Arc<SqliteSessionBackend>,
+    script: Arc<StdMutex<ExecutionScript>>,
+    scope: Option<GoalExecutionScope>,
+}
+
+impl ScriptedLease {
+    async fn pause(&self, scope: &GoalExecutionScope) {
+        assert_eq!(
+            self.store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    fn accounting_error() -> anyhow::Error {
+        anyhow::Error::new(GoalAccountingFailure::settled(
+            GoalAccountingState::Invalid,
+            &["fixture pricing failed".to_owned()],
+        ))
+        .context("fixture turn context")
+    }
+}
+
+#[async_trait]
+impl GoalSessionDriver for ScriptedDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(ScriptedLease {
+            session_key: self.binding.session_key().clone(),
+            store: Arc::clone(&self.store),
+            sessions: Arc::clone(&self.sessions),
+            script: Arc::clone(&self.script),
+            scope: None,
+        }))
+    }
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for ScriptedLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+        Ok(self.sessions.try_load(&self.session_key.durable_id())?)
+    }
+
+    async fn append_resume_response(&mut self, response: String) -> anyhow::Result<()> {
+        self.sessions.append(
+            &self.session_key.durable_id(),
+            &ChatMessage::user(&response),
+        )?;
+        self.script
+            .lock()
+            .unwrap()
+            .steps
+            .push(ScriptedStep::Resume(response));
+        Ok(())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        scope: &GoalExecutionScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
+        if self.scope.is_none() {
+            self.scope = Some(scope.clone());
+        }
+        let fault = {
+            let mut script = self.script.lock().unwrap();
+            script.steps.push(ScriptedStep::Parent(
+                turn.working_history
+                    .into_iter()
+                    .map(|message| (message.role, message.content))
+                    .collect(),
+            ));
+            script.fault
+        };
+        match fault {
+            Some(ScriptedFault::ParentError) => anyhow::bail!("fixture provider failed"),
+            Some(ScriptedFault::PauseThenParentError) => {
+                self.pause(scope).await;
+                anyhow::bail!("fixture provider failed");
+            }
+            Some(ScriptedFault::ParentAccountingFailure) => {
+                return Err(Self::accounting_error());
+            }
+            Some(ScriptedFault::SettleIncomplete) => {
+                assert_eq!(
+                    self.store
+                        .admit_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "fixture-operation",
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+                assert_eq!(
+                    self.store
+                        .settle_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "fixture-operation",
+                            GoalAccountingState::Invalid,
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            _ => {}
+        }
+        Ok(self.script.lock().unwrap().parents.pop_front().unwrap())
+    }
+
+    async fn run_verifier(
+        &mut self,
+        scope: &GoalExecutionScope,
+        turn: GoalVerifierTurn,
+    ) -> anyhow::Result<GoalVerifierResult> {
+        let fault = {
+            let mut script = self.script.lock().unwrap();
+            script.steps.push(ScriptedStep::Verifier(turn.candidate));
+            script.fault
+        };
+        match fault {
+            Some(ScriptedFault::PauseDuringVerifier) => self.pause(scope).await,
+            Some(ScriptedFault::VerifierAccountingFailure) => {
+                return Err(Self::accounting_error());
+            }
+            _ => {}
+        }
+        Ok(GoalVerifierResult {
+            response: self.script.lock().unwrap().verifiers.pop_front().unwrap(),
+            attribution: None,
+        })
+    }
+
+    async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        let fault = self.script.lock().unwrap().fault;
+        if matches!(fault, Some(ScriptedFault::FailAppend)) {
+            anyhow::bail!("fixture append failed");
+        }
+        let scope = self.scope.as_ref().unwrap();
+        let task = self
+            .store
+            .current_goal_for_session(scope.session_id())
+            .await?
+            .unwrap();
+        self.sessions
+            .append(scope.session_id(), &ChatMessage::assistant(&candidate))?;
+        self.script.lock().unwrap().steps.push(ScriptedStep::Append(
+            candidate,
+            task.status,
+            task.execution_epoch,
+        ));
+        if matches!(fault, Some(ScriptedFault::PauseDuringAppend)) {
+            self.pause(scope).await;
+        }
+        Ok(())
+    }
+}
+
+struct ScriptedAccounting;
+
+#[async_trait]
+impl GoalOperationAccounting for ScriptedAccounting {
+    async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pricing_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+struct ScriptedAccountingFactory;
+
+impl GoalOperationAccountingFactory for ScriptedAccountingFactory {
+    fn for_scope(&self, _scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
+        Arc::new(ScriptedAccounting)
+    }
+}
+
+struct EngineFixture {
+    config: Config,
+    runtime: GoalRuntime,
+    store: Arc<SqliteTaskStore>,
+    driver: Arc<ScriptedDriver>,
+    scope: GoalExecutionScope,
+    request: Option<zeroclaw_goal::GoalExecutionRequest>,
+    session_data: PathBuf,
+    // Drop both databases and their shared handles before the temporary files.
+    _directory: tempfile::TempDir,
+}
+
+impl EngineFixture {
+    async fn new(parents: &[&str], verifiers: &[&str], fault: Option<ScriptedFault>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(&directory.path().join("control")).unwrap());
+        let session_data = directory.path().join("history");
+        let config = valid_goal_config(true);
+        let ingress = matrix_ingress();
+        let driver = Arc::new(ScriptedDriver {
+            binding: GoalSessionBinding::new(ingress.session_key().clone()),
+            store: Arc::clone(&store),
+            sessions: Arc::new(SqliteSessionBackend::new(&session_data).unwrap()),
+            script: Arc::new(StdMutex::new(ExecutionScript {
+                parents: parents.iter().map(|text| (*text).to_owned()).collect(),
+                verifiers: verifiers.iter().map(|text| (*text).to_owned()).collect(),
+                steps: Vec::new(),
+                fault,
+            })),
+        });
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let (_, request) = runtime
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Limits(
+                        zeroclaw_commands::goal::GoalBudgetLimits {
+                            token_limit: Some(100),
+                            cost_limit_usd: None,
+                        },
+                    ),
+                    objective: "finish the bounded task".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        let request = request.unwrap();
+        let scope = request.scope().clone();
+        Self {
+            config,
+            runtime,
+            store,
+            driver,
+            scope,
+            request: Some(request),
+            session_data,
+            _directory: directory,
+        }
+    }
+
+    async fn run(&mut self) -> anyhow::Result<zeroclaw_goal::GoalExecutionOutcome> {
+        self.runtime
+            .execution_engine(Arc::new(ScriptedAccountingFactory))
+            .run(&host_settings(&self.config), self.request.take().unwrap())
+            .await
+    }
+
+    async fn task(&self) -> TaskRecord {
+        self.store
+            .current_goal_for_session(self.scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn reason(&self) -> Option<String> {
+        self.store
+            .terminal_reason_for_session_goal(self.scope.task_id(), self.scope.session_id())
+            .await
+            .unwrap()
+    }
+
+    fn steps(&self) -> Vec<ScriptedStep> {
+        self.driver.script.lock().unwrap().steps.clone()
+    }
+
+    fn history(&self) -> Vec<(String, String)> {
+        // A separate backend handle proves the transcript is not only a cache.
+        SqliteSessionBackend::new(&self.session_data)
+            .unwrap()
+            .try_load(self.scope.session_id())
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.role, message.content))
+            .collect()
+    }
+}
+
+const SCRIPTED_COMPLETE: &str =
+    r#"{"decision":"complete","reason":"all criteria met","blockers":[]}"#;
+
+#[tokio::test]
+async fn engine_persists_a_verified_candidate_before_completing() {
+    // Completion follows the single durable candidate append and verifier.
+    let mut fixture = EngineFixture::new(&["final answer"], &[SCRIPTED_COMPLETE], None).await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "final answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("final answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Completed);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "final answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_candidate_persistence_failure_fails_without_verifying_or_completing() {
+    // An append failure ends the exact Goal without admitting its verifier.
+    let mut fixture = EngineFixture::new(&["answer"], &[], Some(ScriptedFault::FailAppend)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("fixture append failed"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("candidate_persistence_failed")
+    );
+    assert!(fixture.history().is_empty());
+}
+
+#[tokio::test]
+async fn engine_pause_during_candidate_persistence_keeps_the_candidate_and_never_completes() {
+    // A winning pause keeps the appended answer and prevents verifier admission.
+    let mut fixture =
+        EngineFixture::new(&["answer"], &[], Some(ScriptedFault::PauseDuringAppend)).await;
+    assert!(fixture.run().await.is_err());
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_pause_during_verification_keeps_the_persisted_candidate_and_never_completes() {
+    // A pause committed during verification cannot be overwritten by completion.
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[SCRIPTED_COMPLETE],
+        Some(ScriptedFault::PauseDuringVerifier),
+    )
+    .await;
+    assert!(fixture.run().await.is_err());
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_blocked_question_is_persisted_before_pause_and_retained_on_resume() {
+    // Resume reads the durable question and appends its response before new work.
+    let payload = serde_json::json!({"options": ["A", "B"]});
+    let blocked = serde_json::json!({"decision": "blocked", "reason": "choice required", "blockers": [{"kind": "needs_user_input", "message": "Choose A or B?", "payload": payload}]}).to_string();
+    let mut fixture = EngineFixture::new(
+        &["Choose A or B?", "Done with B"],
+        &[&blocked, SCRIPTED_COMPLETE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::VerifierBlocked
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    let goal = fixture
+        .store
+        .get_goal_task(fixture.scope.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+    assert_eq!(goal.blockers[0].payload.as_ref(), Some(&payload));
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "Choose A or B?".into())]
+    );
+    let (_, request) = fixture
+        .runtime
+        .submit(
+            &host_settings(&fixture.config),
+            matrix_ingress(),
+            fixture.driver.clone(),
+            GoalCommand::Resume {
+                response: Some("B".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    let request = request.unwrap();
+    fixture.scope = request.scope().clone();
+    fixture.request = Some(request);
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    let steps = fixture.steps();
+    assert!(
+        matches!(&steps[1], ScriptedStep::Append(text, TaskStatus::Running, _) if text == "Choose A or B?")
+    );
+    assert_eq!(steps[3], ScriptedStep::Resume("B".into()));
+    assert_eq!(
+        steps[4],
+        ScriptedStep::Parent(vec![
+            ("assistant".into(), "Choose A or B?".into()),
+            ("user".into(), "B".into())
+        ])
+    );
+    assert!(
+        matches!(&steps[5], ScriptedStep::Append(text, TaskStatus::Running, _) if text == "Done with B")
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![
+            ("assistant".into(), "Choose A or B?".into()),
+            ("user".into(), "B".into()),
+            ("assistant".into(), "Done with B".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn engine_persists_each_continued_candidate_in_order() {
+    // Continued answers persist once while feedback remains only working context.
+    let feedback =
+        r#"{"decision":"continue","reason":"finish the remaining criterion","blockers":[]}"#;
+    let mut fixture = EngineFixture::new(
+        &["draft one", "final answer"],
+        &[feedback, SCRIPTED_COMPLETE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    let steps = fixture.steps();
+    let appended: Vec<_> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ScriptedStep::Append(text, _, _) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appended, vec!["draft one", "final answer"]);
+    let ScriptedStep::Parent(history) = &steps[3] else {
+        panic!("expected the second parent turn");
+    };
+    assert_eq!(
+        history[history.len() - 2],
+        ("assistant".into(), "draft one".into())
+    );
+    assert_eq!(history.last().unwrap().0, "user");
+    assert!(
+        history
+            .last()
+            .unwrap()
+            .1
+            .contains("finish the remaining criterion")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Completed);
+    assert_eq!(
+        fixture.history(),
+        vec![
+            ("assistant".into(), "draft one".into()),
+            ("assistant".into(), "final answer".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_accounting_failure_fails_as_accounting_with_its_diagnostic() {
+    // Context layers preserve typed classification and the original diagnostic.
+    let mut fixture =
+        EngineFixture::new(&[], &[], Some(ScriptedFault::ParentAccountingFailure)).await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture pricing failed"));
+    assert!(!rendered.contains("Goal parent operation failed"));
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+    );
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_incomplete_accounting_names_the_durable_condition() {
+    // A successful parent over durable Invalid accounting cannot append or verify.
+    let mut fixture =
+        EngineFixture::new(&["candidate"], &[], Some(ScriptedFault::SettleIncomplete)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(error.to_string().contains("Goal accounting is incomplete"));
+    assert!(error.to_string().contains("invalid or could not be priced"));
+    assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_operation_error_keeps_its_classification() {
+    // Ordinary provider errors retain their operation failure reason and chain.
+    let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::ParentError)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("Goal parent operation failed"));
+    assert!(format!("{error:#}").contains("fixture provider failed"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("parent_operation_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_accounting_failure_fails_as_accounting_after_the_candidate_is_durable() {
+    // Verifier accounting failure leaves the already appended parent response.
+    let mut fixture = EngineFixture::new(
+        &["final answer"],
+        &[],
+        Some(ScriptedFault::VerifierAccountingFailure),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("fixture pricing failed"));
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "final answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("final answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "final answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_error_after_a_winning_pause_keeps_both_errors_and_the_pause() {
+    // A failed stale-epoch terminal write preserves both errors and the pause.
+    let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::PauseThenParentError)).await;
+    let epoch = fixture.scope.execution_epoch();
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture provider failed"));
+    assert!(rendered.contains("Goal parent operation failed"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    let task = fixture.task().await;
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, epoch + 1);
+    assert_eq!(
+        fixture
+            .store
+            .get_goal_task(fixture.scope.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_reason,
+        Some(GoalPauseReason::OperatorPaused)
+    );
+    assert!(fixture.reason().await.is_none());
+    assert!(fixture.history().is_empty());
 }
 
 #[tokio::test]

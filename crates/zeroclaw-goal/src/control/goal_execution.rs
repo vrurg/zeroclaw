@@ -68,9 +68,9 @@ impl GoalExecutionEngine {
     }
 
     /// Run one admitted Goal epoch to a verified completion or verifier pause.
-    /// A continuation keeps only a process-local transcript; intermediate
-    /// candidates and verifier feedback do not become authoritative user
-    /// history. Every model call uses the runtime's per-scope accountant.
+    /// Every accepted parent candidate is durably appended to the canonical
+    /// session before verification; verifier feedback stays process-local.
+    /// Every model call uses the runtime's per-scope accountant.
     /// `settings` is used only for execution acquisition and must be built
     /// from the current canonical config immediately before that call.
     /// Errors before the first parent attempt—including objective lookup,
@@ -170,6 +170,14 @@ impl GoalExecutionEngine {
                 }
             };
 
+            // Retain each ordinary parent candidate before verification can
+            // continue or pause the same durable session.
+            if let Err(error) = lease.append_parent_candidate(candidate.clone()).await {
+                return Err(self
+                    .fail_with(scope, "candidate_persistence_failed", error)
+                    .await);
+            }
+
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
             // a drained parent result cannot start a second model operation.
@@ -205,7 +213,7 @@ impl GoalExecutionEngine {
 
             match parse_verifier_response(&verifier.response) {
                 Ok(VerifierDecision::Complete) => {
-                    self.complete(scope, lease, candidate).await?;
+                    self.complete(scope).await?;
                     return Ok(GoalExecutionOutcome::Completed);
                 }
                 Ok(VerifierDecision::Continue { reason }) => {
@@ -271,12 +279,7 @@ impl GoalExecutionEngine {
         Ok(task)
     }
 
-    async fn complete(
-        &self,
-        scope: &GoalExecutionScope,
-        lease: &mut dyn GoalSessionExecutionLease,
-        candidate: String,
-    ) -> Result<()> {
+    async fn complete(&self, scope: &GoalExecutionScope) -> Result<()> {
         self.exact_running_task(scope).await?;
         match self
             .registry
@@ -294,8 +297,7 @@ impl GoalExecutionEngine {
                 bail!("Goal completion lost its execution fence")
             }
         }
-        // Delivery failure is observable but does not rewrite verified state.
-        lease.append_verified_candidate(candidate).await
+        Ok(())
     }
 
     async fn pause_verifier_blocked(

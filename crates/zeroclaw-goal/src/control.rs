@@ -310,9 +310,10 @@ pub trait GoalSessionDriver: Send + Sync {
     /// Goal lifecycle needs. The executor treats `ingress` as admission-time
     /// audit data only; live policy stays with the driver and is revalidated
     /// before the lease executes protected work. `canonical_history` is
-    /// read-only, parent and verifier calls
-    /// mutate only process-local working state, and `append_verified_candidate`
-    /// appends and delivers exactly one already-verified final candidate.
+    /// read-only. Parent and verifier calls mutate only process-local working
+    /// state. `append_parent_candidate` durably appends each accepted parent
+    /// candidate once before verification can continue, pause or complete the
+    /// Goal. It persists only, without re-rendering or re-delivering events.
     /// The object is the sole transport bridge used by the later Goal executor.
     async fn acquire_execution(
         &self,
@@ -506,7 +507,14 @@ pub trait GoalSessionExecutionLease: Send {
         scope: &GoalExecutionScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult>;
-    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
+    /// Durably append one accepted parent candidate through the same session
+    /// persistence used for an ordinary turn's final response. Return only
+    /// after the append is durable. The engine calls this once per candidate,
+    /// before verification can continue, pause or complete the Goal.
+    ///
+    /// This method persists only: it must not re-render or re-deliver the
+    /// candidate. Ordinary agent events remain the parent turn's responsibility.
+    async fn append_parent_candidate(&mut self, candidate: String) -> Result<()>;
 }
 
 /// A driver's owned proof that a live session remains authoritative.
