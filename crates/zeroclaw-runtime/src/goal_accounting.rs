@@ -480,8 +480,14 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 }
             }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal operation settlement lost its execution fence"
+                );
                 Err(with_accounting_causes(
-                    anyhow::anyhow!("Goal operation settlement lost its execution fence"),
+                    anyhow::Error::msg("Goal operation settlement lost its execution fence"),
                     &causes,
                 ))
             }
@@ -1940,7 +1946,7 @@ mod tests {
         let canary = "123456:ABC-def_GHI";
         let message = "fixture pricing failed for this route: https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
         let event = usage_event("fallback", 41, 2);
-        let error = anyhow::anyhow!(message);
+        let error = anyhow::Error::msg(message);
         let attrs = usage_warning_attributes(&event, &error);
         let logged_error = attrs["error"].as_str().unwrap();
         assert!(!logged_error.contains(canary));

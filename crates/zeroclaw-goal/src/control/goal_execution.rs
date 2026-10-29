@@ -512,7 +512,7 @@ mod tests {
             .context("fixture turn context")
             .context("fixture outer context");
         assert!(is_accounting_failure(&error));
-        assert!(!is_accounting_failure(&anyhow::anyhow!(same_text)));
+        assert!(!is_accounting_failure(&anyhow::Error::msg(same_text)));
         assert!(!is_accounting_failure(&anyhow::Error::new(
             crate::accounting::GoalOperationFenced::NOT_RUNNING,
         )));
