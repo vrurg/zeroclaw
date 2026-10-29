@@ -28,12 +28,17 @@ use support::{IntentState, NoModelAccounting, Registry};
 use zeroclaw_api::task::TaskStatus;
 use zeroclaw_goal::task::GoalControlIntentSettlement;
 
-fn goal_config_with(default_tokens: u64, verifier: &str, enabled: bool) -> Config {
+fn goal_config_with(
+    default_tokens: Option<u64>,
+    default_cost: Option<f64>,
+    verifier: &str,
+    enabled: bool,
+) -> Config {
     let mut config = Config {
         goal: GoalConfig {
             enabled,
             default_token_limit: default_tokens,
-            default_cost_limit_usd: 0.0,
+            default_cost_limit_usd: default_cost,
             verifier: GoalVerifierConfig {
                 model_provider: ModelProviderRef::new(verifier),
                 model: None,
@@ -54,7 +59,7 @@ fn goal_config_with(default_tokens: u64, verifier: &str, enabled: bool) -> Confi
 }
 
 fn goal_config() -> Config {
-    goal_config_with(1000, "openai.default", true)
+    goal_config_with(Some(1000), Some(0.0), "openai.default", true)
 }
 
 fn settings(config: &Config) -> GoalHostSettings<'_> {
@@ -99,7 +104,7 @@ async fn deferred_start_rechecks_commit_config_and_persists_fresh_defaults() {
         let supervisor = supervisor(registry.clone());
         let ordinary = driver.boundary.clone().lock_owned().await;
         let snapshot = live.handle().snapshot();
-        assert_eq!(snapshot.goal.default_token_limit, 1000);
+        assert_eq!(snapshot.goal.default_token_limit, Some(1000));
         let deferred = queued(
             supervisor
                 .admit_control(
@@ -126,7 +131,7 @@ async fn deferred_start_rechecks_commit_config_and_persists_fresh_defaults() {
             .unwrap();
         live.publish(
             live.next_revision().unwrap(),
-            goal_config_with(2000, verifier, true),
+            goal_config_with(Some(2000), Some(0.0), verifier, true),
         )
         .unwrap();
         let snapshot = live.handle().snapshot();
@@ -189,10 +194,263 @@ async fn deferred_start_rechecks_commit_config_and_persists_fresh_defaults() {
 }
 
 #[tokio::test]
+async fn start_without_budget_flags_or_defaults_returns_budget_required() {
+    let config = goal_config_with(None, None, "openai.default", true);
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    let supervisor = supervisor(registry.clone());
+
+    let GoalControlAdmission::Direct(submission) = supervisor
+        .admit_control(
+            &settings(&config),
+            ingress,
+            driver.clone(),
+            launch_command(false),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a Start without defaults must not be queued")
+    };
+    assert_eq!(submission.into_response(), GoalResponse::BudgetRequired);
+
+    let state = registry.0.lock().unwrap();
+    assert!(state.task.is_none());
+    assert!(state.goal.is_none());
+    assert!(state.transitions.is_empty());
+    assert!(state.intents.is_empty());
+    assert_eq!(state.session_lookups, 0);
+    assert_eq!(
+        driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn explicit_command_budgets_start_without_configured_defaults() {
+    use zeroclaw_commands::goal::GoalBudgetLimits;
+
+    for (budget, expected_tokens, expected_cost) in [
+        (
+            GoalBudgetSelection::Limits(GoalBudgetLimits {
+                token_limit: Some(10),
+                cost_limit_usd: None,
+            }),
+            Some(10),
+            None,
+        ),
+        (
+            GoalBudgetSelection::Limits(GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(2.5),
+            }),
+            None,
+            Some(2.5),
+        ),
+        (GoalBudgetSelection::Unlimited, None, None),
+    ] {
+        let config = goal_config_with(None, None, "openai.default", true);
+        let (driver, ingress) = serialized_fixture();
+        let registry = Arc::new(Registry::default());
+        let supervisor = supervisor(registry.clone());
+        let GoalControlAdmission::Direct(mut submission) = supervisor
+            .admit_control(
+                &settings(&config),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget,
+                    objective: "Start with an explicit budget".into(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("an immediately available Start must be direct")
+        };
+        let GoalResponse::Started(started) = submission.response() else {
+            panic!("explicit budget selection must start")
+        };
+        assert_eq!(started.token_limit, expected_tokens);
+        assert_eq!(started.cost_limit_usd, expected_cost);
+        {
+            let state = registry.0.lock().unwrap();
+            let goal = state.goal.as_ref().expect("Start persists the Goal");
+            assert_eq!(goal.effective_token_limit, expected_tokens);
+            assert_eq!(goal.effective_cost_limit_usd, expected_cost);
+        }
+        supervisor
+            .pause_before_launch(
+                &mut submission,
+                zeroclaw_goal::GoalPauseReason::OperatorPaused,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn single_positive_default_starts_with_that_limit() {
+    let config = goal_config_with(Some(500), None, "openai.default", true);
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    let supervisor = supervisor(registry.clone());
+    let GoalControlAdmission::Direct(mut submission) = supervisor
+        .admit_control(&settings(&config), ingress, driver, launch_command(false))
+        .await
+        .unwrap()
+    else {
+        panic!("an immediately available Start must be direct")
+    };
+
+    let GoalResponse::Started(started) = submission.response() else {
+        panic!("the positive configured default must start")
+    };
+    assert_eq!(started.token_limit, Some(500));
+    assert_eq!(started.cost_limit_usd, None);
+    let state = registry.0.lock().unwrap();
+    let goal = state.goal.as_ref().expect("Start persists the Goal");
+    assert_eq!(goal.effective_token_limit, Some(500));
+    assert_eq!(goal.effective_cost_limit_usd, None);
+    drop(state);
+
+    supervisor
+        .pause_before_launch(
+            &mut submission,
+            zeroclaw_goal::GoalPauseReason::OperatorPaused,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn zero_token_default_without_cost_default_returns_budget_required() {
+    let config = goal_config_with(Some(0), None, "openai.default", true);
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    let supervisor = supervisor(registry.clone());
+    let GoalControlAdmission::Direct(submission) = supervisor
+        .admit_control(&settings(&config), ingress, driver, launch_command(false))
+        .await
+        .unwrap()
+    else {
+        panic!("an unconfigured default must not be queued")
+    };
+    assert_eq!(submission.into_response(), GoalResponse::BudgetRequired);
+
+    let state = registry.0.lock().unwrap();
+    assert!(state.task.is_none());
+    assert!(state.goal.is_none());
+    assert!(state.transitions.is_empty());
+    assert_eq!(state.session_lookups, 0);
+}
+
+#[tokio::test]
+async fn invalid_defaults_reject_explicit_budget_start_with_typed_path() {
+    use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+
+    let config = goal_config_with(Some(500), Some(-1.0), "openai.default", true);
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    let supervisor = supervisor(registry.clone());
+    let error = supervisor
+        .admit_control(
+            &settings(&config),
+            ingress,
+            driver.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetSelection::Limits(zeroclaw_commands::goal::GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: None,
+                }),
+                objective: "Explicit budgets do not bypass config validation".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let structured = ConfigApiError::from_validation(error);
+    assert_eq!(structured.code, ConfigApiCode::InvalidNumericRange);
+    assert_eq!(
+        structured.path.as_deref(),
+        Some("goal.default_cost_limit_usd")
+    );
+    assert_eq!(
+        driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let state = registry.0.lock().unwrap();
+    assert!(state.task.is_none());
+    assert!(state.goal.is_none());
+    assert!(state.transitions.is_empty());
+    assert!(state.intents.is_empty());
+    assert_eq!(state.session_lookups, 0);
+}
+
+#[tokio::test]
+async fn deferred_start_with_defaults_removed_before_commit_returns_budget_required() {
+    let live = LiveConfig::new(goal_config());
+    let (driver, ingress) = serialized_fixture();
+    let registry = Arc::new(Registry::default());
+    let supervisor = supervisor(registry.clone());
+    let ordinary = driver.boundary.clone().lock_owned().await;
+    let snapshot = live.handle().snapshot();
+    let deferred = queued(
+        supervisor
+            .admit_control(
+                &settings(&snapshot),
+                ingress,
+                driver.clone(),
+                launch_command(false),
+            )
+            .await
+            .unwrap(),
+        GoalQueuedControl::Start,
+    );
+    {
+        let state = registry.0.lock().unwrap();
+        assert!(state.task.is_none());
+        assert!(state.transitions.is_empty());
+        assert_eq!(state.intents.len(), 1);
+        assert_eq!(state.intents[0].1, IntentState::Pending);
+    }
+
+    drop(ordinary);
+    let ready = tokio::time::timeout(Duration::from_secs(1), deferred.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    live.publish(
+        live.next_revision().unwrap(),
+        goal_config_with(None, None, "openai.default", true),
+    )
+    .unwrap();
+    let snapshot = live.handle().snapshot();
+    let committed = ready.commit(&settings(&snapshot)).await.unwrap();
+    assert_eq!(committed.response(), &GoalResponse::BudgetRequired);
+    drop(committed.release());
+
+    let state = registry.0.lock().unwrap();
+    assert!(state.task.is_none());
+    assert!(state.goal.is_none());
+    assert!(state.transitions.is_empty());
+    assert_eq!(state.intents.len(), 1);
+    assert!(matches!(state.intents[0].1, IntentState::Settled(_)));
+    assert_eq!(
+        driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
 async fn deferred_intake_checks_execution_config_but_preserves_admin_controls() {
     use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
-    let live = LiveConfig::new(goal_config_with(1000, "openai.missing", true));
+    let live = LiveConfig::new(goal_config_with(
+        Some(1000),
+        Some(0.0),
+        "openai.missing",
+        true,
+    ));
     let (driver, ingress) = serialized_fixture();
     let registry = Arc::new(Registry::default());
     registry.seed(&ingress.session_key().durable_id(), TaskStatus::Paused);
@@ -226,7 +484,7 @@ async fn deferred_intake_checks_execution_config_but_preserves_admin_controls() 
     }
     live.publish(
         live.next_revision().unwrap(),
-        goal_config_with(1000, "openai.missing", false),
+        goal_config_with(Some(1000), Some(0.0), "openai.missing", false),
     )
     .unwrap();
     let snapshot = live.handle().snapshot();
@@ -261,7 +519,12 @@ async fn deferred_intake_checks_execution_config_but_preserves_admin_controls() 
         (GoalCommand::Pause { immediate: false }, 1),
         (GoalCommand::Cancel, 2),
     ] {
-        let live = LiveConfig::new(goal_config_with(1000, "openai.missing", true));
+        let live = LiveConfig::new(goal_config_with(
+            Some(1000),
+            Some(0.0),
+            "openai.missing",
+            true,
+        ));
         let (driver, ingress) = serialized_fixture();
         let registry = Arc::new(Registry::default());
         registry.seed(&ingress.session_key().durable_id(), TaskStatus::Running);

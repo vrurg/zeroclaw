@@ -2168,8 +2168,8 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config {
             goal: zeroclaw_config::goal::GoalConfig {
                 enabled: true,
-                default_token_limit: 1000,
-                default_cost_limit_usd: 0.0,
+                default_token_limit: Some(1000),
+                default_cost_limit_usd: Some(0.0),
                 verifier: zeroclaw_config::goal::GoalVerifierConfig {
                     model_provider: zeroclaw_config::providers::ModelProviderRef::new(
                         "openai.default",

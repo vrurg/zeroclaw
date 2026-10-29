@@ -1272,7 +1272,10 @@ impl GoalController {
         let session_id = ingress.session_key().durable_id();
         if let GoalCommand::Start { objective, budget } = submission.command() {
             validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-            select_limits(settings.default_limits()?, *budget)?;
+            settings.require_execution_admissible()?;
+            let Some(_) = select_limits(|| settings.default_limits(), *budget)? else {
+                return Ok((Some(GoalResponse::BudgetRequired), None));
+            };
             let current = self.registry.current_goal_for_session(&session_id).await?;
             let response = current.as_ref().and_then(|task| {
                 if !ingress_owns_task(ingress, task) {
