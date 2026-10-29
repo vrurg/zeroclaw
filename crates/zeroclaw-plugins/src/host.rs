@@ -373,7 +373,10 @@ impl PluginHost {
                                 );
                                 continue;
                             }
-                            let component = match admit_component(&path, &manifest) {
+                            #[cfg(all(test, unix))]
+                            discovery_step(DiscoveryStep::BeforeComponentAdmission);
+                            let component = match admit_component(&path, &manifest, &manifest_toml)
+                            {
                                 Ok(component) => component,
                                 Err(e) => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to executable artifact admission failure");
@@ -1857,22 +1860,43 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
     }
 }
 
+/// Admit the component of the package at `plugin_dir`, and prove that the
+/// manifest describing it is one this package holds.
+///
+/// Discovery reads every package's manifest by pathname before it decides
+/// which packages to admit, and admission then resolves the payload through a
+/// confined handle of that package root. A republication in between would pair
+/// the manifest that decided admission with another generation's bytes, so the
+/// manifest is read again through that same handle and must match the text
+/// admission was decided on. A different generation is refused; identical text
+/// admits a payload the admitted policy already describes.
 fn admit_component(
     plugin_dir: &Path,
     manifest: &PluginManifest,
+    manifest_toml: &str,
 ) -> Result<Option<AdmittedComponent>, PluginError> {
-    manifest
-        .wasm_path
-        .as_deref()
-        .map(|relative| {
-            let confined = resolve_confined_wasm_path(plugin_dir, relative)?;
-            let bytes = read_stable_file(&confined)?;
-            if let Some(expected) = manifest.wasm_sha256.as_deref() {
-                signature::verify_payload_digest(&bytes, expected)?;
-            }
-            Ok(AdmittedComponent::new(bytes))
-        })
-        .transpose()
+    let Some(relative) = manifest.wasm_path.as_deref() else {
+        return Ok(None);
+    };
+    let republished = || {
+        PluginError::NamespaceChanged(format!(
+            "plugin package changed between reading its manifest and admitting its component: {}",
+            plugin_dir.display()
+        ))
+    };
+    let confined = resolve_confined_wasm_path(plugin_dir, relative)?;
+    let admitted_manifest = confined
+        .at_relative(PathBuf::from("manifest.toml"))
+        .and_then(|manifest| read_stable_file(&manifest))
+        .map_err(|_| republished())?;
+    if admitted_manifest != manifest_toml.as_bytes() {
+        return Err(republished());
+    }
+    let bytes = read_stable_file(&confined)?;
+    if let Some(expected) = manifest.wasm_sha256.as_deref() {
+        signature::verify_payload_digest(&bytes, expected)?;
+    }
+    Ok(Some(AdmittedComponent::new(bytes)))
 }
 
 /// Admit the component of the package `dir` holds, reading it through that
@@ -1984,6 +2008,26 @@ pub(crate) struct ConfinedPayload {
     root_dir: std::os::fd::OwnedFd,
     #[cfg(not(unix))]
     root_handle: same_file::Handle,
+}
+
+impl ConfinedPayload {
+    /// Another file below the same, already-confined root.
+    ///
+    /// The root handle is retained, not reopened by pathname, so a read below
+    /// the returned payload reaches the same generation as a read below `self`
+    /// does, and confinement checks the replacement of a root that moved.
+    fn at_relative(&self, relative: PathBuf) -> Result<ConfinedPayload, PluginError> {
+        Ok(ConfinedPayload {
+            root: self.root.clone(),
+            relative,
+            #[cfg(unix)]
+            root_dir: self.root_dir.try_clone()?,
+            // `same_file::Handle` has no clone of its own; a cloned underlying
+            // file wrapped back into a handle is the same identity.
+            #[cfg(not(unix))]
+            root_handle: same_file::Handle::from_file(self.root_handle.as_file().try_clone()?)?,
+        })
+    }
 }
 
 /// Resolve a manifest executable without allowing traversal or symlink
@@ -2393,6 +2437,34 @@ thread_local! {
 #[cfg(all(test, unix))]
 fn payload_step(step: PayloadStep) {
     PAYLOAD_STEP_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+/// A point in discovery a test can intervene at.
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryStep {
+    /// The manifest decided admission; the component is admitted next.
+    BeforeComponentAdmission,
+}
+
+/// What a test runs at each [`DiscoveryStep`].
+#[cfg(all(test, unix))]
+type DiscoveryStepHook = Box<dyn FnMut(DiscoveryStep)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Called at every [`DiscoveryStep`] reached on this thread, when set.
+    static DISCOVERY_STEP_HOOK: std::cell::RefCell<Option<DiscoveryStepHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn discovery_step(step: DiscoveryStep) {
+    DISCOVERY_STEP_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(step);
         }
@@ -5764,6 +5836,125 @@ capabilities = ["tool"]
         let admitted = admit();
         PAYLOAD_STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
         admitted
+    }
+
+    /// Run `discover` with `hook` called at every discovery step reached on
+    /// this thread.
+    #[cfg(unix)]
+    fn with_discovery_steps<T>(
+        hook: impl FnMut(DiscoveryStep) + 'static,
+        discover: impl FnOnce() -> T,
+    ) -> T {
+        DISCOVERY_STEP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let discovered = discover();
+        DISCOVERY_STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
+        discovered
+    }
+
+    /// Write a tool package at `dir`: `version` and the component bytes tell
+    /// two generations of the same package apart.
+    fn write_tool_package(dir: &Path, version: &str, wasm: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"pkg\"\nversion = \"{version}\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), wasm).unwrap();
+    }
+
+    /// Admission proves the manifest and the component it admits are one
+    /// generation. Here the package is republished between the manifest read
+    /// and the admission, so the old policy would describe the new bytes; the
+    /// read must fail closed instead.
+    #[test]
+    fn admit_component_refuses_a_package_republished_since_its_manifest_was_read() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        write_tool_package(&package, "0.1.0", b"\0asm\x01");
+        let manifest_toml = std::fs::read_to_string(package.join("manifest.toml")).unwrap();
+        let manifest: PluginManifest = toml::from_str(&manifest_toml).unwrap();
+
+        std::fs::remove_dir_all(&package).unwrap();
+        write_tool_package(&package, "0.2.0", b"\0asm\x02");
+        assert_ne!(
+            std::fs::read_to_string(package.join("manifest.toml")).unwrap(),
+            manifest_toml,
+            "the replacement must publish another manifest"
+        );
+
+        let admitted = admit_component(&package, &manifest, &manifest_toml);
+
+        assert!(
+            matches!(admitted, Err(PluginError::NamespaceChanged(_))),
+            "the republished package must be refused, got {:?}",
+            admitted.map(|admitted| admitted.map(|admitted| admitted.bytes().len()))
+        );
+    }
+
+    /// The same package, unchanged, is admitted: the generation check refuses
+    /// republication, not admission itself.
+    #[test]
+    fn admit_component_admits_an_unchanged_package() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        write_tool_package(&package, "0.1.0", b"\0asm\x01");
+        let manifest_toml = std::fs::read_to_string(package.join("manifest.toml")).unwrap();
+        let manifest: PluginManifest = toml::from_str(&manifest_toml).unwrap();
+
+        let admitted = admit_component(&package, &manifest, &manifest_toml)
+            .unwrap()
+            .expect("the package names a component");
+
+        assert_eq!(admitted.bytes(), b"\0asm\x01");
+    }
+
+    /// Discovery reads a package's manifest by pathname, then admits its
+    /// component through a confined handle. A republication in between must not
+    /// let the replacement's bytes run under the manifest that was read, so
+    /// discovery skips the package.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_a_package_republished_between_its_manifest_and_admission() {
+        let root = tempdir().unwrap();
+        let plugins_dir = root.path().join("plugins");
+        let package = plugins_dir.join("pkg");
+        write_tool_package(&package, "0.1.0", b"\0asm\x01");
+        // Discovery ignores hidden entries, so the replacement can wait
+        // beside the package until the step under test.
+        let next = plugins_dir.join(".next").join("pkg");
+        write_tool_package(&next, "0.2.0", b"\0asm\x02");
+
+        let replaced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapped = std::sync::Arc::clone(&replaced);
+        let host = with_discovery_steps(
+            move |step| {
+                assert_eq!(step, DiscoveryStep::BeforeComponentAdmission);
+                std::fs::remove_dir_all(&package).unwrap();
+                std::fs::rename(&next, &package).unwrap();
+                swapped.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            || {
+                PluginHost::from_plugins_dir_with_security(
+                    &plugins_dir,
+                    SignatureMode::Disabled,
+                    Vec::new(),
+                )
+            },
+        )
+        .unwrap();
+
+        assert!(
+            replaced.load(std::sync::atomic::Ordering::SeqCst),
+            "the swap must run during admission"
+        );
+        assert!(
+            host.list_plugins().is_empty(),
+            "a republished package must not be admitted: {:?}",
+            host.list_plugins()
+        );
     }
 
     /// The package root is replaced by a symlink to an attacker tree during

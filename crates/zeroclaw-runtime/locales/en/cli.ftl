@@ -460,6 +460,8 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-signal-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
+channel-signal-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
@@ -472,6 +474,26 @@ channel-telegram-cmd-stop-desc = Cancel the current in-flight task
 channel-telegram-cmd-model-desc = Show or switch the current model
 channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
 channel-telegram-cmd-config-desc = Show current configuration
+
+# ── Telegram: unauthorized-sender notice ──
+# Sent to a sender who is not on this channel's allowlist. Two variants: the
+# bind form while startup pairing is active, and the allowlist form when the
+# allowlist already resolves peers — that deployment authorizes from
+# configuration, so the sender has no operator terminal to reach.
+# `channels.telegram.<alias>.unauthorized_message` overrides both.
+channel-telegram-unauthorized-bind =
+    🔐 This bot requires operator approval.
+
+    Copy this command to the operator terminal:
+    `{ $bindCommand }`
+
+    After the operator runs it, send your message again.
+channel-telegram-unauthorized-allowlist =
+    🔐 This bot requires operator approval.
+
+    Ask the operator to authorize this Telegram account: { $identity }
+
+    After the operator authorizes it, send your message again.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -1683,3 +1705,9 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Result-aware Agent loop recovery
+turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
+turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
+turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
+turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
