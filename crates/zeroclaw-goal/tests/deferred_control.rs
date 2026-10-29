@@ -435,9 +435,10 @@ async fn deferred_start_with_defaults_removed_before_commit_returns_budget_requi
     assert!(state.transitions.is_empty());
     assert_eq!(state.intents.len(), 1);
     assert!(matches!(state.intents[0].1, IntentState::Settled(_)));
+    // Intake and the deferred boundary each revalidate the session binding.
     assert_eq!(
         driver.bind_starts.load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2
     );
 }
 
