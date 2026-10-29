@@ -1805,6 +1805,8 @@ enum ScriptedFault {
     PauseDuringVerifier,
     ParentError,
     PauseThenParentError,
+    VerifierError,
+    PauseThenVerifierError,
     ParentAccountingFailure,
     VerifierAccountingFailure,
     SettleIncomplete,
@@ -1979,6 +1981,11 @@ impl GoalSessionExecutionLease for ScriptedLease {
         };
         match fault {
             Some(ScriptedFault::PauseDuringVerifier) => self.pause(scope).await,
+            Some(ScriptedFault::VerifierError) => anyhow::bail!("fixture verifier failed"),
+            Some(ScriptedFault::PauseThenVerifierError) => {
+                self.pause(scope).await;
+                anyhow::bail!("fixture verifier failed");
+            }
             Some(ScriptedFault::VerifierAccountingFailure) => {
                 return Err(Self::accounting_error());
             }
@@ -2414,6 +2421,38 @@ async fn engine_incomplete_accounting_names_the_durable_condition() {
 }
 
 #[tokio::test]
+async fn engine_empty_candidate_over_incomplete_accounting_fails_as_accounting() {
+    // Accounting failure takes precedence over an empty parent response.
+    let mut fixture =
+        EngineFixture::new(&["   "], &[], Some(ScriptedFault::SettleIncomplete)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert!(fixture.history().is_empty());
+}
+
+#[tokio::test]
+async fn engine_empty_candidate_fails_without_append_or_verifier() {
+    // Complete accounting does not make an empty response a candidate.
+    let mut fixture = EngineFixture::new(&["   "], &[], None).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Goal parent returned an empty candidate")
+    );
+    assert_eq!(fixture.reason().await.as_deref(), Some("candidate_empty"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert!(fixture.history().is_empty());
+}
+
+#[tokio::test]
 async fn engine_parent_operation_error_keeps_its_classification() {
     // Ordinary provider errors retain their operation failure reason and chain.
     let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::ParentError)).await;
@@ -2459,6 +2498,86 @@ async fn engine_verifier_accounting_failure_fails_as_accounting_after_the_candid
     assert_eq!(
         fixture.history(),
         vec![("assistant".into(), "final answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_operation_error_keeps_its_classification() {
+    // Ordinary verifier errors remain distinct from typed accounting failures.
+    let mut fixture =
+        EngineFixture::new(&["answer"], &[], Some(ScriptedFault::VerifierError)).await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("Goal verifier operation failed"));
+    assert!(rendered.contains("fixture verifier failed"));
+    assert!(
+        !error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("verifier_operation_failed")
+    );
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("answer".into()),
+        ]
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_error_after_a_winning_pause_keeps_both_errors_and_the_pause() {
+    // A verifier failure cannot overwrite a committed pause or lose its cause.
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[],
+        Some(ScriptedFault::PauseThenVerifierError),
+    )
+    .await;
+    let epoch = fixture.scope.execution_epoch();
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture verifier failed"));
+    assert!(rendered.contains("Goal verifier operation failed"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append("answer".into(), TaskStatus::Running, epoch),
+            ScriptedStep::Verifier("answer".into()),
+        ]
+    );
+    let task = fixture.task().await;
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, epoch + 1);
+    assert_eq!(
+        fixture
+            .store
+            .get_goal_task(fixture.scope.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_reason,
+        Some(GoalPauseReason::OperatorPaused)
+    );
+    assert!(fixture.reason().await.is_none());
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
     );
 }
 
