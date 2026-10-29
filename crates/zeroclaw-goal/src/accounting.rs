@@ -57,6 +57,78 @@ impl std::fmt::Display for GoalOperationFenced {
 
 impl std::error::Error for GoalOperationFenced {}
 
+/// Goal accounting made incomplete by an observed condition, closing admission
+/// to every further Goal-owned model call. The message embeds each original
+/// error chain unchanged. There is no source, so the bare failure's plain and
+/// alternate displays both show the complete diagnostic exactly once.
+#[derive(Debug)]
+pub struct GoalAccountingFailure {
+    message: String,
+}
+
+impl GoalAccountingFailure {
+    /// Report accounting errors after known usage and its classification are durable.
+    #[must_use]
+    pub fn settled(state: crate::task::GoalAccountingState, causes: &[String]) -> Self {
+        use crate::task::GoalAccountingState;
+
+        let state = match state {
+            GoalAccountingState::Complete => "complete",
+            GoalAccountingState::Missing => "missing",
+            GoalAccountingState::Invalid => "invalid",
+            GoalAccountingState::OutcomeUnknown => "outcome-unknown",
+        };
+        Self {
+            message: format!(
+                "Goal accounting is {state} after a durable usage settlement; no further Goal model call will be admitted: {}",
+                causes.join("; ")
+            ),
+        }
+    }
+
+    /// Name the durable conditions that prevent another Goal-owned model call.
+    #[must_use]
+    pub fn incomplete(state: crate::task::GoalAccountingState, pending: bool) -> Self {
+        use crate::task::GoalAccountingState;
+
+        let mut conditions = Vec::new();
+        match state {
+            GoalAccountingState::Complete => {}
+            GoalAccountingState::Missing => {
+                conditions.push("usage was not reported for an earlier Goal model call");
+            }
+            GoalAccountingState::Invalid => {
+                conditions.push(
+                    "usage for an earlier Goal model call was invalid or could not be priced",
+                );
+            }
+            GoalAccountingState::OutcomeUnknown => {
+                conditions.push("the outcome of an earlier Goal model call is unknown");
+            }
+        }
+        if pending {
+            conditions.push("an earlier Goal model call has not settled");
+        }
+        let message = if conditions.is_empty() {
+            "Goal accounting is incomplete; no further Goal model call will be admitted".to_owned()
+        } else {
+            format!(
+                "Goal accounting is incomplete: {}; no further Goal model call will be admitted",
+                conditions.join("; ")
+            )
+        };
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for GoalAccountingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GoalAccountingFailure {}
+
 /// Configured route at the start of one logical Goal-owned provider operation.
 #[derive(Clone, Debug)]
 pub struct GoalOperationRequest {
@@ -169,7 +241,15 @@ pub struct GoalUsagePrice {
 /// physical attempts in the ordinary provider path have reported.
 #[async_trait]
 pub trait GoalOperationAccounting: Send + Sync {
+    /// Admit work only with complete durable accounting. Incomplete accounting
+    /// returns a [`GoalAccountingFailure`], independently of the Goal budget.
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+    /// Persist known usage and its accounting classification before reopening
+    /// admission. `Ok` means settlement is durable and no accounting error was
+    /// observed by the accountant; the reported settlement may itself still be
+    /// incomplete. An error carrying [`GoalAccountingFailure`] means settlement
+    /// is durable, known usage is recorded, and admission is closed. Any other
+    /// error means settlement may not be durable and a pending marker may remain.
     async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
     async fn pricing_complete(&self) -> anyhow::Result<bool>;
 }
@@ -189,6 +269,60 @@ tokio::task_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounting_failure_display_is_its_complete_diagnostic() {
+        // A bare durable accounting failure renders each original cause exactly once.
+        let failure = GoalAccountingFailure::settled(
+            crate::task::GoalAccountingState::OutcomeUnknown,
+            &["cause one".to_owned(), "cause two".to_owned()],
+        );
+        let expected = "Goal accounting is outcome-unknown after a durable usage settlement; no further Goal model call will be admitted: cause one; cause two";
+        assert_eq!(failure.to_string(), expected);
+        assert!(std::error::Error::source(&failure).is_none());
+        let error = anyhow::Error::new(failure);
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(format!("{error:#}"), expected);
+    }
+
+    #[test]
+    fn incomplete_accounting_failure_names_each_durable_condition() {
+        // Every durable condition is named in order, independently of any budget.
+        use crate::task::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
+
+        for (state, pending, expected) in [
+            (
+                Missing,
+                false,
+                "Goal accounting is incomplete: usage was not reported for an earlier Goal model call; no further Goal model call will be admitted",
+            ),
+            (
+                Invalid,
+                false,
+                "Goal accounting is incomplete: usage for an earlier Goal model call was invalid or could not be priced; no further Goal model call will be admitted",
+            ),
+            (
+                OutcomeUnknown,
+                false,
+                "Goal accounting is incomplete: the outcome of an earlier Goal model call is unknown; no further Goal model call will be admitted",
+            ),
+            (
+                Invalid,
+                true,
+                "Goal accounting is incomplete: usage for an earlier Goal model call was invalid or could not be priced; an earlier Goal model call has not settled; no further Goal model call will be admitted",
+            ),
+            (
+                Complete,
+                false,
+                "Goal accounting is incomplete; no further Goal model call will be admitted",
+            ),
+        ] {
+            assert_eq!(
+                GoalAccountingFailure::incomplete(state, pending).to_string(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn operation_fence_errors_preserve_the_five_refusal_texts_without_a_source() {

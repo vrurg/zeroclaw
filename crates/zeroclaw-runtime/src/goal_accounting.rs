@@ -11,9 +11,9 @@ use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
     accounting::{
-        GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationFenced,
-        GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice,
-        GoalUsagePricer,
+        GoalAccountingFailure, GoalOperationAccounting, GoalOperationAccountingFactory,
+        GoalOperationFenced, GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent,
+        GoalUsagePrice, GoalUsagePricer, combine_accounting_state,
     },
     task::{GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskGoal},
 };
@@ -208,7 +208,12 @@ impl GoalOperationAccountant {
         .context("join strict Goal usage lookup")?
     }
 
-    fn validated_cost_usage(&self, event: &GoalUsageEvent) -> Result<CostTokenUsage> {
+    /// Reject unusable token records, but retain structurally valid usage as
+    /// unpriced when pricing fails, returning that failure separately.
+    fn ledger_usage(
+        &self,
+        event: &GoalUsageEvent,
+    ) -> Result<(CostTokenUsage, Option<anyhow::Error>)> {
         ensure!(
             !event.provider_ref.trim().is_empty() && !event.model.trim().is_empty(),
             "Goal usage event lacks actual provider/model attribution"
@@ -227,32 +232,52 @@ impl GoalOperationAccountant {
         );
         ensure!(input != 0 || output != 0, "Goal usage is all zero");
 
-        let mut price = self
-            .pricer
-            .price(&event.provider_ref, &event.model, &event.usage)?;
-        if !event.priceable {
+        let mut pricing_error = None;
+        let price = if event.priceable {
+            match self
+                .pricer
+                .price(&event.provider_ref, &event.model, &event.usage)
+                .and_then(|price| {
+                    ensure!(
+                        price.cost_usd.is_finite() && price.cost_usd >= 0.0,
+                        "Goal usage cost is invalid"
+                    );
+                    Ok(price)
+                }) {
+                Ok(price) => Some(price),
+                Err(error) => {
+                    pricing_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let price = price.unwrap_or_else(|| {
             // Keep the observed token lower bound, but do not report a dollar
-            // figure based on an invalid cache-token partition.
-            price.cost_usd = 0.0;
-            price.unpriced_tokens = input + output;
-            price.pricing_available = false;
-        }
-        ensure!(
-            price.cost_usd.is_finite() && price.cost_usd >= 0.0,
-            "Goal usage cost is invalid"
-        );
-        Ok(CostTokenUsage {
-            model: event.model.clone(),
-            input_tokens: input,
-            output_tokens: output,
-            cached_input_tokens: event.usage.cached_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: event.usage.cache_creation_input_tokens.unwrap_or(0),
-            total_tokens: input + output,
-            cost_usd: price.cost_usd,
-            unpriced_tokens: price.unpriced_tokens,
-            pricing_available: price.pricing_available,
-            timestamp: price.timestamp,
-        })
+            // figure based on an invalid cache-token partition or failed pricing.
+            GoalUsagePrice {
+                cost_usd: 0.0,
+                unpriced_tokens: input + output,
+                pricing_available: false,
+                timestamp: chrono::Utc::now(),
+            }
+        });
+        Ok((
+            CostTokenUsage {
+                model: event.model.clone(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: event.usage.cached_input_tokens.unwrap_or(0),
+                cache_creation_input_tokens: event.usage.cache_creation_input_tokens.unwrap_or(0),
+                total_tokens: input + output,
+                cost_usd: price.cost_usd,
+                unpriced_tokens: price.unpriced_tokens,
+                pricing_available: price.pricing_available,
+                timestamp: price.timestamp,
+            },
+            pricing_error,
+        ))
     }
 
     async fn record_events(&self, events: Vec<(GoalUsageEvent, CostTokenUsage)>) -> Result<()> {
@@ -275,6 +300,25 @@ impl GoalOperationAccountant {
     }
 }
 
+fn usage_warning_attributes(event: &GoalUsageEvent, error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "provider_ref": event.provider_ref,
+        "model": event.model,
+        "error": crate::security::scrub(&format!("{error:#}")),
+    })
+}
+
+fn with_accounting_causes(error: anyhow::Error, causes: &[String]) -> anyhow::Error {
+    if causes.is_empty() {
+        error
+    } else {
+        error.context(format!(
+            "Goal usage settlement did not complete, and Goal accounting also failed: {}",
+            causes.join("; ")
+        ))
+    }
+}
+
 #[async_trait]
 impl GoalOperationAccounting for GoalOperationAccountant {
     async fn admit(&self, request: GoalOperationRequest) -> Result<()> {
@@ -288,10 +332,12 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         );
 
         let goal = self.current_running_goal().await?;
-        ensure!(
-            goal.goal().accounting_state == GoalAccountingState::Complete,
-            "Goal accounting is incomplete"
-        );
+        if goal.goal().accounting_state != GoalAccountingState::Complete {
+            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.goal().accounting_state,
+                false,
+            )));
+        }
         ensure!(
             goal.goal().pending_call_id.is_none() && goal.goal().pending_call_epoch.is_none(),
             "Goal already has a pending operation"
@@ -363,20 +409,54 @@ impl GoalOperationAccounting for GoalOperationAccountant {
 
         let mut accounting_state = settlement.accounting_state;
         let mut events = Vec::with_capacity(settlement.events.len());
+        let mut causes = Vec::new();
         for event in settlement.events {
-            match self.validated_cost_usage(&event) {
-                Ok(usage) => events.push((event, usage)),
-                Err(_) => accounting_state = GoalAccountingState::Invalid,
+            match self.ledger_usage(&event) {
+                Ok((usage, None)) => events.push((event, usage)),
+                Ok((usage, Some(error))) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(usage_warning_attributes(&event, &error)),
+                        "Goal usage pricing failed; usage retained as unpriced"
+                    );
+                    causes.push(format!(
+                        "usage pricing failed for provider `{}`, model `{}`; {} tokens are treated as unpriced: {error:#}",
+                        event.provider_ref, event.model, usage.total_tokens
+                    ));
+                    accounting_state =
+                        combine_accounting_state(accounting_state, GoalAccountingState::Invalid);
+                    events.push((event, usage));
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(usage_warning_attributes(&event, &error)),
+                        "Goal usage event rejected"
+                    );
+                    causes.push(format!(
+                        "a usage event for provider `{}`, model `{}` was rejected: {error:#}",
+                        event.provider_ref, event.model
+                    ));
+                    accounting_state =
+                        combine_accounting_state(accounting_state, GoalAccountingState::Invalid);
+                }
             }
         }
         if accounting_state == GoalAccountingState::Complete && events.is_empty() {
-            accounting_state = GoalAccountingState::Missing;
+            accounting_state =
+                combine_accounting_state(accounting_state, GoalAccountingState::Missing);
         }
 
         // Preserve known usage before settling the operation state. If ledger
         // persistence fails, the durable pending marker remains for restart
         // recovery to classify as outcome-unknown rather than replaying.
-        self.record_events(events).await?;
+        self.record_events(events)
+            .await
+            .map_err(|error| with_accounting_causes(error, &causes))?;
         match self
             .registry
             .settle_pending_operation(
@@ -386,11 +466,30 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 &operation.id,
                 accounting_state,
             )
-            .await?
+            .await
+            .map_err(|error| with_accounting_causes(error, &causes))?
         {
-            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Applied => {
+                if causes.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow::Error::new(GoalAccountingFailure::settled(
+                        accounting_state,
+                        &causes,
+                    )))
+                }
+            }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                bail!("Goal operation settlement lost its execution fence")
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal operation settlement lost its execution fence"
+                );
+                Err(with_accounting_causes(
+                    anyhow::Error::msg("Goal operation settlement lost its execution fence"),
+                    &causes,
+                ))
             }
         }
     }
@@ -417,6 +516,7 @@ mod tests {
         StoreFailure,
         Pause(GoalTransitionResult),
         PauseStoreFailure,
+        Settlement(GoalTransitionResult),
     }
 
     // Only the queried failure boundary is injected. All lifecycle and ledger
@@ -604,15 +704,20 @@ mod tests {
             pending_call_id: &str,
             accounting_state: GoalAccountingState,
         ) -> Result<GoalTransitionResult> {
-            self.store
-                .settle_pending_operation(
-                    task_id,
-                    session_id,
-                    admitted_epoch,
-                    pending_call_id,
-                    accounting_state,
-                )
-                .await
+            match self.fault {
+                AdmissionFault::Settlement(result) => Ok(result),
+                _ => {
+                    self.store
+                        .settle_pending_operation(
+                            task_id,
+                            session_id,
+                            admitted_epoch,
+                            pending_call_id,
+                            accounting_state,
+                        )
+                        .await
+                }
+            }
         }
 
         async fn update_session_goal_limits(
@@ -1436,6 +1541,459 @@ mod tests {
             .await
             .expect_err("missing usage must not admit another provider call");
         assert!(error.to_string().contains("incomplete"));
+    }
+
+    struct RouteFailingPricer {
+        failing: &'static str,
+        inner: ModelProviderGoalUsagePricer,
+    }
+
+    impl RouteFailingPricer {
+        fn new(failing: &'static str) -> Self {
+            let rates = HashMap::from([
+                ("model.input".to_owned(), 1.0),
+                ("model.output".to_owned(), 2.0),
+                ("model.cached_input".to_owned(), 0.5),
+                ("model.cache_write".to_owned(), 1.5),
+            ]);
+            Self {
+                failing,
+                inner: ModelProviderGoalUsagePricer::new(Arc::new(HashMap::from([
+                    ("fallback".to_owned(), rates.clone()),
+                    ("primary".to_owned(), rates),
+                ]))),
+            }
+        }
+    }
+
+    impl GoalUsagePricer for RouteFailingPricer {
+        fn price(
+            &self,
+            provider_ref: &str,
+            model: &str,
+            usage: &TokenUsage,
+        ) -> Result<GoalUsagePrice> {
+            if provider_ref == self.failing {
+                bail!("fixture pricing failed for this route");
+            }
+            self.inner.price(provider_ref, model, usage)
+        }
+    }
+
+    struct NanPricer;
+
+    impl GoalUsagePricer for NanPricer {
+        fn price(
+            &self,
+            _provider_ref: &str,
+            _model: &str,
+            _usage: &TokenUsage,
+        ) -> Result<GoalUsagePrice> {
+            Ok(GoalUsagePrice {
+                cost_usd: f64::NAN,
+                unpriced_tokens: 0,
+                pricing_available: true,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    fn usage_event(provider_ref: &str, input: u64, output: u64) -> GoalUsageEvent {
+        GoalUsageEvent {
+            provider_ref: provider_ref.to_owned(),
+            model: "model".to_owned(),
+            usage: usage(input, output),
+            priceable: true,
+        }
+    }
+
+    fn cost_records(directory: &TempDir) -> Vec<zeroclaw_config::cost::types::CostRecord> {
+        std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pricing_failure_on_one_event_retains_it_unpriced_with_its_priced_sibling() {
+        // A failed fallback price must not erase either event or hide its original cause.
+        let (store, mut factory, tracker, scope, directory) = fixture().await;
+        factory.pricer = Arc::new(RouteFailingPricer::new("fallback"));
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 41, 2), usage_event("primary", 8, 3)],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        let text = error.to_string();
+        for expected in [
+            "Goal accounting is invalid after a durable usage settlement",
+            "provider `fallback`, model `model`",
+            "43 tokens are treated as unpriced",
+            "fixture pricing failed for this route",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert_eq!(format!("{error:#}"), text);
+        let records = cost_records(&directory);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].provider_ref.as_deref(), Some("fallback"));
+        assert_eq!(records[0].task_id.as_deref(), Some(scope.task_id()));
+        assert_eq!(records[0].usage.input_tokens, 41);
+        assert_eq!(records[0].usage.output_tokens, 2);
+        assert_eq!(records[0].usage.total_tokens, 43);
+        assert_eq!(records[0].usage.cost_usd, 0.0);
+        assert_eq!(records[0].usage.unpriced_tokens, 43);
+        assert!(!records[0].usage.pricing_available);
+        assert_eq!(records[1].provider_ref.as_deref(), Some("primary"));
+        assert_eq!(records[1].usage.total_tokens, 11);
+        assert!((records[1].usage.cost_usd - (8.0 + 3.0 * 2.0) / 1_000_000.0).abs() < 1e-12);
+        assert_eq!(records[1].usage.unpriced_tokens, 0);
+        assert!(records[1].usage.pricing_available);
+        let (tokens, _, pricing_complete) = tracker
+            .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+            .unwrap();
+        assert_eq!(tokens, 54);
+        assert!(!pricing_complete);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert!(goal.effective_token_limit.is_none());
+        assert!(goal.effective_cost_limit_usd.is_none());
+        let next_error = accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap_err();
+        assert!(next_error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(next_error.to_string().contains("incomplete"));
+        assert!(
+            next_error
+                .to_string()
+                .contains("invalid or could not be priced")
+        );
+    }
+
+    #[tokio::test]
+    async fn pricing_failure_does_not_weaken_an_unknown_outcome() {
+        // Pricing uncertainty must not replace the stronger unknown-operation outcome.
+        let (store, mut factory, tracker, scope, directory) = fixture().await;
+        factory.pricer = Arc::new(RouteFailingPricer::new("fallback"));
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::OutcomeUnknown,
+                events: vec![usage_event("fallback", 41, 2)],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(
+            error
+                .to_string()
+                .contains("Goal accounting is outcome-unknown after a durable usage settlement")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("fixture pricing failed for this route")
+        );
+        assert_eq!(cost_records(&directory).len(), 1);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            43
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_price_value_is_retained_as_unpriced_usage() {
+        // Invalid cost values retain the valid token record and surface the pricing condition.
+        let (store, mut factory, tracker, scope, directory) = fixture().await;
+        factory.pricer = Arc::new(NanPricer);
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 10, 5)],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(
+            error
+                .to_string()
+                .contains("15 tokens are treated as unpriced")
+        );
+        assert!(error.to_string().contains("Goal usage cost is invalid"));
+        let records = cost_records(&directory);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].usage.total_tokens, 15);
+        assert_eq!(records[0].usage.cost_usd, 0.0);
+        assert_eq!(records[0].usage.unpriced_tokens, 15);
+        assert!(!records[0].usage.pricing_available);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap(),
+            (15, 0.0, false)
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_route_rates_keep_complete_accounting() {
+        // An ordinary successful unpriced result is not a pricing-resolver error.
+        let (store, factory, tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("unrated", 7, 1)],
+            })
+            .await
+            .unwrap();
+        let records = cost_records(&directory);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider_ref.as_deref(), Some("unrated"));
+        assert_eq!(records[0].usage.unpriced_tokens, 8);
+        assert!(!records[0].usage.pricing_available);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap(),
+            (8, 0.0, false)
+        );
+        assert_eq!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .accounting_state,
+            GoalAccountingState::Complete
+        );
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_usage_event_is_reported_after_its_valid_sibling_settles() {
+        // A structurally rejected event does not suppress a valid sibling's durable usage.
+        let (store, factory, tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 0, 0), usage_event("primary", 8, 3)],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(
+            error
+                .to_string()
+                .contains("a usage event for provider `fallback`, model `model` was rejected")
+        );
+        assert!(error.to_string().contains("Goal usage is all zero"));
+        let records = cost_records(&directory);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider_ref.as_deref(), Some("primary"));
+        assert_eq!(records[0].usage.total_tokens, 11);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            11
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn pricing_failure_with_ledger_failure_keeps_pending_operation_and_both_causes() {
+        // Failed persistence keeps the pending operation and never claims its tokens were recorded.
+        let directory = TempDir::new().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(&directory.path().join("control")).unwrap());
+        let (store, mut factory, _tracker, scope, directory) =
+            fixture_with_store(store, directory).await;
+        factory.pricer = Arc::new(RouteFailingPricer::new("fallback"));
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        let admitted = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        std::fs::create_dir(directory.path().join("state/costs.jsonl")).unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 41, 2)],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<GoalAccountingFailure>())
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("cost storage"));
+        assert!(text.contains("fixture pricing failed for this route"));
+        assert!(text.contains("43 tokens are treated as unpriced"));
+        assert!(!text.contains("were recorded"));
+        assert!(
+            error.to_string().contains(
+                "Goal usage settlement did not complete, and Goal accounting also failed"
+            )
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pending_call_id, admitted.pending_call_id);
+        assert!(goal.pending_call_id.is_some());
+        assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    }
+
+    #[tokio::test]
+    async fn pricing_failure_with_lost_settlement_fence_reports_both_causes() {
+        // A lost settlement fence keeps persisted usage and the original pricing cause.
+        let (store, mut factory, tracker, scope, directory) = fixture().await;
+        factory.pricer = Arc::new(RouteFailingPricer::new("fallback"));
+        let faulted = faulted_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::Settlement(GoalTransitionResult::Stale),
+        );
+        let accountant = faulted.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        let admitted = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 41, 2)],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<GoalAccountingFailure>())
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("Goal operation settlement lost its execution fence"));
+        assert!(text.contains("fixture pricing failed for this route"));
+        let records = cost_records(&directory);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].usage.total_tokens, 43);
+        assert_eq!(records[0].usage.unpriced_tokens, 43);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap(),
+            (43, 0.0, false)
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.pending_call_id, admitted.pending_call_id);
+        assert!(goal.pending_call_id.is_some());
+        assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+    }
+
+    #[tokio::test]
+    async fn usage_warning_attributes_scrub_the_logged_error_but_keep_the_returned_cause() {
+        // The log boundary scrubs the synthetic bot token while the returned cause remains intact.
+        let canary = "123456:ABC-def_GHI";
+        let message = "fixture pricing failed for this route: https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
+        let event = usage_event("fallback", 41, 2);
+        let error = anyhow::Error::msg(message);
+        let attrs = usage_warning_attributes(&event, &error);
+        let logged_error = attrs["error"].as_str().unwrap();
+        assert!(!logged_error.contains(canary));
+        assert!(logged_error.contains("[REDACTED_BOT_TOKEN]"));
+        assert!(logged_error.contains("fixture pricing failed for this route"));
+        assert_eq!(attrs["provider_ref"], "fallback");
+        assert_eq!(attrs["model"], "model");
+
+        struct CanaryPricer {
+            inner: RouteFailingPricer,
+            message: String,
+        }
+
+        impl GoalUsagePricer for CanaryPricer {
+            fn price(
+                &self,
+                provider_ref: &str,
+                model: &str,
+                usage: &TokenUsage,
+            ) -> Result<GoalUsagePrice> {
+                if provider_ref == "fallback" {
+                    return Err(anyhow::Error::msg(self.message.clone()));
+                }
+                self.inner.price(provider_ref, model, usage)
+            }
+        }
+
+        let (_store, mut factory, _tracker, scope, _directory) = fixture().await;
+        factory.pricer = Arc::new(CanaryPricer {
+            inner: RouteFailingPricer::new("fallback"),
+            message: message.to_owned(),
+        });
+        let accountant = factory.for_scope(scope);
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        let error = accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![event],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(error.to_string().contains(canary));
+        assert!(error.to_string().contains(message));
     }
 
     #[test]

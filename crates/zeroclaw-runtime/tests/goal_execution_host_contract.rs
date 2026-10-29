@@ -4,11 +4,13 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use std::{collections::VecDeque, path::PathBuf, sync::Mutex as StdMutex};
 use tempfile::TempDir;
 use tokio::{
     sync::Notify,
     time::{Duration, timeout},
 };
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_commands::goal::GoalCommand;
 use zeroclaw_config::{
     api_error::{ConfigApiCode, ConfigApiError},
@@ -18,6 +20,10 @@ use zeroclaw_config::{
     providers::ModelProviderRef,
     schema::{Config, OpenAIModelProviderConfig},
 };
+use zeroclaw_goal::accounting::{
+    GoalAccountingFailure, GoalOperationAccounting, GoalOperationAccountingFactory,
+    GoalOperationRequest, GoalOperationSettlement,
+};
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalHostSettingsSource, GoalIngressContext,
@@ -25,6 +31,7 @@ use zeroclaw_goal::{
     GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalVerifierResult, GoalVerifierTurn,
 };
+use zeroclaw_infra::{session_backend::SessionBackend, session_sqlite::SqliteSessionBackend};
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
@@ -467,6 +474,9 @@ struct LeaseObservingRegistry {
     pause_observed: AtomicUsize,
     replacement_after_missing_goal: Option<TaskRecord>,
     missing_goal_observed: AtomicBool,
+    task_after_goal_read: Option<TaskRecord>,
+    goal_after_goal_read: Option<GoalTaskRecord>,
+    goal_read_observed: AtomicBool,
 }
 
 impl LeaseObservingRegistry {
@@ -501,6 +511,9 @@ impl LeaseObservingRegistry {
             pause_observed: AtomicUsize::new(0),
             replacement_after_missing_goal: None,
             missing_goal_observed: AtomicBool::new(false),
+            task_after_goal_read: None,
+            goal_after_goal_read: None,
+            goal_read_observed: AtomicBool::new(false),
         }
     }
 
@@ -510,6 +523,29 @@ impl LeaseObservingRegistry {
         let mut replacement = registry.task.clone();
         replacement.id = "replacement-goal".to_owned();
         registry.replacement_after_missing_goal = Some(replacement);
+        registry
+    }
+
+    fn paused_with_change_after_goal_read(
+        ingress: &GoalIngressContext,
+        changed_status: TaskStatus,
+        changed_epoch: i64,
+    ) -> Self {
+        let mut registry = Self::running_for(ingress, Arc::new(AtomicUsize::new(1)));
+        registry.task.status = TaskStatus::Paused;
+        registry.goal.pause_reason = Some(GoalPauseReason::OperatorPaused);
+        registry.goal.pause_description = Some("paused by operator".to_owned());
+        let mut changed_task = registry.task.clone();
+        changed_task.status = changed_status;
+        changed_task.execution_epoch = changed_epoch;
+        if changed_status == TaskStatus::Running {
+            let mut resumed_goal = registry.goal.clone();
+            resumed_goal.pause_reason = None;
+            resumed_goal.pause_description = None;
+            resumed_goal.blockers.clear();
+            registry.goal_after_goal_read = Some(resumed_goal);
+        }
+        registry.task_after_goal_read = Some(changed_task);
         registry
     }
 
@@ -555,7 +591,13 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
             self.missing_goal_observed.store(true, Ordering::SeqCst);
             return Ok(None);
         }
-        Ok(Some(self.goal.clone()))
+        self.goal_read_observed.store(true, Ordering::SeqCst);
+        Ok(Some(
+            self.goal_after_goal_read
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.goal.clone()),
+        ))
     }
 
     async fn update_goal_limits(
@@ -595,13 +637,18 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>> {
         assert_eq!(self.task.session_id.as_deref(), Some(session_id));
-        Ok(Some(
+        Ok(Some(if self.goal_read_observed.load(Ordering::SeqCst) {
+            self.task_after_goal_read
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.task.clone())
+        } else {
             self.replacement_after_missing_goal
                 .as_ref()
                 .filter(|_| self.missing_goal_observed.load(Ordering::SeqCst))
                 .cloned()
-                .unwrap_or_else(|| self.task.clone()),
-        ))
+                .unwrap_or_else(|| self.task.clone())
+        }))
     }
 
     async fn terminal_reason_for_session_goal(
@@ -729,8 +776,10 @@ fn goal_config(enabled: bool, verifier: &str, limits: ConfigGoalBudgetLimits) ->
     let mut config = Config {
         goal: GoalConfig {
             enabled,
-            default_token_limit: limits.token_limit.unwrap_or_default(),
-            default_cost_limit_usd: limits.cost_limit_usd.unwrap_or_default(),
+            // A normalized `None` means explicitly unlimited in these legacy
+            // fixtures, not an unconfigured default.
+            default_token_limit: Some(limits.token_limit.unwrap_or(0)),
+            default_cost_limit_usd: Some(limits.cost_limit_usd.unwrap_or(0.0)),
             verifier: zeroclaw_config::goal::GoalVerifierConfig {
                 model_provider: ModelProviderRef::new(verifier),
                 model: None,
@@ -1300,6 +1349,233 @@ async fn explicit_unlimited_goal_defaults_remain_unlimited() {
 }
 
 #[tokio::test]
+async fn start_without_budget_flags_or_defaults_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let driver = recording_driver(&ingress);
+        let mut config = valid_goal_config(true);
+        config.goal.default_token_limit = None;
+        config.goal.default_cost_limit_usd = None;
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "start without a configured budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_command_budgets_start_without_configured_defaults() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        for (budget, expected_tokens, expected_cost) in [
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: None,
+                }),
+                Some(10),
+                None,
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: None,
+                    cost_limit_usd: Some(2.5),
+                }),
+                None,
+                Some(2.5),
+            ),
+            (
+                GoalBudgetSelection::Limits(GoalBudgetLimits {
+                    token_limit: Some(10),
+                    cost_limit_usd: Some(2.5),
+                }),
+                Some(10),
+                Some(2.5),
+            ),
+            (GoalBudgetSelection::Unlimited, None, None),
+        ] {
+            let mut config = valid_goal_config(true);
+            config.goal.default_token_limit = None;
+            config.goal.default_cost_limit_usd = None;
+            let driver = recording_driver(&ingress);
+            let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+            let submission = GoalExecutionHost::new()
+                .submit(
+                    &host_settings(&config),
+                    ingress.clone(),
+                    driver,
+                    GoalCommand::Start {
+                        budget,
+                        objective: "start with the explicit command budget".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let GoalResponse::Started(started) = controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap()
+            else {
+                panic!("expected explicit command budget to admit Goal start");
+            };
+            assert_eq!(started.token_limit, expected_tokens);
+            assert_eq!(started.cost_limit_usd, expected_cost);
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_positive_default_starts_with_that_limit() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(500),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "use the single configured token limit".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let GoalResponse::Started(started) = controller
+            .submit(&host_settings(&config), &submission)
+            .await
+            .unwrap()
+        else {
+            panic!("expected positive token default to admit Goal start");
+        };
+        assert_eq!(started.token_limit, Some(500));
+        assert_eq!(started.cost_limit_usd, None);
+    }
+}
+
+#[tokio::test]
+async fn zero_token_default_without_cost_default_returns_budget_required() {
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let mut config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: Some(0),
+                cost_limit_usd: None,
+            },
+        );
+        config.goal.default_cost_limit_usd = None;
+        let driver = recording_driver(&ingress);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let submission = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "do not treat a zero-only default as a budget".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::BudgetRequired
+        ));
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn invalid_defaults_reject_explicit_budget_start_with_typed_path() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let config = goal_config(
+            true,
+            "openai.default",
+            ConfigGoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: Some(-1.0),
+            },
+        );
+        let driver = recording_driver(&ingress);
+        let error = GoalExecutionHost::new()
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                        token_limit: Some(10),
+                        cost_limit_usd: None,
+                    }),
+                    objective: "invalid defaults must reject before binding".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_admission_error(
+            error,
+            ConfigApiCode::InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+        );
+        assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn invalid_goal_limits_are_rejected_before_binding_with_typed_path() {
     let config = goal_config(
         true,
@@ -1512,6 +1788,706 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
 
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptedStep {
+    Parent(Vec<(String, String)>),
+    Append(String, TaskStatus, i64),
+    Verifier(String),
+    Resume(String),
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedFault {
+    FailAppend,
+    PauseDuringAppend,
+    PauseDuringVerifier,
+    ParentError,
+    PauseThenParentError,
+    ParentAccountingFailure,
+    VerifierAccountingFailure,
+    SettleIncomplete,
+}
+
+struct ExecutionScript {
+    parents: VecDeque<String>,
+    verifiers: VecDeque<String>,
+    steps: Vec<ScriptedStep>,
+    fault: Option<ScriptedFault>,
+}
+
+struct ScriptedDriver {
+    binding: GoalSessionBinding,
+    store: Arc<SqliteTaskStore>,
+    sessions: Arc<SqliteSessionBackend>,
+    script: Arc<StdMutex<ExecutionScript>>,
+}
+
+struct ScriptedLease {
+    session_key: GoalSessionKey,
+    store: Arc<SqliteTaskStore>,
+    sessions: Arc<SqliteSessionBackend>,
+    script: Arc<StdMutex<ExecutionScript>>,
+    scope: Option<GoalExecutionScope>,
+}
+
+impl ScriptedLease {
+    async fn pause(&self, scope: &GoalExecutionScope) {
+        assert_eq!(
+            self.store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    fn accounting_error() -> anyhow::Error {
+        anyhow::Error::new(GoalAccountingFailure::settled(
+            GoalAccountingState::Invalid,
+            &["fixture pricing failed".to_owned()],
+        ))
+        .context("fixture turn context")
+    }
+}
+
+#[async_trait]
+impl GoalSessionDriver for ScriptedDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+        _checkpoint: &GoalParentTurnCheckpoint,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(ScriptedLease {
+            session_key: self.binding.session_key().clone(),
+            store: Arc::clone(&self.store),
+            sessions: Arc::clone(&self.sessions),
+            script: Arc::clone(&self.script),
+            scope: None,
+        }))
+    }
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for ScriptedLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+        Ok(self.sessions.try_load(&self.session_key.durable_id())?)
+    }
+
+    async fn append_resume_response(&mut self, response: String) -> anyhow::Result<()> {
+        self.sessions.append(
+            &self.session_key.durable_id(),
+            &ChatMessage::user(&response),
+        )?;
+        self.script
+            .lock()
+            .unwrap()
+            .steps
+            .push(ScriptedStep::Resume(response));
+        Ok(())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        scope: &GoalExecutionScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
+        if self.scope.is_none() {
+            self.scope = Some(scope.clone());
+        }
+        let fault = {
+            let mut script = self.script.lock().unwrap();
+            script.steps.push(ScriptedStep::Parent(
+                turn.working_history
+                    .into_iter()
+                    .map(|message| (message.role, message.content))
+                    .collect(),
+            ));
+            script.fault
+        };
+        match fault {
+            Some(ScriptedFault::ParentError) => anyhow::bail!("fixture provider failed"),
+            Some(ScriptedFault::PauseThenParentError) => {
+                self.pause(scope).await;
+                anyhow::bail!("fixture provider failed");
+            }
+            Some(ScriptedFault::ParentAccountingFailure) => {
+                return Err(Self::accounting_error());
+            }
+            Some(ScriptedFault::SettleIncomplete) => {
+                assert_eq!(
+                    self.store
+                        .admit_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "fixture-operation",
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+                assert_eq!(
+                    self.store
+                        .settle_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "fixture-operation",
+                            GoalAccountingState::Invalid,
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            _ => {}
+        }
+        Ok(self.script.lock().unwrap().parents.pop_front().unwrap())
+    }
+
+    async fn run_verifier(
+        &mut self,
+        scope: &GoalExecutionScope,
+        turn: GoalVerifierTurn,
+    ) -> anyhow::Result<GoalVerifierResult> {
+        let fault = {
+            let mut script = self.script.lock().unwrap();
+            script.steps.push(ScriptedStep::Verifier(turn.candidate));
+            script.fault
+        };
+        match fault {
+            Some(ScriptedFault::PauseDuringVerifier) => self.pause(scope).await,
+            Some(ScriptedFault::VerifierAccountingFailure) => {
+                return Err(Self::accounting_error());
+            }
+            _ => {}
+        }
+        Ok(GoalVerifierResult {
+            response: self.script.lock().unwrap().verifiers.pop_front().unwrap(),
+            attribution: None,
+        })
+    }
+
+    async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        let fault = self.script.lock().unwrap().fault;
+        if matches!(fault, Some(ScriptedFault::FailAppend)) {
+            anyhow::bail!("fixture append failed");
+        }
+        let scope = self.scope.as_ref().unwrap();
+        let task = self
+            .store
+            .current_goal_for_session(scope.session_id())
+            .await?
+            .unwrap();
+        self.sessions
+            .append(scope.session_id(), &ChatMessage::assistant(&candidate))?;
+        self.script.lock().unwrap().steps.push(ScriptedStep::Append(
+            candidate,
+            task.status,
+            task.execution_epoch,
+        ));
+        if matches!(fault, Some(ScriptedFault::PauseDuringAppend)) {
+            self.pause(scope).await;
+        }
+        Ok(())
+    }
+}
+
+struct ScriptedAccounting;
+
+#[async_trait]
+impl GoalOperationAccounting for ScriptedAccounting {
+    async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pricing_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+struct ScriptedAccountingFactory;
+
+impl GoalOperationAccountingFactory for ScriptedAccountingFactory {
+    fn for_scope(&self, _scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
+        Arc::new(ScriptedAccounting)
+    }
+}
+
+struct EngineFixture {
+    config: Config,
+    runtime: GoalRuntime,
+    store: Arc<SqliteTaskStore>,
+    driver: Arc<ScriptedDriver>,
+    scope: GoalExecutionScope,
+    request: Option<zeroclaw_goal::GoalExecutionRequest>,
+    session_data: PathBuf,
+    // Drop both databases and their shared handles before the temporary files.
+    _directory: tempfile::TempDir,
+}
+
+impl EngineFixture {
+    async fn new(parents: &[&str], verifiers: &[&str], fault: Option<ScriptedFault>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(&directory.path().join("control")).unwrap());
+        let session_data = directory.path().join("history");
+        let config = valid_goal_config(true);
+        let ingress = matrix_ingress();
+        let driver = Arc::new(ScriptedDriver {
+            binding: GoalSessionBinding::new(ingress.session_key().clone()),
+            store: Arc::clone(&store),
+            sessions: Arc::new(SqliteSessionBackend::new(&session_data).unwrap()),
+            script: Arc::new(StdMutex::new(ExecutionScript {
+                parents: parents.iter().map(|text| (*text).to_owned()).collect(),
+                verifiers: verifiers.iter().map(|text| (*text).to_owned()).collect(),
+                steps: Vec::new(),
+                fault,
+            })),
+        });
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let (_, request) = runtime
+            .submit(
+                &host_settings(&config),
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Limits(
+                        zeroclaw_commands::goal::GoalBudgetLimits {
+                            token_limit: Some(100),
+                            cost_limit_usd: None,
+                        },
+                    ),
+                    objective: "finish the bounded task".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        let request = request.unwrap();
+        let scope = request.scope().clone();
+        Self {
+            config,
+            runtime,
+            store,
+            driver,
+            scope,
+            request: Some(request),
+            session_data,
+            _directory: directory,
+        }
+    }
+
+    async fn run(&mut self) -> anyhow::Result<zeroclaw_goal::GoalExecutionOutcome> {
+        // The engine resolves settings from a live handle at acquisition.
+        let live = LiveConfig::new(self.config.clone());
+        let source = GoalHostSettingsSource::new(live.handle(), 42, "test-boot")?;
+        self.runtime
+            .execution_engine(Arc::new(ScriptedAccountingFactory))
+            .run(
+                &source,
+                self.request.take().unwrap(),
+                GoalParentTurnCheckpoint::new(),
+            )
+            .await
+    }
+
+    async fn task(&self) -> TaskRecord {
+        self.store
+            .current_goal_for_session(self.scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn reason(&self) -> Option<String> {
+        self.store
+            .terminal_reason_for_session_goal(self.scope.task_id(), self.scope.session_id())
+            .await
+            .unwrap()
+    }
+
+    fn steps(&self) -> Vec<ScriptedStep> {
+        self.driver.script.lock().unwrap().steps.clone()
+    }
+
+    fn history(&self) -> Vec<(String, String)> {
+        // A separate backend handle proves the transcript is not only a cache.
+        SqliteSessionBackend::new(&self.session_data)
+            .unwrap()
+            .try_load(self.scope.session_id())
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.role, message.content))
+            .collect()
+    }
+}
+
+const SCRIPTED_COMPLETE: &str =
+    r#"{"decision":"complete","reason":"all criteria met","blockers":[]}"#;
+
+#[tokio::test]
+async fn engine_persists_a_verified_candidate_before_completing() {
+    // Completion follows the single durable candidate append and verifier.
+    let mut fixture = EngineFixture::new(&["final answer"], &[SCRIPTED_COMPLETE], None).await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "final answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("final answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Completed);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "final answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_candidate_persistence_failure_fails_without_verifying_or_completing() {
+    // An append failure ends the exact Goal without admitting its verifier.
+    let mut fixture = EngineFixture::new(&["answer"], &[], Some(ScriptedFault::FailAppend)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("fixture append failed"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("candidate_persistence_failed")
+    );
+    assert!(fixture.history().is_empty());
+}
+
+#[tokio::test]
+async fn engine_pause_during_candidate_persistence_keeps_the_candidate_and_never_completes() {
+    // A winning pause keeps the appended answer and prevents verifier admission.
+    let mut fixture =
+        EngineFixture::new(&["answer"], &[], Some(ScriptedFault::PauseDuringAppend)).await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Fenced
+    );
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_pause_during_verification_keeps_the_persisted_candidate_and_never_completes() {
+    // A pause committed during verification cannot be overwritten by completion.
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[SCRIPTED_COMPLETE],
+        Some(ScriptedFault::PauseDuringVerifier),
+    )
+    .await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Fenced
+    );
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_blocked_question_is_persisted_before_pause_and_retained_on_resume() {
+    // Resume reads the durable question and appends its response before new work.
+    let payload = serde_json::json!({"options": ["A", "B"]});
+    let blocked = serde_json::json!({"decision": "blocked", "reason": "choice required", "blockers": [{"kind": "needs_user_input", "message": "Choose A or B?", "payload": payload}]}).to_string();
+    let mut fixture = EngineFixture::new(
+        &["Choose A or B?", "Done with B"],
+        &[&blocked, SCRIPTED_COMPLETE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::VerifierBlocked
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    let goal = fixture
+        .store
+        .get_goal_task(fixture.scope.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+    assert_eq!(goal.blockers[0].payload.as_ref(), Some(&payload));
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "Choose A or B?".into())]
+    );
+    let (_, request) = fixture
+        .runtime
+        .submit(
+            &host_settings(&fixture.config),
+            matrix_ingress(),
+            fixture.driver.clone(),
+            GoalCommand::Resume {
+                response: Some("B".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    let request = request.unwrap();
+    fixture.scope = request.scope().clone();
+    fixture.request = Some(request);
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    let steps = fixture.steps();
+    assert!(
+        matches!(&steps[1], ScriptedStep::Append(text, TaskStatus::Running, _) if text == "Choose A or B?")
+    );
+    assert_eq!(steps[3], ScriptedStep::Resume("B".into()));
+    assert_eq!(
+        steps[4],
+        ScriptedStep::Parent(vec![
+            ("assistant".into(), "Choose A or B?".into()),
+            ("user".into(), "B".into())
+        ])
+    );
+    assert!(
+        matches!(&steps[5], ScriptedStep::Append(text, TaskStatus::Running, _) if text == "Done with B")
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![
+            ("assistant".into(), "Choose A or B?".into()),
+            ("user".into(), "B".into()),
+            ("assistant".into(), "Done with B".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn engine_persists_each_continued_candidate_in_order() {
+    // Continued answers persist once while feedback remains only working context.
+    let feedback =
+        r#"{"decision":"continue","reason":"finish the remaining criterion","blockers":[]}"#;
+    let mut fixture = EngineFixture::new(
+        &["draft one", "final answer"],
+        &[feedback, SCRIPTED_COMPLETE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture.run().await.unwrap(),
+        zeroclaw_goal::GoalExecutionOutcome::Completed
+    );
+    let steps = fixture.steps();
+    let appended: Vec<_> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ScriptedStep::Append(text, _, _) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appended, vec!["draft one", "final answer"]);
+    let ScriptedStep::Parent(history) = &steps[3] else {
+        panic!("expected the second parent turn");
+    };
+    assert_eq!(
+        history[history.len() - 2],
+        ("assistant".into(), "draft one".into())
+    );
+    assert_eq!(history.last().unwrap().0, "user");
+    assert!(
+        history
+            .last()
+            .unwrap()
+            .1
+            .contains("finish the remaining criterion")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Completed);
+    assert_eq!(
+        fixture.history(),
+        vec![
+            ("assistant".into(), "draft one".into()),
+            ("assistant".into(), "final answer".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_accounting_failure_fails_as_accounting_with_its_diagnostic() {
+    // Context layers preserve typed classification and the original diagnostic.
+    let mut fixture =
+        EngineFixture::new(&[], &[], Some(ScriptedFault::ParentAccountingFailure)).await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture pricing failed"));
+    assert!(!rendered.contains("Goal parent operation failed"));
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+    );
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_incomplete_accounting_names_the_durable_condition() {
+    // A successful parent over durable Invalid accounting cannot append or verify.
+    let mut fixture =
+        EngineFixture::new(&["candidate"], &[], Some(ScriptedFault::SettleIncomplete)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(error.to_string().contains("Goal accounting is incomplete"));
+    assert!(error.to_string().contains("invalid or could not be priced"));
+    assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_operation_error_keeps_its_classification() {
+    // Ordinary provider errors retain their operation failure reason and chain.
+    let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::ParentError)).await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("Goal parent operation failed"));
+    assert!(format!("{error:#}").contains("fixture provider failed"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("parent_operation_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_accounting_failure_fails_as_accounting_after_the_candidate_is_durable() {
+    // Verifier accounting failure leaves the already appended parent response.
+    let mut fixture = EngineFixture::new(
+        &["final answer"],
+        &[],
+        Some(ScriptedFault::VerifierAccountingFailure),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("fixture pricing failed"));
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "final answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("final answer".into()),
+        ]
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "final answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_error_after_a_winning_pause_keeps_both_errors_and_the_pause() {
+    // A failed stale-epoch terminal write preserves both errors and the pause.
+    let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::PauseThenParentError)).await;
+    let epoch = fixture.scope.execution_epoch();
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture provider failed"));
+    assert!(rendered.contains("Goal parent operation failed"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    let task = fixture.task().await;
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, epoch + 1);
+    assert_eq!(
+        fixture
+            .store
+            .get_goal_task(fixture.scope.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_reason,
+        Some(GoalPauseReason::OperatorPaused)
+    );
+    assert!(fixture.reason().await.is_none());
+    assert!(fixture.history().is_empty());
 }
 
 #[tokio::test]
@@ -2380,6 +3356,71 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
 }
 
 #[tokio::test]
+async fn runtime_start_without_budget_defaults_returns_budget_required_without_execution() {
+    use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
+
+    // Missing defaults stop admission without handing off execution; explicit limits admit it.
+    for ingress in [matrix_ingress(), zerocode_ingress("main")] {
+        let session_id = ingress.session_key().durable_id();
+        let mut config = valid_goal_config(true);
+        config.goal.default_token_limit = None;
+        config.goal.default_cost_limit_usd = None;
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+        let settings = host_settings(&config);
+        let driver = Arc::new(ExecutionDriver {
+            binding: GoalSessionBinding::new(ingress.session_key().clone()),
+            execution_acquires: AtomicUsize::new(0),
+            delivered: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let (response, execution) = runtime
+            .submit(
+                &settings,
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Defaults,
+                    objective: "start without configured budget defaults".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(matches!(response, GoalResponse::BudgetRequired));
+        assert!(execution.is_none());
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (response, execution) = runtime
+            .submit(
+                &settings,
+                ingress,
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetSelection::Limits(GoalBudgetLimits {
+                        token_limit: Some(10),
+                        cost_limit_usd: None,
+                    }),
+                    objective: "start with explicit budget limits".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(matches!(response, GoalResponse::Started(_)));
+        assert!(execution.is_some());
+        assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn runtime_rejects_dangling_verifier_for_start_and_resume_but_allows_status() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
@@ -2945,6 +3986,113 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         driver.reconnect_is_allowed(),
         "the lease may release after the guarded lifecycle submission is settled"
     );
+}
+
+async fn status_for_registry(
+    config: &GoalHostSettings<'_>,
+    ingress: &GoalIngressContext,
+    registry: Arc<LeaseObservingRegistry>,
+) -> GoalResponse {
+    let controller = GoalController::new(registry as Arc<dyn GoalTaskRegistry>);
+    let submission = GoalExecutionHost::new()
+        .submit(
+            config,
+            ingress.clone(),
+            recording_driver(ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    controller.submit(config, &submission).await.unwrap()
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_resume_changes_status_and_epoch() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Running,
+        2,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_terminal_status_change() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Cancelled,
+        1,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_is_stale_after_same_id_epoch_only_change() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::paused_with_change_after_goal_read(
+        &ingress,
+        TaskStatus::Paused,
+        2,
+    ));
+
+    assert!(matches!(
+        status_for_registry(&settings, &ingress, registry).await,
+        GoalResponse::Stale
+    ));
+}
+
+#[tokio::test]
+async fn status_projection_preserves_stable_running_and_paused_snapshots() {
+    let config = valid_goal_config(true);
+    let settings = host_settings(&config);
+    let ingress = matrix_ingress();
+    let mut running_fixture =
+        LeaseObservingRegistry::running_for(&ingress, Arc::new(AtomicUsize::new(1)));
+    running_fixture.goal.effective_token_limit = Some(100);
+    running_fixture.goal.effective_cost_limit_usd = Some(0.75);
+    let running = Arc::new(running_fixture);
+
+    let GoalResponse::Status(running) = status_for_registry(&settings, &ingress, running).await
+    else {
+        panic!("stable running task should project as status");
+    };
+    assert_eq!(running.status, TaskStatus::Running);
+    assert_eq!(running.execution_epoch, 1);
+    assert_eq!(running.pause_reason, None);
+    assert_eq!(running.token_limit, Some(100));
+    assert_eq!(running.cost_limit_usd, Some(0.75));
+    assert_eq!(running.accounting_state, GoalAccountingState::Complete);
+    assert!(!running.resumable);
+
+    let mut paused = LeaseObservingRegistry::running_for(&ingress, Arc::new(AtomicUsize::new(1)));
+    paused.task.status = TaskStatus::Paused;
+    paused.goal.pause_reason = Some(GoalPauseReason::OperatorPaused);
+    paused.goal.pause_description = Some("paused by operator".to_owned());
+    let GoalResponse::Status(paused) =
+        status_for_registry(&settings, &ingress, Arc::new(paused)).await
+    else {
+        panic!("stable paused task should project as status");
+    };
+    assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(paused.execution_epoch, 1);
+    assert_eq!(paused.pause_reason, Some(GoalPauseReason::OperatorPaused));
+    assert!(paused.resumable);
 }
 
 #[tokio::test]

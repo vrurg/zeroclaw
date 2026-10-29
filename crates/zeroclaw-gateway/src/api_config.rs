@@ -5191,7 +5191,7 @@ mod tests {
     async fn editor_validation_regression_p10_unrelated_edit_retains_goal_cost_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config.goal.default_cost_limit_usd = -1.0;
+        config.goal.default_cost_limit_usd = Some(-1.0);
         config.save().await.unwrap();
         let state = test_state(config);
         let (status, json) = response_json(
@@ -5221,7 +5221,7 @@ mod tests {
     async fn editor_validation_regression_p10_dirty_verifier_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config.goal.default_cost_limit_usd = -1.0;
+        config.goal.default_cost_limit_usd = Some(-1.0);
         assert_editor_patch_rejected_without_mutation(
             config,
             serde_json::json!([{
@@ -5676,6 +5676,616 @@ mod tests {
         assert_eq!(reloaded.gateway.websocket_ping_interval_secs, 45);
         assert_eq!(persisted["composio"]["api_key"], original_disk_secret);
         assert_eq!(state.config.read().gateway.websocket_ping_interval_secs, 45);
+    }
+
+    #[tokio::test]
+    async fn editor_validation_regression_cross_field_input_edit_is_rejected_without_publishing() {
+        // An unchanged TTL error still rejects edits to its announce-interval input.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.nodes.mdns.peer_ttl_secs = 30;
+        config.nodes.mdns.announce_interval_secs = 60;
+
+        assert_editor_patch_rejected_without_mutation(
+            config,
+            serde_json::json!([{
+                "op": "replace",
+                "path": "/nodes/mdns/announce_interval_secs",
+                "value": 120
+            }]),
+            "invalid_numeric_range",
+            Some("nodes.mdns.peer_ttl_secs"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn editor_validation_regression_unrelated_edit_keeps_cross_field_warning() {
+        // Unrelated saves preserve the TTL warning and the complete persisted state.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.nodes.mdns.peer_ttl_secs = 30;
+        config.nodes.mdns.announce_interval_secs = 60;
+        let max_tasks = config.scheduler.max_tasks + 1;
+        config.save().await.unwrap();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/scheduler/max_tasks",
+                    "value": max_tasks
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let warnings: Vec<_> = json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "pre_existing_validation_error")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{json}");
+        assert_eq!(warnings[0]["path"], "nodes.mdns.peer_ttl_secs", "{json}");
+        assert_eq!(state.config.read().scheduler.max_tasks, max_tasks);
+        assert_eq!(state.config.read().nodes.mdns.peer_ttl_secs, 30);
+        assert_eq!(state.config.read().nodes.mdns.announce_interval_secs, 60);
+        let reloaded = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&state.config.read().config_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(state.config.read().clone()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_enabling_with_configured_verifier_saves_without_budget_keys() {
+        // A valid enable-only save must not invent default budget values.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        assert!(!config.goal.enabled);
+        assert!(config.goal.verifier.model_provider.as_str().is_empty());
+        goal_configure_test_verifier(&mut config);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        assert!(state.config.read().goal.enabled);
+        assert!(
+            json["warnings"].as_array().is_none_or(|warnings| {
+                warnings.iter().all(|warning| {
+                    !warning["path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("goal."))
+                })
+            }),
+            "{json}"
+        );
+        assert!(state.config.read().validate().is_ok());
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            persisted["goal"]["verifier"]["model_provider"].as_str(),
+            Some("openai.default")
+        );
+        let goal = persisted["goal"].as_table().unwrap();
+        assert!(!goal.contains_key("default_token_limit"));
+        assert!(!goal.contains_key("default_cost_limit_usd"));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, None);
+    }
+
+    #[tokio::test]
+    async fn goal_patch_enabling_without_verifier_is_rejected_without_publishing() {
+        // Enabling without a verifier introduces an error and cannot publish.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let state = test_state(config);
+        let published_before = serde_json::to_value(state.config.read().clone()).unwrap();
+        let revision_before = state.config.revision();
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::RequiredFieldEmpty),
+            "{json}"
+        );
+        assert_eq!(json["path"], "goal.verifier.model_provider", "{json}");
+        assert_eq!(state.config.revision(), revision_before);
+        assert!(!state.config.read().goal.enabled);
+        assert_eq!(
+            serde_json::to_value(state.config.read().clone()).unwrap(),
+            published_before
+        );
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_enabling_with_dangling_verifier_is_rejected_without_publishing() {
+        // A reference valid while disabled must resolve before enabling Goal.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.goal.verifier.model_provider = "openai.missing".into();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let state = test_state(config);
+        let published_before = serde_json::to_value(state.config.read().clone()).unwrap();
+        let revision_before = state.config.revision();
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::DanglingReference),
+            "{json}"
+        );
+        assert_eq!(json["path"], "goal.verifier.model_provider", "{json}");
+        assert_eq!(state.config.revision(), revision_before);
+        assert!(!state.config.read().goal.enabled);
+        assert_eq!(
+            serde_json::to_value(state.config.read().clone()).unwrap(),
+            published_before
+        );
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_enabling_and_selecting_verifier_together_saves() {
+        // One batched save can enable Goal and choose its verifier together.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .providers
+            .models
+            .openai
+            .insert("default".to_string(), Default::default());
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    { "op": "replace", "path": "/goal/enabled", "value": true },
+                    {
+                        "op": "replace",
+                        "path": "/goal/verifier/model_provider",
+                        "value": "openai.default"
+                    }
+                ])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        assert!(
+            json["warnings"].as_array().is_none_or(|warnings| {
+                warnings.iter().all(|warning| {
+                    !warning["path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("goal."))
+                })
+            }),
+            "{json}"
+        );
+        assert!(state.config.read().goal.enabled);
+        assert_eq!(
+            state.config.read().goal.verifier.model_provider.as_str(),
+            "openai.default"
+        );
+        assert!(state.config.read().validate().is_ok());
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(persisted["goal"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            persisted["goal"]["verifier"]["model_provider"].as_str(),
+            Some("openai.default")
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_existing_goal_error_does_not_hide_later_dirty_error() {
+        // Retaining an old Goal error must not conceal a new delegate error.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.missing".into();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let state = test_state(config);
+        let published_before = serde_json::to_value(state.config.read().clone()).unwrap();
+        let revision_before = state.config.revision();
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/delegate/timeout_secs",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::InvalidNumericRange),
+            "{json}"
+        );
+        assert_eq!(json["path"], "delegate.timeout_secs", "{json}");
+        assert_eq!(state.config.revision(), revision_before);
+        assert_eq!(
+            serde_json::to_value(state.config.read().clone()).unwrap(),
+            published_before
+        );
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_goal_edit_keeping_goal_invalid_is_rejected() {
+        // Editing a Goal input must leave its configuration valid as a whole.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.missing".into();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let state = test_state(config);
+        let published_before = serde_json::to_value(state.config.read().clone()).unwrap();
+        let revision_before = state.config.revision();
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/verifier/model",
+                    "value": "gpt-test"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::DanglingReference),
+            "{json}"
+        );
+        assert_eq!(json["path"], "goal.verifier.model_provider", "{json}");
+        assert_eq!(state.config.revision(), revision_before);
+        assert_eq!(
+            serde_json::to_value(state.config.read().clone()).unwrap(),
+            published_before
+        );
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_disabling_repairs_existing_dangling_verifier() {
+        // Disabling repairs a dangling verifier without discarding its value.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.missing".into();
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/enabled",
+                    "value": false
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        assert!(
+            json["warnings"].as_array().is_none_or(|warnings| {
+                warnings.iter().all(|warning| {
+                    !warning["path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("goal."))
+                })
+            }),
+            "{json}"
+        );
+        assert!(!state.config.read().goal.enabled);
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert!(!reloaded.goal.enabled);
+        assert_eq!(
+            reloaded.goal.verifier.model_provider.as_str(),
+            "openai.missing"
+        );
+        assert!(state.config.read().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn goal_patch_budget_default_remove_and_zero_persist_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(500);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_cost_limit_usd",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["goal"]["default_cost_limit_usd"].as_float(),
+            Some(0.0)
+        );
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "remove",
+                    "path": "/goal/default_token_limit"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert!(
+            !persisted["goal"]
+                .as_table()
+                .unwrap()
+                .contains_key("default_token_limit")
+        );
+        assert_eq!(state.config.read().goal.default_token_limit, None);
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn goal_patch_budget_default_null_replace_clears_and_keeps_explicit_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(500);
+        config.goal.default_cost_limit_usd = Some(0.0);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let state = test_state(config);
+
+        // A cleared optional integer must disappear without changing its zero sibling.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_token_limit",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        let goal = persisted["goal"].as_table().unwrap();
+        assert!(!goal.contains_key("default_token_limit"));
+        assert_eq!(goal["default_cost_limit_usd"].as_float(), Some(0.0));
+        assert_eq!(state.config.read().goal.default_token_limit, None);
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, Some(0.0));
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, None);
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(0.0));
+
+        // Typing zero is an explicit value, unlike clearing the same input.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_token_limit",
+                    "value": 0
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert_eq!(
+            persisted["goal"]["default_token_limit"].as_integer(),
+            Some(0)
+        );
+        assert_eq!(state.config.read().goal.default_token_limit, Some(0));
+
+        // Optional floats use the same null-clear contract and survive reload.
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/goal/default_cost_limit_usd",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let persisted: toml::Value = toml::from_str(&disk).unwrap();
+        assert!(
+            !persisted["goal"]
+                .as_table()
+                .unwrap()
+                .contains_key("default_cost_limit_usd")
+        );
+        assert_eq!(state.config.read().goal.default_cost_limit_usd, None);
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.goal.default_token_limit, Some(0));
+        assert_eq!(reloaded.goal.default_cost_limit_usd, None);
+
+        // Required numbers still reject null without publishing or writing anything.
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let port_before = state.config.read().gateway.port;
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/gateway/port",
+                    "value": null
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}: {json}");
+        assert_eq!(json["path"], "gateway.port", "{json}");
+        assert_eq!(
+            json["code"],
+            serde_json::json!(ConfigApiCode::ValidationFailed),
+            "{json}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), disk_before);
+        assert_eq!(state.config.read().gateway.port, port_before);
     }
 
     #[tokio::test]

@@ -22,7 +22,9 @@ use zeroclaw_api::{
 use zeroclaw_commands::goal::GoalCommand;
 
 use crate::{
-    accounting::{GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory},
+    accounting::{
+        GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOperationAccountingFactory,
+    },
     checkpoint::{GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint},
     task::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -48,8 +50,10 @@ use launch_guard::GoalLaunchGuard;
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
 const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
-const MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES: usize = 4 * 1024;
-const MAX_VERIFIER_RESPONSE_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 bytes accepted before parsing a verifier response.
+const MAX_VERIFIER_RESPONSE_BYTES: usize = 1_048_576;
+/// Maximum compact-JSON bytes retained for one blocker payload.
+pub(super) const MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES: usize = 4_096;
 
 /// Terminal or paused result of one owned Goal execution epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,6 +1230,13 @@ fn is_fenced_lifecycle_epoch(task: &TaskRecord, scope: &GoalExecutionScope) -> b
                 .is_some_and(|epoch| task.execution_epoch == epoch)
 }
 
+// Context layers may wrap a failure, but only its type determines accounting classification.
+fn is_accounting_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<GoalAccountingFailure>())
+}
+
 impl GoalExecutionEngine {
     pub fn new(
         runtime: GoalRuntime,
@@ -1250,9 +1261,9 @@ impl GoalExecutionEngine {
     }
 
     /// Run one admitted Goal epoch to a verified completion or verifier pause.
-    /// A continuation keeps only a process-local transcript; intermediate
-    /// candidates and verifier feedback do not become authoritative user
-    /// history. Every model call uses the runtime's per-scope accountant.
+    /// Every accepted parent candidate is durably appended to the canonical
+    /// session before verification; verifier feedback stays process-local.
+    /// Every model call uses the runtime's per-scope accountant.
     /// Resolve `source` once, immediately before execution acquisition. The
     /// operation-local config and borrowed settings are dropped before model
     /// work; no live-config read guard is held across an await.
@@ -1366,27 +1377,33 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(candidate) => {
+                    self.require_complete_accounting(scope, accountant.as_ref())
+                        .await?;
                     if candidate.trim().is_empty() {
                         self.fail(scope, "candidate_empty").await?;
                         bail!("Goal parent returned an empty candidate");
                     }
-
-                    // Parent output is ordinary agent output, not verifier
-                    // metadata. Persist and deliver it before any verifier
-                    // decision can pause or terminate this execution.
-                    lease
-                        .append_parent_candidate(candidate.clone())
-                        .await
-                        .context("publish Goal parent candidate before verification")?;
-                    self.require_complete_accounting(scope, accountant.as_ref())
-                        .await?;
                     candidate
                 }
                 Err(error) => {
-                    self.fail(scope, "parent_operation_failed").await?;
-                    return Err(error).context("Goal parent operation failed");
+                    let (reason, error) = if is_accounting_failure(&error) {
+                        ("accounting_missing_or_invalid", error)
+                    } else {
+                        (
+                            "parent_operation_failed",
+                            error.context("Goal parent operation failed"),
+                        )
+                    };
+                    return Err(self.fail_with(scope, reason, error).await);
                 }
             };
+            // Retain each ordinary parent candidate before verification can
+            // continue or pause the same durable session.
+            if let Err(error) = lease.append_parent_candidate(candidate.clone()).await {
+                return Err(self
+                    .fail_with(scope, "candidate_persistence_failed", error)
+                    .await);
+            }
             drop(parent_operation);
 
             // A lifecycle transition can race with the parent call above.
@@ -1437,6 +1454,14 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
+                    let (reason, error) = if is_accounting_failure(&error) {
+                        ("accounting_missing_or_invalid", error)
+                    } else {
+                        (
+                            "verifier_operation_failed",
+                            error.context("Goal verifier operation failed"),
+                        )
+                    };
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
                         scope,
@@ -1450,9 +1475,9 @@ impl GoalExecutionEngine {
                         "pending",
                         "operation_failed",
                     );
-                    if let Err(transition_error) =
-                        self.fail(scope, "verifier_operation_failed").await
-                    {
+                    // A failed lifecycle transition must not replace the operation's
+                    // original error; it is added as context, as in `fail_with`.
+                    if let Err(transition_error) = self.fail(scope, reason).await {
                         log_verifier_diagnostic(
                             self.diagnostic_text_guard.as_deref(),
                             scope,
@@ -1466,7 +1491,7 @@ impl GoalExecutionEngine {
                             "terminal_transition_failed",
                             "after_controller_action",
                         );
-                        return Err(transition_error);
+                        return Err(error.context(format!("{transition_error:#}")));
                     }
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
@@ -1481,7 +1506,7 @@ impl GoalExecutionEngine {
                         "terminal_failure",
                         "after_controller_action",
                     );
-                    return Err(error).context("Goal verifier operation failed");
+                    return Err(error);
                 }
             };
             drop(verifier_operation);
@@ -1685,8 +1710,13 @@ impl GoalExecutionEngine {
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
-            self.fail(scope, "accounting_missing_or_invalid").await?;
-            bail!("Goal accounting is incomplete");
+            let error = anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.accounting_state,
+                goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some(),
+            ));
+            return Err(self
+                .fail_with(scope, "accounting_missing_or_invalid", error)
+                .await);
         }
         if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
             self.fail(scope, "pricing_unavailable").await?;
@@ -1778,6 +1808,19 @@ impl GoalExecutionEngine {
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
                 bail!("Goal verifier pause lost its execution fence")
             }
+        }
+    }
+
+    // A failed lifecycle transition must not replace the operation's original error.
+    async fn fail_with(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.fail(scope, reason).await {
+            Ok(()) => error,
+            Err(transition_error) => error.context(format!("{transition_error:#}")),
         }
     }
 
@@ -1981,6 +2024,8 @@ fn log_verifier_diagnostic(
 }
 
 fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
+    // The raw limit bounds parsing and the payload limit bounds stored pause
+    // state. Neither limit alters an accepted value.
     ensure!(
         raw.len() <= MAX_VERIFIER_RESPONSE_BYTES,
         "verifier response is too large"
@@ -2008,11 +2053,10 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
                 payload.is_object(),
                 "verifier blocker payload must be a JSON object"
             );
+            let encoded = serde_json::to_string(payload)
+                .context("verifier blocker payload cannot be encoded")?;
             ensure!(
-                serde_json::to_vec(payload)
-                    .context("serialize verifier blocker payload")?
-                    .len()
-                    <= MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES,
+                encoded.len() <= MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES,
                 "verifier blocker payload is too large"
             );
         }
@@ -2182,6 +2226,24 @@ mod tests {
         let committed = ready.commit(&settings).await.unwrap();
         drop(committed.release());
         assert!(supervisor.try_retire().await);
+    }
+
+    #[test]
+    fn accounting_failures_are_classified_by_type_through_context_layers() {
+        // Context preserves typed classification, while an identical message is insufficient.
+        let failure = GoalAccountingFailure::settled(
+            GoalAccountingState::Invalid,
+            &["fixture pricing failed".to_owned()],
+        );
+        let same_text = failure.to_string();
+        let error = anyhow::Error::new(failure)
+            .context("fixture turn context")
+            .context("fixture outer context");
+        assert!(is_accounting_failure(&error));
+        assert!(!is_accounting_failure(&anyhow::Error::msg(same_text)));
+        assert!(!is_accounting_failure(&anyhow::Error::new(
+            crate::accounting::GoalOperationFenced::NOT_RUNNING,
+        )));
     }
 
     #[test]
@@ -2423,5 +2485,72 @@ mod tests {
             pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::ExternalDependency)]),
             GoalPauseReason::ExternalDependency
         );
+    }
+
+    #[test]
+    fn verifier_protocol_accepts_a_blocker_payload_at_the_byte_limit() {
+        // Multibyte data at the compact-JSON byte ceiling remains unchanged.
+        let payload = serde_json::json!({"context": "é".repeat(2_041)});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let VerifierDecision::Blocked { blockers, .. } = parse_verifier_response(&raw).unwrap()
+        else {
+            panic!("expected a bounded blocked decision");
+        };
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].payload.as_ref(), Some(&payload));
+    }
+
+    #[test]
+    fn verifier_protocol_rejects_a_blocker_payload_over_the_byte_limit() {
+        // One ASCII byte over the multibyte boundary rejects the whole value.
+        let payload = serde_json::json!({"context": format!("{}x", "é".repeat(2_041))});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES + 1
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("payload is too large"));
+    }
+
+    #[test]
+    fn verifier_protocol_bounds_the_raw_response_bytes() {
+        // Whitespace counts toward the pre-parse UTF-8 response ceiling.
+        let mut raw =
+            r#"{"decision":"continue","reason":"finish the criterion","blockers":[]}"#.to_owned();
+        raw.extend(std::iter::repeat_n(
+            ' ',
+            MAX_VERIFIER_RESPONSE_BYTES - raw.len(),
+        ));
+        assert_eq!(raw.len(), MAX_VERIFIER_RESPONSE_BYTES);
+        assert!(matches!(
+            parse_verifier_response(&raw).unwrap(),
+            VerifierDecision::Continue { .. }
+        ));
+        raw.push(' ');
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("response is too large"));
     }
 }

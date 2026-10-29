@@ -639,6 +639,8 @@ impl CostTracker {
     /// routes in one ledger append and one durable sync. This is for one
     /// already-admitted logical operation whose provider path surfaced more
     /// than one billed event; it does not coalesce or reattribute events.
+    /// Each event updates every derived total and inherited ancestor exactly
+    /// as the single scoped writer would.
     pub fn record_scoped_usage_batch_with_owned_task_and_provider_attribution(
         &self,
         events: Vec<(TokenUsage, String)>,
@@ -664,12 +666,14 @@ impl CostTracker {
             return Ok(());
         }
 
-        let track_per_agent = self.config.read().track_per_agent;
+        let (_, track_per_agent) = self.mode();
         let effective_alias = track_per_agent
             .then(|| agent_alias.map(str::to_string))
             .flatten();
+        let recorded_alias = effective_alias.clone();
         let mut records = Vec::with_capacity(events.len());
         let mut totals = Vec::with_capacity(events.len());
+        let mut record_days_and_costs = Vec::with_capacity(events.len());
 
         for (usage, provider_ref) in events {
             anyhow::ensure!(
@@ -681,6 +685,7 @@ impl CostTracker {
                 "Token usage cost must be a finite, non-negative value"
             );
             totals.push((usage.cost_usd, usage.total_tokens));
+            record_days_and_costs.push((usage.timestamp.naive_utc().date(), usage.cost_usd));
             records.push(CostRecord::with_attribution_and_provider(
                 &self.session_id,
                 effective_alias.clone(),
@@ -704,6 +709,14 @@ impl CostTracker {
         }
 
         drop(storage);
+        for (record_day, cost_usd) in record_days_and_costs {
+            self.credit_inherited_descendant_spend(
+                track_per_agent,
+                recorded_alias.as_deref(),
+                record_day,
+                cost_usd,
+            );
+        }
         append_outcome.into_result()
     }
 
@@ -805,6 +818,23 @@ impl CostTracker {
 
         drop(storage);
 
+        self.credit_inherited_descendant_spend(
+            track_per_agent,
+            recorded_alias.as_deref(),
+            record_day,
+            cost_usd,
+        );
+
+        append_outcome.into_result()
+    }
+
+    fn credit_inherited_descendant_spend(
+        &self,
+        track_per_agent: bool,
+        recorded_alias: Option<&str>,
+        record_day: NaiveDate,
+        cost_usd: f64,
+    ) {
         // Delegation-chain accounting: usage recorded through an
         // agent-scoped tracker with an inherited chain lands on the ledger
         // under this tracker's own alias, so the ancestors' per-alias daily
@@ -822,14 +852,12 @@ impl CostTracker {
         // against that ancestor's ceiling.
         if track_per_agent && let BudgetScope::Agent { inherited, .. } = &self.budget_scope {
             for entry in inherited {
-                if recorded_alias.as_deref() == Some(entry.alias.as_str()) {
+                if recorded_alias == Some(entry.alias.as_str()) {
                     continue;
                 }
                 entry.add_descendant_spend(record_day, cost_usd);
             }
         }
-
-        append_outcome.into_result()
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
@@ -1613,6 +1641,24 @@ impl CostStorage {
             )
         })?;
 
+        self.fold_appended_record(&record);
+
+        let sync_result = sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        });
+
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
+    }
+
+    /// Fold each record from either append path so its derived totals match a
+    /// rebuild from the ledger.
+    fn fold_appended_record(&mut self, record: &CostRecord) {
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
             self.daily_cost_usd += record.usage.cost_usd;
@@ -1631,18 +1677,6 @@ impl CostStorage {
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
-
-        let sync_result = sync_file(&file).with_context(|| {
-            format!(
-                "Failed to sync cost storage at {}",
-                self.path.display().to_string()
-            )
-        });
-
-        Ok(match sync_result {
-            Ok(()) => AppendOutcome::Synced,
-            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
-        })
     }
 
     fn add_records_with_sync(
@@ -1681,13 +1715,7 @@ impl CostStorage {
         }
 
         for record in &records {
-            let timestamp = record.usage.timestamp.naive_utc();
-            if timestamp.date() == self.cached_day {
-                self.daily_cost_usd += record.usage.cost_usd;
-            }
-            if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
-                self.monthly_cost_usd += record.usage.cost_usd;
-            }
+            self.fold_appended_record(record);
         }
 
         let sync_result = sync_file(&file).with_context(|| {
@@ -1715,7 +1743,7 @@ impl CostStorage {
     }
 
     /// Per-alias spend for the cached current day. Reads only the in-memory
-    /// bucket maintained by the append path / rebuild, so per-agent budget
+    /// bucket maintained by both append paths / rebuild, so per-agent budget
     /// checks never rescan the ledger.
     fn get_daily_cost_for_agent(&self, agent_alias: &str) -> f64 {
         self.daily_cost_by_agent
@@ -2462,6 +2490,293 @@ mod tests {
             .unwrap();
 
         assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_counts_toward_agent_daily_ceiling() {
+        // A scoped batch must count against the attributed agent's ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (usage_costing_at(1.25, now), "provider.primary".to_owned()),
+                (usage_costing_at(0.75, now), "provider.fallback".to_owned()),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        match base
+            .derived_for_agent("main", 1.0)
+            .check_budget(0.0)
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(agent_alias.as_deref(), Some("main"));
+                assert!((current_usd - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected main's $1 ceiling to be exceeded, got {other:?}"),
+        }
+        assert!(!matches!(
+            base.derived_for_agent("other", 1.0)
+                .check_budget(0.0)
+                .unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
+        assert!((base.get_summary().unwrap().daily_cost_usd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_per_agent_cache_matches_ledger_and_rebuild() {
+        // Batch, single, and unattributed appends must agree with the ledger oracle.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![(usage_costing_at(1.0, now), "provider.batch".to_owned())],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+        base.record_usage_with_agent(usage_costing_at(2.0, now), Some("other"))
+            .unwrap();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![(usage_costing_at(3.0, now), "provider.unassigned".to_owned())],
+            None,
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut storage = base.lock_storage();
+        assert!(storage.aggregates_current);
+        assert_eq!(storage.daily_cost_by_agent, ledger_daily_by_agent(&path));
+        let before_rebuild = storage.daily_cost_by_agent.clone();
+        let period = ReportingPeriod::current();
+        storage
+            .rebuild_aggregates(period.day, period.year, period.month)
+            .unwrap();
+        assert_eq!(storage.daily_cost_by_agent, before_rebuild);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_prior_day_record_invalidates_day_cache() {
+        // An off-day batch row invalidates the day cache before later reads.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let today_cost = 0.75;
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (
+                    usage_costing_at(1.25, now - Duration::days(2)),
+                    "provider.prior".to_owned(),
+                ),
+                (
+                    usage_costing_at(today_cost, now),
+                    "provider.today".to_owned(),
+                ),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        {
+            let storage = base.lock_storage();
+            assert!(!storage.aggregates_current);
+        }
+        let expected = HashMap::from([("main".to_owned(), today_cost)]);
+        let mut storage = base.lock_storage();
+        storage.ensure_period_cache_current().unwrap();
+        assert_eq!(
+            storage.daily_cost_by_agent,
+            ledger_daily_by_agent(&storage.path)
+        );
+        assert_eq!(storage.daily_cost_by_agent, expected);
+        assert!((storage.daily_cost_usd - today_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_without_per_agent_tracking_stays_unattributed() {
+        // A disabled per-agent mode must discard the supplied batch alias.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (usage_costing_at(1.25, now), "provider.one".to_owned()),
+                (usage_costing_at(0.75, now), "provider.two".to_owned()),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records.iter().all(|record| record.agent_alias.is_none()));
+        let storage = base.lock_storage();
+        assert!(storage.daily_cost_by_agent.is_empty());
+        assert!((storage.daily_cost_usd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_sync_failure_keeps_per_agent_totals_consistent() {
+        // An appended batch remains visible to every total when sync fails.
+        fn fail_sync(_: &File) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced sync failure"))
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let error = base
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+                vec![
+                    (usage_costing_at(1.0, now), "provider.one".to_owned()),
+                    (usage_costing_at(1.0, now), "provider.two".to_owned()),
+                ],
+                Some("main"),
+                Some("goal-a".to_owned()),
+                fail_sync,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to sync cost storage"));
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.agent_alias.as_deref() == Some("main"))
+        );
+        let storage = base.lock_storage();
+        assert_eq!(storage.daily_cost_by_agent, ledger_daily_by_agent(&path));
+        assert!((storage.daily_cost_by_agent["main"] - 2.0).abs() < 1e-9);
+        drop(storage);
+        match base
+            .derived_for_agent("main", 1.0)
+            .check_budget(0.0)
+            .unwrap()
+        {
+            BudgetCheck::Exceeded { current_usd, .. } => {
+                assert!((current_usd - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected main's $1 ceiling to be exceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_on_frozen_chain_scope_matches_single_writer() {
+        // A frozen descendant mode must credit ancestors for every batch event.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_usage_with_agent(usage_costing_at(6.0, now), Some("parent"))
+            .unwrap();
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+        child
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+                vec![
+                    (usage_costing_at(0.5, now), "provider.one".to_owned()),
+                    (usage_costing_at(0.5, now), "provider.two".to_owned()),
+                ],
+                Some("child"),
+                Some("goal-a".to_owned()),
+            )
+            .unwrap();
+
+        assert!((base.get_summary_for_agent("child").unwrap().daily_cost_usd - 1.0).abs() < 1e-9);
+        for tracker in [&parent_scope, &child] {
+            match tracker.check_budget(0.0).unwrap() {
+                BudgetCheck::Exceeded {
+                    current_usd,
+                    agent_alias,
+                    ..
+                } => {
+                    assert_eq!(agent_alias.as_deref(), Some("parent"));
+                    assert!((current_usd - 7.0).abs() < 1e-9);
+                }
+                other => panic!("expected parent's $5 ceiling to be exceeded, got {other:?}"),
+            }
+        }
     }
 
     #[test]
