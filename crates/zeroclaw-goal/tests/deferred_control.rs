@@ -308,11 +308,12 @@ async fn single_positive_default_starts_with_that_limit() {
     };
     assert_eq!(started.token_limit, Some(500));
     assert_eq!(started.cost_limit_usd, None);
-    let state = registry.0.lock().unwrap();
-    let goal = state.goal.as_ref().expect("Start persists the Goal");
-    assert_eq!(goal.effective_token_limit, Some(500));
-    assert_eq!(goal.effective_cost_limit_usd, None);
-    drop(state);
+    {
+        let state = registry.0.lock().unwrap();
+        let goal = state.goal.as_ref().expect("Start persists the Goal");
+        assert_eq!(goal.effective_token_limit, Some(500));
+        assert_eq!(goal.effective_cost_limit_usd, None);
+    }
 
     supervisor
         .pause_before_launch(
