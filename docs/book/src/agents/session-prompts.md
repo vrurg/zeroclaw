@@ -190,7 +190,10 @@ stored content, its digest and later model context retain the original bytes.
 
 Strict confirmations use literal previews on CLI, Matrix, Slack, Telegram,
 Signal, Web and ZeroCode. They do not interpret proposed content as attachment
-markers or rich-text instructions. Slack and Telegram deny a confirmation that
+markers or rich-text instructions. Signal sends strict previews directly as
+text, bypassing the media-marker processing used for ordinary messages and
+approvals, so a proposed marker cannot upload a workspace file.
+Slack and Telegram deny a confirmation that
 cannot fit their message limit rather than truncating the proposed content.
 Slack escapes mention/link control characters in strict previews. Telegram
 uses preformatted text for proposed content, including an explicit preformatted
