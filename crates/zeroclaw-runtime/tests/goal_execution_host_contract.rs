@@ -2265,21 +2265,21 @@ mod supervisor_error_contract {
                 self.entered.add_permits(1);
                 self.release.acquire().await.unwrap().forget();
             }
-            if let Some(state) = self.accounting {
-                if state != GoalAccountingState::OutcomeUnknown {
-                    assert_eq!(
-                        self.store
-                            .settle_pending_operation(
-                                scope.task_id(),
-                                scope.session_id(),
-                                scope.execution_epoch(),
-                                "held-operation",
-                                state,
-                            )
-                            .await?,
-                        GoalTransitionResult::Applied
-                    );
-                }
+            if let Some(state) = self.accounting
+                && state != GoalAccountingState::OutcomeUnknown
+            {
+                assert_eq!(
+                    self.store
+                        .settle_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "held-operation",
+                            state,
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
             }
             self.inner.run_parent_turn(scope, turn).await
         }
@@ -2451,15 +2451,14 @@ mod supervisor_error_contract {
                  WHERE task_id = ?1 AND session_id = ?2 ORDER BY intent_id",
                 )
                 .unwrap();
-            let states = statement
+            statement
                 .query_map(
                     rusqlite::params![self.scope.task_id(), self.scope.session_id()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            states
+                .unwrap()
         }
     }
 
