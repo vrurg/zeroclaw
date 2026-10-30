@@ -2457,10 +2457,10 @@ async fn run_tool_call_loop_impl<'a>(
         let provider_dispatch_model = hook_selected_model
             .as_deref()
             .unwrap_or(active_dispatch_model);
-        // Only direct Agent turns scope the complete prompt variants. Preserve
-        // the channel loop's existing hook/protocol behavior rather than
-        // silently widening this delegation-focused repair into channel prompt
-        // reconciliation.
+        // Only direct Agent turns scope complete native/text variants. This gate
+        // selects their protocol model. Private channel turns instead restore
+        // canonical history through REQUIRED_SESSION_PROMPT_SECTION, without
+        // borrowing those Agent variants.
         let uses_scoped_tool_protocol = with_scoped_tool_protocol_prompts(|_| ()).is_some();
         let protocol_model = if uses_scoped_tool_protocol {
             provider_dispatch_model

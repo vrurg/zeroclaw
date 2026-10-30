@@ -152,8 +152,8 @@ protections described below, including when mutation approval is disabled.
 content value is at most 2 KiB and their combined content is at most 8 KiB.
 
 When `max_system_prompt_chars` is finite, `session_prompt_set` first checks
-the proposed rendered collection against the largest host prompt that the
-current primary turn prepares. It rejects a collection that would not fit,
+the proposed rendered collection against the largest captured host prompt for
+the current primary turn. It rejects a collection that would not fit,
 without writing it; the collection read, check, and update occur in one SQLite
 transaction. This is best-effort admission, not the dispatch authority:
 configuration or other turn inputs can still change after the snapshot is
@@ -165,10 +165,13 @@ tool instructions exceed the budget, that step records a failure without
 dispatching its request; the parent can continue on its intact prompt. Private
 requests also recheck the limit after request-only host instructions are added.
 
-If the initial primary-turn check fails, the session cannot use its tools to
-repair the collection because the turn never starts. Reset or delete the session,
-which atomically removes its attachments; raising `max_system_prompt_chars` is
-an alternative when the host-prompt limit is intentionally too small.
+If either the initial primary-turn check or a later request-only instruction
+check prevents primary dispatch, the session cannot use its tools to repair the
+collection. Best-effort admission does not reserve the later single-tool
+instruction, so a collection accepted near the cap may still need this recovery.
+Reset or delete the session, which atomically removes its attachments; raising
+`max_system_prompt_chars` is an alternative when the host-prompt limit is
+intentionally too small.
 
 Changes take effect on the next top-level turn. The runtime appends a dedicated
 `## Session Prompts` section to the host-built system prompt. Entries are JSON
