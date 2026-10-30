@@ -1720,6 +1720,9 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 
 skill-http-request-timeout = HTTP request timed out
 
+session-prompt-system-message-missing = Required session prompts have no provider system message
+session-prompt-request-context-changed = Required session prompts are missing or changed in the provider request
+
 session-prompt-approval-description = Approve this one persistent session-prompt mutation. This approval cannot be remembered.
 session-prompt-approval-domain = sqlite chat session prompts
 session-prompt-approval-denied = Session prompt mutation not executed: { $reason }

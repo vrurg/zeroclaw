@@ -855,7 +855,9 @@ fn check_required_request_prompt_budget(messages: &[ChatMessage], max_chars: usi
                     .with_attrs(serde_json::json!({"error_key": "session_prompt_context_missing"})),
                 "Required session prompts have no provider system message"
             );
-            anyhow::Error::msg("Required session prompts have no provider system message")
+            anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "session-prompt-system-message-missing",
+            ))
         })?;
     let section_intact = REQUIRED_SESSION_PROMPT_SECTION
         .try_with(|section| {
@@ -872,7 +874,9 @@ fn check_required_request_prompt_budget(messages: &[ChatMessage], max_chars: usi
                 .with_attrs(serde_json::json!({"error_key": "session_prompt_context_changed"})),
             "Required session prompts are missing or changed in the provider request"
         );
-        anyhow::bail!("Required session prompts are missing or changed in the provider request");
+        anyhow::bail!(crate::i18n::get_required_cli_string(
+            "session-prompt-request-context-changed"
+        ));
     }
     crate::agent::prompt::check_required_session_prompt_budget(
         system.content.chars().count(),

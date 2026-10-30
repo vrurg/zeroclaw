@@ -1960,6 +1960,25 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_integrity_refusals_load_from_english_fallback() {
+        let english = include_str!("../locales/en/cli.ftl");
+        for key in [
+            "session-prompt-system-message-missing",
+            "session-prompt-request-context-changed",
+        ] {
+            let expected = format_ftl_message(english, "en", key, &[])
+                .expect("integrity refusal must have an English source");
+            assert!(!expected.trim().is_empty());
+            for locale in available_locales() {
+                // Absent translations follow the documented embedded-English
+                // fallback; no process-global locale or disk source is changed.
+                let loaded = load_cli_strings_from_sources(&locale.code, None, None);
+                assert_eq!(loaded.get(key), Some(&expected), "{}: {key}", locale.code);
+            }
+        }
+    }
+
+    #[test]
     fn session_prompt_context_refusal_preserves_each_locale() {
         let key = "session-prompt-context-unavailable";
         for (locale, tools) in [
