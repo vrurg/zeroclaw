@@ -115,7 +115,9 @@ the gateway before using the feature through WebSocket chat.
 
 An enabled configuration with another session backend is rejected. Prompt
 attachments are not available to cron jobs, delegates, subagents, one-shot
-requests, or auxiliary calls.
+requests, or auxiliary calls. The channel reply-intent classifier receives the
+host prompt without the private attachment section, even when it uses a separate
+provider; the primary request retains the complete section.
 
 Independent transcripts started during a turn, including delegated agents,
 subagents, inline runs, and SOP steps assigned to another agent, use their own system

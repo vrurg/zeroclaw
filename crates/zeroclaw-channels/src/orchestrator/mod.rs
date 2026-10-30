@@ -9991,6 +9991,11 @@ async fn process_channel_message_body(
         system_prompt.chars().count(),
         max,
     );
+    // The auxiliary classifier may use a different provider. Preserve the
+    // assembled host input before appending private primary-turn context;
+    // neither the classifier nor a heading-based projection owns that tail.
+    let classifier_host_prompt =
+        (!session_prompt_attachments.is_empty()).then(|| system_prompt.clone());
     if append_session_prompts_to_channel_system_prompt(
         &mut system_prompt,
         &session_prompt_attachments,
@@ -10150,7 +10155,9 @@ async fn process_channel_message_body(
                         attempt_allowlist.clone(),
                         classify_channel_reply_intent(
                             classifier_provider_arc.as_ref(),
-                            history[0].content.as_str(),
+                            classifier_host_prompt
+                                .as_deref()
+                                .unwrap_or(history[0].content.as_str()),
                             &history,
                             classifier_model_owned.as_str(),
                             classifier_temperature.or(runtime_defaults.defaults.temperature),
@@ -34352,6 +34359,201 @@ BTC is currently around $65,000 based on latest tool output."#
             assert_eq!(ends.len(), 2, "two logical turns need two ends: {events:?}");
             for (start, end) in starts.iter().zip(&ends) {
                 assert_eq!(start, end, "each logical turn must keep one matched pair");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_session_prompts_out_of_classifier() {
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        struct PromptCapture {
+            reply: &'static str,
+            requests: Mutex<Vec<Vec<ChatMessage>>>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for PromptCapture {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "prompt-boundary-capture"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for PromptCapture {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+
+            fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+                true
+            }
+
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.requests.lock().unwrap().push(vec![
+                    ChatMessage::system(system.unwrap_or_default()),
+                    ChatMessage::user(message),
+                ]);
+                Ok(self.reply.into())
+            }
+
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some(self.reply.into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        const PRIVATE: &str = "stored-session-prompt-canary";
+        const HOST: &str = "Keep this host-only classifier policy.";
+        // The final case uses the first actual primary request's size, making
+        // initial admission fit while the request-only single-tool rule cannot.
+        let mut final_prompt_chars = None;
+        for (has_attachment, below_final_limit) in [(false, false), (true, false), (true, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            let channel = Arc::new(RecordingChannel::default());
+            let classifier = Arc::new(PromptCapture {
+                reply: "REPLY",
+                requests: Mutex::new(Vec::new()),
+            });
+            let primary = Arc::new(PromptCapture {
+                reply: "visible reply",
+                requests: Mutex::new(Vec::new()),
+            });
+            let cap = if below_final_limit {
+                final_prompt_chars.expect("valid attached request runs first") - 1
+            } else {
+                0
+            };
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.channels.session_prompts_enabled = true;
+            config.providers.models.openai.insert(
+                "intent".into(),
+                zeroclaw_config::schema::OpenAIModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("intent-model".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+            config.runtime_profiles.insert(
+                "prompt-boundary".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_system_prompt_chars: Some(cap),
+                    single_tool_rounds: Some(true),
+                    ..Default::default()
+                },
+            );
+            let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "prompt-boundary".into(),
+                classifier_provider: "openai.intent".into(),
+                ..Default::default()
+            };
+            agent.resolved.max_system_prompt_chars = cap;
+            config.agents.insert("test-agent".into(), agent.clone());
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                primary.clone(),
+                config,
+                agent,
+                "test-provider",
+                None,
+            );
+            let inner = Arc::make_mut(&mut ctx);
+            inner.session_store = Some(backend.clone());
+            inner.workspace_dir = Arc::new(tmp.path().to_path_buf());
+            inner.system_prompt = Arc::new(HOST.into());
+            inner.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            );
+            inner
+                .provider_cache
+                .lock()
+                .unwrap()
+                .insert("openai.intent".into(), classifier.clone());
+            let msg = ChannelMessage {
+                id: "classifier-boundary".into(),
+                sender: "test-sender".into(),
+                reply_target: "test-room".into(),
+                content: "Please continue the task.".into(),
+                channel: "test-channel".into(),
+                ..Default::default()
+            };
+            let key = runtime_conversation_history_key(&ctx, &msg);
+            if has_attachment {
+                let owner = backend.admit_session_prompt_owner(&key).unwrap();
+                backend
+                    .set_session_prompt_for_owner(&owner, "task", PRIVATE, None)
+                    .unwrap();
+            }
+            process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+            let classified = classifier.requests.lock().unwrap().clone();
+            assert_eq!(
+                classified.len(),
+                1,
+                "the separate auxiliary provider must run"
+            );
+            assert!(classified[0][0].content.contains(HOST));
+            assert!(
+                classified[0]
+                    .iter()
+                    .all(|message| !message.content.contains(PRIVATE)),
+                "the auxiliary classifier must not receive the stored attachment"
+            );
+            assert!(!classified[0][0].content.contains("## Session Prompts"));
+            let primary_calls = primary.requests.lock().unwrap().clone();
+            if below_final_limit {
+                assert!(
+                    primary_calls.is_empty(),
+                    "late admission must precede the primary provider"
+                );
+                let sent = channel.sent_messages.lock().await;
+                assert!(
+                    sent.iter()
+                        .any(|message| message.contains("max_system_prompt_chars"))
+                );
+            } else {
+                assert_eq!(primary_calls.len(), 1);
+                let prompt = &primary_calls[0][0].content;
+                assert_eq!(prompt.contains(PRIVATE), has_attachment);
+                assert!(prompt.contains(HOST));
+                if has_attachment {
+                    assert!(prompt.ends_with(
+                        &zeroclaw_infra::session_prompts::render_session_prompts(
+                            &backend.list_session_prompts(&key).unwrap(),
+                        )
+                    ));
+                    final_prompt_chars = Some(prompt.chars().count());
+                }
             }
         }
     }
