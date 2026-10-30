@@ -301,6 +301,7 @@ fn full_chat_fixture_names() -> BTreeSet<String> {
         "poll",
         "proxy_config",
         "reaction",
+        "read_skill",
         "schedule",
         "send_message_to_peer",
         "send_via",
