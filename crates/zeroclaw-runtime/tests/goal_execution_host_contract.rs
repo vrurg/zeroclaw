@@ -2542,7 +2542,8 @@ mod supervisor_error_contract {
             let mut fixture = Fixture::new(turn, fault, None).await;
             fixture.start().await;
             let supervisor = fixture.supervisor.clone();
-            let restart = tokio::spawn(async move { supervisor.pause_for_restart().await });
+            let restart =
+                zeroclaw_spawn::spawn!(async move { supervisor.pause_for_restart().await });
             timeout(Duration::from_secs(1), async {
                 loop {
                     if fixture.task().await.status == TaskStatus::Paused {
@@ -2622,7 +2623,7 @@ mod supervisor_error_contract {
         let supervisor = fixture.supervisor.clone();
         let source = fixture.source.clone();
         let mut started = fixture.started.take().unwrap();
-        let launch = tokio::spawn(async move {
+        let launch = zeroclaw_spawn::spawn!(async move {
             supervisor
                 .launch_after_response(&source, &mut started)
                 .await
@@ -2638,7 +2639,7 @@ mod supervisor_error_contract {
         let supervisor = fixture.supervisor.clone();
         let config = fixture.config.clone();
         let driver = fixture.driver.clone();
-        let cancel = tokio::spawn(async move {
+        let cancel = zeroclaw_spawn::spawn!(async move {
             supervisor
                 .submit(
                     &host_settings(&config),
