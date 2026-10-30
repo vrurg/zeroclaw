@@ -428,9 +428,21 @@ pub(crate) fn check_required_session_prompt_budget(
     max_chars: usize,
 ) -> Result<()> {
     if max_chars > 0 && total_chars > max_chars {
-        anyhow::bail!(
-            "Persistent session prompts and required host context exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "error_key": "session_prompt_budget_exceeded",
+                    "total_chars": total_chars,
+                    "max_system_prompt_chars": max_chars,
+                })),
+            "Required session prompts and host context exceed the system prompt budget"
         );
+        anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+            "session-prompt-required-context-over-budget",
+            &[("limit", &max_chars.to_string())],
+        ));
     }
     Ok(())
 }
@@ -984,7 +996,16 @@ mod tests {
         )
         .expect_err("one-byte overflow must fail instead of truncating host policy");
 
-        assert!(error.to_string().contains("required host context"));
+        assert_eq!(
+            error.to_string(),
+            crate::i18n::get_required_cli_string_with_args(
+                "session-prompt-required-context-over-budget",
+                &[(
+                    "limit",
+                    &(original.chars().count() + attachments.chars().count() + 1).to_string()
+                )],
+            ),
+        );
         assert_eq!(
             prompt, original,
             "failed composition must preserve the host prompt"

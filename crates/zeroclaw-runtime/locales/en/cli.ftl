@@ -1720,6 +1720,7 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 
 skill-http-request-timeout = HTTP request timed out
 
+session-prompt-required-context-over-budget = Persistent session prompts and required host context exceed max_system_prompt_chars ({ $limit }); refusing to dispatch without them
 session-prompt-system-message-missing = Required session prompts have no provider system message
 session-prompt-request-context-changed = Required session prompts are missing or changed in the provider request
 

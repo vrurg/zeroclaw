@@ -8425,7 +8425,13 @@ mod sop_step_reassembly_tests {
                     Some(&parent),
                 )
                 .expect_err("expanded instructions must fail admission");
-                assert!(error.to_string().contains("required host context"));
+                assert_eq!(
+                    error.to_string(),
+                    crate::i18n::get_required_cli_string_with_args(
+                        "session-prompt-required-context-over-budget",
+                        &[("limit", &parent.chars().count().to_string())],
+                    ),
+                );
                 assert!(!error.to_string().contains("REQUIRED_SCOPE_CANARY"));
             },
         )

@@ -1979,6 +1979,28 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_budget_refusal_formats_catalogue_fallback_and_override() {
+        let key = "session-prompt-required-context-over-budget";
+        for locale in available_locales() {
+            let sources = CliFtlSources {
+                locale: locale.code.clone(),
+                disk: None,
+                builtin: None,
+            };
+            let text = format_cli_string_with_args(&sources, key, &[("limit", "42")])
+                .expect("budget refusal must have an English fallback with its limit");
+            assert!(text.contains("max_system_prompt_chars (42)"));
+        }
+        let translated = get_disk_override_cli_string_for_test(
+            "fr",
+            "session-prompt-required-context-over-budget = Limite { $limit } atteinte.",
+            key,
+            &[("limit", "42")],
+        );
+        assert_eq!(translated, "Limite 42 atteinte.");
+    }
+
+    #[test]
     fn session_prompt_context_refusal_preserves_each_locale() {
         let key = "session-prompt-context-unavailable";
         for (locale, tools) in [
