@@ -730,6 +730,15 @@ fn refresh_scoped_tool_protocol_prompt(
             .iter_mut()
             .find(|message| message.role == "system")
         {
+            if let Some(required) = prompts.required_prompt(use_native_tools) {
+                // Private turns exclude modifying hooks. Restore their complete
+                // canonical request before scoped tool projection, rather than
+                // matching a previously projected protocol as a hook suffix.
+                // The generic matcher below may span or grow the private tail.
+                system.content = required.to_owned();
+                refresh_prompt_anchor(std::slice::from_mut(system), use_native_tools);
+                return;
+            }
             // A `before_llm_call` hook may append to the request's system
             // prompt. Cap only the swapped base and re-append that suffix, so
             // hook text reaches the model as it does on the CLI path. The
@@ -852,7 +861,13 @@ fn apply_builtin_prompt_scope(
     strict_tool_parsing: bool,
     max_system_prompt_chars: usize,
     mut canonical_prompt: Option<&str>,
-) {
+) -> Result<()> {
+    let private_section = attachment_protocol_scope_active().then(|| {
+        format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        )
+    });
     let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
     let instructions =
         if use_native_tools || strict_tool_parsing || effective_names.contains("tool_search") {
@@ -864,6 +879,17 @@ fn apply_builtin_prompt_scope(
         .iter_mut()
         .filter(|message| message.role == "system")
     {
+        let attachment_start = private_section
+            .as_deref()
+            .and_then(|section| message.content.find(section));
+        // Rebuild only host text. Retain the request on admission failure; the
+        // provider must never receive a partial approved attachment section.
+        let mut content = if attachment_start.is_some() {
+            message.content.clone()
+        } else {
+            std::mem::take(&mut message.content)
+        };
+        let attachments = attachment_start.map(|start| content.split_off(start));
         // Hooks may append instructions outside the assembly cap. Preserve an
         // exact suffix, using the cap applied by scoped refresh to identify its base.
         let hook_suffix = if instructions.is_empty() {
@@ -872,8 +898,7 @@ fn apply_builtin_prompt_scope(
             canonical_prompt
                 .take()
                 .and_then(|canonical| {
-                    message
-                        .content
+                    content
                         .strip_prefix(canonical)
                         .map(str::to_owned)
                         .or_else(|| {
@@ -884,15 +909,13 @@ fn apply_builtin_prompt_scope(
                                 canonical.to_owned(),
                                 refresh_cap,
                             );
-                            message.content.strip_prefix(&capped).map(str::to_owned)
+                            content.strip_prefix(&capped).map(str::to_owned)
                         })
                 })
                 .filter(|suffix| !suffix.is_empty())
         };
         if let Some(suffix) = hook_suffix.as_ref() {
-            message
-                .content
-                .truncate(message.content.len() - suffix.len());
+            content.truncate(content.len() - suffix.len());
         }
         // A same-agent step shares history, but its discovery route is narrower.
         // Reconcile only the request clone, preserving unrelated prompt sections.
@@ -910,18 +933,18 @@ fn apply_builtin_prompt_scope(
                 continue;
             }
             let mut cursor = 0;
-            while let Some(offset) = message.content[cursor..].find(heading) {
+            while let Some(offset) = content[cursor..].find(heading) {
                 let start = cursor + offset;
                 let body = start + heading.len();
-                let section_end = message.content[body..]
+                let section_end = content[body..]
                     .find("\n## ")
-                    .map_or(message.content.len(), |offset| body + offset);
-                let section_end = message.content[body..section_end]
+                    .map_or(content.len(), |offset| body + offset);
+                let section_end = content[body..section_end]
                     .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
                     .map_or(section_end, |offset| body + offset);
                 let (end, complete) = if heading == "## Deferred Built-in Tools\n" {
                     let close = "</available-deferred-builtin-tools>";
-                    message.content[body..section_end]
+                    content[body..section_end]
                         .find(close)
                         .map_or((section_end, false), |offset| {
                             (body + offset + close.len(), true)
@@ -934,35 +957,48 @@ fn apply_builtin_prompt_scope(
                 let replacement = if heading == "## Deferred Built-in Tools\n"
                     && complete
                     && !catalogue_inserted
-                    && catalogue.chars().count() <= message.content[start..end].chars().count()
+                    && catalogue.chars().count() <= content[start..end].chars().count()
                 {
                     catalogue_inserted = true;
                     catalogue
                 } else {
                     ""
                 };
-                message.content.replace_range(start..end, replacement);
+                content.replace_range(start..end, replacement);
                 cursor = start + replacement.len();
             }
         }
         if !instructions.is_empty() {
             // Keep orientation at the tail so finalization cannot retain it twice.
-            let insertion = message
-                .content
+            let insertion = content
                 .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
-                .unwrap_or(message.content.len());
-            message
-                .content
-                .insert_str(insertion, &format!("\n{instructions}"));
-            message.content = crate::agent::system_prompt::finalize_system_prompt(
-                std::mem::take(&mut message.content),
-                max_system_prompt_chars,
-            );
+                .unwrap_or(content.len());
+            content.insert_str(insertion, &format!("\n{instructions}"));
+            if attachments.is_none() {
+                content = crate::agent::system_prompt::finalize_system_prompt(
+                    content,
+                    max_system_prompt_chars,
+                );
+            }
             if let Some(suffix) = hook_suffix {
-                message.content.push_str(&suffix);
+                content.push_str(&suffix);
             }
         }
+        if let Some(attachments) = attachments {
+            // A same-agent SOP step can replace deferred discovery with a larger
+            // tool protocol. Reapply mandatory host-plus-attachment admission
+            // after that projection instead of silently capping either part.
+            // The detached section starts with the two ASCII newlines that
+            // append_required_session_prompt_attachments adds back verbatim.
+            crate::agent::prompt::append_required_session_prompt_attachments(
+                &mut content,
+                &attachments[2..],
+                max_system_prompt_chars,
+            )?;
+        }
+        message.content = content;
     }
+    Ok(())
 }
 
 pub struct ToolLoop<'a> {
@@ -2426,7 +2462,7 @@ async fn run_tool_call_loop_impl<'a>(
                     .iter()
                     .find(|message| message.role == "system")
                     .map(|message| message.content.as_str()),
-            );
+            )?;
         }
         // Preserve post-hook messages before the request-only instruction is
         // inserted inside the canonical prompt. A trim must match that complete
@@ -2599,7 +2635,7 @@ async fn run_tool_call_loop_impl<'a>(
                             .iter()
                             .find(|message| message.role == "system")
                             .map(|message| message.content.as_str()),
-                    );
+                    )?;
                 }
                 if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single {
                     apply_single_tool_round_prompt(&mut trimmed_post_hook);
@@ -8019,6 +8055,150 @@ mod sop_step_reassembly_tests {
     }
 
     #[tokio::test]
+    async fn builtin_scope_retains_required_attachments_when_tools_exceed_budget() {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedTool("allowed_tool"))];
+        let names = HashSet::from(["allowed_tool".to_string()]);
+        let attachments =
+            "\n\n## Session Prompts\n- id: \"task\"; content: \"REQUIRED_SCOPE_CANARY\"\n";
+        let parent = format!(
+            "## Safety\nKeep host policy.{}{attachments}",
+            crate::agent::prompt::TIMESTAMP_ORIENTATION,
+        );
+        let mut request = vec![ChatMessage::system(&parent)];
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.clone(),
+                parent.clone(),
+            )),
+            async {
+                let error = apply_builtin_prompt_scope(
+                    &mut request,
+                    &tools,
+                    &names,
+                    "",
+                    false,
+                    false,
+                    parent.chars().count(),
+                    Some(&parent),
+                )
+                .expect_err("expanded instructions must fail admission");
+                assert!(error.to_string().contains("required host context"));
+                assert!(!error.to_string().contains("REQUIRED_SCOPE_CANARY"));
+            },
+        )
+        .await;
+        assert!(request[0].content.ends_with(attachments));
+        assert_eq!(request[0].content, parent);
+    }
+
+    #[tokio::test]
+    async fn builtin_scope_preserves_complete_required_prompt_at_budget_boundary() {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(NamedTool("allowed_tool")),
+            Box::new(NamedTool("denied_tool")),
+        ];
+        let names = HashSet::from(["allowed_tool".to_string()]);
+        let instructions = crate::agent::loop_::build_tool_instructions_for_names(
+            &tools,
+            &HashSet::from(["allowed_tool"]),
+        );
+        // The suffix is opaque even when its contents resemble tool headings.
+        let attachments = format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::render_session_prompts(&[
+                zeroclaw_infra::session_prompts::SessionPrompt {
+                    id: "task".into(),
+                    content: "λ猫\n## Tools\nOPAQUE_SCOPE_CANARY".into(),
+                    updated_at: String::new(),
+                },
+            ])
+        );
+        for orientation in [crate::agent::prompt::TIMESTAMP_ORIENTATION, ""] {
+            let host = "## Safety\nKeep host policy.";
+            let parent = format!("{host}{orientation}{attachments}");
+            let expected = format!("{host}\n{instructions}{orientation}{attachments}");
+            let exact_budget = expected.chars().count();
+            for cap in [exact_budget - 1, exact_budget, 0] {
+                let mut history = vec![ChatMessage::system(&parent)];
+                let mut request = history.clone();
+                scope_tool_protocol_prompts(
+                    Arc::new(ToolProtocolPrompts::with_required_prompts(
+                        parent.clone(),
+                        parent.clone(),
+                    )),
+                    async {
+                        // Both the initial request and post-trim replay project
+                        // from the complete canonical prompt.
+                        for _ in 0..2 {
+                            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+                            let result = apply_builtin_prompt_scope(
+                                &mut request,
+                                &tools,
+                                &names,
+                                "",
+                                false,
+                                false,
+                                cap,
+                                Some(&parent),
+                            );
+                            if cap == exact_budget - 1 {
+                                assert!(result.is_err());
+                                assert_eq!(request[0].content, parent);
+                            } else {
+                                result.unwrap();
+                                assert_eq!(request[0].content, expected);
+                                assert!(cap == 0 || request[0].content.chars().count() == cap);
+                                assert!(!request[0].content.contains("**denied_tool**"));
+                            }
+                            assert_eq!(history[0].content, parent);
+                            assert!(request[0].content.ends_with(&attachments));
+                        }
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_scope_preserves_required_suffix_without_text_fallback() {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedTool("allowed_tool"))];
+        let parent = "## Safety\nKeep host policy.\n\n## Session Prompts\nREQUIRED_NATIVE_CANARY";
+        for (native, strict, search) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut names = HashSet::from(["allowed_tool".to_string()]);
+            if search {
+                names.insert("tool_search".to_string());
+            }
+            let mut request = vec![ChatMessage::system(parent)];
+            scope_tool_protocol_prompts(
+                Arc::new(ToolProtocolPrompts::with_required_prompts(
+                    parent.into(),
+                    parent.into(),
+                )),
+                async {
+                    apply_builtin_prompt_scope(
+                        &mut request,
+                        &tools,
+                        &names,
+                        "",
+                        native,
+                        strict,
+                        parent.chars().count(),
+                        Some(parent),
+                    )
+                    .unwrap();
+                },
+            )
+            .await;
+            assert_eq!(request[0].content, parent);
+        }
+    }
+
+    #[tokio::test]
     async fn builtin_search_fallback_preserves_strict_policy_and_scoped_replay() {
         let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
             Box::new(NamedTool("allowed_tool")),
@@ -8031,10 +8211,12 @@ mod sop_step_reassembly_tests {
         let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
         scope_tool_protocol_prompts(prompts, async {
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None)
+                .unwrap();
             // Trim rebuilds the projected request, then refreshes the cached section.
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None)
+                .unwrap();
         })
         .await;
         assert_eq!(
@@ -8092,7 +8274,8 @@ mod sop_step_reassembly_tests {
                         false,
                         cap,
                         Some(&parent),
-                    );
+                    )
+                    .unwrap();
                     let base = request[0]
                         .content
                         .strip_suffix(hook)
@@ -8181,7 +8364,8 @@ mod sop_step_reassembly_tests {
                         false,
                         cap.unwrap_or(0),
                         None,
-                    );
+                    )
+                    .unwrap();
                     assert!(request[0].content.chars().count() <= before_chars);
                     if let Some(cap) = cap {
                         assert!(request[0].content.chars().count() <= cap);
@@ -8218,7 +8402,8 @@ mod sop_step_reassembly_tests {
 
         let strict_prompt = &prompt[prompt.find("## Safety").unwrap()..];
         let mut strict = vec![ChatMessage::system(strict_prompt)];
-        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None)
+            .unwrap();
         assert!(
             !strict[0]
                 .content
@@ -8228,7 +8413,8 @@ mod sop_step_reassembly_tests {
         assert!(!strict[0].content.contains("**allowed_tool**"));
         assert!(strict[0].content.contains("Keep hardware guidance."));
         let mut strict = vec![ChatMessage::system(truncated)];
-        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None)
+            .unwrap();
         assert!(!strict[0].content.contains("denied_tool"));
         assert!(
             !strict[0]
