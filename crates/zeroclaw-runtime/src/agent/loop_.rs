@@ -1336,7 +1336,8 @@ pub use super::turn::{
     ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
     THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
-    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+    scope_required_session_prompt_section, scrub_credentials, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 #[cfg(test)]
 pub(crate) use super::turn::{

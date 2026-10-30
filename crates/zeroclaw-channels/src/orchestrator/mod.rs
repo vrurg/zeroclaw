@@ -10021,6 +10021,11 @@ async fn process_channel_message_body(
         .await;
         return;
     }
+    // The admitted snapshot remains the source of truth for this turn. Move
+    // its rendered section into the loop scope, including same-agent steps;
+    // independent transcripts withhold it rather than borrowing this context.
+    let required_session_prompt_section = (!session_prompt_attachments.is_empty())
+        .then(|| std::sync::Arc::<str>::from(session_prompt_attachments));
     // Captured before the tool-call loop can drop whole turns, so the
     // post-loop resync below can detect that a trim happened.
     let prior_turns_len_before_loop = prior_turns.len();
@@ -10750,6 +10755,10 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_runtime::agent::loop_::scope_required_session_prompt_section(
+                required_session_prompt_section.clone(),
+                tool_loop,
+            );
             let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
                 ctx.prompt_config.channels.session_prompts_enabled && ctx.session_store.is_some(),
                 tool_loop,

@@ -641,6 +641,24 @@ tokio::task_local! {
     static TOOL_PROTOCOL_PROMPTS: Option<Arc<ToolProtocolPrompts>>;
 }
 
+tokio::task_local! {
+    /// The channel primary turn moves its admitted snapshot's rendered section
+    /// here. This carries that immutable payload across the tool loop and its
+    /// same-transcript steps without borrowing Agent protocol variants.
+    static REQUIRED_SESSION_PROMPT_SECTION: Option<Arc<str>>;
+}
+
+/// Carry an admitted primary turn's required section through its request work.
+/// Runtime-owned independent transcripts withhold it alongside protocol variants.
+pub async fn scope_required_session_prompt_section<F: std::future::Future>(
+    section: Option<Arc<str>>,
+    future: F,
+) -> F::Output {
+    REQUIRED_SESSION_PROMPT_SECTION
+        .scope(section.filter(|section| !section.is_empty()), future)
+        .await
+}
+
 fn with_scoped_tool_protocol_prompts<R>(f: impl FnOnce(&ToolProtocolPrompts) -> R) -> Option<R> {
     TOOL_PROTOCOL_PROMPTS
         .try_with(|prompts| prompts.as_deref().map(f))
@@ -649,7 +667,15 @@ fn with_scoped_tool_protocol_prompts<R>(f: impl FnOnce(&ToolProtocolPrompts) -> 
 }
 
 fn attachment_protocol_scope_active() -> bool {
-    with_scoped_tool_protocol_prompts(|prompts| prompts.required_pair.is_some()).unwrap_or(false)
+    channel_session_prompt_scope_active()
+        || with_scoped_tool_protocol_prompts(|prompts| prompts.required_pair.is_some())
+            .unwrap_or(false)
+}
+
+fn channel_session_prompt_scope_active() -> bool {
+    REQUIRED_SESSION_PROMPT_SECTION
+        .try_with(|section| section.is_some())
+        .unwrap_or(false)
 }
 
 /// Scope complete prompt variants around an Agent turn's own transcript. This
@@ -667,7 +693,9 @@ pub(crate) async fn without_attachment_protocol_prompts<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     if attachment_protocol_scope_active() {
-        TOOL_PROTOCOL_PROMPTS.scope(None, future).await
+        REQUIRED_SESSION_PROMPT_SECTION
+            .scope(None, TOOL_PROTOCOL_PROMPTS.scope(None, future))
+            .await
     } else {
         future.await
     }
@@ -707,6 +735,20 @@ fn refresh_scoped_tool_protocol_prompt(
     request_messages: &mut [ChatMessage],
     use_native_tools: bool,
 ) {
+    if channel_session_prompt_scope_active() {
+        // Channels own their assembled history prompt, not an Agent's native/
+        // text pair. Rebuild from that owner on both initial and trimmed paths
+        // so re-projecting a request cannot accumulate protocol separators.
+        if let Some(canonical) = history.iter().find(|message| message.role == "system")
+            && let Some(system) = request_messages
+                .iter_mut()
+                .find(|message| message.role == "system")
+        {
+            system.content.clone_from(&canonical.content);
+            refresh_prompt_anchor(std::slice::from_mut(system), use_native_tools);
+        }
+        return;
+    }
     let _ = with_scoped_tool_protocol_prompts(|prompts| {
         // History keeps the swapped prompt without re-capping it; only the
         // provider-bound copy is capped. A capped native request is rebuilt
@@ -744,11 +786,9 @@ fn refresh_scoped_tool_protocol_prompt(
             // hook text reaches the model as it does on the CLI path. The
             // request may already be finalized (the post-trim rebuild).
             let rebuilt = history_prompts.and_then(|(before, swapped)| {
-                let canonical = prompts.required_prompt(use_native_tools).or_else(|| {
-                    use_native_tools
-                        .then_some(prompts.native_request.as_deref())
-                        .flatten()
-                });
+                let canonical = use_native_tools
+                    .then_some(prompts.native_request.as_deref())
+                    .flatten();
                 let base = match canonical {
                     Some(canonical) => {
                         let mut selected = [ChatMessage::system(canonical.to_owned())];
@@ -798,6 +838,47 @@ fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
 
 fn single_tool_round_error() -> anyhow::Error {
     anyhow::Error::new(stream_consume::SingleToolRoundViolation::default())
+}
+
+fn check_required_request_prompt_budget(messages: &[ChatMessage], max_chars: usize) -> Result<()> {
+    if !attachment_protocol_scope_active() {
+        return Ok(());
+    }
+    let system = messages
+        .iter()
+        .find(|message| message.role == "system")
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({"error_key": "session_prompt_context_missing"})),
+                "Required session prompts have no provider system message"
+            );
+            anyhow::Error::msg("Required session prompts have no provider system message")
+        })?;
+    let section_intact = REQUIRED_SESSION_PROMPT_SECTION
+        .try_with(|section| {
+            section
+                .as_deref()
+                .is_none_or(|section| system.content.ends_with(section))
+        })
+        .unwrap_or(true);
+    if !section_intact {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({"error_key": "session_prompt_context_changed"})),
+            "Required session prompts are missing or changed in the provider request"
+        );
+        anyhow::bail!("Required session prompts are missing or changed in the provider request");
+    }
+    crate::agent::prompt::check_required_session_prompt_budget(
+        system.content.chars().count(),
+        max_chars,
+    )?;
+    Ok(())
 }
 
 /// Only adjust the runtime's tool protocol and transient request prompt.
@@ -1845,8 +1926,8 @@ async fn run_tool_call_loop_impl<'a>(
         knobs,
     } = exec;
 
-    // Config-backed loops resolve the executing alias; configless Agent turns
-    // already carry this cap in their transient protocol context. Zero is unlimited.
+    // Config-backed loops resolve the executing alias. Other callers use a
+    // transient protocol cap when supplied; zero means unlimited.
     let max_system_prompt_chars = config
         .zip(agent_alias)
         .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
@@ -2475,6 +2556,9 @@ async fn run_tool_call_loop_impl<'a>(
             prepared_source_rows.insert(0, usize::MAX);
             post_hook_snapshot.insert(0, provider_request_messages[0].clone());
         }
+        // Include request-only host instructions in private prompt admission.
+        // Ordinary prompts retain their existing capping policy.
+        check_required_request_prompt_budget(&provider_request_messages, max_system_prompt_chars)?;
 
         if context_token_budget > 0 {
             let system_floor =
@@ -2640,6 +2724,7 @@ async fn run_tool_call_loop_impl<'a>(
                 if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single {
                     apply_single_tool_round_prompt(&mut trimmed_post_hook);
                 }
+                check_required_request_prompt_budget(&trimmed_post_hook, max_system_prompt_chars)?;
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
@@ -8052,6 +8137,260 @@ mod sop_step_reassembly_tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn builtin_channel_scope_checks_budget_at_provider_boundary() {
+        struct ScopeCapture {
+            inner: CaptureProvider,
+            native: bool,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ScopeCapture {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&self.inner)
+            }
+            fn alias(&self) -> &str {
+                "text-scope-capture"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for ScopeCapture {
+            fn supports_native_tools(&self) -> bool {
+                self.native
+            }
+            fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+                true
+            }
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<String> {
+                self.inner
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.inner.chat(request, model, temperature).await
+            }
+        }
+
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(NamedTool("allowed_tool")),
+            Box::new(NamedTool("tool_search")),
+        ]);
+        let mut activated = crate::tools::ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(
+            tools
+                .iter()
+                .filter(|tool| tool.name() != "tool_search")
+                .map(|tool| tool.spec())
+                .collect(),
+        );
+        let activated = Arc::new(std::sync::Mutex::new(activated));
+        let rendered = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: "CHANNEL_SCOPE_CANARY λ猫".into(),
+                updated_at: String::new(),
+            },
+        ]);
+        let host = "## Safety\nKeep host policy.";
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let parent = format!("{host}{orientation}\n\n{rendered}");
+        let instructions = crate::agent::loop_::build_tool_instructions_for_names(
+            &tools,
+            &HashSet::from(["allowed_tool"]),
+        );
+        let exact_cap = parent.chars().count() + 1 + instructions.chars().count();
+        let mut native_request = vec![ChatMessage::system(&parent)];
+        apply_single_tool_round_prompt(&mut native_request);
+        let native_cap = native_request[0].content.chars().count();
+        for (native, exact_cap) in [(false, exact_cap), (true, native_cap)] {
+            for cap in [parent.chars().count(), exact_cap] {
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let provider = ScopeCapture {
+                    inner: CaptureProvider {
+                        requests: requests.clone(),
+                    },
+                    native,
+                };
+                let mut config = zeroclaw_config::schema::Config::default();
+                config.channels.session_prompts_enabled = true;
+                config.agents.insert(
+                    "outer".into(),
+                    zeroclaw_config::schema::AliasedAgentConfig {
+                        runtime_profile: "scope".into(),
+                        ..Default::default()
+                    },
+                );
+                config.runtime_profiles.insert(
+                    "scope".into(),
+                    zeroclaw_config::schema::RuntimeProfileConfig {
+                        max_system_prompt_chars: Some(cap),
+                        max_context_tokens: Some(1200),
+                        deferred_builtin_tools: true,
+                        single_tool_rounds: Some(native),
+                        ..Default::default()
+                    },
+                );
+                let mut history = vec![
+                    ChatMessage::system(&parent),
+                    ChatMessage::user("x".repeat(20_000)),
+                    ChatMessage::assistant("y".repeat(20_000)),
+                    ChatMessage::user("Continue the synthetic task."),
+                ];
+                let mut crumb = false;
+                let excluded = vec!["tool_search".to_string()];
+                let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+                let pacing = zeroclaw_config::schema::PacingConfig::default();
+                let knobs = LoopKnobs::default();
+                let mut memory_preamble = None;
+                let future = run_tool_call_loop(ToolLoop {
+                    exec: ResolvedAgentExecution::resolve(
+                        ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "mock",
+                            model: "mock",
+                            dispatch_model: "mock",
+                            temperature: None,
+                        },
+                        ResolvedIo {
+                            tools_registry: &tools,
+                            observer: &crate::observability::NoopObserver,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &multimodal,
+                            config: Some(&config),
+                            hooks: None,
+                            activated_tools: Some(&activated),
+                            model_switch_callback: None,
+                            receipt_generator: None,
+                            security: None,
+                        },
+                        ResolvedRuntimeKnobs {
+                            max_tool_iterations: 3,
+                            excluded_tools: &excluded,
+                            dedup_exempt_tools: &[],
+                            pacing: &pacing,
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                                context_token_budget: 1200,
+                                ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                                    100_000,
+                                )
+                            },
+                            context_limits_resolver: None,
+                            knobs: &knobs,
+                        },
+                    ),
+                    history: &mut history,
+                    history_has_trim_breadcrumb: &mut crumb,
+                    injected_memory_preamble: &mut memory_preamble,
+                    channel_name: "matrix",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: Some("outer"),
+                    parent_agent_alias: None,
+                    turn_id: "scope-budget",
+                    served_route_sink: None,
+                    sop_reassembly: None,
+                });
+                // Channels have no Agent protocol-pair scope. A same-agent SOP step
+                // keeps the admitted section but withholds prompt-tool capability.
+                let result = scope_required_session_prompt_section(
+                    Some(Arc::from(rendered.as_str())),
+                    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(false, future),
+                )
+                .await;
+                let captured = requests.lock().unwrap();
+                if cap < exact_cap {
+                    assert!(result.is_err());
+                    assert!(
+                        captured.is_empty(),
+                        "an oversized required prompt must not reach the provider"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), "child-done");
+                    assert!(
+                        crumb,
+                        "the valid request must exercise post-trim reconstruction"
+                    );
+                    assert_eq!(captured.len(), 1);
+                    assert!(captured[0].0[0].content.ends_with(&rendered));
+                    assert_eq!(captured[0].0[0].content.chars().count(), exact_cap);
+                }
+                assert_eq!(history[0].content, parent);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_channel_context_is_withheld_from_independent_transcripts() {
+        scope_required_session_prompt_section(Some(Arc::from("required section")), async {
+            assert!(attachment_protocol_scope_active());
+            check_required_request_prompt_budget(&[ChatMessage::system("required section")], 0)
+                .unwrap();
+            assert!(check_required_request_prompt_budget(&[], 0).is_err());
+            assert!(
+                check_required_request_prompt_budget(&[ChatMessage::system("changed")], 0).is_err()
+            );
+            without_attachment_protocol_prompts(async {
+                assert!(!attachment_protocol_scope_active());
+                let ordinary = vec![ChatMessage::system(
+                    "host\n\n## Session Prompts\nordinary text",
+                )];
+                // A heading in operator-authored host text is not an admitted
+                // snapshot and must not introduce a new budget refusal.
+                check_required_request_prompt_budget(&ordinary, 1).unwrap();
+            })
+            .await;
+            assert!(attachment_protocol_scope_active());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn builtin_channel_contexts_do_not_cross_parallel_turns() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let check = |own: &'static str, other: &'static str, barrier: Arc<tokio::sync::Barrier>| {
+            scope_required_session_prompt_section(Some(Arc::from(own)), async move {
+                barrier.wait().await;
+                for _ in 0..2 {
+                    check_required_request_prompt_budget(&[ChatMessage::system(own)], 0).unwrap();
+                    assert!(
+                        check_required_request_prompt_budget(&[ChatMessage::system(other)], 0)
+                            .is_err()
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        tokio::join!(
+            check("context-a", "context-b", barrier.clone()),
+            check("context-b", "context-a", barrier),
+        );
     }
 
     #[tokio::test]

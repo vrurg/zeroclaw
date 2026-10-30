@@ -155,11 +155,16 @@ current primary turn prepares. It rejects a collection that would not fit,
 without writing it; the collection read, check, and update occur in one SQLite
 transaction. This is best-effort admission, not the dispatch authority:
 configuration or other turn inputs can still change after the snapshot is
-computed. In that case, ZeroClaw fails the affected turn before provider
+computed. In that case, ZeroClaw fails the affected request before provider
 dispatch rather than dropping attachments or truncating host context.
 
-If that final check fails, the affected session cannot use its tools to repair
-the collection because the turn never starts. Reset or delete the session,
+Same-agent SOP steps retain the primary transcript. If a later step's scoped
+tool instructions exceed the budget, that step records a failure without
+dispatching its request; the parent can continue on its intact prompt. Private
+requests also recheck the limit after request-only host instructions are added.
+
+If the initial primary-turn check fails, the session cannot use its tools to
+repair the collection because the turn never starts. Reset or delete the session,
 which atomically removes its attachments; raising `max_system_prompt_chars` is
 an alternative when the host-prompt limit is intentionally too small.
 

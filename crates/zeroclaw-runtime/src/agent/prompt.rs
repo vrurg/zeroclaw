@@ -416,13 +416,22 @@ pub fn append_required_session_prompt_attachments(
 
     let attachment_chars = attachments.chars().count().saturating_add(2);
     let total_chars = prompt.chars().count().saturating_add(attachment_chars);
+    check_required_session_prompt_budget(total_chars, max_chars)?;
+    prompt.push_str("\n\n");
+    prompt.push_str(attachments);
+    Ok(())
+}
+
+/// Validate mandatory context again after request-only host instructions change.
+pub(crate) fn check_required_session_prompt_budget(
+    total_chars: usize,
+    max_chars: usize,
+) -> Result<()> {
     if max_chars > 0 && total_chars > max_chars {
         anyhow::bail!(
             "Persistent session prompts and required host context exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
         );
     }
-    prompt.push_str("\n\n");
-    prompt.push_str(attachments);
     Ok(())
 }
 
