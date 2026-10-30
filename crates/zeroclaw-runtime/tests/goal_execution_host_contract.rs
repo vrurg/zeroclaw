@@ -1804,6 +1804,7 @@ enum ScriptedFault {
     PauseDuringAppend,
     PauseDuringVerifier,
     ParentError,
+    ParentPanic,
     PauseThenParentError,
     VerifierError,
     PauseThenVerifierError,
@@ -1932,6 +1933,7 @@ impl GoalSessionExecutionLease for ScriptedLease {
         };
         match fault {
             Some(ScriptedFault::ParentError) => anyhow::bail!("fixture provider failed"),
+            Some(ScriptedFault::ParentPanic) => panic!("fixture parent panicked"),
             Some(ScriptedFault::PauseThenParentError) => {
                 self.pause(scope).await;
                 anyhow::bail!("fixture provider failed");
@@ -2152,6 +2154,604 @@ impl EngineFixture {
             .into_iter()
             .map(|message| (message.role, message.content))
             .collect()
+    }
+}
+
+mod supervisor_error_contract {
+    use super::*;
+    use tokio::sync::Semaphore;
+
+    #[derive(Clone, Copy)]
+    enum HeldTurn {
+        Parent,
+        Verifier,
+    }
+
+    struct HeldDriver {
+        inner: Arc<ScriptedDriver>,
+        turn: HeldTurn,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        accounting: Option<GoalAccountingState>,
+        command: Arc<tokio::sync::Mutex<()>>,
+        binds: AtomicUsize,
+        hold_rebind: AtomicBool,
+        rebind_entered: Semaphore,
+        release_rebind: Semaphore,
+    }
+
+    struct HeldLease {
+        inner: Box<dyn GoalSessionExecutionLease>,
+        store: Arc<SqliteTaskStore>,
+        turn: HeldTurn,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        accounting: Option<GoalAccountingState>,
+    }
+
+    #[async_trait]
+    impl GoalSessionDriver for HeldDriver {
+        fn session_key(&self) -> &GoalSessionKey {
+            self.inner.session_key()
+        }
+
+        async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+            let ordinal = self.binds.fetch_add(1, Ordering::SeqCst) + 1;
+            let command = self.command.clone().lock_owned().await;
+            if ordinal == 2 && self.hold_rebind.load(Ordering::SeqCst) {
+                self.rebind_entered.add_permits(1);
+                self.release_rebind.acquire().await.unwrap().forget();
+            }
+            Ok(GoalSessionLease::new(self.inner.binding.clone(), command))
+        }
+
+        async fn acquire_execution(
+            &self,
+            ingress: &GoalIngressContext,
+            scope: &GoalExecutionScope,
+            checkpoint: &GoalParentTurnCheckpoint,
+        ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+            Ok(Box::new(HeldLease {
+                inner: self
+                    .inner
+                    .acquire_execution(ingress, scope, checkpoint)
+                    .await?,
+                store: self.inner.store.clone(),
+                turn: self.turn,
+                entered: self.entered.clone(),
+                release: self.release.clone(),
+                accounting: self.accounting,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionExecutionLease for HeldLease {
+        fn session_key(&self) -> &GoalSessionKey {
+            self.inner.session_key()
+        }
+
+        fn canonical_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+            self.inner.canonical_history()
+        }
+
+        async fn append_resume_response(&mut self, response: String) -> anyhow::Result<()> {
+            self.inner.append_resume_response(response).await
+        }
+
+        async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+            self.inner.append_parent_candidate(candidate).await
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            scope: &GoalExecutionScope,
+            turn: GoalParentTurn,
+        ) -> anyhow::Result<String> {
+            if self.accounting.is_some() {
+                assert_eq!(
+                    self.store
+                        .admit_pending_operation(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            "held-operation",
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            if matches!(self.turn, HeldTurn::Parent) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            if let Some(state) = self.accounting {
+                if state != GoalAccountingState::OutcomeUnknown {
+                    assert_eq!(
+                        self.store
+                            .settle_pending_operation(
+                                scope.task_id(),
+                                scope.session_id(),
+                                scope.execution_epoch(),
+                                "held-operation",
+                                state,
+                            )
+                            .await?,
+                        GoalTransitionResult::Applied
+                    );
+                }
+            }
+            self.inner.run_parent_turn(scope, turn).await
+        }
+
+        async fn run_verifier(
+            &mut self,
+            scope: &GoalExecutionScope,
+            turn: GoalVerifierTurn,
+        ) -> anyhow::Result<GoalVerifierResult> {
+            if matches!(self.turn, HeldTurn::Verifier) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.inner.run_verifier(scope, turn).await
+        }
+    }
+
+    struct Fixture {
+        config: Config,
+        source: GoalHostSettingsSource,
+        store: Arc<SqliteTaskStore>,
+        driver: Arc<HeldDriver>,
+        supervisor: Arc<GoalExecutionSupervisor>,
+        scope: GoalExecutionScope,
+        started: Option<zeroclaw_goal::GoalExecutionSubmission>,
+        _directory: TempDir,
+    }
+
+    impl Fixture {
+        async fn new(
+            turn: HeldTurn,
+            fault: ScriptedFault,
+            accounting: Option<GoalAccountingState>,
+        ) -> Self {
+            let directory = TempDir::new().unwrap();
+            let store = Arc::new(SqliteTaskStore::new(&directory.path().join("control")).unwrap());
+            let config = valid_goal_config(true);
+            let ingress = matrix_ingress();
+            let inner = Arc::new(ScriptedDriver {
+                binding: GoalSessionBinding::new(ingress.session_key().clone()),
+                store: store.clone(),
+                sessions: Arc::new(
+                    SqliteSessionBackend::new(&directory.path().join("history")).unwrap(),
+                ),
+                script: Arc::new(StdMutex::new(ExecutionScript {
+                    parents: VecDeque::from(["candidate".to_owned()]),
+                    verifiers: VecDeque::from([SCRIPTED_COMPLETE.to_owned()]),
+                    steps: Vec::new(),
+                    fault: Some(fault),
+                })),
+            });
+            let driver = Arc::new(HeldDriver {
+                inner,
+                turn,
+                entered: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                accounting,
+                command: Arc::new(tokio::sync::Mutex::new(())),
+                binds: AtomicUsize::new(0),
+                hold_rebind: AtomicBool::new(false),
+                rebind_entered: Semaphore::new(0),
+                release_rebind: Semaphore::new(0),
+            });
+            let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+            let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+                runtime.execution_engine(Arc::new(ScriptedAccountingFactory)),
+            )));
+            let live = LiveConfig::new(config.clone());
+            let source = GoalHostSettingsSource::new(live.handle(), 42, "test-boot").unwrap();
+            let started = supervisor
+                .submit(
+                    &host_settings(&config),
+                    ingress,
+                    driver.clone(),
+                    GoalCommand::Start {
+                        budget: zeroclaw_commands::goal::GoalBudgetSelection::Limits(
+                            zeroclaw_commands::goal::GoalBudgetLimits {
+                                token_limit: Some(100),
+                                cost_limit_usd: None,
+                            },
+                        ),
+                        objective: "finish the bounded task".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let task = store
+                .current_goal_for_session(&driver.session_key().durable_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let scope =
+                GoalExecutionScope::new(task.id, task.session_id.unwrap(), task.execution_epoch)
+                    .unwrap();
+            Self {
+                config,
+                source,
+                store,
+                driver,
+                supervisor,
+                scope,
+                started: Some(started),
+                _directory: directory,
+            }
+        }
+
+        async fn start(&mut self) {
+            self.supervisor
+                .launch_after_response(&self.source, &mut self.started.take().unwrap())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), self.driver.entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+
+        async fn task(&self) -> TaskRecord {
+            self.store
+                .current_goal_for_session(self.scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn pause(&self) -> zeroclaw_goal::GoalExecutionSubmission {
+            let pause = self
+                .supervisor
+                .submit(
+                    &host_settings(&self.config),
+                    matrix_ingress(),
+                    self.driver.clone(),
+                    GoalCommand::Pause { immediate: true },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                pause.response(),
+                GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Pause)
+            ));
+            pause
+        }
+
+        async fn reason(&self) -> Option<String> {
+            self.store
+                .terminal_reason_for_session_goal(self.scope.task_id(), self.scope.session_id())
+                .await
+                .unwrap()
+        }
+
+        async fn goal(&self) -> GoalTaskRecord {
+            self.store
+                .get_goal_task(self.scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        fn intent_states(&self) -> Vec<(String, Option<String>)> {
+            let connection = rusqlite::Connection::open_with_flags(
+                self._directory.path().join("control/control_plane.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT state, outcome_reason FROM goal_control_intents
+                 WHERE task_id = ?1 AND session_id = ?2 ORDER BY intent_id",
+                )
+                .unwrap();
+            let states = statement
+                .query_map(
+                    rusqlite::params![self.scope.task_id(), self.scope.session_id()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            states
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_settled_parent_and_verifier_errors_preserve_operator_pause_and_original_error()
+     {
+        for (turn, fault, cause) in [
+            (
+                HeldTurn::Parent,
+                ScriptedFault::ParentError,
+                "fixture provider failed",
+            ),
+            (
+                HeldTurn::Verifier,
+                ScriptedFault::VerifierError,
+                "fixture verifier failed",
+            ),
+        ] {
+            let mut fixture = Fixture::new(turn, fault, None).await;
+            fixture.start().await;
+            let mut pause = fixture.pause().await;
+            fixture.driver.release.add_permits(1);
+            let error = fixture.supervisor.drain(&fixture.scope).await.unwrap_err();
+            assert!(format!("{error:#}").contains(cause));
+            assert!(matches!(
+                fixture
+                    .supervisor
+                    .launch_after_response(&fixture.source, &mut pause)
+                    .await
+                    .unwrap(),
+                Some(GoalResponse::Paused(_))
+            ));
+            let task = fixture.task().await;
+            assert_eq!(task.status, TaskStatus::Paused);
+            assert_eq!(task.execution_epoch, fixture.scope.execution_epoch() + 1);
+            let goal = fixture.goal().await;
+            assert_eq!(goal.pause_reason, Some(GoalPauseReason::OperatorPaused));
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none());
+            assert!(goal.pending_call_epoch.is_none());
+            assert_eq!(fixture.reason().await, None);
+            assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+            let history = fixture
+                .driver
+                .inner
+                .sessions
+                .try_load(fixture.scope.session_id())
+                .unwrap();
+            assert_eq!(
+                history.len(),
+                usize::from(matches!(turn, HeldTurn::Verifier))
+            );
+            if matches!(turn, HeldTurn::Verifier) {
+                assert_eq!(history[0].content, "candidate");
+            }
+            let steps = &fixture.driver.inner.script.lock().unwrap().steps;
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| matches!(step, ScriptedStep::Parent(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| matches!(step, ScriptedStep::Verifier(_)))
+                    .count(),
+                usize::from(matches!(turn, HeldTurn::Verifier))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_settled_parent_and_verifier_errors_preserve_restart_pause() {
+        for (turn, fault) in [
+            (HeldTurn::Parent, ScriptedFault::ParentError),
+            (HeldTurn::Verifier, ScriptedFault::VerifierError),
+        ] {
+            let mut fixture = Fixture::new(turn, fault, None).await;
+            fixture.start().await;
+            let supervisor = fixture.supervisor.clone();
+            let restart = tokio::spawn(async move { supervisor.pause_for_restart().await });
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if fixture.task().await.status == TaskStatus::Paused {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            fixture.driver.release.add_permits(1);
+            timeout(Duration::from_secs(1), restart)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let task = fixture.task().await;
+            assert_eq!(task.status, TaskStatus::Paused);
+            let goal = fixture.goal().await;
+            assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(fixture.reason().await, None);
+            assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_incomplete_accounting_still_fails_after_operator_pause() {
+        for state in [
+            GoalAccountingState::Missing,
+            GoalAccountingState::Invalid,
+            GoalAccountingState::OutcomeUnknown,
+        ] {
+            let mut fixture =
+                Fixture::new(HeldTurn::Parent, ScriptedFault::ParentError, Some(state)).await;
+            fixture.start().await;
+            let _pause = fixture.pause().await;
+            fixture.driver.release.add_permits(1);
+            let error = fixture.supervisor.drain(&fixture.scope).await.unwrap_err();
+            assert!(format!("{error:#}").contains("fixture provider failed"));
+            let task = fixture.task().await;
+            assert_eq!(task.status, TaskStatus::Failed);
+            let goal = fixture.goal().await;
+            assert_eq!(goal.accounting_state, state);
+            assert!(goal.pending_call_id.is_none());
+            assert!(goal.pending_call_epoch.is_none());
+            assert_eq!(
+                fixture.reason().await.as_deref(),
+                Some(if state == GoalAccountingState::OutcomeUnknown {
+                    "accounting_outcome_unknown"
+                } else {
+                    "accounting_missing_or_invalid"
+                })
+            );
+            assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_unpaused_parent_error_remains_terminal() {
+        let mut fixture = Fixture::new(HeldTurn::Parent, ScriptedFault::ParentError, None).await;
+        fixture.start().await;
+        fixture.driver.release.add_permits(1);
+        let error = fixture.supervisor.drain(&fixture.scope).await.unwrap_err();
+        assert!(format!("{error:#}").contains("fixture provider failed"));
+        assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+        assert_eq!(
+            fixture.reason().await.as_deref(),
+            Some("parent_operation_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_cancel_observes_worker_registered_while_waiting_for_command_lease() {
+        let mut fixture = Fixture::new(HeldTurn::Parent, ScriptedFault::ParentError, None).await;
+        fixture.driver.hold_rebind.store(true, Ordering::SeqCst);
+        let supervisor = fixture.supervisor.clone();
+        let source = fixture.source.clone();
+        let mut started = fixture.started.take().unwrap();
+        let launch = tokio::spawn(async move {
+            supervisor
+                .launch_after_response(&source, &mut started)
+                .await
+        });
+        timeout(
+            Duration::from_secs(1),
+            fixture.driver.rebind_entered.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        let supervisor = fixture.supervisor.clone();
+        let config = fixture.config.clone();
+        let driver = fixture.driver.clone();
+        let cancel = tokio::spawn(async move {
+            supervisor
+                .submit(
+                    &host_settings(&config),
+                    matrix_ingress(),
+                    driver,
+                    GoalCommand::Cancel,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while fixture.driver.binds.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.driver.release_rebind.add_permits(1);
+        launch.await.unwrap().unwrap();
+        let mut cancel = timeout(Duration::from_secs(1), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cancel.response(),
+            GoalResponse::TransitionPending(zeroclaw_goal::GoalPendingAction::Cancel)
+        ));
+        fixture.driver.release.add_permits(1);
+        assert!(matches!(
+            fixture
+                .supervisor
+                .launch_after_response(&fixture.source, &mut cancel)
+                .await
+                .unwrap(),
+            Some(GoalResponse::Cancelled(_))
+        ));
+        assert_eq!(fixture.task().await.status, TaskStatus::Cancelled);
+        assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+    }
+
+    #[tokio::test]
+    async fn supervisor_worker_panic_closes_queued_checkpoint_and_normal_drain_fails_missing_completion()
+     {
+        for accounting in [None, Some(GoalAccountingState::OutcomeUnknown)] {
+            let mut fixture =
+                Fixture::new(HeldTurn::Parent, ScriptedFault::ParentPanic, accounting).await;
+            fixture.start().await;
+            let zeroclaw_goal::GoalControlAdmission::Queued { deferred, .. } = fixture
+                .supervisor
+                .admit_control(
+                    &host_settings(&fixture.config),
+                    matrix_ingress(),
+                    fixture.driver.clone(),
+                    GoalCommand::Pause { immediate: false },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("active parent must queue the control");
+            };
+            assert_eq!(fixture.intent_states(), vec![("pending".to_owned(), None)]);
+            fixture.driver.release.add_permits(1);
+            let closed = match timeout(Duration::from_secs(1), deferred.wait())
+                .await
+                .unwrap()
+            {
+                Err(closed) => closed,
+                Ok(_) => panic!("a panicked worker must not admit the queued control"),
+            };
+            assert!(
+                std::error::Error::source(&closed)
+                    .unwrap()
+                    .is::<zeroclaw_goal::GoalCheckpointClosed>()
+            );
+            let settled_intents = vec![(
+                "superseded".to_owned(),
+                Some("checkpoint_closed".to_owned()),
+            )];
+            assert_eq!(fixture.intent_states(), settled_intents);
+            let error = fixture.supervisor.drain(&fixture.scope).await.unwrap_err();
+            assert!(format!("{error:#}").contains("stopped without reporting its completion"));
+            assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+            let goal = fixture.goal().await;
+            assert_eq!(
+                goal.accounting_state,
+                accounting.unwrap_or(GoalAccountingState::Complete)
+            );
+            assert!(goal.pending_call_id.is_none());
+            assert!(goal.pending_call_epoch.is_none());
+            assert_eq!(
+                fixture.reason().await.as_deref(),
+                Some(if accounting.is_some() {
+                    "accounting_outcome_unknown"
+                } else {
+                    "executor_failed"
+                })
+            );
+            assert_eq!(fixture.intent_states(), settled_intents);
+            assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_missing_completion_is_terminal_even_after_operator_pause() {
+        let mut fixture = Fixture::new(HeldTurn::Parent, ScriptedFault::ParentPanic, None).await;
+        fixture.start().await;
+        let _pause = fixture.pause().await;
+        fixture.driver.release.add_permits(1);
+        let error = fixture.supervisor.drain(&fixture.scope).await.unwrap_err();
+        assert!(format!("{error:#}").contains("stopped without reporting its completion"));
+        assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+        assert_eq!(fixture.reason().await.as_deref(), Some("executor_failed"));
+        assert!(!fixture.supervisor.owns_scope(&fixture.scope).await);
     }
 }
 

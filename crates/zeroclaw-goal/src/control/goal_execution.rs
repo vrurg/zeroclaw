@@ -331,6 +331,15 @@ struct GoalWorker {
 
 type GoalWorkerCompletion = std::result::Result<GoalExecutionOutcome, String>;
 
+// A queued control must also be released when the worker future unwinds or is dropped.
+struct GoalWorkerCheckpointGuard(GoalParentTurnCheckpoint);
+
+impl Drop for GoalWorkerCheckpointGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 struct GoalRestartFence {
     scopes: Vec<GoalExecutionScope>,
     error: Option<anyhow::Error>,
@@ -410,13 +419,16 @@ impl GoalExecutionSupervisor {
         let execution_epoch = scope.execution_epoch();
         let checkpoint = GoalParentTurnCheckpoint::new();
         let worker_checkpoint = checkpoint.clone();
+        let checkpoint_guard = GoalWorkerCheckpointGuard(checkpoint.clone());
         let (completion_tx, completion) = watch::channel(None);
         let source = source.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            let result = engine
-                .run(&source, request, worker_checkpoint.clone())
-                .await;
-            worker_checkpoint.close();
+            let result = {
+                let _checkpoint_guard = checkpoint_guard;
+                engine
+                    .run(&source, request, worker_checkpoint.clone())
+                    .await
+            };
 
             // The engine normally records its own expected execution failures.
             // Acquisition and other unexpected failures can occur before that
@@ -486,7 +498,6 @@ impl GoalExecutionSupervisor {
             Some(gate) => gate.admit(&command).await?,
             None => None,
         };
-        let previous = self.scope_for_session(&ingress).await?;
         let retained_driver = Arc::clone(&driver);
         let retained_ingress = ingress.clone();
         let runtime_submission = self
@@ -494,6 +505,7 @@ impl GoalExecutionSupervisor {
             .runtime
             .submit(settings, ingress, driver, command)
             .await?;
+        let previous = self.scope_for_session(&retained_ingress).await?;
         Ok(self.execution_submission(
             runtime_submission,
             previous,
@@ -950,8 +962,8 @@ impl GoalExecutionSupervisor {
         let outcome = completion
             .borrow()
             .clone()
-            .context("Goal execution worker stopped without reporting its completion")?
-            .map_err(anyhow::Error::msg);
+            .context("Goal execution worker stopped without reporting its completion")
+            .and_then(|outcome| outcome.map_err(anyhow::Error::msg));
         // Lifecycle finalization owns worker retirement and pending-operation
         // classification. Never let a generic drainer remove the handle first.
         let _ = self.drain_lifecycle_fence(scope).await?;
@@ -1053,10 +1065,12 @@ impl GoalExecutionSupervisor {
                 break;
             }
         }
-        let completion_error = match completion.borrow().clone() {
-            Some(Ok(_)) => None,
-            Some(Err(error)) => Some(error),
-            None => Some("Goal worker stopped without reporting its completion".to_owned()),
+        let (completion_missing, completion_failed) = {
+            let completion = completion.borrow();
+            (
+                completion.is_none(),
+                matches!(completion.as_ref(), Some(Err(_))),
+            )
         };
 
         let Some(current) = self
@@ -1124,8 +1138,13 @@ impl GoalExecutionSupervisor {
             return Ok(None);
         }
         let mut classified_epoch = None;
+        let pending_operation = goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some();
+        let incomplete_accounting = goal.accounting_state != GoalAccountingState::Complete;
         if matches!(current.status, TaskStatus::Paused | TaskStatus::Running)
-            && (goal.pending_call_id.is_some() || completion_error.is_some())
+            && (pending_operation
+                || incomplete_accounting
+                || completion_missing
+                || (current.status == TaskStatus::Running && completion_failed))
         {
             let failure_epoch = current.execution_epoch;
             match self
@@ -1136,8 +1155,10 @@ impl GoalExecutionSupervisor {
                     scope.session_id(),
                     failure_epoch,
                     TaskStatus::Failed,
-                    Some(if goal.pending_call_id.is_some() {
+                    Some(if pending_operation {
                         "accounting_outcome_unknown".to_owned()
+                    } else if incomplete_accounting {
+                        "accounting_missing_or_invalid".to_owned()
                     } else {
                         "executor_failed".to_owned()
                     }),
